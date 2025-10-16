@@ -1,0 +1,34 @@
+// Test string literals and str type
+fn test_string_literal() -> str {
+    const greeting: str = "Hello, world!";
+    return greeting;
+}
+
+fn test_string_empty() -> str {
+    const empty: str = "";
+    return empty;
+}
+
+fn test_string_unicode() -> str {
+    const unicode: str = "Hello, 世界! 🌍";
+    return unicode;
+}
+
+fn test_string_with_spaces() -> str {
+    const spaced: str = "This is a test string";
+    return spaced;
+}
+
+fn test_string_parameter(message: str) -> str {
+    return message;
+}
+
+fn test_string_variable() -> str {
+    var msg: str = "Variable string";
+    return msg;
+}
+
+fn test_string_const() -> str {
+    const msg: str = "Constant string";
+    return msg;
+}

@@ -1,0 +1,39 @@
+// Comprehensive test demonstrating u8, u16, and u32 functionality
+fn test_all_types() -> u32 {
+    // Test u8 (8-bit: 0-255)
+    const small_a: u8 = 100;
+    const small_b: u8 = 155;
+    const small_sum: u8 = small_a + small_b; // 255
+
+    // Test u16 (16-bit: 0-65535)  
+    const medium_a: u16 = 30000;
+    const medium_b: u16 = 35535;
+    const medium_sum: u16 = medium_a + medium_b; // 65535
+
+    // Test u32 (32-bit: 0-4294967295)
+    const large_a: u32 = 2000000000;
+    const large_b: u32 = 2294967295;
+    const large_sum: u32 = large_a + large_b; // 4294967295
+
+    return large_sum;
+}
+
+fn test_boundary_values() -> u32 {
+    // Test minimum values
+    const u8_min: u8 = 0;
+    const u16_min: u16 = 0;
+    const u32_min: u32 = 0;
+
+    // Test maximum values
+    const u8_max: u8 = 255;
+    const u16_max: u16 = 65535;
+    const u32_max: u32 = 4294967295;
+
+    return u32_max;
+}
+
+fn test_type_promotion(small: u8, medium: u16, large: u32) -> u32 {
+    // All parameters are properly typed
+    // Return the largest value
+    return large;
+}

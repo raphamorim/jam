@@ -1,0 +1,63 @@
+// Test if/else statements
+fn test_if_basic() -> u8 {
+    if (1 == 1) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+
+fn test_if_comparison() -> u8 {
+    const a: u8 = 10;
+    const b: u8 = 5;
+    
+    if (a > b) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+fn test_if_equality() -> u8 {
+    const x: u8 = 100;
+    const y: u8 = 100;
+    
+    if (x == y) {
+        return 255;
+    } else {
+        return 0;
+    }
+}
+
+fn test_if_not_equal() -> u8 {
+    const a: u8 = 50;
+    const b: u8 = 75;
+    
+    if (a != b) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+fn test_if_less_than() -> u8 {
+    const small: u8 = 10;
+    const big: u8 = 20;
+    
+    if (small < big) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+fn test_if_greater_equal() -> u8 {
+    const val: u8 = 15;
+    const threshold: u8 = 15;
+    
+    if (val >= threshold) {
+        return 1;
+    } else {
+        return 0;
+    }
+}

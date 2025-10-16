@@ -1,0 +1,33 @@
+// Test u8 type - 8-bit unsigned integer (0-255)
+fn test_u8_basic() -> u8 {
+    const a: u8 = 100;
+    const b: u8 = 50;
+    return a + b;
+}
+
+fn test_u8_max_value() -> u8 {
+    const max: u8 = 255;
+    return max;
+}
+
+fn test_u8_min_value() -> u8 {
+    const min: u8 = 0;
+    return min;
+}
+
+fn test_u8_arithmetic() -> u8 {
+    const a: u8 = 10;
+    const b: u8 = 20;
+    const sum: u8 = a + b;
+    return sum;
+}
+
+fn test_u8_variables() -> u8 {
+    var x: u8 = 42;
+    const y: u8 = 8;
+    return x + y;
+}
+
+fn test_u8_function_params(a: u8, b: u8) -> u8 {
+    return a + b;
+}

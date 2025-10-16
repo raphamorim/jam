@@ -1,0 +1,63 @@
+// Test bool type - boolean values (true/false)
+fn test_bool_basic() -> bool {
+    const flag: bool = true;
+    return flag;
+}
+
+fn test_bool_false() -> bool {
+    const flag: bool = false;
+    return flag;
+}
+
+fn test_bool_variables() -> bool {
+    var isActive: bool = true;
+    const isReady: bool = false;
+    return isActive;
+}
+
+fn test_bool_comparison() -> bool {
+    const a: bool = true;
+    const b: bool = false;
+    
+    if (a == true) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+fn test_bool_equality() -> bool {
+    const x: bool = true;
+    const y: bool = true;
+    
+    if (x == y) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+fn test_bool_inequality() -> bool {
+    const a: bool = true;
+    const b: bool = false;
+    
+    if (a != b) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+fn test_bool_in_if() -> u8 {
+    const condition: bool = true;
+    
+    if (condition == true) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+
+fn test_bool_function_param(flag: bool) -> bool {
+    return flag;
+}

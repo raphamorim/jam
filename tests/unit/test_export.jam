@@ -1,0 +1,8 @@
+// Test export function declarations
+export fn exported_func(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+fn main() -> u8 {
+    return 0;
+}

@@ -1,0 +1,9 @@
+TabWidth: 4
+IndentWidth: 4
+UseTab: ForIndentation
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortBlocksOnASingleLine: Always
+AllowShortFunctionsOnASingleLine: All
+AllowShortLambdasOnASingleLine: All
+AllowShortLoopsOnASingleLine: true
+SpacesBeforeTrailingComments: 2

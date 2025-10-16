@@ -1,0 +1,20 @@
+// Jam functions to be called from C
+// These will be compiled with C ABI
+
+fn jam_multiply(a: i32, b: i32) -> i32 {
+    return a + b;  // Intentionally wrong for now since we don't have multiplication
+}
+
+fn jam_square(x: i32) -> i32 {
+    return x + x;  // Intentionally using addition (will be x*x when we add multiply)
+}
+
+fn jam_greet(name: str) {
+    println("Hello from Jam!");
+    // In the future: println("Hello, " + name + " from Jam!");
+}
+
+fn main() -> u8 {
+    // This won't be called when C is the entry point
+    return 0;
+}

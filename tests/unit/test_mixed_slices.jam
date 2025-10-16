@@ -1,0 +1,42 @@
+// Test mixed string and slice usage
+fn test_string_and_slice_params(message: str, data: []u8) -> str {
+    return message;
+}
+
+fn test_string_slice_conversion() -> []u8 {
+    const text: str = "convert me";
+    // In the future, this would convert str to []u8
+    const bytes: []u8 = text;
+    return bytes;
+}
+
+fn test_slice_functions(input: []u8) -> []u8 {
+    return input;
+}
+
+fn test_string_functions(input: str) -> str {
+    return input;
+}
+
+// Test complex slice types
+fn test_i8_slice() -> []i8 {
+    var data: []i8;
+    return data;
+}
+
+fn test_i16_slice() -> []i16 {
+    var data: []i16;
+    return data;
+}
+
+fn test_i32_slice() -> []i32 {
+    var data: []i32;
+    return data;
+}
+
+// Test slice assignment
+fn test_slice_assignment() -> []u8 {
+    const original: []u8 = "original";
+    var copy: []u8 = original;
+    return copy;
+}

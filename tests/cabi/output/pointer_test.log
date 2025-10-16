@@ -1,0 +1,4 @@
+Pointer size: 8 bytes
+Pointer alignment: 8 bytes
+int32_t size: 4 bytes
+int32_t alignment: 4 bytes

@@ -1,0 +1,7 @@
+// Test extern function declarations
+extern fn ext_func1(x: i32) -> i32;
+extern fn ext_func2() -> i32;
+
+fn main() -> u8 {
+    return 0;
+}

@@ -1,0 +1,39 @@
+// Test u16 type - 16-bit unsigned integer (0-65535)
+fn test_u16_basic() -> u16 {
+    const a: u16 = 1000;
+    const b: u16 = 2000;
+    return a + b;
+}
+
+fn test_u16_max_value() -> u16 {
+    const max: u16 = 65535;
+    return max;
+}
+
+fn test_u16_min_value() -> u16 {
+    const min: u16 = 0;
+    return min;
+}
+
+fn test_u16_large_numbers() -> u16 {
+    const a: u16 = 30000;
+    const b: u16 = 20000;
+    return a + b;
+}
+
+fn test_u16_mixed_operations() -> u16 {
+    const small: u16 = 100;
+    const large: u16 = 10000;
+    return small + large;
+}
+
+fn test_u16_variables() -> u16 {
+    var x: u16 = 5000;
+    const y: u16 = 1500;
+    return x + y;
+}
+
+fn test_u16_function_params(a: u16, b: u16) -> u16 {
+    const sum: u16 = a + b;
+    return sum;
+}

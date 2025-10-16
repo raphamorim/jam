@@ -1,0 +1,39 @@
+// Test u32 type - 32-bit unsigned integer (0-4294967295)
+fn test_u32_basic() -> u32 {
+    const a: u32 = 100000;
+    const b: u32 = 200000;
+    return a + b;
+}
+
+fn test_u32_max_value() -> u32 {
+    const max: u32 = 4294967295;
+    return max;
+}
+
+fn test_u32_min_value() -> u32 {
+    const min: u32 = 0;
+    return min;
+}
+
+fn test_u32_large_numbers() -> u32 {
+    const a: u32 = 1000000;
+    const b: u32 = 2000000;
+    return a + b;
+}
+
+fn test_u32_very_large() -> u32 {
+    const huge: u32 = 4000000000;
+    const small: u32 = 100000000;
+    return huge + small;
+}
+
+fn test_u32_variables() -> u32 {
+    var x: u32 = 500000;
+    const y: u32 = 750000;
+    return x + y;
+}
+
+fn test_u32_function_params(a: u32, b: u32) -> u32 {
+    const result: u32 = a + b;
+    return result;
+}

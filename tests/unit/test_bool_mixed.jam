@@ -1,0 +1,27 @@
+// Test bool with mixed types
+fn test_bool_mixed_types() -> u8 {
+    const isEnabled: bool = true;
+    const count: u8 = 10;
+    
+    if (isEnabled == true) {
+        if (count > 5) {
+            return 100;
+        } else {
+            return 50;
+        }
+    } else {
+        return 0;
+    }
+}
+
+fn test_bool_complex_conditions() -> bool {
+    const a: u8 = 15;
+    const b: u8 = 10;
+    const flag: bool = true;
+    
+    if ((a > b) == flag) {
+        return true;
+    } else {
+        return false;
+    }
+}

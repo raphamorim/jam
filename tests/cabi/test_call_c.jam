@@ -1,0 +1,7 @@
+// Test 1: Call C function from Jam
+// This Jam code will call a C function
+
+fn main() -> u8 {
+    println("Calling C function add_numbers from Jam...");
+    return 0;
+}

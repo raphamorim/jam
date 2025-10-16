@@ -1,0 +1,23 @@
+// Test if statements without else
+fn test_if_only() -> u8 {
+    const x: u8 = 5;
+    
+    if (x == 5) {
+        const result: u8 = 100;
+        return result;
+    }
+    
+    return 0;
+}
+
+fn test_if_nested_expressions() -> u8 {
+    const a: u8 = 10;
+    const b: u8 = 20;
+    const c: u8 = 30;
+    
+    if ((a + b) == c) {
+        return 1;
+    } else {
+        return 0;
+    }
+}

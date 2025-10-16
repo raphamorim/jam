@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  build-linux-x86:
+    name: Build on Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang cmake
+          llvm-config --version
+
+      - name: Configure and build
+        run: |
+          mkdir -p build
+          cd build
+          cmake ..
+          cmake --build . -j $(nproc)
+
+      - name: Test compiler with sample file
+        run: |
+          cp test.txt build/
+          cd build
+          ./jam test.txt || echo "Execution completed with $?"
+
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86-artifacts
+          path: |
+            build/jam
+            build/output*
+
+  build-linux-arm:
+    name: Build on Linux (ARM64)
+    runs-on: ubuntu-latest-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang cmake
+          llvm-config --version
+
+      - name: Configure and build
+        run: |
+          mkdir -p build
+          cd build
+          cmake ..
+          cmake --build . -j $(nproc)
+
+      - name: Test compiler with sample file
+        run: |
+          cp test.txt build/
+          cd build
+          ./jam test.txt || echo "Execution completed with $?"
+
+      - name: Archive ARM build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm-artifacts
+          path: |
+            build/jam
+            build/output*
+
+  build-macos:
+    name: Build on macOS
+    strategy:
+      matrix:
+        arch: [macos-latest, macos-latest-arm64]
+    runs-on: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM via Homebrew
+        run: |
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> $GITHUB_PATH
+          llvm-config --version
+
+      - name: Configure and build
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_PREFIX_PATH=$(brew --prefix llvm)
+          cmake --build . -j $(sysctl -n hw.ncpu)
+
+      - name: Test compiler with sample file
+        run: |
+          cp test.txt build/
+          cd build
+          ./jam test.txt || echo "Execution completed with $?"
+
+      - name: Archive macOS build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-artifacts
+          path: |
+            build/jam
+            build/output*

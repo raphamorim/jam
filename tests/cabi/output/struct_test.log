@@ -1,0 +1,4 @@
+Struct Point size: 8 bytes
+int32_t size: 4 bytes
+Pointer size: 8 bytes
+Point: x=10, y=20

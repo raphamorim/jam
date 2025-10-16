@@ -1,0 +1,48 @@
+// Test byte slices []u8
+fn test_u8_slice_basic() -> []u8 {
+    const data: []u8 = "hello";
+    return data;
+}
+
+fn test_u8_slice_empty() -> []u8 {
+    const empty: []u8 = "";
+    return empty;
+}
+
+fn test_u8_slice_parameter(data: []u8) -> []u8 {
+    return data;
+}
+
+fn test_u8_slice_variable() -> []u8 {
+    var buffer: []u8 = "buffer data";
+    return buffer;
+}
+
+fn test_u8_slice_const() -> []u8 {
+    const buffer: []u8 = "constant buffer";
+    return buffer;
+}
+
+// Test other slice types
+fn test_u16_slice() -> []u16 {
+    // This would need array literal syntax in the future
+    // For now, just test the type parsing
+    var data: []u16;
+    return data;
+}
+
+fn test_u32_slice() -> []u32 {
+    var data: []u32;
+    return data;
+}
+
+fn test_bool_slice() -> []bool {
+    var data: []bool;
+    return data;
+}
+
+// Test nested slice types (for future)
+fn test_slice_of_slices() -> [][]u8 {
+    var data: [][]u8;
+    return data;
+}
