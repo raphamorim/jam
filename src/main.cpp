@@ -732,6 +732,24 @@ static int compileAndRun(const std::string &filename,
 
 	jam::Target host = jam::Target::getHostTarget();
 
+	// libm linking. LLVM's `frem` on floating-point operands lowers
+	// to a `fmod` libcall, so any `%` on a float needs the math
+	// runtime visible to the linker. Rules per OS/libc:
+	//   * macOS: libSystem bundles math; never pass `-lm`.
+	//   * Windows: MSVCRT bundles math; never pass `-lm`.
+	//   * Linux/FreeBSD + glibc: math lives in libm.so; pass `-lm`.
+	//   * Linux/FreeBSD + musl: math is bundled into libc.a; passing
+	//     `-lm` would fail on installs without a stub libm.a.
+	// `linkLibc` is hard-coded to true today since Jam always links
+	// libc; it becomes a real toggle when a freestanding compile mode
+	// lands.
+	const bool linkLibc = true;
+	if (linkLibc &&
+	    (host.os == jam::OS::Linux || host.os == jam::OS::FreeBSD) &&
+	    host.abi != jam::ABI::Musl) {
+		linkCmd += " -lm";
+	}
+
 	// Strip unreferenced functions/data at link time. Pairs with
 	// FunctionSections / DataSections set on the TargetMachine, which split
 	// each symbol into its own section so the linker can GC them
