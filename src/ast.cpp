@@ -11,6 +11,7 @@
 #include "codegen.h"
 #include "jam_llvm.h"
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
