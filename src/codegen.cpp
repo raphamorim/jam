@@ -475,9 +475,8 @@ JamCodegenContext::getImportHandle(const std::string &handle) const {
 	return (it == importHandles_.end()) ? nullptr : &it->second;
 }
 
-std::string
-JamCodegenContext::formatNamespaceLookupError(const std::string &kind,
-                                              const std::string &qualified) const {
+std::string JamCodegenContext::formatNamespaceLookupError(
+    const std::string &kind, const std::string &qualified) const {
 	size_t dotPos = qualified.find('.');
 	if (dotPos == std::string::npos) {
 		return "Unknown " + kind + ": " + qualified;
@@ -598,9 +597,9 @@ uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
 		    aliasTarget != kNoType) {
 			return typeSize(aliasTarget);
 		}
-		throw std::runtime_error("typeSize: " +
-		                         formatNamespaceLookupError("user-defined type",
-		                                                    substName));
+		throw std::runtime_error(
+		    "typeSize: " +
+		    formatNamespaceLookupError("user-defined type", substName));
 	}
 	case TypeKind::Union: {
 		const UnionInfo *info = lookupUnion(ty);
@@ -688,9 +687,9 @@ uint64_t JamCodegenContext::typeAlign(TypeIdx ty) const {
 		    aliasTarget != kNoType) {
 			return typeAlign(aliasTarget);
 		}
-		throw std::runtime_error("typeAlign: " +
-		                         formatNamespaceLookupError("user-defined type",
-		                                                    substName));
+		throw std::runtime_error(
+		    "typeAlign: " +
+		    formatNamespaceLookupError("user-defined type", substName));
 	}
 	case TypeKind::Union: {
 		const UnionInfo *info = lookupUnion(ty);

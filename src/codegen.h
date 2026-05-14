@@ -253,8 +253,7 @@ class JamCodegenContext {
 	                          const std::string &modulePath);
 	void registerPrivateName(const std::string &handle,
 	                         const std::string &name);
-	const ImportHandleInfo *
-	getImportHandle(const std::string &handle) const;
+	const ImportHandleInfo *getImportHandle(const std::string &handle) const;
 	std::string formatNamespaceLookupError(const std::string &kind,
 	                                       const std::string &qualified) const;
 
@@ -300,8 +299,8 @@ class JamCodegenContext {
 		size_t operator()(const GenericInstanceKey &k) const {
 			size_t h = std::hash<const void *>{}(k.fn);
 			for (TypeIdx t : k.args) {
-				h ^= std::hash<uint32_t>{}(t) + 0x9e3779b9 + (h << 6) +
-				     (h >> 2);
+				h ^=
+				    std::hash<uint32_t>{}(t) + 0x9e3779b9 + (h << 6) + (h >> 2);
 			}
 			return h;
 		}

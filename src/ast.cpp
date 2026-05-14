@@ -1557,8 +1557,18 @@ static JamValueRef codegenCall(JamCodegenContext &ctx, const AstNode &n) {
 
 	JamFunctionRef CalleeF =
 	    JamLLVMGetFunction(ctx.getModule(), llvmName.c_str());
+	if (!CalleeF && llvmName == callee) {
+		size_t dotPos = callee.find('.');
+		if (dotPos != std::string::npos &&
+		    ctx.getFunctionAST(callee) != nullptr) {
+			std::string bare = callee.substr(dotPos + 1);
+			CalleeF = JamLLVMGetFunction(ctx.getModule(), bare.c_str());
+			if (CalleeF) llvmName = bare;
+		}
+	}
 	if (!CalleeF) {
-		throw std::runtime_error("Unknown function referenced: " + callee);
+		throw std::runtime_error(
+		    ctx.formatNamespaceLookupError("function", callee));
 	}
 
 	// when the callee's parameter is a Let/Move-mode aggregate that

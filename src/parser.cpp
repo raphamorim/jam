@@ -259,8 +259,13 @@ NodeIdx Parser::parsePrimary() {
 				continue;
 			}
 
-			// TOK_OPEN_PAREN, Foo(T).method(args)
-			if (!chainStarted) {
+			// TOK_OPEN_PAREN: typecall on a generic — either bare
+			// `Foo(T).method(args)` (chainStarted=false) or namespace-
+			// qualified `handle.Foo(T).method(args)` when `handle` was
+			// bound by `import(...)`.
+			bool isNamespacedTypecall =
+			    chainStarted && importHandles.count(name) > 0;
+			if (!chainStarted || isNamespacedTypecall) {
 				int peekIdx = current + 1;  // first token after (
 				int depth = 1;
 				while (peekIdx < (int)tokens.size() && depth > 0) {
@@ -299,8 +304,13 @@ NodeIdx Parser::parsePrimary() {
 					consume(TOK_CLOSE_PAREN,
 					        "Expected ')' after method arguments");
 
+					// For `handle.Vec(T)...`, the receiver type's name
+					// is the dotted chain so it matches the qualified
+					// alias main.cpp registered under handle.Vec.
+					std::string receiverName =
+					    isNamespacedTypecall ? qualifiedName(expr) : name;
 					TypeIdx receiverTy = typePool->internGenericCall(
-					    stringPool->intern(name), std::move(typeArgs));
+					    stringPool->intern(receiverName), std::move(typeArgs));
 
 					ExtraIdx extra = nodes->reserveExtra(2 + methodArgs.size());
 					nodes->setExtra(extra, static_cast<uint32_t>(methodName));
@@ -425,14 +435,23 @@ TypeIdx Parser::parseType() {
 		throw std::runtime_error("Unknown base type: " + s);
 	}
 	if (match(TOK_IDENTIFIER)) {
-		const std::string &ident = previous().lexeme;
-		if (ident == "Self") {
+		const std::string &firstIdent = previous().lexeme;
+		if (firstIdent == "Self") {
 			if (structContextStack.empty()) {
 				throw std::runtime_error(
 				    "`Self` is only valid inside a struct body");
 			}
 			return typePool->internNamed(
 			    stringPool->intern(structContextStack.back()));
+		}
+		// Optional module qualifier: `Handle.TypeName`. main.cpp
+		// registers each main-module import's pub items under
+		// `<handle>.<name>` so the existing struct/enum/union/type-alias
+		// and generic-fn lookups resolve the qualified form transparently.
+		std::string ident = firstIdent;
+		if (match(TOK_DOT)) {
+			consume(TOK_IDENTIFIER, "Expected type name after `.`");
+			ident = firstIdent + "." + previous().lexeme;
 		}
 		if (check(TOK_OPEN_PAREN)) {
 			advance();  // consume `(`
@@ -1335,6 +1354,7 @@ std::unique_ptr<ImportDeclAST> Parser::parseImportDecl() {
 	consume(TOK_CLOSE_PAREN, "Expected ')' after import path");
 	consume(TOK_SEMI, "Expected ';' after import declaration");
 
+	importHandles.insert(name);
 	return std::make_unique<ImportDeclAST>(name, path);
 }
 

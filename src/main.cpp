@@ -147,22 +147,29 @@ static int compileAndRun(const std::string &filename,
 
 	codegenCtx.setAnonStructs(&sharedAnonStructs);
 	codegenCtx.setAnonEnums(&sharedAnonEnums);
-	auto declareStructs = [&](ModuleAST *m) {
+	// `publicOnly` is set when iterating an imported module: only `pub`
+	// items get registered, so non-pub items can't leak into the
+	// importing module via bare-name lookup. Main-module decls always
+	// register since there's no outer consumer.
+	auto declareStructs = [&](ModuleAST *m, bool publicOnly) {
 		for (auto &s : m->Structs) {
+			if (publicOnly && !s->isPub) continue;
 			JamTypeRef structType = JamLLVMStructCreateNamed(
 			    codegenCtx.getContext(), s->Name.c_str());
 			codegenCtx.registerStruct(s->Name, structType, s->Fields);
 		}
 	};
-	auto declareUnions = [&](ModuleAST *m) {
+	auto declareUnions = [&](ModuleAST *m, bool publicOnly) {
 		for (auto &u : m->Unions) {
+			if (publicOnly && !u->isPub) continue;
 			JamTypeRef unionType = JamLLVMStructCreateNamed(
 			    codegenCtx.getContext(), u->Name.c_str());
 			codegenCtx.registerUnion(u->Name, unionType, u->Fields);
 		}
 	};
-	auto fillStructBodies = [&](ModuleAST *m) {
+	auto fillStructBodies = [&](ModuleAST *m, bool publicOnly) {
 		for (auto &s : m->Structs) {
+			if (publicOnly && !s->isPub) continue;
 			std::vector<JamTypeRef> fieldTypes;
 			fieldTypes.reserve(s->Fields.size());
 			for (auto &f : s->Fields) {
@@ -179,8 +186,9 @@ static int compileAndRun(const std::string &filename,
 	// padding makes up the difference between that field's size and the
 	// largest field's size, so the union ends up with the right size and
 	// alignment for any field's stored value.
-	auto fillUnionBodies = [&](ModuleAST *m) {
+	auto fillUnionBodies = [&](ModuleAST *m, bool publicOnly) {
 		for (auto &u : m->Unions) {
+			if (publicOnly && !u->isPub) continue;
 			if (u->Fields.empty()) {
 				throw std::runtime_error("Union `" + u->Name +
 				                         "` must have at least one field");
@@ -219,8 +227,9 @@ static int compileAndRun(const std::string &filename,
 			                     false);
 		}
 	};
-	auto declareEnums = [&](ModuleAST *m) {
+	auto declareEnums = [&](ModuleAST *m, bool publicOnly) {
 		for (auto &e : m->Enums) {
+			if (publicOnly && !e->isPub) continue;
 			std::vector<JamCodegenContext::EnumVariantInfo> variants;
 			variants.reserve(e->Variants.size());
 			for (auto &v : e->Variants) {
@@ -246,8 +255,9 @@ static int compileAndRun(const std::string &filename,
 	// payload size and the alignDriver scalar's size, rounded up to
 	// maxAlign so the trailing slot in an array of enums is correctly
 	// aligned.
-	auto fillEnumBodies = [&](ModuleAST *m) {
+	auto fillEnumBodies = [&](ModuleAST *m, bool publicOnly) {
 		for (auto &e : m->Enums) {
+			if (publicOnly && !e->isPub) continue;
 			const auto *info = codegenCtx.getEnum(e->Name);
 			if (!info || !info->hasPayloadVariant) continue;
 
@@ -333,24 +343,24 @@ static int compileAndRun(const std::string &filename,
 	};
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
 		if (path == "std") continue;
-		declareStructs(importedModule.get());
-		declareUnions(importedModule.get());
-		declareEnums(importedModule.get());
+		declareStructs(importedModule.get(), /*publicOnly=*/true);
+		declareUnions(importedModule.get(), /*publicOnly=*/true);
+		declareEnums(importedModule.get(), /*publicOnly=*/true);
 		declareEnumLLVMTypes(importedModule.get());
 	}
-	declareStructs(module.get());
-	declareUnions(module.get());
-	declareEnums(module.get());
+	declareStructs(module.get(), /*publicOnly=*/false);
+	declareUnions(module.get(), /*publicOnly=*/false);
+	declareEnums(module.get(), /*publicOnly=*/false);
 	declareEnumLLVMTypes(module.get());
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
 		if (path == "std") continue;
-		fillStructBodies(importedModule.get());
-		fillUnionBodies(importedModule.get());
-		fillEnumBodies(importedModule.get());
+		fillStructBodies(importedModule.get(), /*publicOnly=*/true);
+		fillUnionBodies(importedModule.get(), /*publicOnly=*/true);
+		fillEnumBodies(importedModule.get(), /*publicOnly=*/true);
 	}
-	fillStructBodies(module.get());
-	fillUnionBodies(module.get());
-	fillEnumBodies(module.get());
+	fillStructBodies(module.get(), /*publicOnly=*/false);
+	fillUnionBodies(module.get(), /*publicOnly=*/false);
+	fillEnumBodies(module.get(), /*publicOnly=*/false);
 
 	// Register module-scope `const NAME[: T]? = expr;` bindings. These
 	// are inlined at use sites (see AstTag::Variable in ast.cpp), so we
@@ -398,6 +408,42 @@ static int compileAndRun(const std::string &filename,
 			if (func->isPub) {
 				codegenCtx.registerFunctionAST(func->Name, func.get());
 			}
+		}
+	}
+
+	for (auto &import : module->Imports) {
+		if (import->Path == "std" || import->Path == "test") continue;
+		const std::string &handle = import->Name;
+		ModuleAST *importedModule = resolver.getOrLoadModule(import->Path);
+		if (!importedModule) continue;
+		codegenCtx.registerImportHandle(handle, import->Path);
+		auto aliasNamed = [&](const std::string &bare) {
+			TypeIdx target = codegenCtx.getTypePool().internNamed(
+			    codegenCtx.getStringPool().intern(bare));
+			codegenCtx.registerTypeAlias(handle + "." + bare, target);
+		};
+		// Track pub vs non-pub items per handle. Pub items get the
+		// qualified registration; non-pub get recorded so a later
+		// lookup miss produces the precise "not exported" diagnostic.
+		for (auto &func : importedModule->Functions) {
+			if (func->isPub) {
+				codegenCtx.registerFunctionAST(handle + "." + func->Name,
+				                               func.get());
+			} else {
+				codegenCtx.registerPrivateName(handle, func->Name);
+			}
+		}
+		for (auto &s : importedModule->Structs) {
+			if (s->isPub) aliasNamed(s->Name);
+			else codegenCtx.registerPrivateName(handle, s->Name);
+		}
+		for (auto &e : importedModule->Enums) {
+			if (e->isPub) aliasNamed(e->Name);
+			else codegenCtx.registerPrivateName(handle, e->Name);
+		}
+		for (auto &u : importedModule->Unions) {
+			if (u->isPub) aliasNamed(u->Name);
+			else codegenCtx.registerPrivateName(handle, u->Name);
 		}
 	}
 

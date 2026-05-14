@@ -12,6 +12,7 @@
 #include "ast_flat.h"
 #include "token.h"
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 class Parser {
@@ -58,6 +59,7 @@ class Parser {
 	std::vector<std::unique_ptr<StructDeclAST>> anonStructs;
 	std::vector<std::unique_ptr<EnumDeclAST>> anonEnums;
 	std::vector<std::string> structContextStack;
+	std::unordered_set<std::string> importHandles;
 	std::unique_ptr<UnionDeclAST> parseUnionDecl();
 	std::unique_ptr<EnumDeclAST> parseEnumDecl();
 	std::unique_ptr<ConstDeclAST> parseConstDecl();

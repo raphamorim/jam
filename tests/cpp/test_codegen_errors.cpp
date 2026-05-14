@@ -105,26 +105,22 @@ class CodegenErrorTests {
 		                  testIntToFloatRejected);
 		framework.addTest("Codegen - mixed-width float binary op without cast",
 		                  testMixedFloatWidthRejected);
-		framework.addTest(
-		    "Codegen - destructured non-pub symbol rejected",
-		    testDestructuredNonPubRejected);
+		framework.addTest("Codegen - destructured non-pub symbol rejected",
+		                  testDestructuredNonPubRejected);
 		framework.addTest("Codegen - `pub` on import rejected",
 		                  testPubOnImportRejected);
-		framework.addTest(
-		    "Codegen - `pub` on destructuring import rejected",
-		    testPubOnDestructuringRejected);
-		framework.addTest(
-		    "Codegen - namespace access to non-pub type rejected",
-		    testNamespaceNonPubType);
+		framework.addTest("Codegen - `pub` on destructuring import rejected",
+		                  testPubOnDestructuringRejected);
+		framework.addTest("Codegen - namespace access to non-pub type rejected",
+		                  testNamespaceNonPubType);
 		framework.addTest(
 		    "Codegen - namespace access to missing symbol rejected",
 		    testNamespaceMissingSymbol);
 		framework.addTest(
 		    "Codegen - namespace access via unknown handle rejected",
 		    testNamespaceUnknownHandle);
-		framework.addTest(
-		    "Codegen - namespace access to non-pub fn rejected",
-		    testNamespaceNonPubFn);
+		framework.addTest("Codegen - namespace access to non-pub fn rejected",
+		                  testNamespaceNonPubFn);
 		framework.addTest(
 		    "Codegen - bare-name access to non-pub imported type blocked",
 		    testBareNamePrivateBlocked);
@@ -248,13 +244,12 @@ fn main() i32 { return 0; }
 	// `const { X } = import("lib")` requires X to be `pub` in lib.
 	// Non-pub triggers a precise "is not exported" diagnostic.
 	static void testDestructuredNonPubRejected() {
-		auto r = compileWithLib(
-		    "must_fail_destructured_nonpub",
-		    R"(
+		auto r = compileWithLib("must_fail_destructured_nonpub",
+		                        R"(
 const { Hidden } = import("lib");
 fn main() {}
 )",
-		    "const Hidden = struct { n: i32, };\n");
+		                        "const Hidden = struct { n: i32, };\n");
 		ASSERT_TRUE(r.exitCode != 0);
 		ASSERT_TRUE(stderrContains(r, "Hidden"));
 		ASSERT_TRUE(stderrContains(r, "is not exported from module"));
@@ -287,13 +282,12 @@ fn main() {}
 	// `mod.Private` where Private isn't pub: emits the precise
 	// "is not exported" diagnostic instead of a generic "Unknown".
 	static void testNamespaceNonPubType() {
-		auto r = compileWithLib(
-		    "must_fail_ns_nonpub_type",
-		    R"(
+		auto r = compileWithLib("must_fail_ns_nonpub_type",
+		                        R"(
 const lib = import("lib");
 fn main() { var v: lib.Private = { n: 1 }; }
 )",
-		    "const Private = struct { n: i32, };\n");
+		                        "const Private = struct { n: i32, };\n");
 		ASSERT_TRUE(r.exitCode != 0);
 		ASSERT_TRUE(stderrContains(r, "Private"));
 		ASSERT_TRUE(stderrContains(r, "is not exported from module"));
@@ -302,13 +296,12 @@ fn main() { var v: lib.Private = { n: 1 }; }
 	// `mod.Nope` where Nope doesn't exist at all in `lib`: distinct
 	// "does not exist" diagnostic, separable from the non-pub case.
 	static void testNamespaceMissingSymbol() {
-		auto r = compileWithLib(
-		    "must_fail_ns_missing",
-		    R"(
+		auto r = compileWithLib("must_fail_ns_missing",
+		                        R"(
 const lib = import("lib");
 fn main() { var v: lib.Nope = { n: 1 }; }
 )",
-		    "pub const Val = struct { n: i32, };\n");
+		                        "pub const Val = struct { n: i32, };\n");
 		ASSERT_TRUE(r.exitCode != 0);
 		ASSERT_TRUE(stderrContains(r, "Nope"));
 		ASSERT_TRUE(stderrContains(r, "does not exist in module"));
@@ -328,13 +321,12 @@ fn main() { var v: unknown.X = { n: 1 }; }
 	// produces the precise "not exported" diagnostic via the shared
 	// formatNamespaceLookupError helper.
 	static void testNamespaceNonPubFn() {
-		auto r = compileWithLib(
-		    "must_fail_ns_nonpub_fn",
-		    R"(
+		auto r = compileWithLib("must_fail_ns_nonpub_fn",
+		                        R"(
 const lib = import("lib");
 fn main() { var r: i32 = lib.priv(7); }
 )",
-		    "fn priv(x: i32) i32 { return x; }\n");
+		                        "fn priv(x: i32) i32 { return x; }\n");
 		ASSERT_TRUE(r.exitCode != 0);
 		ASSERT_TRUE(stderrContains(r, "priv"));
 		ASSERT_TRUE(stderrContains(r, "is not exported from module"));
@@ -345,13 +337,12 @@ fn main() { var r: i32 = lib.priv(7); }
 	// imported structs globally regardless of pub; the publicOnly
 	// gate closes that hole.
 	static void testBareNamePrivateBlocked() {
-		auto r = compileWithLib(
-		    "must_fail_bare_name_private",
-		    R"(
+		auto r = compileWithLib("must_fail_bare_name_private",
+		                        R"(
 const lib = import("lib");
 fn main() { var v: Private = { n: 1 }; }
 )",
-		    "const Private = struct { n: i32, };\n");
+		                        "const Private = struct { n: i32, };\n");
 		ASSERT_TRUE(r.exitCode != 0);
 		ASSERT_TRUE(stderrContains(r, "Private"));
 	}
