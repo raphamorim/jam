@@ -13,11 +13,11 @@ fn bool_not(a: bool) bool {
 }
 
 fn bool_and(a: bool, b: bool) bool {
-    return a and b;
+    return a && b;
 }
 
 fn bool_or(a: bool, b: bool) bool {
-    return a or b;
+    return a || b;
 }
 
 fn bool_eq(a: bool, b: bool) bool {

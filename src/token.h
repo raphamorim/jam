@@ -55,8 +55,8 @@ enum TokenType {
 	TOK_PUB,        // pub keyword (visible to Jam modules, like Zig)
 	TOK_IMPORT,     // import keyword
 	TOK_DOT,        // . for member access
-	TOK_AND,        // and (logical AND)
-	TOK_OR,         // or (logical OR)
+	TOK_AND,        // && (logical AND, short-circuit)
+	TOK_OR,         // || (logical OR, short-circuit)
 	TOK_NOT,        // ! (logical NOT)
 	TOK_TFN,        // tfn keyword (test function)
 	TOK_STRUCT,     // struct keyword

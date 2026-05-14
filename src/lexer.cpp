@@ -122,10 +122,6 @@ void Lexer::identifier() {
 		addToken(TOK_PUB, text);
 	} else if (text == "import") {
 		addToken(TOK_IMPORT, text);
-	} else if (text == "and") {
-		addToken(TOK_AND, text);
-	} else if (text == "or") {
-		addToken(TOK_OR, text);
 	} else if (text == "tfn") {
 		addToken(TOK_TFN, text);
 	} else if (text == "struct") {
@@ -541,10 +537,18 @@ std::vector<Token> Lexer::scanTokens() {
 			addToken(TOK_PERCENT, "%");
 			break;
 		case '&':
-			addToken(TOK_AMP, "&");
+			if (match('&')) {
+				addToken(TOK_AND, "&&");
+			} else {
+				addToken(TOK_AMP, "&");
+			}
 			break;
 		case '|':
-			addToken(TOK_PIPE, "|");
+			if (match('|')) {
+				addToken(TOK_OR, "||");
+			} else {
+				addToken(TOK_PIPE, "|");
+			}
 			break;
 		case '^':
 			addToken(TOK_CARET, "^");

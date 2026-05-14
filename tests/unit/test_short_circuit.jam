@@ -1,41 +1,41 @@
-// Test short-circuit evaluation for 'and' and 'or' operators
+// Test short-circuit evaluation for `&&` and `||` operators.
 
-// Test 'and' short-circuit: if first is false, second is not evaluated
+// `&&` short-circuit: if first is false, second is not evaluated.
 fn test_and_short_circuit(a: bool, b: bool) bool {
-    return a and b;
+    return a && b;
 }
 
-// Test 'or' short-circuit: if first is true, second is not evaluated
+// `||` short-circuit: if first is true, second is not evaluated.
 fn test_or_short_circuit(a: bool, b: bool) bool {
-    return a or b;
+    return a || b;
 }
 
-// Nested short-circuit: (a and b) or c
+// Nested short-circuit: (a && b) || c
 fn test_nested_and_or(a: bool, b: bool, c: bool) bool {
-    return (a and b) or c;
+    return (a && b) || c;
 }
 
-// Nested short-circuit: (a or b) and c
+// Nested short-circuit: (a || b) && c
 fn test_nested_or_and(a: bool, b: bool, c: bool) bool {
-    return (a or b) and c;
+    return (a || b) && c;
 }
 
-// Chain: a and b and c
+// Chain: a && b && c
 fn test_chain_and(a: bool, b: bool, c: bool) bool {
-    return a and b and c;
+    return a && b && c;
 }
 
-// Chain: a or b or c
+// Chain: a || b || c
 fn test_chain_or(a: bool, b: bool, c: bool) bool {
-    return a or b or c;
+    return a || b || c;
 }
 
-// Mixed with not: !a and b
+// Mixed with not: !a && b
 fn test_not_and(a: bool, b: bool) bool {
-    return !a and b;
+    return !a && b;
 }
 
-// Mixed with not: a or !b
+// Mixed with not: a || !b
 fn test_or_not(a: bool, b: bool) bool {
-    return a or !b;
+    return a || !b;
 }
