@@ -1,0 +1,44 @@
+// Namespace-qualified access via an `import(...)` handle:
+//   * `c.Vec(i32)` as a type
+//   * `c.Vec(i32).empty()` as a typecall (qualified generic + method)
+//   * mixing bare `Vec(i32)` and `c.Vec(i32)` in the same function
+//     resolves to a single instantiation (FunctionAST-identity dedup).
+//
+// The negative path (non-pub, unknown handle, etc.) is covered by
+// tests/cpp/test_codegen_errors.cpp.
+const { assert } = import("test");
+const c = import("std/collections");
+
+tfn typeAndTypecallViaHandle() {
+    // Type position uses `c.Vec(i32)`; typecall position uses
+    // `c.Vec(i32).empty()`. The instance method calls are unchanged
+    // (they dispatch on the receiver's value type, not the syntactic
+    // path that produced it).
+    var v: c.Vec(i32) = c.Vec(i32).empty();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    assert(v.len() as i32, 3);
+}
+
+tfn dedupAcrossSpellings() {
+    // Both spellings point at the same Vec FunctionAST; the identity
+    // cache routes them to a single Vec__i32 instantiation. The
+    // user-visible effect is that mixing them just works without
+    // diagnostics or runtime divergence.
+    var v1: c.Vec(i32) = c.Vec(i32).empty();
+    var v2: Vec(i32) = Vec(i32).empty();
+    v1.push(1);
+    v2.push(2);
+    assert(v1.len() as i32, 1);
+    assert(v2.len() as i32, 1);
+}
+
+tfn varTypedByHandleStaysConsistent() {
+    // A variable declared with a handle-qualified type still pushes
+    // and reads back correctly; the type annotation is just a
+    // surface-syntax variation on the same underlying struct.
+    var v: c.Vec(i32) = c.Vec(i32).empty();
+    v.push(99);
+    assert(v.len() as i32, 1);
+}
