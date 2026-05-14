@@ -165,7 +165,8 @@ JamTypeRef JamCodegenContext::getLLVMType(TypeIdx ty) const {
 				result = getLLVMType(aliasTarget);
 				break;
 			}
-			throw std::runtime_error("Unknown user-defined type: " + name);
+			throw std::runtime_error(
+			    formatNamespaceLookupError("user-defined type", name));
 		}
 		break;
 	}
@@ -458,6 +459,43 @@ JamCodegenContext::getFunctionAST(const std::string &name) const {
 	return (it == functionAsts.end()) ? nullptr : it->second;
 }
 
+void JamCodegenContext::registerImportHandle(const std::string &handle,
+                                             const std::string &modulePath) {
+	importHandles_[handle].modulePath = modulePath;
+}
+
+void JamCodegenContext::registerPrivateName(const std::string &handle,
+                                            const std::string &name) {
+	importHandles_[handle].privateNames.insert(name);
+}
+
+const JamCodegenContext::ImportHandleInfo *
+JamCodegenContext::getImportHandle(const std::string &handle) const {
+	auto it = importHandles_.find(handle);
+	return (it == importHandles_.end()) ? nullptr : &it->second;
+}
+
+std::string
+JamCodegenContext::formatNamespaceLookupError(const std::string &kind,
+                                              const std::string &qualified) const {
+	size_t dotPos = qualified.find('.');
+	if (dotPos == std::string::npos) {
+		return "Unknown " + kind + ": " + qualified;
+	}
+	std::string handle = qualified.substr(0, dotPos);
+	std::string bare = qualified.substr(dotPos + 1);
+	const auto *info = getImportHandle(handle);
+	if (!info) {
+		return "unknown module handle `" + handle + "` in `" + qualified + "`";
+	}
+	if (info->privateNames.count(bare)) {
+		return "symbol `" + bare + "` is not exported from module `" +
+		       info->modulePath + "`";
+	}
+	return "symbol `" + bare + "` does not exist in module `" +
+	       info->modulePath + "`";
+}
+
 const JamCodegenContext::ModuleConstInfo *
 JamCodegenContext::getModuleConst(const std::string &name) const {
 	auto it = moduleConsts.find(name);
@@ -560,12 +598,17 @@ uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
 		    aliasTarget != kNoType) {
 			return typeSize(aliasTarget);
 		}
-		throw std::runtime_error("typeSize on unregistered user type");
+		throw std::runtime_error("typeSize: " +
+		                         formatNamespaceLookupError("user-defined type",
+		                                                    substName));
 	}
 	case TypeKind::Union: {
 		const UnionInfo *info = lookupUnion(ty);
 		if (!info) {
-			throw std::runtime_error("typeSize on unregistered union type");
+			const std::string &name =
+			    stringPool.get(static_cast<StringIdx>(k.a));
+			throw std::runtime_error("typeSize: " +
+			                         formatNamespaceLookupError("union", name));
 		}
 		uint64_t maxSize = 0, maxAlign = 1;
 		for (const auto &f : info->fields) {
@@ -645,12 +688,17 @@ uint64_t JamCodegenContext::typeAlign(TypeIdx ty) const {
 		    aliasTarget != kNoType) {
 			return typeAlign(aliasTarget);
 		}
-		throw std::runtime_error("typeAlign on unregistered user type");
+		throw std::runtime_error("typeAlign: " +
+		                         formatNamespaceLookupError("user-defined type",
+		                                                    substName));
 	}
 	case TypeKind::Union: {
 		const UnionInfo *info = lookupUnion(ty);
 		if (!info) {
-			throw std::runtime_error("typeAlign on unregistered union type");
+			const std::string &name =
+			    stringPool.get(static_cast<StringIdx>(k.a));
+			throw std::runtime_error("typeAlign: " +
+			                         formatNamespaceLookupError("union", name));
 		}
 		uint64_t maxAlign = 1;
 		for (const auto &f : info->fields) {
@@ -727,14 +775,29 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 	const std::string &calleeName = stringPool.get(static_cast<StringIdx>(k.a));
 	const auto &args = typePool.genericArgsAt(k.b);
 
+	// Identity-based lookup: namespace-qualified and bare callees both
+	// resolve to the same FunctionAST (main.cpp registers both forms).
+	// Look it up by whichever name the caller used.
 	const FunctionAST *generic = getFunctionAST(calleeName);
 	if (!generic) {
-		throw std::runtime_error("Unknown generic: " + calleeName);
+		throw std::runtime_error(
+		    formatNamespaceLookupError("generic", calleeName));
 	}
 	if (!generic->isGeneric()) {
 		throw std::runtime_error(
 		    "Identifier `" + calleeName +
 		    "` is a non-generic function used in a type position");
+	}
+
+	// Identity cache: if the same (FunctionAST, concrete args) has
+	// already been instantiated via a different syntactic path, reuse
+	// that result. Keeps `c.Vec(i32)` and `Vec(i32)` pointing at the
+	// same Vec__i32 struct.
+	GenericInstanceKey idKey{generic, std::vector<TypeIdx>(args)};
+	auto idCached = genericInstances_.find(idKey);
+	if (idCached != genericInstances_.end()) {
+		genericResolutions_[callTy] = idCached->second;
+		return idCached->second;
 	}
 	if (args.size() != generic->Args.size()) {
 		throw std::runtime_error("Generic `" + calleeName + "` expects " +
@@ -784,11 +847,14 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 			break;
 		}
 		if (value.tag == AstTag::StructExpr) {
-			result = instantiateStructExpr(value, calleeName, args, subst);
+			// Use generic->Name (the bare source-level name) for the
+			// instantiated struct name so syntactic prefixes like
+			// `c.Vec` don't bake into `Vec__i32`.
+			result = instantiateStructExpr(value, generic->Name, args, subst);
 			break;
 		}
 		if (value.tag == AstTag::EnumExpr) {
-			result = instantiateEnumExpr(value, calleeName, args, subst);
+			result = instantiateEnumExpr(value, generic->Name, args, subst);
 			break;
 		}
 		throw std::runtime_error(
@@ -802,6 +868,7 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 		                         "` has no return statement to evaluate");
 	}
 
+	genericInstances_[idKey] = result;
 	genericResolutions_[callTy] = result;
 	return result;
 }
