@@ -245,6 +245,19 @@ class JamCodegenContext {
 	void registerFunctionAST(const std::string &name, const FunctionAST *fn);
 	const FunctionAST *getFunctionAST(const std::string &name) const;
 
+	struct ImportHandleInfo {
+		std::string modulePath;
+		std::unordered_set<std::string> privateNames;
+	};
+	void registerImportHandle(const std::string &handle,
+	                          const std::string &modulePath);
+	void registerPrivateName(const std::string &handle,
+	                         const std::string &name);
+	const ImportHandleInfo *
+	getImportHandle(const std::string &handle) const;
+	std::string formatNamespaceLookupError(const std::string &kind,
+	                                       const std::string &qualified) const;
+
 	// sret state: when the current function returns a large
 	// aggregate, the codegen-managed sret slot (the leading `ptr` arg)
 	// is kept here so codegenReturn knows where to store the return
@@ -262,14 +275,40 @@ class JamCodegenContext {
 
   private:
 	std::unordered_map<std::string, const FunctionAST *> functionAsts;
+	std::unordered_map<std::string, ImportHandleInfo> importHandles_;
 	JamValueRef sretSlot = nullptr;
 	TypeIdx currentReturnType_ = kNoType;
 
-	// cache mapping from the deferred-call TypeIdx (a
-	// `TypeKind::GenericCall` entry) to the concrete TypeIdx produced
-	// by substitution + memoization. Populated lazily from
-	// resolveGenericCall.
+	// `genericResolutions_` memoizes per-callsite: every unique
+	// `TypeKind::GenericCall` TypeIdx maps to the resolved TypeIdx.
+	// Fast path for repeated lookups of the exact same syntactic call.
+	//
+	// `genericInstances_` is the identity cache: it deduplicates
+	// instantiations of the *same* FunctionAST with the *same* concrete
+	// args across syntactic paths (e.g. bare `Vec(i32)` and namespace-
+	// qualified `c.Vec(i32)` both resolve to the same Vec FunctionAST
+	// and produce a single Vec__i32 struct).
 	mutable std::unordered_map<TypeIdx, TypeIdx> genericResolutions_;
+	struct GenericInstanceKey {
+		const FunctionAST *fn;
+		std::vector<TypeIdx> args;
+		bool operator==(const GenericInstanceKey &o) const {
+			return fn == o.fn && args == o.args;
+		}
+	};
+	struct GenericInstanceKeyHash {
+		size_t operator()(const GenericInstanceKey &k) const {
+			size_t h = std::hash<const void *>{}(k.fn);
+			for (TypeIdx t : k.args) {
+				h ^= std::hash<uint32_t>{}(t) + 0x9e3779b9 + (h << 6) +
+				     (h >> 2);
+			}
+			return h;
+		}
+	};
+	mutable std::unordered_map<GenericInstanceKey, TypeIdx,
+	                           GenericInstanceKeyHash>
+	    genericInstances_;
 
 	// borrowed pointer to the parsed module's anonymous
 	// struct bodies (those produced by `struct { ... }` expressions).
