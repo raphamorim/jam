@@ -18,6 +18,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 
 namespace {
 
@@ -56,6 +57,37 @@ bool stderrContains(const CompileResult &r, const std::string &substr) {
 	return r.stderr_.find(substr) != std::string::npos;
 }
 
+// Multi-file variant: writes `main.jam` and `lib.jam` into a fresh
+// /tmp directory, then runs jam.out on main.jam. The module resolver
+// uses main.jam's directory as `baseDir`, so `import("lib")` from
+// main resolves to the sibling lib.jam without any std-lib lookup.
+CompileResult compileWithLib(const std::string &name,
+                             const std::string &mainSource,
+                             const std::string &libSource) {
+	std::string dir = "/tmp/jam_test_" + name;
+	mkdir(dir.c_str(), 0755);
+	{
+		std::ofstream out(dir + "/lib.jam");
+		out << libSource;
+	}
+	std::string mainPath = dir + "/main.jam";
+	{
+		std::ofstream out(mainPath);
+		out << mainSource;
+	}
+	std::string cmd = "./jam.out " + mainPath + " 2>&1";
+
+	std::string output;
+	FILE *pipe = popen(cmd.c_str(), "r");
+	if (!pipe) { throw std::runtime_error("popen failed: " + cmd); }
+	char buf[256];
+	while (fgets(buf, sizeof(buf), pipe) != nullptr) output += buf;
+	int status = pclose(pipe);
+
+	int exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+	return {exitCode, std::move(output)};
+}
+
 }  // namespace
 
 class CodegenErrorTests {
@@ -73,6 +105,29 @@ class CodegenErrorTests {
 		                  testIntToFloatRejected);
 		framework.addTest("Codegen - mixed-width float binary op without cast",
 		                  testMixedFloatWidthRejected);
+		framework.addTest(
+		    "Codegen - destructured non-pub symbol rejected",
+		    testDestructuredNonPubRejected);
+		framework.addTest("Codegen - `pub` on import rejected",
+		                  testPubOnImportRejected);
+		framework.addTest(
+		    "Codegen - `pub` on destructuring import rejected",
+		    testPubOnDestructuringRejected);
+		framework.addTest(
+		    "Codegen - namespace access to non-pub type rejected",
+		    testNamespaceNonPubType);
+		framework.addTest(
+		    "Codegen - namespace access to missing symbol rejected",
+		    testNamespaceMissingSymbol);
+		framework.addTest(
+		    "Codegen - namespace access via unknown handle rejected",
+		    testNamespaceUnknownHandle);
+		framework.addTest(
+		    "Codegen - namespace access to non-pub fn rejected",
+		    testNamespaceNonPubFn);
+		framework.addTest(
+		    "Codegen - bare-name access to non-pub imported type blocked",
+		    testBareNamePrivateBlocked);
 	}
 
   private:
@@ -188,6 +243,117 @@ fn main() i32 { return 0; }
 		ASSERT_TRUE(r.exitCode != 0);
 		ASSERT_TRUE(stderrContains(r, "drop"));
 		ASSERT_TRUE(stderrContains(r, "default"));
+	}
+
+	// `const { X } = import("lib")` requires X to be `pub` in lib.
+	// Non-pub triggers a precise "is not exported" diagnostic.
+	static void testDestructuredNonPubRejected() {
+		auto r = compileWithLib(
+		    "must_fail_destructured_nonpub",
+		    R"(
+const { Hidden } = import("lib");
+fn main() {}
+)",
+		    "const Hidden = struct { n: i32, };\n");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "Hidden"));
+		ASSERT_TRUE(stderrContains(r, "is not exported from module"));
+	}
+
+	// `pub const x = import(...)` is rejected; re-exports aren't a
+	// feature yet.
+	static void testPubOnImportRejected() {
+		auto r = compileSource("must_fail_pub_import", R"(
+pub const std = import("std");
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "pub"));
+		ASSERT_TRUE(stderrContains(r, "imports"));
+	}
+
+	// `pub const { X } = import(...)` is rejected explicitly so the
+	// destructuring path doesn't silently drop the pub modifier.
+	static void testPubOnDestructuringRejected() {
+		auto r = compileSource("must_fail_pub_destructuring", R"(
+pub const { Vec } = import("std/collections");
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "pub"));
+		ASSERT_TRUE(stderrContains(r, "destructuring"));
+	}
+
+	// `mod.Private` where Private isn't pub: emits the precise
+	// "is not exported" diagnostic instead of a generic "Unknown".
+	static void testNamespaceNonPubType() {
+		auto r = compileWithLib(
+		    "must_fail_ns_nonpub_type",
+		    R"(
+const lib = import("lib");
+fn main() { var v: lib.Private = { n: 1 }; }
+)",
+		    "const Private = struct { n: i32, };\n");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "Private"));
+		ASSERT_TRUE(stderrContains(r, "is not exported from module"));
+	}
+
+	// `mod.Nope` where Nope doesn't exist at all in `lib`: distinct
+	// "does not exist" diagnostic, separable from the non-pub case.
+	static void testNamespaceMissingSymbol() {
+		auto r = compileWithLib(
+		    "must_fail_ns_missing",
+		    R"(
+const lib = import("lib");
+fn main() { var v: lib.Nope = { n: 1 }; }
+)",
+		    "pub const Val = struct { n: i32, };\n");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "Nope"));
+		ASSERT_TRUE(stderrContains(r, "does not exist in module"));
+	}
+
+	// `unknown.X` where `unknown` was never bound to an import.
+	static void testNamespaceUnknownHandle() {
+		auto r = compileSource("must_fail_ns_unknown_handle", R"(
+fn main() { var v: unknown.X = { n: 1 }; }
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "unknown module handle"));
+		ASSERT_TRUE(stderrContains(r, "unknown.X"));
+	}
+
+	// `mod.fn()` where fn isn't pub: namespace fn-call path also
+	// produces the precise "not exported" diagnostic via the shared
+	// formatNamespaceLookupError helper.
+	static void testNamespaceNonPubFn() {
+		auto r = compileWithLib(
+		    "must_fail_ns_nonpub_fn",
+		    R"(
+const lib = import("lib");
+fn main() { var r: i32 = lib.priv(7); }
+)",
+		    "fn priv(x: i32) i32 { return x; }\n");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "priv"));
+		ASSERT_TRUE(stderrContains(r, "is not exported from module"));
+	}
+
+	// Non-pub structs from imported modules must not leak via the
+	// bare-name path. Previously `declareStructs` registered all
+	// imported structs globally regardless of pub; the publicOnly
+	// gate closes that hole.
+	static void testBareNamePrivateBlocked() {
+		auto r = compileWithLib(
+		    "must_fail_bare_name_private",
+		    R"(
+const lib = import("lib");
+fn main() { var v: Private = { n: 1 }; }
+)",
+		    "const Private = struct { n: i32, };\n");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "Private"));
 	}
 };
 
