@@ -84,6 +84,7 @@ JamTypeRef JamCodegenContext::getLLVMType(TypeIdx ty) const {
 	switch (k.kind) {
 	case TypeKind::Invalid:
 	case TypeKind::Void:
+	case TypeKind::NoReturn:
 		result = getVoidType();
 		break;
 	case TypeKind::Bool:
@@ -523,6 +524,7 @@ uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
 	switch (k.kind) {
 	case TypeKind::Invalid:
 	case TypeKind::Void:
+	case TypeKind::NoReturn:
 		return 0;
 	case TypeKind::Bool:
 		return 1;
@@ -638,6 +640,7 @@ uint64_t JamCodegenContext::typeAlign(TypeIdx ty) const {
 	switch (k.kind) {
 	case TypeKind::Invalid:
 	case TypeKind::Void:
+	case TypeKind::NoReturn:
 		return 1;
 	case TypeKind::Bool:
 		return 1;

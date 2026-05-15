@@ -1,0 +1,110 @@
+// Regression: `match` in statement position where every arm body
+// either (a) ends in a void-returning fn call, or (b) terminates
+// the basic block (via `return`). Both cases previously crashed
+// the compiler:
+//   (a) the phi over arm-produced values was built with a void
+//       type — LLVM segfaults on Phi with void type.
+//   (b) the merge block was created and the builder positioned
+//       there, but no arm reached it; combined with a non-void
+//       return type on the surrounding fn, the function had a
+//       trailing unterminated block and emission segfaulted.
+//
+// Fix:
+//   (a) detect void phi type before building the phi; return a
+//       discarded sentinel instead.
+//   (b) terminate the dead merge block with `unreachable` so the
+//       IR verifies.
+const { assert } = import("test");
+
+// (a) Void user-fn calls in every arm — statement-form match.
+// Each arm calls a different void helper, so the per-arm body's
+// "value" is a void call instruction (which used to leak into the
+// phi-type lookup).
+fn voidHelperA() {}
+fn voidHelperB() {}
+fn voidHelperC() {}
+fn voidHelperD() {}
+
+fn dispatchVoid(sel: i32) {
+    match (sel) {
+        0 { voidHelperA(); }
+        1 { voidHelperB(); }
+        2 { voidHelperC(); }
+        _ { voidHelperD(); }
+    }
+}
+
+tfn matchWithVoidArmsCompiles() {
+    // Pre-fix this segfaulted the compiler before any code ran.
+    // No side effect to verify — the existence of a passing test
+    // proves the codegen path succeeded.
+    dispatchVoid(0);
+    dispatchVoid(1);
+    dispatchVoid(2);
+    dispatchVoid(99);
+    assert(1, 1);
+}
+
+// (b) Match-as-tail with `return` in every arm. Surrounding fn has
+// a non-void return type. Pre-fix the trailing merge block had no
+// terminator and LLVM emission segfaulted.
+fn dispatchReturn(sel: i32) i32 {
+    match (sel) {
+        0 { return 10; }
+        1 { return 20; }
+        2 { return 30; }
+        _ { return 99; }
+    }
+}
+
+tfn matchAsTailWithReturnsCompiles() {
+    assert(dispatchReturn(0), 10);
+    assert(dispatchReturn(1), 20);
+    assert(dispatchReturn(2), 30);
+    assert(dispatchReturn(100), 99);
+}
+
+// Combined: hex-literal patterns, multi-arg call sites, scrutinee
+// is a function call. Mirrors the user-reported pattern. Verified
+// via per-arm helpers that return distinct values.
+fn maskOp(opc: u32) u32 { return (opc >> 21) & 0x1f; }
+fn handle00(c: i32) i32 { return c + 1; }
+fn handle04(c: i32) i32 { return c + 2; }
+fn handle10(c: i32) i32 { return c + 3; }
+fn handleDefault(c: i32) i32 { return c + 99; }
+
+fn dispatchUserPattern(c: i32, opc: u32) i32 {
+    match (maskOp(opc)) {
+        0x00 { return handle00(c); }
+        0x04 { return handle04(c); }
+        0x10 { return handle10(c); }
+        _    { return handleDefault(c); }
+    }
+}
+
+tfn userReportedPatternCompiles() {
+    assert(dispatchUserPattern(0, 0x00000000), 1);  // mask=0x00
+    assert(dispatchUserPattern(0, 0x00800000), 2);  // mask=0x04
+    assert(dispatchUserPattern(0, 0x02000000), 3);  // mask=0x10
+    assert(dispatchUserPattern(0, 0xffffffff), 99); // mask=0x1f
+}
+
+// Mixed-arm shape: one arm ends in a void fn call, another in a real
+// value. The phi-type detection must skip the void arm and pick the
+// value arm's type; the void arm gets a typed-zero substitute. A
+// regression for that picking logic.
+fn mixedMatch(sel: i32) i32 {
+    return match (sel) {
+        0 { voidHelperA(); 0 }
+        1 { 42 }
+        _ { 99 }
+    };
+}
+
+tfn mixedVoidAndValueArmsCompile() {
+    // Each arm produces a concrete i32; the void helper call sits as
+    // a discarded statement before the arm's trailing expression.
+    assert(mixedMatch(0), 0);
+    assert(mixedMatch(1), 42);
+    assert(mixedMatch(100), 99);
+}

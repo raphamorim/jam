@@ -175,19 +175,8 @@ JAM_EXTERN_C void JamLLVMAddParamAttrZeroExt(JamFunctionRef func,
                                              unsigned argIdx);
 JAM_EXTERN_C void JamLLVMAddRetAttrZeroExt(JamFunctionRef func);
 
-// Apply the default function-level attribute set every Jam-defined function
-// should carry. Mirrors what clang and Zig emit so generated IR has the same
-// `#0` attribute group and benefits from the same codegen hints:
-//
-//   nounwind                — Jam has no exceptions; safe on every defined fn.
-//   uwtable=sync            — emit unwind tables for backtraces / debuggers.
-//   frame-pointer="all"     — keep a frame pointer (required on macOS ARM64).
-//   target-cpu=<host CPU>   — let LLVM use CPU-specific instructions.
-//   target-features=<host>  — propagate host feature set (NEON, AVX, ...).
-//
-// `isExtern` skips `nounwind` and `uwtable` for declarations of foreign
-// functions (we don't know whether they unwind, and the unwind table for
-// them is the responsibility of whatever compiled them).
+JAM_EXTERN_C void JamLLVMSetFunctionNoReturn(JamFunctionRef func);
+
 JAM_EXTERN_C void JamLLVMApplyDefaultFnAttrs(JamFunctionRef func,
                                              bool isExtern);
 

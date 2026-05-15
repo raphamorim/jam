@@ -124,6 +124,15 @@ class CodegenErrorTests {
 		framework.addTest(
 		    "Codegen - bare-name access to non-pub imported type blocked",
 		    testBareNamePrivateBlocked);
+		framework.addTest(
+		    "Codegen - non-void fn that forgets to return is rejected",
+		    testForgottenReturnRejected);
+		framework.addTest(
+		    "Codegen - non-void fn with missing else branch is rejected",
+		    testMissingElseReturnRejected);
+		framework.addTest(
+		    "Codegen - noreturn fn whose body may fall through is rejected",
+		    testNoreturnFallsThroughRejected);
 	}
 
   private:
@@ -330,6 +339,52 @@ fn main() { var r: i32 = lib.priv(7); }
 		ASSERT_TRUE(r.exitCode != 0);
 		ASSERT_TRUE(stderrContains(r, "priv"));
 		ASSERT_TRUE(stderrContains(r, "is not exported from module"));
+	}
+
+	// Non-void function whose body may complete without returning a
+	// value. Previously emitted `unreachable` silently — calling the
+	// fn was undefined behavior at runtime. Now rejected at compile
+	// time, mirroring Zig's `endsWithNoReturn()` check.
+	static void testForgottenReturnRejected() {
+		auto r = compileSource("must_fail_forgotten_return", R"(
+fn forgotReturn() i32 { var x: i32 = 42; }
+fn main() i32 { return forgotReturn(); }
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "forgotReturn"));
+		ASSERT_TRUE(stderrContains(r, "non-void return type"));
+		ASSERT_TRUE(stderrContains(r, "without returning a value"));
+	}
+
+	// A `noreturn` function must diverge on every path. A body that
+	// could complete normally (e.g. a single var-decl with no later
+	// statement) violates the contract and is rejected.
+	static void testNoreturnFallsThroughRejected() {
+		auto r = compileSource("must_fail_noreturn_fallthrough", R"(
+fn faker() noreturn {
+    var x: i32 = 1;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "faker"));
+		ASSERT_TRUE(stderrContains(r, "noreturn"));
+		ASSERT_TRUE(stderrContains(r, "without diverging"));
+	}
+
+	// `if (cond) { return X; }` with no else falls through on the
+	// false branch. The same diagnostic should fire even though the
+	// body contains a `return` statement.
+	static void testMissingElseReturnRejected() {
+		auto r = compileSource("must_fail_missing_else_return", R"(
+fn maybe(cond: bool) i32 {
+    if (cond) { return 1; }
+}
+fn main() i32 { return maybe(true); }
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "maybe"));
+		ASSERT_TRUE(stderrContains(r, "non-void return type"));
 	}
 
 	// Non-pub structs from imported modules must not leak via the

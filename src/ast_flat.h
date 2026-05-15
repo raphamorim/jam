@@ -302,6 +302,7 @@ class StringPool {
 enum class TypeKind : uint8_t {
 	Invalid = 0,
 	Void,
+	NoReturn,
 	Bool,
 	Int,        // intT.bits, intT.isSigned
 	Float,      // floatT.bits
@@ -354,6 +355,7 @@ inline bool operator==(const TypeKey &x, const TypeKey &y) {
 	switch (x.kind) {
 	case TypeKind::Invalid:
 	case TypeKind::Void:
+	case TypeKind::NoReturn:
 	case TypeKind::Bool:
 		return true;
 	case TypeKind::Int:
@@ -409,8 +411,9 @@ constexpr TypeIdx U64 = 9;
 constexpr TypeIdx I64 = 10;
 constexpr TypeIdx F32 = 11;
 constexpr TypeIdx F64 = 12;
-constexpr TypeIdx Type = 13;  // the meta-type
-constexpr TypeIdx U1 = Bool;  // alias
+constexpr TypeIdx Type = 13;
+constexpr TypeIdx NoReturn = 14;
+constexpr TypeIdx U1 = Bool;
 }  // namespace BuiltinType
 
 class TypePool {
@@ -450,6 +453,7 @@ class TypePool {
 		pushKey(TypeKey{TypeKind::Float, 0, 0, 32, 0});
 		pushKey(TypeKey{TypeKind::Float, 0, 0, 64, 0});
 		pushKey(TypeKey{TypeKind::Type, 0, 0, 0, 0});
+		pushKey(TypeKey{TypeKind::NoReturn, 0, 0, 0, 0});
 	}
 
 	TypeIdx intern(TypeKey k) {

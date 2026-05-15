@@ -432,6 +432,7 @@ TypeIdx Parser::parseType() {
 		if (s == "bool" || s == "u1") return BuiltinType::Bool;
 		if (s == "str") return typePool->internSlice(BuiltinType::U8);
 		if (s == "type") return BuiltinType::Type;
+		if (s == "noreturn") return BuiltinType::NoReturn;
 		throw std::runtime_error("Unknown base type: " + s);
 	}
 	if (match(TOK_IDENTIFIER)) {

@@ -445,6 +445,10 @@ void JamLLVMApplyDefaultFnAttrs(JamFunctionRef func, bool isExtern) {
 	if (!feats.empty()) F->addFnAttr("target-features", feats);
 }
 
+void JamLLVMSetFunctionNoReturn(JamFunctionRef func) {
+	UNWRAP_FUNCTION(func)->addFnAttr(llvm::Attribute::NoReturn);
+}
+
 void JamLLVMAddParamAttrSret(JamFunctionRef func, unsigned argIdx,
                              JamTypeRef pointeeType, unsigned align) {
 	llvm::Function *F = UNWRAP_FUNCTION(func);
@@ -486,6 +490,7 @@ JamFunctionRef JamLLVMGetBasicBlockParent(JamBasicBlockRef block) {
 JamValueRef JamLLVMGetBasicBlockTerminator(JamBasicBlockRef block) {
 	return WRAP_VALUE(UNWRAP_BLOCK(block)->getTerminator());
 }
+
 
 JamValueRef JamLLVMBuildAlloca(JamBuilderRef builder, JamTypeRef type,
                                uint64_t alignBytes, const char *name) {

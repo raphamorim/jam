@@ -1,0 +1,39 @@
+// We test compilation only — actually CALLING a noreturn fn would
+// terminate the test runner. The fact that these definitions
+// compile and the codegen accepts them is the regression signal.
+//
+// Specifically:
+//   * `abort` is declared `extern ... noreturn`.
+//   * `safeAbort` chains: noreturn body that calls another
+//     noreturn fn. The codegen recognizes the call site as
+//     diverging and emits `unreachable` after it, satisfying the
+//     "body must diverge" check for safeAbort itself.
+//   * `loopForever` diverges via `while (true)`: the loop body is
+//     empty (no break), so the loop exit block is dead and the
+//     `noreturn` contract is upheld via CFG analysis.
+//   * `noReturnAfterCall` exercises the "extern noreturn call lets
+//     an enclosing non-void fn omit its return" path: `stmtDiverges`
+//     recognizes the call as noreturn-typed, so the function-tail
+//     check treats the body as diverging and no forgotten-return
+//     error fires.
+const { assert } = import("test");
+
+extern fn abort() noreturn;
+
+fn safeAbort() noreturn {
+    abort();
+}
+
+fn loopForever() noreturn {
+    while (true) {}
+}
+
+fn noReturnAfterCall() i32 {
+    abort();
+}
+
+tfn noreturnDeclarationsCompile() {
+    // All three diverging fns compiled; the test runner only verifies
+    // that fact. Calling them would terminate the process.
+    assert(1, 1);
+}

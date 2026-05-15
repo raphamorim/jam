@@ -1702,6 +1702,12 @@ static JamValueRef codegenCall(JamCodegenContext &ctx, const AstNode &n) {
 		return JamLLVMBuildLoad(ctx.getBuilder(), calleeSretPointee,
 		                        calleeSretSlot, "sretload");
 	}
+	// callee declared `noreturn`: control never returns. Terminate the
+	// current block with `unreachable` so any code emitted after this
+	// expression statement is dead from the CFG's perspective.
+	if (calleeAST && calleeAST->ReturnType == BuiltinType::NoReturn) {
+		JamLLVMBuildUnreachable(ctx.getBuilder());
+	}
 	return callResult;
 }
 
@@ -2586,24 +2592,31 @@ static JamValueRef codegenMatch(JamCodegenContext &ctx, const AstNode &n) {
 	JamLLVMPositionBuilderAtEnd(ctx.getBuilder(), mergeBB);
 
 	// Build a phi over arm-produced values when all arms agree on a
-	// non-void type. This is the value of the `match` expression. If
-	// no arms reached the merge block (every arm terminated), return
-	// a sentinel (caller is statement-form and won't use the value).
+	// non-void type. This is the value of the `match` expression.
+	// When every arm terminated (e.g. all arms `return`), no path
+	// reaches the merge block; leave it untermited and let the
+	// surrounding code (defineBody, or subsequent statements that
+	// emit into the block) handle the dead-block case. Emitting an
+	// `unreachable` here would be incorrect when more user code
+	// follows the match — the builder would insert instructions
+	// after the terminator and produce malformed IR.
 	if (armResults.empty()) {
 		return JamLLVMConstInt(ctx.getInt8Type(), 0, false);
 	}
-	// Filter out null values (empty bodies) and replace with sentinel
-	// of the unified type. Use the first non-null value's type as the
-	// phi type.
+	// Pick the phi type from the first arm that produced a non-void
+	// value. Empty bodies and void-typed values (e.g. statement-form
+	// match arms ending in a void fn call) get a typed-zero substitute
+	// below; LLVM rejects a phi with void type, so we skip those when
+	// choosing. If every arm is void/empty, skip the phi entirely.
 	JamTypeRef phiType = nullptr;
 	for (auto &r : armResults) {
-		if (r.second && JamLLVMTypeOf(r.second)) {
-			phiType = JamLLVMTypeOf(r.second);
-			break;
-		}
+		if (!r.second) continue;
+		JamTypeRef ty = JamLLVMTypeOf(r.second);
+		if (!ty || JamLLVMTypeIsVoid(ty)) continue;
+		phiType = ty;
+		break;
 	}
 	if (!phiType) {
-		// Every arm body was empty — match has no meaningful value.
 		return JamLLVMConstInt(ctx.getInt8Type(), 0, false);
 	}
 	JamValueRef phi =
@@ -3319,6 +3332,9 @@ JamFunctionRef FunctionAST::declarePrototype(JamCodegenContext &ctx) {
 	JamFunctionRef F =
 	    JamLLVMAddFunction(ctx.getModule(), funcName.c_str(), FT);
 	JamLLVMApplyDefaultFnAttrs(F, isExtern);
+	if (ReturnType == BuiltinType::NoReturn) {
+		JamLLVMSetFunctionNoReturn(F);
+	}
 
 	// Apply sret attributes to the leading parameter when applicable.
 	if (rabi.kind == jam::abi::ReturnABI::Kind::Indirect) {
@@ -3353,6 +3369,171 @@ JamFunctionRef FunctionAST::declarePrototype(JamCodegenContext &ctx) {
 	}
 
 	return F;
+}
+
+//  - `return`, `break`, `continue`               — diverge by definition
+//  - `Call(callee)` where callee is `noreturn`   — diverge
+//  - `if/else` where both branches diverge       — diverge
+//  - `if (true) { … diverges }`                  — diverge (const-fold)
+//  - `if (false) ... else { … diverges }`         — diverge (const-fold)
+//  - `match` where every arm diverges            — diverge
+//  - `while (true) { … }` with no reachable break — diverge
+//
+// anything else (var-decls, assignments, plain calls, …) reports false,
+// meaning "this statement could fall through." The function-tail check
+// in `defineBody` uses this to:
+//   - emit `unreachable` after a diverging tail (so the IR verifies);
+//   - error on a non-diverging tail in a non-void / `noreturn` fn.
+
+static bool stmtDiverges(JamCodegenContext &ctx, NodeIdx idx);
+
+// Returns true iff `last-of-sequence` diverges. An empty sequence
+// trivially does not diverge (control falls through to the caller).
+static bool seqDiverges(JamCodegenContext &ctx, ExtraIdx base,
+                        uint32_t count) {
+	if (count == 0) return false;
+	NodeIdx last =
+	    static_cast<NodeIdx>(ctx.getNodeStore().getExtra(base + count - 1));
+	return stmtDiverges(ctx, last);
+}
+
+// Compile-time bool literal extractor. Sets `*val` and returns true
+// when `idx` is a `BoolLit` node; returns false otherwise.
+static bool tryEvalCompileTimeBool(JamCodegenContext &ctx, NodeIdx idx,
+                                   bool *val) {
+	const AstNode &n = ctx.getNodeStore().get(idx);
+	if (n.tag == AstTag::BoolLit) {
+		*val = (n.lhs != 0);
+		return true;
+	}
+	return false;
+}
+
+// True iff a `Call` node's target function is declared `noreturn`.
+// Dynamic / unresolved calls return false (conservative).
+static bool calleeIsNoReturn(JamCodegenContext &ctx, const AstNode &n) {
+	if (n.flags & 1) return false;  // dynamic call
+	const std::string &name =
+	    ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
+	const FunctionAST *fn = ctx.getFunctionAST(name);
+	return fn && fn->ReturnType == BuiltinType::NoReturn;
+}
+
+// True iff `idx` contains a `break` reachable from the current
+// loop's lexical level (i.e., not nested inside another while/for).
+// Used by `while (true)` to decide whether the loop can exit.
+static bool containsReachableBreak(JamCodegenContext &ctx, NodeIdx idx) {
+	const NodeStore &ns = ctx.getNodeStore();
+	const AstNode &n = ns.get(idx);
+	switch (n.tag) {
+	case AstTag::Break:
+		return true;
+	case AstTag::WhileNode:
+	case AstTag::ForNode:
+		return false;  // break inside a nested loop belongs to that loop
+	case AstTag::IfNode: {
+		ExtraIdx ex = static_cast<ExtraIdx>(n.rhs);
+		uint32_t thenCount = ns.getExtra(ex);
+		uint32_t elseCount = ns.getExtra(ex + 1);
+		ExtraIdx then0 = ex + 2;
+		ExtraIdx else0 = then0 + thenCount;
+		for (uint32_t i = 0; i < thenCount; i++) {
+			if (containsReachableBreak(
+			        ctx, static_cast<NodeIdx>(ns.getExtra(then0 + i)))) {
+				return true;
+			}
+		}
+		for (uint32_t i = 0; i < elseCount; i++) {
+			if (containsReachableBreak(
+			        ctx, static_cast<NodeIdx>(ns.getExtra(else0 + i)))) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case AstTag::MatchNode: {
+		ExtraIdx ex = static_cast<ExtraIdx>(n.rhs);
+		uint32_t armCount = ns.getExtra(ex);
+		uint32_t pos = 1;
+		for (uint32_t a = 0; a < armCount; a++) {
+			uint32_t bodyCount = ns.getExtra(ex + pos + 1);
+			ExtraIdx bodyStart = ex + pos + 2;
+			for (uint32_t b = 0; b < bodyCount; b++) {
+				if (containsReachableBreak(
+				        ctx, static_cast<NodeIdx>(ns.getExtra(bodyStart + b)))) {
+					return true;
+				}
+			}
+			pos = pos + 2 + bodyCount;
+		}
+		return false;
+	}
+	default:
+		return false;
+	}
+}
+
+static bool stmtDiverges(JamCodegenContext &ctx, NodeIdx idx) {
+	const NodeStore &ns = ctx.getNodeStore();
+	const AstNode &n = ns.get(idx);
+	switch (n.tag) {
+	case AstTag::Return:
+	case AstTag::Break:
+	case AstTag::Continue:
+		return true;
+	case AstTag::Call:
+		return calleeIsNoReturn(ctx, n);
+	case AstTag::IfNode: {
+		NodeIdx condIdx = static_cast<NodeIdx>(n.lhs);
+		ExtraIdx ex = static_cast<ExtraIdx>(n.rhs);
+		uint32_t thenCount = ns.getExtra(ex);
+		uint32_t elseCount = ns.getExtra(ex + 1);
+		ExtraIdx then0 = ex + 2;
+		ExtraIdx else0 = then0 + thenCount;
+		bool condVal;
+		if (tryEvalCompileTimeBool(ctx, condIdx, &condVal)) {
+			return condVal ? seqDiverges(ctx, then0, thenCount)
+			               : seqDiverges(ctx, else0, elseCount);
+		}
+		// Runtime cond: both branches must diverge for the whole
+		// expression to. A missing else (elseCount == 0) means the
+		// false path falls through.
+		if (elseCount == 0) return false;
+		return seqDiverges(ctx, then0, thenCount) &&
+		       seqDiverges(ctx, else0, elseCount);
+	}
+	case AstTag::MatchNode: {
+		ExtraIdx ex = static_cast<ExtraIdx>(n.rhs);
+		uint32_t armCount = ns.getExtra(ex);
+		uint32_t pos = 1;
+		for (uint32_t a = 0; a < armCount; a++) {
+			uint32_t bodyCount = ns.getExtra(ex + pos + 1);
+			ExtraIdx bodyStart = ex + pos + 2;
+			if (!seqDiverges(ctx, bodyStart, bodyCount)) return false;
+			pos = pos + 2 + bodyCount;
+		}
+		return armCount > 0;
+	}
+	case AstTag::WhileNode: {
+		NodeIdx condIdx = static_cast<NodeIdx>(n.lhs);
+		bool condVal;
+		if (!tryEvalCompileTimeBool(ctx, condIdx, &condVal) || !condVal) {
+			return false;
+		}
+		ExtraIdx ex = static_cast<ExtraIdx>(n.rhs);
+		uint32_t bodyCount = ns.getExtra(ex);
+		ExtraIdx body0 = ex + 1;
+		for (uint32_t i = 0; i < bodyCount; i++) {
+			if (containsReachableBreak(
+			        ctx, static_cast<NodeIdx>(ns.getExtra(body0 + i)))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	default:
+		return false;
+	}
 }
 
 void FunctionAST::defineBody(JamCodegenContext &ctx) {
@@ -3423,11 +3604,35 @@ void FunctionAST::defineBody(JamCodegenContext &ctx) {
 
 	if (!JamLLVMGetBasicBlockTerminator(
 	        JamLLVMGetInsertBlock(ctx.getBuilder()))) {
-		// Implicit fall-through end of body — emit drops for the
-		// function-level scope (the only active scope at this point) and
-		// then the implicit terminator.
-		emitTopScopeDrops(ctx);
-		if (ReturnType == kNoType) { JamLLVMBuildRetVoid(ctx.getBuilder()); }
+		//   1. Void return type — emit `ret void`.
+		//   2. `noreturn` — body must diverge. Falls-through is an error.
+		//   3. Non-void, body diverges — emit `unreachable`.
+		//   4. Non-void, body may fall through — error (missing return).
+		// Divergence is determined by AST-level analysis on the last
+		// statement (see stmtDiverges), modeling Zig's noreturn-type
+		// propagation through expressions.
+		bool diverges = !Body.empty() && stmtDiverges(ctx, Body.back());
+		if (ReturnType == kNoType) {
+			emitTopScopeDrops(ctx);
+			JamLLVMBuildRetVoid(ctx.getBuilder());
+		} else if (ReturnType == BuiltinType::NoReturn) {
+			if (!diverges) {
+				throw std::runtime_error(
+				    "function `" + Name +
+				    "` is declared `noreturn` but its body may complete "
+				    "without diverging");
+			}
+			emitTopScopeDrops(ctx);
+			JamLLVMBuildUnreachable(ctx.getBuilder());
+		} else if (diverges) {
+			emitTopScopeDrops(ctx);
+			JamLLVMBuildUnreachable(ctx.getBuilder());
+		} else {
+			throw std::runtime_error(
+			    "function `" + Name +
+			    "` has a non-void return type but its body may complete "
+			    "without returning a value");
+		}
 	}
 	ctx.popDropScope();
 	ctx.clearDrops();
