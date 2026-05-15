@@ -1,0 +1,39 @@
+//   1. `return match (c) { … } ;` — the match's phi value flows
+//      directly into the function's return slot. Every arm must
+//      contribute a typed value to the phi, and the merge block
+//      must remain reachable.
+//   2. `return match (c) { … } + 1;` — the match's phi value is
+//      consumed by a binary expression in the surrounding context.
+//      Pins down that the phi type is recovered correctly when no
+//      explicit return-type annotation hints at it.
+const { assert } = import("test");
+
+const Color = enum { Red, Green, Blue };
+
+fn score(c: Color) u8 {
+    return match (c) {
+        Color.Red { 1 }
+        Color.Green { 2 }
+        Color.Blue { 3 }
+    };
+}
+
+fn scorePlusOne(c: Color) u8 {
+    return match (c) {
+        Color.Red { 1 }
+        Color.Green { 2 }
+        Color.Blue { 3 }
+    } + 1;
+}
+
+tfn exhaustiveEnumExpressionDoesNotPoisonMerge() {
+    assert(score(Color.Red), 1);
+    assert(score(Color.Green), 2);
+    assert(score(Color.Blue), 3);
+}
+
+tfn matchExpressionWithoutExpectedTypeStillProducesValue() {
+    assert(scorePlusOne(Color.Red), 2);
+    assert(scorePlusOne(Color.Green), 3);
+    assert(scorePlusOne(Color.Blue), 4);
+}
