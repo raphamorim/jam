@@ -52,12 +52,10 @@ enum class JirTag : uint8_t {
 	// Float: `a` = lo32, `b` = hi32 of f32/f64 bit pattern; `ty` = f32/f64.
 	// Bool: `a` = 0 or 1; `ty` = i1.
 	// Str: `a` = StringIdx; `ty` = []u8.
-	// Null: `ty` = pointer type.
 	Int,
 	Float,
 	Bool,
 	Str,
-	Null,
 
 	// ── Storage ────────────────────────────────────────────────
 	// Alloca: `ty` = pointee type. Result type is implicitly ptr-to-`ty`.
@@ -101,7 +99,7 @@ enum class JirTag : uint8_t {
 	SIToFP, UIToFP,
 	FPToSI, FPToUI,
 	FPExt, FPTrunc,
-	PtrToInt, IntToPtr, BitCast,
+	BitCast,
 
 	// ── Control flow ──────────────────────────────────────────
 	// Br:          `a` = JirBlockRef target. No result.
@@ -110,6 +108,11 @@ enum class JirTag : uint8_t {
 	//                  [defaultBlock, caseCount,
 	//                   case0_lo, case0_hi, case0_signed, case0_block,
 	//                   case1_..., ...]
+	//              Canonical multi-way branch. astgen today lowers match
+	//              to chained CondBr — Switch is the dense-integer path
+	//              jir_codegen is ready for (same shape Rust's
+	//              MIR::TerminatorKind::SwitchInt and Zig's
+	//              air.switch_br use).
 	// Ret:         `a` = value ref (or kNoJirRef for void).
 	// Unreachable: no operands.
 	Br,

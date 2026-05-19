@@ -635,6 +635,64 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		                  lctx.blockMap.at(elseB));
 		return nullptr;
 	}
+	case JirTag::Switch: {
+		// Multi-way branch over an integer scrutinee. Layout per
+		// jir.h: extra[0] = default block, extra[1] = caseCount,
+		// extra[2 + i*4 + 0..3] = {lo32, hi32, signed, block} for
+		// each case. The case constants must match the scrut's LLVM
+		// type — we read it from the scrut JirInst's `ty`.
+		//
+		// Specialization, mirroring rustc_codegen_ssa/mir/block.rs::
+		// codegen_switchint_terminator: collapse Switch back to a
+		// cond_br when the shape is trivial.
+		//   * 1 case + default → ICmpEq + CondBr (always valid: the
+		//     default is the cond_br's `else` whether it's a live
+		//     fall-through block or an unreachable one).
+		// Rust also collapses 2-case bool shapes — that requires
+		// knowing the default block is unreachable (i.e. the match is
+		// exhaustive on {0, 1}). astgen doesn't track exhaustiveness
+		// yet, so we skip it and let LLVM's middle-end fold the
+		// pattern in -O1+.
+		JamValueRef scrut = emitInst(lctx, inst.a);
+		const JirInst &scrutInst = lctx.jfn.getInst(inst.a);
+		JamTypeRef scrutLlvmTy = lctx.ctx.getLLVMType(scrutInst.ty);
+		JirExtraIdx extra = static_cast<JirExtraIdx>(inst.b);
+		JirBlockRef defaultB =
+		    static_cast<JirBlockRef>(lctx.jfn.getExtra(extra));
+		uint32_t caseCount = lctx.jfn.getExtra(extra + 1);
+
+		auto readCase = [&](uint32_t i) {
+			JirExtraIdx base = extra + 2 + i * 4;
+			uint64_t lo = lctx.jfn.getExtra(base + 0);
+			uint64_t hi = lctx.jfn.getExtra(base + 1);
+			bool isSigned = lctx.jfn.getExtra(base + 2) != 0;
+			JirBlockRef caseB =
+			    static_cast<JirBlockRef>(lctx.jfn.getExtra(base + 3));
+			uint64_t bits = lo | (hi << 32);
+			JamValueRef caseVal =
+			    JamLLVMConstInt(scrutLlvmTy, bits, isSigned);
+			return std::tuple{caseVal, caseB, bits};
+		};
+
+		if (caseCount == 1) {
+			auto [caseVal, caseB, _bits] = readCase(0);
+			JamValueRef cmp = buildICmp(lctx, JAM_ICMP_EQ, scrut, caseVal,
+			                             "match.eq");
+			JamLLVMBuildCondBr(lctx.ctx.getBuilder(), cmp,
+			                    lctx.blockMap.at(caseB),
+			                    lctx.blockMap.at(defaultB));
+			return nullptr;
+		}
+
+		JamValueRef sw = JamLLVMBuildSwitch(
+		    lctx.ctx.getBuilder(), scrut, lctx.blockMap.at(defaultB),
+		    caseCount);
+		for (uint32_t i = 0; i < caseCount; i++) {
+			auto [caseVal, caseB, _bits] = readCase(i);
+			JamLLVMAddCase(sw, caseVal, lctx.blockMap.at(caseB));
+		}
+		return nullptr;
+	}
 	case JirTag::Ret: {
 		// sret return: store the value through the leading hidden
 		// `ptr sret(%T)` arg and emit `ret void`. The caller already

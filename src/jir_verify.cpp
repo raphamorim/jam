@@ -27,7 +27,6 @@ const char *tagName(JirTag t) {
 	case JirTag::Float: return "Float";
 	case JirTag::Bool: return "Bool";
 	case JirTag::Str: return "Str";
-	case JirTag::Null: return "Null";
 	case JirTag::Alloca: return "Alloca";
 	case JirTag::Load: return "Load";
 	case JirTag::Store: return "Store";
@@ -77,8 +76,6 @@ const char *tagName(JirTag t) {
 	case JirTag::FPToUI: return "FPToUI";
 	case JirTag::FPExt: return "FPExt";
 	case JirTag::FPTrunc: return "FPTrunc";
-	case JirTag::PtrToInt: return "PtrToInt";
-	case JirTag::IntToPtr: return "IntToPtr";
 	case JirTag::BitCast: return "BitCast";
 	case JirTag::Br: return "Br";
 	case JirTag::CondBr: return "CondBr";
@@ -251,7 +248,6 @@ struct Verifier {
 		case JirTag::Float:
 		case JirTag::Bool:
 		case JirTag::Str:
-		case JirTag::Null:
 		case JirTag::Param:
 		case JirTag::Unreachable:
 			return;
@@ -273,8 +269,6 @@ struct Verifier {
 		case JirTag::FPToUI:
 		case JirTag::FPExt:
 		case JirTag::FPTrunc:
-		case JirTag::PtrToInt:
-		case JirTag::IntToPtr:
 		case JirTag::BitCast:
 		case JirTag::FieldAccess:
 		case JirTag::ExtractValue:

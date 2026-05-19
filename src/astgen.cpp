@@ -117,7 +117,8 @@ static bool blockHasTerminator(const JirBlock &block, const JirFunction &jfn) {
 	JirRef last = block.insts.back();
 	JirTag t = jfn.getInst(last).tag;
 	return t == JirTag::Ret || t == JirTag::Unreachable ||
-	       t == JirTag::Br || t == JirTag::CondBr || t == JirTag::Switch;
+	       t == JirTag::Br || t == JirTag::CondBr ||
+	       t == JirTag::Switch;
 }
 
 // Count blocks that branch into `target` via Br / CondBr / Switch.
@@ -1863,6 +1864,87 @@ struct ArmBinding {
 };
 using ArmBindings = std::vector<ArmBinding>;
 
+// A single case row of a Switch dispatch: the discriminant value
+// (zero-extended to 64 bits; sign bit recorded separately so codegen
+// can pick the right LLVM const helper), and the block to jump to
+// when the scrutinee matches. Multiple cases can share the same
+// target — that's how or-patterns of literals collapse.
+struct SwitchCase {
+	uint64_t value;
+	bool isSigned;
+	JirBlockRef target;
+};
+
+// Recursively walk a pattern and try to express it as one or more
+// Switch cases targeting `armBlock`. Returns false if anything in the
+// pattern can't be a Switch case (PatRange, PatEnumVariant with
+// bindings, any unrecognised tag). PatWildcard is handled by the
+// caller — it doesn't contribute cases, it becomes the default block.
+//
+// `scrutIsEnum` selects how PatLit / PatEnumVariant are validated:
+//   * integer scrutinee → only PatLit accepted; value = literal bits.
+//   * enum scrutinee   → only PatEnumVariant accepted; value = the
+//                         variant's discriminant byte. The enum's
+//                         `EnumInfo` is supplied so we can resolve the
+//                         variant name without re-doing the lookup
+//                         later.
+static bool collectSwitchCases(const NodeStore &ns,
+                               JamCodegenContext &ctx,
+                               NodeIdx patIdx,
+                               JirBlockRef armBlock,
+                               TypeIdx scrutTy,
+                               bool scrutIsEnum,
+                               const JamCodegenContext::EnumInfo *einfo,
+                               std::vector<SwitchCase> &out) {
+	const AstNode &p = ns.get(patIdx);
+	switch (p.tag) {
+	case AstTag::PatLit: {
+		if (scrutIsEnum) return false;
+		uint64_t val = static_cast<uint64_t>(p.lhs) |
+		               (static_cast<uint64_t>(p.rhs) << 32);
+		bool isNeg = (p.flags & 1) != 0;
+		if (isNeg) {
+			// Two's-complement encoding at the scrut's width; the
+			// codegen sign-extends to LLVM int width on AddCase.
+			val = static_cast<uint64_t>(-static_cast<int64_t>(val));
+		}
+		const TypeKey &sk = ctx.getTypePool().get(scrutTy);
+		bool signedCmp = sk.kind == TypeKind::Int && sk.b != 0;
+		out.push_back(SwitchCase{val, signedCmp, armBlock});
+		return true;
+	}
+	case AstTag::PatEnumVariant: {
+		if (!scrutIsEnum || einfo == nullptr) return false;
+		// Reject pattern shapes that need a binding block before the
+		// arm body — Switch can only jump straight to `armBlock`.
+		bool hasBindings = (p.flags & 1) != 0;
+		if (hasBindings) return false;
+		StringIdx variantNameId = static_cast<StringIdx>(p.rhs);
+		const std::string &variantName =
+		    ctx.getStringPool().get(variantNameId);
+		int vidx = ctx.getEnumVariantIndex(einfo->name, variantName);
+		if (vidx < 0) return false;
+		uint64_t disc = einfo->variants[vidx].discriminant;
+		out.push_back(SwitchCase{disc, false, armBlock});
+		return true;
+	}
+	case AstTag::PatOr: {
+		ExtraIdx ex = static_cast<ExtraIdx>(p.lhs);
+		uint32_t cnt = ns.getExtra(ex);
+		for (uint32_t i = 0; i < cnt; i++) {
+			NodeIdx sub = static_cast<NodeIdx>(ns.getExtra(ex + 1 + i));
+			if (!collectSwitchCases(ns, ctx, sub, armBlock, scrutTy,
+			                         scrutIsEnum, einfo, out)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
 // Compare scrut against a single pattern; the resulting i1 is fed to
 // a CondBr that jumps to `armBlock` on match, `nextBlock` otherwise.
 // Handles PatLit (single equality), PatRange (lo<=x<=hi), and PatOr
@@ -2171,40 +2253,122 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		resultSlot = emitAllocaHoisted(gctx, alloca);
 	}
 
-	// Dispatch chain. Skip the wildcard arm in the per-pattern compare
-	// loop; it becomes the final fallthrough block.
 	std::vector<ArmBindings> armBindings(armCount);
 	JirBlockRef defaultB = (wildcardArmIdx >= 0)
 	                            ? armBlocks[wildcardArmIdx]
 	                            : gctx.jfn.pushBlock("nomatch");
-	bool emittedAnyDispatch = false;
-	for (uint32_t i = 0; i < armCount; i++) {
-		if (static_cast<int>(i) == wildcardArmIdx) continue;
-		JirBlockRef next = (i + 1 < armCount &&
-		                    static_cast<int>(i + 1) != wildcardArmIdx)
-		                       ? gctx.jfn.pushBlock("matchnext")
-		                       : defaultB;
-		astgenPatternCompare(gctx, arms[i].patIdx, scrut, scrutTy,
-		                     armBlocks[i], next, &armBindings[i]);
-		if (next != defaultB) gctx.currentBlock = next;
-		emittedAnyDispatch = true;
+
+	// Try the Switch lowering first. Every non-wildcard arm has to be
+	// a pattern that resolves to a single integer-equality test (or a
+	// PatOr of such patterns). Anything else — ranges, payload
+	// bindings, mixed shapes — falls through to the CondBr chain.
+	const TypeKey &sk = gctx.ctx.getTypePool().get(scrutTy);
+	bool scrutIsInt = sk.kind == TypeKind::Int;
+	const JamCodegenContext::EnumInfo *einfo = nullptr;
+	if (sk.kind == TypeKind::Named || sk.kind == TypeKind::Enum) {
+		einfo = gctx.ctx.lookupEnum(scrutTy);
 	}
-	// All arms were wildcards (only a `_` arm, or none). Emit an
-	// unconditional Br from the entry block into the default block.
-	if (!emittedAnyDispatch) {
-		emitBr(gctx, defaultB);
+	bool scrutIsEnum = einfo != nullptr;
+	bool tryingSwitch = (scrutIsInt || scrutIsEnum);
+	std::vector<SwitchCase> switchCases;
+	if (tryingSwitch) {
+		const NodeStore &ns = gctx.ctx.getNodeStore();
+		for (uint32_t i = 0; i < armCount; i++) {
+			if (static_cast<int>(i) == wildcardArmIdx) continue;
+			if (!collectSwitchCases(ns, gctx.ctx, arms[i].patIdx,
+			                         armBlocks[i], scrutTy, scrutIsEnum,
+			                         einfo, switchCases)) {
+				tryingSwitch = false;
+				break;
+			}
+		}
 	}
-	// If the last non-wildcard arm fell through, we need its `next`
-	// to terminate. The compare loop above already wired the final
-	// next to `defaultB`. When there's no catch-all wildcard, fall
-	// through to merge — matches legacy semantics where a match
-	// without `_` simply leaves any prior state unchanged. (For
-	// expression-form matches the result slot stays at its
-	// uninitialised value; user code that relies on the value
-	// after a non-exhaustive match is at fault.)
-	if (wildcardArmIdx < 0) {
-		gctx.currentBlock = defaultB;
-		emitBr(gctx, mergeB);
+
+	if (tryingSwitch) {
+		// Build the integer scrutinee. For an enum scrut we pull out
+		// the discriminant byte: ExtractValue(0) for payloaded enums,
+		// BitCast otherwise (the LLVM runtime form is already i8 for
+		// unit-only enums but JIR carries the Named type).
+		JirRef caseScrut = scrut;
+		TypeIdx caseScrutTy = scrutTy;
+		if (scrutIsEnum) {
+			JirInst extract{};
+			if (einfo->hasPayloadVariant) {
+				extract.tag = JirTag::ExtractValue;
+				extract.a = scrut;
+				extract.b = 0;
+			} else {
+				extract.tag = JirTag::BitCast;
+				extract.a = scrut;
+			}
+			extract.ty = BuiltinType::U8;
+			caseScrut = emit(gctx, extract);
+			caseScrutTy = BuiltinType::U8;
+		}
+
+		// Encode extras: [defaultBlock, caseCount,
+		//                 (lo, hi, signed, target) × N].
+		uint32_t caseCount = static_cast<uint32_t>(switchCases.size());
+		std::vector<uint32_t> packed;
+		packed.reserve(2 + caseCount * 4);
+		packed.push_back(static_cast<uint32_t>(defaultB));
+		packed.push_back(caseCount);
+		for (const SwitchCase &sc : switchCases) {
+			packed.push_back(static_cast<uint32_t>(sc.value & 0xFFFFFFFFu));
+			packed.push_back(static_cast<uint32_t>(sc.value >> 32));
+			packed.push_back(sc.isSigned ? 1u : 0u);
+			packed.push_back(static_cast<uint32_t>(sc.target));
+		}
+		JirExtraIdx extraIdx =
+		    gctx.jfn.pushExtra(packed.data(), packed.size());
+		JirInst sw{};
+		sw.tag = JirTag::Switch;
+		sw.a = caseScrut;
+		sw.b = extraIdx;
+		(void)caseScrutTy;
+		emit(gctx, sw);
+
+		// Default block branches to merge when no wildcard arm exists,
+		// matching the chained-CondBr semantics (non-exhaustive match
+		// falls through; expression-form match leaves the result slot
+		// at its default).
+		if (wildcardArmIdx < 0) {
+			gctx.currentBlock = defaultB;
+			emitBr(gctx, mergeB);
+		}
+	} else {
+		// Dispatch chain. Skip the wildcard arm in the per-pattern
+		// compare loop; it becomes the final fallthrough block.
+		bool emittedAnyDispatch = false;
+		for (uint32_t i = 0; i < armCount; i++) {
+			if (static_cast<int>(i) == wildcardArmIdx) continue;
+			JirBlockRef next = (i + 1 < armCount &&
+			                    static_cast<int>(i + 1) != wildcardArmIdx)
+			                       ? gctx.jfn.pushBlock("matchnext")
+			                       : defaultB;
+			astgenPatternCompare(gctx, arms[i].patIdx, scrut, scrutTy,
+			                     armBlocks[i], next, &armBindings[i]);
+			if (next != defaultB) gctx.currentBlock = next;
+			emittedAnyDispatch = true;
+		}
+		// All arms were wildcards (only a `_` arm, or none). Emit an
+		// unconditional Br from the entry block into the default
+		// block.
+		if (!emittedAnyDispatch) {
+			emitBr(gctx, defaultB);
+		}
+		// If the last non-wildcard arm fell through, we need its
+		// `next` to terminate. The compare loop above already wired
+		// the final next to `defaultB`. When there's no catch-all
+		// wildcard, fall through to merge — matches legacy semantics
+		// where a match without `_` simply leaves any prior state
+		// unchanged. (For expression-form matches the result slot
+		// stays at its uninitialised value; user code that relies on
+		// the value after a non-exhaustive match is at fault.)
+		if (wildcardArmIdx < 0) {
+			gctx.currentBlock = defaultB;
+			emitBr(gctx, mergeB);
+		}
 	}
 
 	// Arm bodies. Each arm installs its bindings into gctx.locals
@@ -2284,13 +2448,12 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 }
 
 // AstGen for `TypeMethodCall` (`Vec(i32).empty()`, `Color.Red()`).
-// Mirrors the legacy `codegenTypeMethodCall` shape: resolves the
-// receiver TypeIdx to its struct/enum name (triggering lazy generic
-// instantiation as a side effect), synthesizes a regular Call AST
-// node with qualified name `ReceiverName.method`, and recurses into
-// astgenCall. Instantiated methods are emitted via the legacy
-// per-fn codegen path; the JIR Call resolves them by LLVM name at
-// codegen time, so cross-path linkage Just Works.
+// Resolves the receiver TypeIdx to its struct/enum name (triggering
+// lazy generic instantiation as a side effect), synthesizes a regular
+// Call AST node with qualified name `ReceiverName.method`, and recurses
+// into astgenCall. Instantiation runs the full astgen → jirDefineBody
+// pipeline in `JamCodegenContext::instantiateStructExpr`, so the JIR
+// Call here resolves cleanly by LLVM name at codegen time.
 static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n) {
 	const NodeStore &nsConst = gctx.ctx.getNodeStore();
 	NodeStore &ns = const_cast<NodeStore &>(nsConst);

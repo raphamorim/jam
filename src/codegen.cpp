@@ -935,7 +935,7 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 			FunctionAST *clonePtr;
 			// Carries Pass 1's metadata JirFunction so Pass 2 can
 			// append the body without redoing param-mode + return-
-			// type lookups. Empty for legacy mode (no JIR used).
+			// type lookups.
 			JirFunction passOneJir;
 		};
 		std::vector<InstMethod> insts;
