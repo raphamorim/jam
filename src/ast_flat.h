@@ -223,17 +223,36 @@ static_assert(sizeof(AstNode) == 16,
 class NodeStore {
 	std::vector<AstNode> nodes_;
 	std::vector<uint32_t> extra_;
+	// Parallel array recording the source line for each node, indexed
+	// the same as `nodes_`. Populated by the parser at emit-time from
+	// the lexer's token line. Consulted by the codegen error formatter
+	// so user-visible diagnostics carry `file:line:` prefixes.
+	std::vector<int> lines_;
 
   public:
 	NodeStore() {
 		// Reserve slot 0 as the null sentinel so kNoNode is a no-op.
 		nodes_.push_back(AstNode{AstTag::Invalid, 0, 0, 0, 0, 0});
+		lines_.push_back(0);
 	}
 
 	NodeIdx addNode(AstNode n) {
 		NodeIdx id = static_cast<NodeIdx>(nodes_.size());
 		nodes_.push_back(n);
+		lines_.push_back(0);
 		return id;
+	}
+
+	// Variant used by the parser when it knows the source line.
+	NodeIdx addNodeAt(AstNode n, int line) {
+		NodeIdx id = static_cast<NodeIdx>(nodes_.size());
+		nodes_.push_back(n);
+		lines_.push_back(line);
+		return id;
+	}
+
+	int getLine(NodeIdx id) const {
+		return id < lines_.size() ? lines_[id] : 0;
 	}
 
 	const AstNode &get(NodeIdx id) const { return nodes_[id]; }

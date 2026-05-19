@@ -14,6 +14,7 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
@@ -704,6 +705,47 @@ JamValueRef JamLLVMBuildCondBr(JamBuilderRef builder, JamValueRef cond,
                                JamBasicBlockRef elseBlock) {
 	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateCondBr(
 	    UNWRAP_VALUE(cond), UNWRAP_BLOCK(thenBlock), UNWRAP_BLOCK(elseBlock)));
+}
+
+JamValueRef JamLLVMBuildSwitch(JamBuilderRef builder, JamValueRef scrut,
+                               JamBasicBlockRef defaultBlock,
+                               unsigned numCasesHint) {
+	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateSwitch(
+	    UNWRAP_VALUE(scrut), UNWRAP_BLOCK(defaultBlock), numCasesHint));
+}
+
+void JamLLVMAddCase(JamValueRef switchInst, JamValueRef caseVal,
+                    JamBasicBlockRef caseBlock) {
+	llvm::cast<llvm::SwitchInst>(UNWRAP_VALUE(switchInst))
+	    ->addCase(llvm::cast<llvm::ConstantInt>(UNWRAP_VALUE(caseVal)),
+	              UNWRAP_BLOCK(caseBlock));
+}
+
+// Position the builder immediately before `block`'s terminator. Used
+// by codegenMatch's value-promotion pass: each arm has already
+// emitted drops + a `br merge`, and we need to insert zext/sext/fpext
+// (for peer-type resolution) before the branch without losing it.
+void JamLLVMPositionBuilderBeforeTerminator(JamBuilderRef builder,
+                                            JamBasicBlockRef block) {
+	llvm::BasicBlock *bb = UNWRAP_BLOCK(block);
+	llvm::Instruction *term = bb->getTerminator();
+	if (term) {
+		UNWRAP_BUILDER(builder)->SetInsertPoint(term);
+	} else {
+		UNWRAP_BUILDER(builder)->SetInsertPoint(bb);
+	}
+}
+
+JamValueRef JamLLVMBuildZExt(JamBuilderRef builder, JamValueRef val,
+                             JamTypeRef destType, const char *name) {
+	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateZExt(
+	    UNWRAP_VALUE(val), UNWRAP_TYPE(destType), name));
+}
+
+JamValueRef JamLLVMBuildSExt(JamBuilderRef builder, JamValueRef val,
+                             JamTypeRef destType, const char *name) {
+	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateSExt(
+	    UNWRAP_VALUE(val), UNWRAP_TYPE(destType), name));
 }
 
 JamValueRef JamLLVMBuildRet(JamBuilderRef builder, JamValueRef val) {

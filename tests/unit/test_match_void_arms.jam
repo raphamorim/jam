@@ -108,3 +108,73 @@ tfn mixedVoidAndValueArmsCompile() {
     assert(mixedMatch(1), 42);
     assert(mixedMatch(100), 99);
 }
+
+// Peer-type resolution across arms of different natural widths.
+// `100` lowers as i8; `200` lowers as i8; `300` doesn't fit in i8
+// and lowers as i16. Without peer-type widening at phi-build time,
+// the wildcard arm's value would be substituted with typed zero
+// because phi-type would be picked from arm 1 (i8) and arm 3's i16
+// value wouldn't match. Mirrors Zig's resolvePeerTypes() behaviour.
+fn pickByWidth(sel: i32, gate: bool) i32 {
+    var r: i32 = 0;
+    if (gate) {
+        r = match (sel) {
+            1 { 100 }
+            2 { 200 }
+            _ { 300 }
+        };
+    }
+    return r;
+}
+
+tfn matchPromotesNarrowerArmsToWidestType() {
+    assert(pickByWidth(1, true), 100);
+    assert(pickByWidth(2, true), 200);
+    assert(pickByWidth(99, true), 300);  // pre-fix this returned 0
+    assert(pickByWidth(99, false), 0);
+}
+
+// Catch-all (`_`) must not generate a redundant `br i1 true, body,
+// next` conditional branch — the dead-edge predecessor would leave
+// the merge block's phi with a missing incoming pair and produce
+// malformed IR. Side-effect arms (no value, no phi at merge) are
+// still affected by the routing bug — a misroute would be visible
+// at runtime via wrong-output / bus errors.
+fn dispatchSideEffects(x: i32, gate: bool) i32 {
+    var hits: i32 = 0;
+    if (gate) {
+        match (x) {
+            1 { hits = 11; }
+            2 { hits = 22; }
+            _ { hits = 99; }
+        }
+    }
+    return hits;
+}
+
+tfn catchAllArmRoutesCorrectly() {
+    assert(dispatchSideEffects(1, true), 11);
+    assert(dispatchSideEffects(2, true), 22);
+    assert(dispatchSideEffects(7, true), 99);   // wildcard
+    assert(dispatchSideEffects(0, false), 0);
+}
+
+// Signed-mixed-width arms. Before expected-type propagation, arm 1's
+// `-1` lowered as i8 signed and arm 2's `300` lowered as i16 unsigned.
+// Phi was i16 with the wildcard's value substituted via ZExt → -1 became
+// 255 (i16). Now the var-decl's `i32` is threaded into each arm's tail
+// expression, so both literals lower as i32 from the start; the phi is
+// i32 directly and signed semantics are preserved. Mirrors Rust's
+// rustc_hir_typeck/src/_match.rs:67-97 where each arm is checked with
+// the expected type.
+fn signedPick(sel: i32) i32 {
+    return match (sel) {
+        1 { -1 }
+        _ { 300 }
+    };
+}
+
+tfn signedMixedWidthArmsPreserveSign() {
+    assert(signedPick(1), -1);
+    assert(signedPick(2), 300);
+}

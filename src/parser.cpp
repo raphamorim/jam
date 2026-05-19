@@ -97,7 +97,14 @@ NodeIdx Parser::emit(AstNode n) {
 	if (n.mainToken == 0 && current > 0) {
 		n.mainToken = static_cast<uint32_t>(current - 1);
 	}
-	return nodes->addNode(n);
+	// Record source line for codegen-time diagnostics. The mainToken's
+	// line lets `file:line:` prefixes appear on errors thrown deep in
+	// codegen even though the AST itself is positionless.
+	int line = 0;
+	if (n.mainToken < tokens.size()) {
+		line = tokens[n.mainToken].line;
+	}
+	return nodes->addNodeAt(n, line);
 }
 
 // Walk a chain of MemberAccess nodes back to its root Variable and produce
@@ -792,6 +799,29 @@ NodeIdx Parser::parseExpression() {
 		}
 		consume(TOK_CLOSE_BRACE, "Expected '}' after while body");
 
+		ExtraIdx extra = nodes->reserveExtra(1 + body.size());
+		nodes->setExtra(extra, static_cast<uint32_t>(body.size()));
+		for (size_t i = 0; i < body.size(); i++) {
+			nodes->setExtra(extra + 1 + i, body[i]);
+		}
+		return emit(AstNode{AstTag::WhileNode, 0, 0, 0,
+		                    static_cast<uint32_t>(cond), extra});
+	}
+	if (match(TOK_LOOP)) {
+		// `loop { body }` desugars to `while (true) { body }`. Reusing
+		// WhileNode means the existing codegen, drop-tracking, and
+		// stmtDiverges all "just work" — `stmtDiverges` already
+		// recognizes `while (true)` with no reachable break as
+		// diverging. The dedicated keyword exists for readability and
+		// to express "this never falls through" at the source level.
+		consume(TOK_OPEN_BRACE, "Expected '{' after 'loop'");
+		std::vector<NodeIdx> body;
+		while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
+			body.push_back(parseExpression());
+		}
+		consume(TOK_CLOSE_BRACE, "Expected '}' after loop body");
+
+		NodeIdx cond = emit(AstNode{AstTag::BoolLit, 0, 0, 0, 1, 0});
 		ExtraIdx extra = nodes->reserveExtra(1 + body.size());
 		nodes->setExtra(extra, static_cast<uint32_t>(body.size()));
 		for (size_t i = 0; i < body.size(); i++) {

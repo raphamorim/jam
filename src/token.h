@@ -46,6 +46,7 @@ enum TokenType {
 	TOK_CLOSE_BRACKET,
 	TOK_STRING_LITERAL,
 	TOK_WHILE,
+	TOK_LOOP,       // `loop { ... }` — infinite loop, syntactically noreturn unless body breaks
 	TOK_FOR,
 	TOK_BREAK,
 	TOK_CONTINUE,

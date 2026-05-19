@@ -44,7 +44,10 @@ build:
 	clang++ -c ./src/init_analysis.cpp -o ./init_analysis.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
 	clang++ -c ./src/drop_registry.cpp -o ./drop_registry.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
 	clang++ -c ./src/abi.cpp -o ./abi.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./jam.out ./jam_llvm.o ./main.o ./lexer.o ./parser.o ./ast.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
+	clang++ -c ./src/astgen.cpp -o ./astgen.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	clang++ -c ./src/jir_codegen.cpp -o ./jir_codegen.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	clang++ -c ./src/jir_verify.cpp -o ./jir_verify.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	clang++ -o ./jam.out ./jam_llvm.o ./main.o ./lexer.o ./parser.o ./ast.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o ./astgen.o ./jir_codegen.o ./jir_verify.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
 
 cmake-build:
 	@echo "Building with CMake..."
@@ -113,14 +116,14 @@ test-init: build
 	@echo ""
 	@echo "Building and running init-analyzer C++ tests..."
 	clang++ -c ./tests/cpp/test_init_analysis.cpp -o ./test_init_analysis.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./init_tests ./test_init_analysis.o ./jam_llvm.o ./lexer.o ./parser.o ./ast.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
+	clang++ -o ./init_tests ./test_init_analysis.o ./jam_llvm.o ./lexer.o ./parser.o ./ast.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o ./astgen.o ./jir_codegen.o ./jir_verify.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
 	./init_tests
 
 test-abi: build
 	@echo ""
 	@echo "Building and running ABI classifier C++ tests..."
 	clang++ -c ./tests/cpp/test_abi.cpp -o ./test_abi.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./abi_tests ./test_abi.o ./jam_llvm.o ./lexer.o ./parser.o ./ast.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
+	clang++ -o ./abi_tests ./test_abi.o ./jam_llvm.o ./lexer.o ./parser.o ./ast.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o ./astgen.o ./jir_codegen.o ./jir_verify.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
 	./abi_tests
 
 test-codegen-errors: build
@@ -130,7 +133,14 @@ test-codegen-errors: build
 	clang++ -o ./codegen_error_tests ./test_codegen_errors.o
 	./codegen_error_tests
 
-test: test-unit test-init test-abi test-codegen-errors
+test-jir: build
+	@echo ""
+	@echo "Building and running JIR C++ tests..."
+	clang++ -c ./tests/cpp/test_jir_skeleton.cpp -o ./test_jir_skeleton.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	clang++ -o ./jir_tests ./test_jir_skeleton.o
+	./jir_tests
+
+test: test-unit test-init test-abi test-codegen-errors test-jir
 
 fmt: format
 

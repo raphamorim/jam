@@ -1,0 +1,89 @@
+// `loop { ... }` — explicit infinite loop, syntactically diverges
+// unless the body contains a reachable `break`. Desugars to
+// `while (true) { ... }` so the existing while codegen + drop
+// tracking + stmtDiverges all apply unchanged. The new keyword
+// exists so the source reads more clearly than `while (true)` for
+// "this never falls through" patterns.
+const { assert } = import("test");
+
+// A noreturn function whose body is an infinite loop containing
+// only a `return` from the outer fn — analogous to Rust's
+// `fn forever() -> ! { loop { return 1; } }` (which loops once
+// then exits via return).
+fn tailReturn(n: i32) i32 {
+    loop {
+        return n * 2;
+    }
+}
+
+tfn loopWithReturnInBodyDivergesAndYields() {
+    assert(tailReturn(21), 42);
+    assert(tailReturn(0), 0);
+    assert(tailReturn(-5), -10);
+}
+
+// `loop { break value; }` is the Rust-style "loop that produces a
+// value via break". Jam's existing break support means we can
+// emulate this with an outer mutable binding.
+fn countUpTo(limit: i32) i32 {
+    var i: i32 = 0;
+    loop {
+        if (i >= limit) {
+            break;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+tfn loopWithBreakIsExitable() {
+    assert(countUpTo(0), 0);
+    assert(countUpTo(5), 5);
+    assert(countUpTo(100), 100);
+}
+
+// A `loop { abort(); }` declared `noreturn`. The body contains only
+// a call to a noreturn fn — both layers of divergence analysis
+// (noreturn-call recognition + loop-with-true-cond) confirm this
+// never falls through.
+extern fn abort() noreturn;
+
+fn alwaysAborts() noreturn {
+    loop {
+        abort();
+    }
+}
+
+tfn loopOfNoreturnCompilesAsNoreturn() {
+    // Don't actually call alwaysAborts — abort would terminate the
+    // test runner. The fact that this file compiles is the regression
+    // signal: pre-`loop`-keyword + pre-noreturn this would either
+    // fail to compile or wrongly report a missing return.
+    assert(1, 1);
+}
+
+// Nested loop with inner break. The inner loop exits via break;
+// the outer loop continues. Pins down that break doesn't cross
+// loop boundaries.
+fn nestedLoop(rows: i32, cols: i32) i32 {
+    var total: i32 = 0;
+    var r: i32 = 0;
+    loop {
+        if (r >= rows) { break; }
+        var c: i32 = 0;
+        loop {
+            if (c >= cols) { break; }
+            total = total + 1;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return total;
+}
+
+tfn nestedLoopBreakStaysScoped() {
+    assert(nestedLoop(3, 4), 12);
+    assert(nestedLoop(5, 5), 25);
+    assert(nestedLoop(0, 99), 0);
+    assert(nestedLoop(7, 0), 0);
+}

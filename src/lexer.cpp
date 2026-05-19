@@ -102,6 +102,8 @@ void Lexer::identifier() {
 		addToken(TOK_MATCH, text);
 	} else if (text == "while") {
 		addToken(TOK_WHILE, text);
+	} else if (text == "loop") {
+		addToken(TOK_LOOP, text);
 	} else if (text == "for") {
 		addToken(TOK_FOR, text);
 	} else if (text == "break") {

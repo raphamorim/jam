@@ -199,6 +199,30 @@ JAM_EXTERN_C JamBasicBlockRef JamLLVMAppendBasicBlock(JamFunctionRef func,
 JAM_EXTERN_C JamFunctionRef JamLLVMGetBasicBlockParent(JamBasicBlockRef block);
 JAM_EXTERN_C JamValueRef JamLLVMGetBasicBlockTerminator(JamBasicBlockRef block);
 
+// LLVM `switch` instruction: structural dispatch on an integer
+// scrutinee. `defaultBlock` is the else target reached when no case
+// matches. `numCasesHint` is a size hint (LLVM resizes if more cases
+// are added). Returns the SwitchInst as a JamValueRef so callers can
+// hand it back to JamLLVMAddCase.
+JAM_EXTERN_C JamValueRef JamLLVMBuildSwitch(JamBuilderRef builder,
+                                            JamValueRef scrut,
+                                            JamBasicBlockRef defaultBlock,
+                                            unsigned numCasesHint);
+JAM_EXTERN_C void JamLLVMAddCase(JamValueRef switchInst, JamValueRef caseVal,
+                                 JamBasicBlockRef caseBlock);
+
+// Position the builder immediately before the block's terminator
+// instruction. Used to insert zext/sext for peer-type promotion of
+// match-arm values after the arm has already emitted its `br merge`.
+JAM_EXTERN_C void
+JamLLVMPositionBuilderBeforeTerminator(JamBuilderRef builder,
+                                       JamBasicBlockRef block);
+
+JAM_EXTERN_C JamValueRef JamLLVMBuildZExt(JamBuilderRef builder, JamValueRef val,
+                                          JamTypeRef destType, const char *name);
+JAM_EXTERN_C JamValueRef JamLLVMBuildSExt(JamBuilderRef builder, JamValueRef val,
+                                          JamTypeRef destType, const char *name);
+
 // Stack alloca with an explicit alignment in bytes. Pass 0 to fall back to
 // LLVM's data-layout-derived inference, but prefer passing the type's real
 // alignment (via JamCodegenContext::typeAlign). LLVM's getPrefTypeAlign

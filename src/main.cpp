@@ -20,10 +20,14 @@
 #include <vector>
 
 #include "ast.h"
+#include "astgen.h"
 #include "cabi.h"
 #include "codegen.h"
 #include "init_analysis.h"
 #include "jam_llvm.h"
+#include "jir_codegen.h"
+#include "jir_verify.h"
+#include "mangling.h"
 #include "lexer.h"
 #include "module_resolver.h"
 #include "parser.h"
@@ -450,7 +454,7 @@ static int compileAndRun(const std::string &filename,
 	// Pass 1b: prototypes for the main module's functions (we still skip
 	// test funcs in non-test mode and user `main` in test mode).
 	std::vector<std::string> testFunctionNames;
-	std::vector<FunctionAST *> mainModuleEmits;
+	std::vector<JirFunction> jirFunctions;
 	for (auto &function : module->Functions) {
 		if (function->isTest && !testMode) continue;
 		if (!function->isTest && testMode && function->Name == "main") {
@@ -463,15 +467,27 @@ static int compileAndRun(const std::string &filename,
 		// functions. They get registered (so call sites can find them)
 		// but no LLVM is emitted until an instantiation in supplies
 		// concrete type arguments.
-		if (!function->isGeneric()) {
-			function->declarePrototype(codegenCtx);
-			mainModuleEmits.push_back(function.get());
-		}
 		// register by source-level name so call codegen can recover
 		// parameter modes for callsite ABI decisions. Generic functions
 		// also need to be in the registry — call sites consult it to
-		// drive instantiation.
-		codegenCtx.registerFunctionAST(function->Name, function.get());
+		// drive instantiation. The JIR astgen for bodies happens later
+		// (after pass 1c struct methods are also registered), so any
+		// astgen-time callee lookup can see every function in the
+		// module.
+		//
+		// Test functions get the `__test_` prefix in their registry key
+		// to avoid colliding with a regular function of the same source
+		// name — Jam allows `fn add_u8(...)` and `tfn add_u8()` to coexist,
+		// and the bare-name lookup in astgenCall must resolve to the
+		// regular function, not its similarly-named test.
+		const std::string regName = function->isTest
+		                                 ? "__test_" + function->Name
+		                                 : function->Name;
+		codegenCtx.registerFunctionAST(regName, function.get());
+		// Non-generic main-module functions get their LLVM prototype
+		// emitted by `jirDeclarePrototype` in pass 1d, alongside their
+		// JirFunction. Generics emit nothing here — each instantiation
+		// declares its own prototype in `instantiateStructExpr`.
 	}
 
 	// Methods declared inside struct bodies (`fn name(self: ..., ...)`).
@@ -537,30 +553,96 @@ static int compileAndRun(const std::string &filename,
 			}
 			m->declarePrototype(codegenCtx);
 			codegenCtx.registerFunctionAST(s->Name + "." + m->Name, m.get());
-			mainModuleEmits.push_back(m.get());
 		}
 	}
 
-	// Pass 2a: bodies for pub functions in imported modules. Generics
-	// are skipped here too (their bodies are walked at instantiation).
+	// Build the drop registry up front so AstGen can read it via
+	// `JamCodegenContext::getDropRegistry()` to track which `var`
+	// bindings need their drop fn called at scope exit.
+	jam::drops::DropRegistry dropRegistry = jam::drops::buildDropRegistry(
+	    *module, codegenCtx.getTypePool(), codegenCtx.getStringPool());
+	codegenCtx.setDropRegistry(&dropRegistry);
+
+	// Pass 1d: every function (free fns + struct methods + imported
+	// pub fns) is registered. Run AstGen on each so call sites inside
+	// their bodies can resolve every callee — including
+	// `Counter.default`-style static-method calls that the parser
+	// doesn't know about until pass 1c.
+	//
+	// For main-module free functions, AstGen also emits the LLVM
+	// prototype here via `jirDeclarePrototype` — the JIR's by-value
+	// ABI (mut/move → ptr) matches what jir_codegen expects when it
+	// emits the body in pass 2b. Struct methods and imported pub
+	// fns get their prototype from `FunctionAST::declarePrototype`
+	// in passes 1a / 1c so sret + extern attribute handling stays
+	// available for the types that need them.
+	for (auto &function : module->Functions) {
+		if (function->isTest && !testMode) continue;
+		if (!function->isTest && testMode && function->Name == "main") {
+			continue;
+		}
+		if (function->isGeneric()) continue;
+		JirFunction jfn = astgenFunction(*function, codegenCtx);
+		jfn.name = mangledFunctionName(
+		    *function, codegenCtx.getTypePool(),
+		    codegenCtx.getStringPool());
+		jirDeclarePrototype(jfn, codegenCtx);
+		jirFunctions.push_back(std::move(jfn));
+	}
+	for (auto &s : module->Structs) {
+		for (auto &m : s->Methods) {
+			JirFunction jfn = astgenFunction(*m, codegenCtx);
+			jfn.name = mangledFunctionName(
+			    *m, codegenCtx.getTypePool(),
+			    codegenCtx.getStringPool());
+			jirFunctions.push_back(std::move(jfn));
+		}
+	}
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
 		if (path == "std") continue;
 		for (auto &func : importedModule->Functions) {
 			if (func->isPub && !func->isGeneric()) {
-				func->defineBody(codegenCtx);
+				JirFunction jfn = astgenFunction(*func, codegenCtx);
+				jfn.name = mangledFunctionName(
+				    *func, codegenCtx.getTypePool(),
+				    codegenCtx.getStringPool());
+				jirFunctions.push_back(std::move(jfn));
 			}
 		}
 	}
 
+	// Verify each JirFunction's structural invariants before codegen
+	// runs. Catches malformed dispatch, missing terminators,
+	// out-of-bounds refs, and use-before-def across blocks — failures
+	// that would otherwise show up as either silent miscompiles or
+	// LLVM-verifier crashes much later. Diagnostics are aborts: the
+	// function shouldn't reach jir_codegen if it's malformed.
+	bool anyVerifyFailed = false;
+	for (const JirFunction &jfn : jirFunctions) {
+		auto diags = verifyJirFunction(
+		    jfn, &codegenCtx.getTypePool(),
+		    &codegenCtx.getStringPool(),
+		    +[](void *c, TypeIdx t) -> TypeIdx {
+			    auto *cc = static_cast<JamCodegenContext *>(c);
+			    const TypeKey &k = cc->getTypePool().get(t);
+			    if (k.kind == TypeKind::GenericCall) {
+				    TypeIdx r = cc->resolveGenericCall(t);
+				    if (r != kNoType) return r;
+			    }
+			    return t;
+		    },
+		    &codegenCtx);
+		for (const auto &d : diags) {
+			std::cerr << filename << ": " << d << "\n";
+			anyVerifyFailed = true;
+		}
+	}
+	if (anyVerifyFailed) return 1;
+
 	// Definite-init + mode-aware
 	// callsite analysis runs after every prototype is in scope but
-	// before any body is codegen'd. The drop registry is built here and
-	// kept alive for the whole codegen pass — codegen reads it via the
-	// codegenCtx pointer to emit drops at scope exit. Errors abort
-	// compilation; bodies of bad functions are never lowered.
-	jam::drops::DropRegistry dropRegistry = jam::drops::buildDropRegistry(
-	    *module, codegenCtx.getTypePool(), codegenCtx.getStringPool());
-	codegenCtx.setDropRegistry(&dropRegistry);
+	// before any body is codegen'd. The drop registry was built
+	// earlier (before pass 1d) so the JIR astgen could read it.
 	{
 		jam::init_analysis::FunctionRegistry fnRegistry;
 		for (auto &fn : module->Functions) { fnRegistry[fn->Name] = fn.get(); }
@@ -577,8 +659,8 @@ static int compileAndRun(const std::string &filename,
 		}
 
 		std::vector<jam::init_analysis::Diagnostic> allDiags;
-		for (FunctionAST *function : mainModuleEmits) {
-			if (function->isExtern) continue;
+		auto runAnalysis = [&](FunctionAST *function) {
+			if (function->isExtern) return;
 			auto diags = jam::init_analysis::analyze(
 			    *function, codegenCtx.getNodeStore(),
 			    codegenCtx.getStringPool(), tokens, &fnRegistry, &dropRegistry,
@@ -590,12 +672,28 @@ static int compileAndRun(const std::string &filename,
 			allDiags.insert(allDiags.end(),
 			                std::make_move_iterator(diags.begin()),
 			                std::make_move_iterator(diags.end()));
+		};
+		// Run init / drop analysis on every non-generic main-module
+		// function and struct method. The pipeline registered all of
+		// them in pass 1c / 1d, so this single sweep covers everything
+		// emitted in pass 2b.
+		for (auto &function : module->Functions) {
+			if (function->isTest && !testMode) continue;
+			if (!function->isTest && testMode &&
+			    function->Name == "main") continue;
+			if (function->isGeneric()) continue;
+			runAnalysis(function.get());
+		}
+		for (auto &s : module->Structs) {
+			for (auto &m : s->Methods) runAnalysis(m.get());
 		}
 		if (!allDiags.empty()) { return 1; }
 
-		// Pass 2b: bodies for the main module's functions.
-		for (FunctionAST *function : mainModuleEmits) {
-			function->defineBody(codegenCtx);
+		// Pass 2b: emit each JirFunction's LLVM body. Every prototype
+		// (main-module fns, struct methods, imported pub fns) was
+		// declared in pass 1a–1c so jir_codegen Call lookups resolve.
+		for (const JirFunction &jfn : jirFunctions) {
+			jirDefineBody(jfn, codegenCtx);
 		}
 	}
 

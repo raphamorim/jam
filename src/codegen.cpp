@@ -8,7 +8,11 @@
 #include "codegen.h"
 
 #include "ast.h"
+#include "astgen.h"
+#include "jir_codegen.h"
+#include "jir_verify.h"
 
+#include <iostream>
 #include <stdexcept>
 
 JamCodegenContext::JamCodegenContext(const char *moduleName) {
@@ -209,36 +213,6 @@ JamCodegenContext::getTypeFromString(const std::string &typeStr) const {
 	return getLLVMType(internFromString(typeStr));
 }
 
-void JamCodegenContext::setVariable(const std::string &name,
-                                    JamValueRef value) {
-	namedValues[name] = value;
-}
-
-JamValueRef JamCodegenContext::getVariable(const std::string &name) const {
-	auto it = namedValues.find(name);
-	if (it != namedValues.end()) { return it->second; }
-	return nullptr;
-}
-
-void JamCodegenContext::clearVariables() {
-	namedValues.clear();
-	namedValueTypes.clear();
-}
-
-bool JamCodegenContext::hasVariable(const std::string &name) const {
-	return namedValues.find(name) != namedValues.end();
-}
-
-void JamCodegenContext::setVariableType(const std::string &name, TypeIdx type) {
-	namedValueTypes[name] = type;
-}
-
-TypeIdx JamCodegenContext::getVariableType(const std::string &name) const {
-	auto it = namedValueTypes.find(name);
-	if (it != namedValueTypes.end()) return it->second;
-	return kNoType;
-}
-
 void JamCodegenContext::registerStruct(
     const std::string &name, JamTypeRef type,
     std::vector<std::pair<std::string, TypeIdx>> fields) const {
@@ -424,26 +398,6 @@ void JamCodegenContext::registerModuleConst(const std::string &name,
                                             NodeIdx init, TypeIdx declared) {
 	moduleConsts[name] = ModuleConstInfo{init, declared};
 }
-
-// drop tracking with a scope stack. registerLocalDrop pushes
-// to the topmost active scope; pushDropScope/popDropScope are called at
-// block boundaries by the codegen. clearDrops resets the entire stack
-// (called at function-body entry).
-void JamCodegenContext::registerLocalDrop(const std::string &name,
-                                          JamValueRef alloca,
-                                          JamTypeRef llvmType,
-                                          const FunctionAST *dropFn) {
-	if (dropScopes.empty()) dropScopes.emplace_back();
-	dropScopes.back().push_back(DropEntry{name, alloca, llvmType, dropFn});
-}
-
-void JamCodegenContext::pushDropScope() { dropScopes.emplace_back(); }
-
-void JamCodegenContext::popDropScope() {
-	if (!dropScopes.empty()) dropScopes.pop_back();
-}
-
-void JamCodegenContext::clearDrops() { dropScopes.clear(); }
 
 // function-AST lookup. main.cpp registers each Jam-defined function
 // by source-level name so call codegen can recover the parameter modes
@@ -979,6 +933,10 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 	if (!anon->Methods.empty()) {
 		struct InstMethod {
 			FunctionAST *clonePtr;
+			// Carries Pass 1's metadata JirFunction so Pass 2 can
+			// append the body without redoing param-mode + return-
+			// type lookups. Empty for legacy mode (no JIR used).
+			JirFunction passOneJir;
 		};
 		std::vector<InstMethod> insts;
 		insts.reserve(anon->Methods.size());
@@ -1019,25 +977,51 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 			// Declarations need the substitution context for any
 			// nested type expressions in the signature.
 			setCurrentSubst(bodySubst);
-			clonePtr->declarePrototype(mutCtx);
+			// Pass 1 builds a signature-only JirFunction and emits
+			// the prototype with JIR's ABI (mut/move → ptr). The
+			// metadata is cached on the InstMethod entry so Pass 2
+			// can continue from here instead of rebuilding it.
+			JirFunction passOneJir = astgenMetadata(*clonePtr, mutCtx);
+			passOneJir.name = clonePtr->Name;
+			jirDeclarePrototype(passOneJir, mutCtx);
 			clearCurrentSubst();
-			insts.push_back({clonePtr});
+			insts.push_back({clonePtr, std::move(passOneJir)});
 		}
 
 		// Pass 2: define bodies. All methods are now declared, so
-		// `self.method()` calls between them resolve cleanly.
-		StateSnapshot savedState = snapshotState();
+		// `self.method()` calls between them resolve cleanly. The
+		// cloned bodies go through astgen + JIR codegen — the same
+		// typed pipeline main-module functions use, so generics
+		// aren't a second-class path. Save the builder's insertion
+		// block before each `jirDefineBody` re-positions it, so the
+		// caller (which may be mid-emission of the trigger expression
+		// that asked for instantiation) finds the builder where it
+		// left off.
 		JamBasicBlockRef savedBB = JamLLVMGetInsertBlock(getBuilder());
-		for (const auto &im : insts) {
+		for (auto &im : insts) {
 			setCurrentSubst(bodySubst);
-			// TODO v2: errors thrown here surface with the generic
-			// body's source location, not the call site that triggered
-			// instantiation. Track callers in a dependency trail so
-			// messages point at the right spot.
-			im.clonePtr->defineBody(mutCtx);
+			// Pass 2 continues from Pass 1's metadata — no duplicate
+			// parameter-mode / return-type lookups. `astgenBodyInto`
+			// appends the body in place.
+			astgenBodyInto(im.passOneJir, *im.clonePtr, mutCtx);
+			auto diags = verifyJirFunction(
+			    im.passOneJir, &typePool, &stringPool,
+			    +[](void *c, TypeIdx t) -> TypeIdx {
+				    auto *cc = static_cast<JamCodegenContext *>(c);
+				    const TypeKey &k = cc->getTypePool().get(t);
+				    if (k.kind == TypeKind::GenericCall) {
+					    TypeIdx r = cc->resolveGenericCall(t);
+					    if (r != kNoType) return r;
+				    }
+				    return t;
+			    },
+			    &mutCtx);
+			for (const auto &d : diags) {
+				std::cerr << "(instantiation) " << d << "\n";
+			}
+			jirDefineBody(im.passOneJir, mutCtx);
 			clearCurrentSubst();
 		}
-		restoreState(std::move(savedState));
 		if (savedBB) { JamLLVMPositionBuilderAtEnd(getBuilder(), savedBB); }
 	}
 

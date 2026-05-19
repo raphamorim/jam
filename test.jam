@@ -1,0 +1,5 @@
+const {fmt} = import("std");
+
+fn main() {
+	fmt.println(1);	
+}

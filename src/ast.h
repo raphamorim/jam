@@ -10,6 +10,7 @@
 
 #include "ast_flat.h"
 #include "jam_llvm.h"
+#include "param_mode.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,11 +32,10 @@ class JamCodegenContext;
 //
 // See docs/MVS.md §2 for the full specification. Modes are static-only;
 // the calling convention is unchanged at the LLVM IR level (see §7).
-enum class ParamMode : uint8_t {
-	Let = 0,
-	Mut,
-	Move,
-};
+// ParamMode lives in its own header (`param_mode.h`) so other
+// translation units — notably JIR — can carry per-param modes
+// without dragging in the rest of ast.h. Re-exported here for
+// source-compat with existing #include "ast.h" users.
 
 // One function parameter. Mode defaults to Let when not annotated at the
 // declaration site (the common case for read-only parameters).
@@ -67,16 +67,13 @@ class FunctionAST {
 	      Body(std::move(Body)), isExtern(isExtern), isExport(isExport),
 	      isPub(isPub), isTest(isTest), isVarArgs(isVarArgs) {}
 
-	// Two-pass codegen: declarePrototype emits just the LLVM function
-	// signature (so other functions can reference this one before its body
-	// is built), and defineBody fills in the body. This is what enables
-	// out-of-order definitions, including the common "main on top" layout.
+	// Emit the LLVM function signature without the body. Callers can
+	// reference this fn before its body is lowered, which is what
+	// enables out-of-order definitions (`main` at the top of the file
+	// calling helpers declared below). The body is lowered through
+	// the AstGen → JIR → LLVM pipeline (`astgenFunction` +
+	// `jirDefineBody`).
 	JamFunctionRef declarePrototype(JamCodegenContext &ctx);
-	void defineBody(JamCodegenContext &ctx);
-
-	// Convenience: declare + define in one shot. Kept so single-pass
-	// callers (extern, repl-style code) still work.
-	JamFunctionRef codegen(JamCodegenContext &ctx);
 
 	// a function is generic iff any of its parameters has
 	// type `type` (the meta-type) or its return type is `type`. Generic
@@ -243,21 +240,5 @@ class ModuleAST {
 
 	ModuleAST() = default;
 };
-
-// Loop-context globals consumed by Break/Continue codegen.
-extern JamBasicBlockRef CurrentLoopContinue;
-extern JamBasicBlockRef CurrentLoopBreak;
-
-// Codegen entry point for a single flat-AST node. expectedType (if non-null)
-// drives literal materialization (e.g. integer literals adopt the expected
-// width, struct literals know their target struct).
-JamValueRef codegenNode(JamCodegenContext &ctx, NodeIdx node,
-                        JamTypeRef expectedType = nullptr);
-
-// Lvalue-pointer resolver: returns a pointer to the storage backing `node`
-// and writes the element type through `outElemType`. Used by assignment and
-// address-of paths for `arr[i]`, `g.board[i]`, struct field chains, etc.
-JamValueRef resolveLvaluePtr(JamCodegenContext &ctx, NodeIdx node,
-                             JamTypeRef &outElemType);
 
 #endif  // AST_H

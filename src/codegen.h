@@ -65,17 +65,6 @@ class JamCodegenContext {
 	NodeStore &getNodeStore() { return nodeStore; }
 	const NodeStore &getNodeStore() const { return nodeStore; }
 
-	// Variable management
-	void setVariable(const std::string &name, JamValueRef value);
-	JamValueRef getVariable(const std::string &name) const;
-	void clearVariables();
-	bool hasVariable(const std::string &name) const;
-
-	// Variable type tracking. Types are interned TypeIdx; kNoType means
-	// "unknown" (caller must handle).
-	void setVariableType(const std::string &name, TypeIdx type);
-	TypeIdx getVariableType(const std::string &name) const;
-
 	// Struct registry. Field names stay as std::string for now (struct
 	// fields are queried by name); field types are TypeIdx.
 	struct StructInfo {
@@ -199,26 +188,10 @@ class JamCodegenContext {
 		}
 		return nullptr;
 	}
-	// scope-aware drops: each lexical block (function body, if/else
-	// arm, while/for body, match arm body) has its own DropEntry vector.
-	// pushDropScope/popDropScope are called at block boundaries; the
-	// codegen emits drops for the topmost scope at the end of each block
-	// and for *every* active scope at every Return.
-	void registerLocalDrop(const std::string &name, JamValueRef alloca,
-	                       JamTypeRef llvmType, const FunctionAST *dropFn);
-	void pushDropScope();
-	void popDropScope();
-	const std::vector<std::vector<DropEntry>> &getDropScopes() const {
-		return dropScopes;
-	}
-	void clearDrops();
-
   private:
 	JamContextRef ctx;
 	JamModuleRef mod;
 	JamBuilderRef builder;
-	std::map<std::string, JamValueRef> namedValues;
-	std::map<std::string, TypeIdx> namedValueTypes;
 	// `structs` is mutable because lazily instantiates new
 	// struct types (e.g. `Maybe(File)`) on demand from inside the
 	// otherwise-const `resolveGenericCall` / `getLLVMType` paths.
@@ -232,9 +205,10 @@ class JamCodegenContext {
 	// Lazy LLVM type per TypeIdx (built once, reused). Indexed by TypeIdx.
 	mutable std::vector<JamTypeRef> llvmTypeCache;
 
-	// drop state (see DropEntry / setDropRegistry above).
+	// Pre-built map of struct → drop fn (built before any function is
+	// lowered). AstGen consults this to wire drop calls at scope exit;
+	// drop tracking itself lives in the per-function `AstGenCtx`.
 	const jam::drops::DropRegistry *dropRegistry = nullptr;
-	std::vector<std::vector<DropEntry>> dropScopes;
 
 	// callsite ABI: when codegen for a call expression needs to know
 	// the callee's parameter modes (e.g. to decide whether to auto-take
@@ -257,26 +231,9 @@ class JamCodegenContext {
 	std::string formatNamespaceLookupError(const std::string &kind,
 	                                       const std::string &qualified) const;
 
-	// sret state: when the current function returns a large
-	// aggregate, the codegen-managed sret slot (the leading `ptr` arg)
-	// is kept here so codegenReturn knows where to store the return
-	// value. Set in defineBody, cleared at function exit.
-	void setSretSlot(JamValueRef slot) { sretSlot = slot; }
-	JamValueRef getSretSlot() const { return sretSlot; }
-
-	// Per-function return TypeIdx, populated by defineBody so codegenReturn
-	// can patch the target type into struct-literal returns. Without this,
-	// `fn default() Self { return { n: 0 }; }` couldn't tell the literal
-	// what struct to construct (the literal's d.lhs is parser-time
-	// kNoType).
-	void setCurrentReturnType(TypeIdx ty) { currentReturnType_ = ty; }
-	TypeIdx getCurrentReturnType() const { return currentReturnType_; }
-
   private:
 	std::unordered_map<std::string, const FunctionAST *> functionAsts;
 	std::unordered_map<std::string, ImportHandleInfo> importHandles_;
-	JamValueRef sretSlot = nullptr;
-	TypeIdx currentReturnType_ = kNoType;
 
 	// `genericResolutions_` memoizes per-callsite: every unique
 	// `TypeKind::GenericCall` TypeIdx maps to the resolved TypeIdx.
@@ -349,34 +306,6 @@ class JamCodegenContext {
 	mutable std::unordered_map<std::string, TypeIdx> currentSubst_;
 
   public:
-	// snapshot/restore of the per-function codegen state.
-	// Used to wrap recursive method instantiation that runs inside the
-	// outer caller's codegen flow — the inner declarePrototype +
-	// defineBody would otherwise clear the caller's variables and
-	// drop scopes.
-	struct StateSnapshot {
-		std::map<std::string, JamValueRef> namedValues;
-		std::map<std::string, TypeIdx> namedValueTypes;
-		std::vector<std::vector<DropEntry>> dropScopes;
-		JamValueRef sretSlot;
-	};
-	StateSnapshot snapshotState() const {
-		return StateSnapshot{namedValues, namedValueTypes, dropScopes,
-		                     sretSlot};
-	}
-	void restoreState(StateSnapshot s) const {
-		// All-or-nothing reassignment of the per-function state. The
-		// `mutable` qualifier on these fields is reserved for incremental
-		// caching (struct registry, type-pool growth, etc.); whole-state
-		// reassignment by snapshot is a different access mode and uses
-		// const_cast to be honest about that.
-		auto &self = const_cast<JamCodegenContext &>(*this);
-		self.namedValues = std::move(s.namedValues);
-		self.namedValueTypes = std::move(s.namedValueTypes);
-		self.dropScopes = std::move(s.dropScopes);
-		self.sretSlot = s.sretSlot;
-	}
-
 	// resolve a `TypeKind::GenericCall` TypeIdx to a concrete
 	// TypeIdx by running the substitution engine on the generic
 	// function's body. Result is memoized — subsequent calls with the
