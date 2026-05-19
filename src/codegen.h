@@ -302,7 +302,7 @@ class JamCodegenContext {
 	// type substitution context active during codegen of an
 	// instantiated method's body. Lookups of Named types (T, Self,
 	// __anon_struct_N) consult this map first. Set/cleared around
-	// declarePrototype + defineBody calls in instantiateStructExpr.
+	// jirDeclarePrototype + jirDefineBody calls in instantiateStructExpr.
 	mutable std::unordered_map<std::string, TypeIdx> currentSubst_;
 
   public:
@@ -337,7 +337,7 @@ class JamCodegenContext {
 
 	// substitution context manipulators. The map is active
 	// only during codegen of an instantiated method's body — set right
-	// before declarePrototype/defineBody, cleared right after.
+	// before jirDeclarePrototype/jirDefineBody, cleared right after.
 	void setCurrentSubst(std::unordered_map<std::string, TypeIdx> s) const {
 		currentSubst_ = std::move(s);
 	}

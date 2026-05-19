@@ -7,6 +7,7 @@
 
 #include "astgen.h"
 
+#include "abi.h"
 #include "ast.h"
 #include "codegen.h"
 #include "mangling.h"
@@ -2658,9 +2659,21 @@ static std::string resolvePrefix(JamCodegenContext &ctx,
 // param's TypeIdx as the expected hint so literals settle at the
 // right width.
 static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
+	jam::abi::ParamABI pabi =
+	    jam::abi::classifyParam(p.Mode, p.Type, gctx.ctx);
+	if (pabi.kind != jam::abi::ParamABI::Kind::ByPointer) {
+		return astgenExpr(gctx, argIdx, p.Type);
+	}
+	// ByPointer: feed an address. Mut / Move want the caller's
+	// storage when the arg is an lvalue (so writes are observed by the
+	// caller). Let / Const reach here only for large aggregates — the
+	// callee can't mutate them through the pointer (no `mut`), but the
+	// LLVM signature wants a pointer because the value is too big to
+	// pass in registers. In both cases, when the arg isn't already an
+	// lvalue we spill it to a fresh alloca.
+	const AstNode &argNode = gctx.ctx.getNodeStore().get(argIdx);
 	if (p.Mode == ParamMode::Mut || p.Mode == ParamMode::Move) {
 		TypeIdx leafTy = kNoType;
-		const AstNode &argNode = gctx.ctx.getNodeStore().get(argIdx);
 		switch (argNode.tag) {
 		case AstTag::Variable:
 		case AstTag::MemberAccess:
@@ -2669,23 +2682,21 @@ static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 			return astgenLvalue(gctx, argIdx, leafTy);
 		case AstTag::AddressOf:
 			return astgenExpr(gctx, argIdx, kNoType);
-		default: {
-			JirRef val = astgenExpr(gctx, argIdx, p.Type);
-			leafTy = gctx.jfn.getInst(val).ty;
-			JirInst alloca{};
-			alloca.tag = JirTag::Alloca;
-			alloca.ty = leafTy;
-			JirRef ptr = emitAllocaHoisted(gctx, alloca);
-			JirInst store{};
-			store.tag = JirTag::Store;
-			store.a = ptr;
-			store.b = val;
-			emit(gctx, store);
-			return ptr;
-		}
+		default: break;
 		}
 	}
-	return astgenExpr(gctx, argIdx, p.Type);
+	JirRef val = astgenExpr(gctx, argIdx, p.Type);
+	TypeIdx leafTy = gctx.jfn.getInst(val).ty;
+	JirInst alloca{};
+	alloca.tag = JirTag::Alloca;
+	alloca.ty = leafTy;
+	JirRef ptr = emitAllocaHoisted(gctx, alloca);
+	JirInst store{};
+	store.tag = JirTag::Store;
+	store.a = ptr;
+	store.b = val;
+	emit(gctx, store);
+	return ptr;
 }
 
 static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
@@ -3230,21 +3241,25 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 	// the function top level drops here at function exit.
 	pushDropScope(gctx);
 
-	// Lower each parameter:
-	//   - `let` / `const` mode: the legacy ABI passes by value; we
-	//     alloca + store + register the alloca as the local so reads
-	//     funnel through Load(alloca) like ordinary locals.
-	//   - `mut` / `move` mode: the legacy ABI passes by pointer (the
-	//     pointer points into the caller's storage). We register the
-	//     param JirRef *directly* as the local's "alloca" so reads,
-	//     writes, and field access all operate on the original
-	//     storage. JIR flag bit 0 on Param marks this so jir_codegen
-	//     and the FieldAddr/IndexAddr codegen treat the value as a
+	// Lower each parameter. The ABI classifier is the single source of
+	// truth — both the prototype emitter and the call-site argument
+	// lowering ask the same `classifyParam(mode, type)` question, so
+	// the LLVM signature and the call argument types always agree.
+	//   - ByValue: param arrives as a value. Alloca + store + register
+	//     the alloca as the local so reads emit Load(alloca) like any
+	//     ordinary local.
+	//   - ByPointer: param arrives as a pointer to caller-owned
+	//     storage (mut / move always; let / const for aggregates >
+	//     kByValueMaxBytes). Register the param JirRef directly as
+	//     the local's "alloca" so reads, writes, and field access all
+	//     operate on that pointer. JIR flag bit 0 on Param tells
+	//     jir_codegen + FieldAddr/IndexAddr to treat the value as a
 	//     pointer-to-pointee rather than a by-value Param.
 	for (size_t i = 0; i < fn.Args.size(); i++) {
 		const Param &p = fn.Args[i];
-		bool byPtr = p.Mode == ParamMode::Mut ||
-		             p.Mode == ParamMode::Move;
+		jam::abi::ParamABI pabi =
+		    jam::abi::classifyParam(p.Mode, p.Type, ctx);
+		bool byPtr = pabi.kind == jam::abi::ParamABI::Kind::ByPointer;
 		JirInst paramInst{};
 		paramInst.tag = JirTag::Param;
 		paramInst.a = static_cast<uint32_t>(i);

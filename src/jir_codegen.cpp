@@ -7,6 +7,7 @@
 
 #include "jir_codegen.h"
 
+#include "abi.h"
 #include "ast.h"
 #include "codegen.h"
 #include "jam_llvm.h"
@@ -42,6 +43,18 @@ static JamValueRef buildFCmp(JirCodegenCtx &lctx, JamFloatPredicate p,
 }
 
 static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r);
+
+// Forward declarations of the shared ABI classifier helpers used by
+// both prototype emission (`jirDeclarePrototype`) and per-instruction
+// lowering (`Param`, `Ret`, `Call`). Definitions are below — kept near
+// `jirDeclarePrototype` so the prototype + caller-side ABI policy
+// lives in one block.
+jam::abi::ReturnABI jirClassifyReturn(const JirFunction &jfn,
+                                       const JamCodegenContext &ctx);
+bool jirReturnIsSret(const JirFunction &jfn,
+                      const JamCodegenContext &ctx);
+jam::abi::ParamABI jirClassifyParam(const JirFunction &jfn, size_t i,
+                                     const JamCodegenContext &ctx);
 
 // Public entry: look up the cached LLVM value for `r`, or emit it
 // (recursing for any unrelated subexpressions) and cache the result.
@@ -115,13 +128,17 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		return slice;
 	}
 	case JirTag::Param: {
-		// flags & 1 means the param is a `mut` / `move` and the LLVM
-		// signature passes a pointer to the pointee type. We hand
-		// back the pointer directly so the local map can use it as
-		// the alloca-equivalent for `self`-style field access.
+		// flags & 1 means the param is ByPointer (mut / move always;
+		// let / const for aggregates > kByValueMaxBytes). We hand back
+		// the LLVM pointer directly so the local map can use it as
+		// the alloca-equivalent for field access / self-style reads.
+		// When the function uses sret, the source-level param at JIR
+		// index `i` lives at LLVM index `i + 1` (the sret slot owns
+		// LLVM index 0).
 		JamFunctionRef f = JamLLVMGetFunction(
 		    lctx.ctx.getModule(), lctx.jfn.name.c_str());
-		return JamLLVMGetParam(f, inst.a);
+		unsigned argOffset = jirReturnIsSret(lctx.jfn, lctx.ctx) ? 1u : 0u;
+		return JamLLVMGetParam(f, inst.a + argOffset);
 	}
 	case JirTag::Alloca: {
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
@@ -565,16 +582,40 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		}
 		JirExtraIdx extra = static_cast<JirExtraIdx>(inst.b);
 		uint32_t argCount = lctx.jfn.getExtra(extra);
+		bool calleeUsesSret = JamLLVMFunctionUsesSret(f);
 		std::vector<JamValueRef> args;
-		args.reserve(argCount);
+		args.reserve(argCount + (calleeUsesSret ? 1u : 0u));
+		JamValueRef sretSlot = nullptr;
+		if (calleeUsesSret) {
+			// Allocate caller-owned storage for the result, prepend
+			// its pointer as the hidden first argument. The slot type
+			// comes from the callee's sret attribute, which carries
+			// the pointee type. Result is loaded back after the call.
+			JamTypeRef pointee = JamLLVMFunctionSretPointeeType(f);
+			uint64_t align = lctx.ctx.typeAlign(inst.ty);
+			sretSlot = JamLLVMBuildAlloca(lctx.ctx.getBuilder(), pointee,
+			                              align, "sret.slot");
+			args.push_back(sretSlot);
+		}
 		for (uint32_t i = 0; i < argCount; i++) {
 			JirRef ar =
 			    static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
 			args.push_back(emitInst(lctx, ar));
 		}
+		if (calleeUsesSret) {
+			// The LLVM call itself returns void; the value lives in
+			// the sret slot. Load it so the JirRef → LLVM value map
+			// holds the materialized return value.
+			JamLLVMBuildCall(lctx.ctx.getBuilder(), f, args.data(),
+			                  static_cast<unsigned>(args.size()), "");
+			JamTypeRef retLlvmTy = lctx.ctx.getLLVMType(inst.ty);
+			return JamLLVMBuildLoad(lctx.ctx.getBuilder(), retLlvmTy,
+			                         sretSlot, "sret.val");
+		}
 		const char *resultName = (inst.ty == kNoType) ? "" : "call";
 		return JamLLVMBuildCall(lctx.ctx.getBuilder(), f, args.data(),
-		                        argCount, resultName);
+		                        static_cast<unsigned>(args.size()),
+		                        resultName);
 	}
 	// === Control ===
 	case JirTag::Br: {
@@ -595,6 +636,20 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		return nullptr;
 	}
 	case JirTag::Ret: {
+		// sret return: store the value through the leading hidden
+		// `ptr sret(%T)` arg and emit `ret void`. The caller already
+		// owns the slot, so we don't allocate anything here.
+		if (jirReturnIsSret(lctx.jfn, lctx.ctx)) {
+			JamFunctionRef f = JamLLVMGetFunction(
+			    lctx.ctx.getModule(), lctx.jfn.name.c_str());
+			JamValueRef sretSlot = JamLLVMGetParam(f, 0);
+			if (inst.a != kNoJirRef) {
+				JamValueRef v = emitInst(lctx, inst.a);
+				JamLLVMBuildStore(lctx.ctx.getBuilder(), v, sretSlot);
+			}
+			JamLLVMBuildRetVoid(lctx.ctx.getBuilder());
+			return nullptr;
+		}
 		if (inst.a == kNoJirRef) {
 			JamLLVMBuildRetVoid(lctx.ctx.getBuilder());
 		} else {
@@ -613,44 +668,109 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 	}
 }
 
+// Single ABI source-of-truth used by both prototype emission and
+// call/body lowering. extern and test functions skip the classifier
+// for returns (extern follows the C ABI literally, tests are always
+// nullary-void). Mirrors Zig's `iterateParamTypes` + `firstParamSRet`
+// pattern: classification is a pure function of (mode, type, fn-kind),
+// so call sites and definitions never disagree.
+jam::abi::ReturnABI jirClassifyReturn(const JirFunction &jfn,
+                                       const JamCodegenContext &ctx) {
+	if (jfn.isExtern || jfn.isTest) {
+		return jam::abi::ReturnABI{
+		    jam::abi::ReturnABI::Kind::Direct,
+		    (jfn.isTest || jfn.returnType == kNoType)
+		        ? ctx.getVoidType()
+		        : ctx.getLLVMType(jfn.returnType),
+		    0};
+	}
+	if (jfn.returnType == kNoType) {
+		return jam::abi::ReturnABI{jam::abi::ReturnABI::Kind::Direct,
+		                            ctx.getVoidType(), 0};
+	}
+	return jam::abi::classifyReturn(jfn.returnType, ctx);
+}
+
+// Does the LLVM signature have a leading `ptr sret(%T)` argument?
+bool jirReturnIsSret(const JirFunction &jfn,
+                      const JamCodegenContext &ctx) {
+	return jirClassifyReturn(jfn, ctx).kind ==
+	       jam::abi::ReturnABI::Kind::Indirect;
+}
+
+// Param classification used by both prototype and call site. extern
+// preserves the user-written type verbatim (the user already wrote
+// what they want at the FFI boundary, e.g. `*const T` for an out-ptr).
+jam::abi::ParamABI jirClassifyParam(const JirFunction &jfn, size_t i,
+                                     const JamCodegenContext &ctx) {
+	TypeIdx t = jfn.paramTypes[i];
+	if (jfn.isExtern) {
+		return jam::abi::ParamABI{jam::abi::ParamABI::Kind::ByValue,
+		                           ctx.getLLVMType(t), 0};
+	}
+	ParamMode mode = i < jfn.paramModes.size() ? jfn.paramModes[i]
+	                                           : ParamMode::Let;
+	return jam::abi::classifyParam(mode, t, ctx);
+}
+
 }  // namespace
 
 void jirDeclarePrototype(const JirFunction &jfn, JamCodegenContext &ctx) {
-	// Direct-return ABI: large aggregate returns still go through the
-	// legacy declarePrototype path. JIR-declared functions stay
-	// by-value for returns; sret is a future extension.
-	JamTypeRef retType = (jfn.returnType == kNoType)
-	                         ? ctx.getVoidType()
-	                         : ctx.getLLVMType(jfn.returnType);
+	jam::abi::ReturnABI rabi = jirClassifyReturn(jfn, ctx);
+	bool sret = rabi.kind == jam::abi::ReturnABI::Kind::Indirect;
+
 	std::vector<JamTypeRef> argTypes;
-	argTypes.reserve(jfn.paramTypes.size());
+	argTypes.reserve(jfn.paramTypes.size() + (sret ? 1u : 0u));
+	if (sret) {
+		// Leading `ptr` carries the caller-owned return slot. Attribute
+		// (sret + align) applied after AddFunction below.
+		argTypes.push_back(
+		    JamLLVMPointerType(ctx.getLLVMType(jfn.returnType), 0));
+	}
 	for (size_t i = 0; i < jfn.paramTypes.size(); i++) {
-		TypeIdx t = jfn.paramTypes[i];
-		// Choose ABI per-mode. Today's LLVM backend lowers Mut and
-		// Move parameters by pointer; Let/Const pass by value. A
-		// non-LLVM backend can read `paramModes` and pick its own
-		// strategy (e.g. register-passing small Move structs).
-		ParamMode mode = i < jfn.paramModes.size()
-		                     ? jfn.paramModes[i]
-		                     : ParamMode::Let;
-		bool byPtr = mode == ParamMode::Mut || mode == ParamMode::Move;
-		if (byPtr) {
-			JamTypeRef pointee = ctx.getLLVMType(t);
-			argTypes.push_back(JamLLVMPointerType(pointee, 0));
+		jam::abi::ParamABI pabi = jirClassifyParam(jfn, i, ctx);
+		if (pabi.kind == jam::abi::ParamABI::Kind::ByPointer) {
+			argTypes.push_back(JamLLVMPointerType(
+			    ctx.getLLVMType(jfn.paramTypes[i]), 0));
 		} else {
-			argTypes.push_back(ctx.getLLVMType(t));
+			argTypes.push_back(pabi.llvmType);
 		}
 	}
+
+	JamTypeRef retType = sret ? ctx.getVoidType() : rabi.directType;
 	JamTypeRef ft = JamLLVMFunctionType(
 	    retType, argTypes.data(), static_cast<unsigned>(argTypes.size()),
 	    jfn.isVarArgs);
 	JamFunctionRef f =
 	    JamLLVMAddFunction(ctx.getModule(), jfn.name.c_str(), ft);
 	JamLLVMApplyDefaultFnAttrs(f, jfn.isExtern);
-	if (jfn.isExtern || jfn.isExport || jfn.name == "main") {
+	if (jfn.returnType == BuiltinType::NoReturn) {
+		JamLLVMSetFunctionNoReturn(f);
+	}
+	if (sret) {
+		JamLLVMAddParamAttrSret(f, 0, ctx.getLLVMType(jfn.returnType),
+		                         rabi.sretAlign);
+	}
+
+	bool externalLinkage =
+	    jfn.isExtern || jfn.isExport || jfn.name == "main";
+	if (externalLinkage) {
 		JamLLVMSetLinkage(reinterpret_cast<JamValueRef>(f),
 		                  JAM_LINKAGE_EXTERNAL);
 		JamLLVMSetFunctionCallConv(f, JAM_CALLCONV_C);
+		// C ABI requires bool args / returns to be zero-extended to
+		// the underlying register width. Internal-linkage callers use
+		// our own ABI, so we skip zext there.
+		const unsigned argOffset = sret ? 1u : 0u;
+		for (size_t i = 0; i < jfn.paramTypes.size(); i++) {
+			if (jfn.paramTypes[i] == BuiltinType::Bool) {
+				JamLLVMAddParamAttrZeroExt(
+				    f, static_cast<unsigned>(i) + argOffset);
+			}
+		}
+		if (!sret && jfn.returnType == BuiltinType::Bool) {
+			JamLLVMAddRetAttrZeroExt(f);
+		}
 	} else {
 		JamLLVMSetLinkage(reinterpret_cast<JamValueRef>(f),
 		                  JAM_LINKAGE_INTERNAL);

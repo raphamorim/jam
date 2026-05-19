@@ -943,7 +943,7 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 
 		JamCodegenContext &mutCtx = const_cast<JamCodegenContext &>(*this);
 
-		// Pass 1: clone + register + declarePrototype for every method.
+		// Pass 1: clone + register + jirDeclarePrototype for every method.
 		for (const auto &origMethod : anon->Methods) {
 			std::vector<Param> instArgs;
 			instArgs.reserve(origMethod->Args.size());

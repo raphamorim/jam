@@ -404,7 +404,11 @@ static int compileAndRun(const std::string &filename,
 		if (path == "std") continue;
 		for (auto &func : importedModule->Functions) {
 			if (func->isPub && !func->isGeneric()) {
-				func->declarePrototype(codegenCtx);
+				JirFunction jfn = astgenMetadata(*func, codegenCtx);
+				jfn.name = mangledFunctionName(
+				    *func, codegenCtx.getTypePool(),
+				    codegenCtx.getStringPool());
+				jirDeclarePrototype(jfn, codegenCtx);
 			}
 			// Generic functions are still registered so call sites can
 			// look them up for instantiation, but no LLVM is emitted
@@ -551,7 +555,13 @@ static int compileAndRun(const std::string &filename,
 				          << s->Name << "." << m->Name << "`)\n";
 				return 1;
 			}
-			m->declarePrototype(codegenCtx);
+			{
+				JirFunction jfn = astgenMetadata(*m, codegenCtx);
+				jfn.name = mangledFunctionName(
+				    *m, codegenCtx.getTypePool(),
+				    codegenCtx.getStringPool());
+				jirDeclarePrototype(jfn, codegenCtx);
+			}
 			codegenCtx.registerFunctionAST(s->Name + "." + m->Name, m.get());
 		}
 	}
@@ -569,13 +579,13 @@ static int compileAndRun(const std::string &filename,
 	// `Counter.default`-style static-method calls that the parser
 	// doesn't know about until pass 1c.
 	//
-	// For main-module free functions, AstGen also emits the LLVM
-	// prototype here via `jirDeclarePrototype` — the JIR's by-value
-	// ABI (mut/move → ptr) matches what jir_codegen expects when it
-	// emits the body in pass 2b. Struct methods and imported pub
-	// fns get their prototype from `FunctionAST::declarePrototype`
-	// in passes 1a / 1c so sret + extern attribute handling stays
-	// available for the types that need them.
+	// All non-generic functions get their LLVM prototype from
+	// `jirDeclarePrototype`. The classifier handles sret, by-pointer,
+	// noreturn, zext, and callconv uniformly, so call sites and
+	// definitions never disagree. Main-module free fns are declared
+	// here in pass 1d; struct methods (pass 1c) and imported pub fns
+	// (pass 1a) declare earlier so their bodies — also emitted via
+	// JIR — can reference each other across pass boundaries.
 	for (auto &function : module->Functions) {
 		if (function->isTest && !testMode) continue;
 		if (!function->isTest && testMode && function->Name == "main") {

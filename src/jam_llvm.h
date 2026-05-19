@@ -185,6 +185,13 @@ JAM_EXTERN_C void JamLLVMApplyDefaultFnAttrs(JamFunctionRef func,
 // must be `ptr`-typed; the pointee type and alignment are passed
 // explicitly. Used by codegen for functions returning aggregates whose
 // size exceeds the by-value threshold.
+// Reflective queries on a function's parameter ABI. Used at call sites
+// to detect that the LLVM signature has a leading `ptr sret(%T)` arg —
+// the call needs to alloca a slot and prepend it, then load the result
+// back. Returns nullptr-wrapped type if the function has no sret arg.
+JAM_EXTERN_C bool JamLLVMFunctionUsesSret(JamFunctionRef func);
+JAM_EXTERN_C JamTypeRef JamLLVMFunctionSretPointeeType(JamFunctionRef func);
+
 JAM_EXTERN_C void JamLLVMAddParamAttrSret(JamFunctionRef func, unsigned argIdx,
                                           JamTypeRef pointeeType,
                                           unsigned align);

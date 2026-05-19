@@ -18,9 +18,13 @@ class JamCodegenContext;
 // maps to a small handful of LLVM IR instructions and the JirRef →
 // LLVM Value mapping carries the dataflow.
 //
-// Two-step API matching the existing FunctionAST::declarePrototype /
-// defineBody split: the prototype emission happens before body
-// emission so forward references between functions resolve.
+// Two-step API: prototype emission runs first so forward references
+// between functions resolve before any body is lowered. The classifier
+// inside `jirDeclarePrototype` is the single source of truth for the
+// LLVM signature — call sites in `jirDefineBody` and arg lowering in
+// astgen both consult the same `jam::abi::classify*` routines, so the
+// caller and callee can never disagree on by-value vs by-pointer or
+// direct vs sret returns.
 void jirDeclarePrototype(const JirFunction &jfn, JamCodegenContext &ctx);
 void jirDefineBody(const JirFunction &jfn, JamCodegenContext &ctx);
 

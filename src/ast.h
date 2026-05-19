@@ -67,14 +67,6 @@ class FunctionAST {
 	      Body(std::move(Body)), isExtern(isExtern), isExport(isExport),
 	      isPub(isPub), isTest(isTest), isVarArgs(isVarArgs) {}
 
-	// Emit the LLVM function signature without the body. Callers can
-	// reference this fn before its body is lowered, which is what
-	// enables out-of-order definitions (`main` at the top of the file
-	// calling helpers declared below). The body is lowered through
-	// the AstGen → JIR → LLVM pipeline (`astgenFunction` +
-	// `jirDefineBody`).
-	JamFunctionRef declarePrototype(JamCodegenContext &ctx);
-
 	// a function is generic iff any of its parameters has
 	// type `type` (the meta-type) or its return type is `type`. Generic
 	// functions are not lowered to LLVM at decl time — instead they are

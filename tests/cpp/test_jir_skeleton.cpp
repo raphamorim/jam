@@ -1,11 +1,11 @@
 // Unit tests for the JIR skeleton: data-structure invariants of jir.h
 // (sentinels, monotonic refs, extra pool, instruction size).
 //
-// End-to-end coverage of `--via-jir` is intentionally *not* duplicated
-// here: once codegen has fully migrated to JIR, the existing unit and
-// codegen-error suites will exercise it as the only path. Adding
-// parallel JIR-flagged copies of the same programs would just be
-// churn we'd delete later.
+// End-to-end coverage is intentionally *not* duplicated here: codegen
+// has fully migrated to JIR, so the existing unit and codegen-error
+// suites already exercise it as the only path. This file sticks to
+// the parts a black-box test can't reach: data-structure invariants
+// of jir.h itself.
 
 #include "../../src/jir.h"
 #include "test_framework.h"

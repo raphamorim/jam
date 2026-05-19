@@ -461,6 +461,21 @@ void JamLLVMAddParamAttrSret(JamFunctionRef func, unsigned argIdx,
 	                llvm::Attribute::getWithAlignment(ctx, llvm::Align(align)));
 }
 
+bool JamLLVMFunctionUsesSret(JamFunctionRef func) {
+	llvm::Function *F = UNWRAP_FUNCTION(func);
+	return F->arg_size() > 0 &&
+	       F->getArg(0)->hasAttribute(llvm::Attribute::StructRet);
+}
+
+JamTypeRef JamLLVMFunctionSretPointeeType(JamFunctionRef func) {
+	llvm::Function *F = UNWRAP_FUNCTION(func);
+	if (F->arg_size() == 0) return WRAP_TYPE((llvm::Type *)nullptr);
+	llvm::Attribute attr =
+	    F->getArg(0)->getAttribute(llvm::Attribute::StructRet);
+	if (!attr.isValid()) return WRAP_TYPE((llvm::Type *)nullptr);
+	return WRAP_TYPE(attr.getValueAsType());
+}
+
 void JamLLVMSetValueName(JamValueRef val, const char *name) {
 	UNWRAP_VALUE(val)->setName(name);
 }

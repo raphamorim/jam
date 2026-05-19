@@ -24,11 +24,11 @@
 //     (`Vec__i32.push`) — we keep it.
 //   - Everything else → bare `fn.Name`.
 //
-// Centralised here so the legacy `FunctionAST::declarePrototype` path
-// and the JIR `astgen::emitCall` path agree on the symbol — they used
-// to encode the rules separately, which is exactly the kind of
-// duplication that causes "unknown callee" miscompiles when one site
-// gains a new mangling case and the other doesn't.
+// Centralised so every site that picks a function's LLVM symbol
+// (`jirDeclarePrototype`, `astgen::emitCall`, generic instantiation in
+// `codegen.cpp`) reads the same rules — duplicating the mangling table
+// per call site is exactly how "unknown callee" miscompiles creep in
+// when one site gains a new case and the others don't.
 inline std::string mangledFunctionName(const FunctionAST &fn,
                                        const TypePool &types,
                                        const StringPool &strings) {

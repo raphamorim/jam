@@ -17,12 +17,14 @@ add_definitions(${LLVM_DEFINITIONS})
 
 add_executable(jam
   src/abi.cpp
-  src/ast.cpp
+  src/astgen.cpp
   src/cabi.cpp
   src/codegen.cpp
   src/drop_registry.cpp
   src/init_analysis.cpp
   src/jam_llvm.cpp
+  src/jir_codegen.cpp
+  src/jir_verify.cpp
   src/lexer.cpp
   src/main.cpp
   src/module_resolver.cpp
