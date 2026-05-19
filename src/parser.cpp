@@ -8,7 +8,6 @@
 #include "parser.h"
 #include "number_literal.h"
 #include <cstring>
-#include <stdexcept>
 
 // Validate a number lexeme via the dedicated validator
 // (number_literal.cpp). Strips a leading `-` sign before delegating —
@@ -18,8 +17,8 @@
 // Returns the 64-bit magnitude. For float literals the bit pattern of
 // the parsed `double` is returned via `bit_cast`, and `isFloatOut` is
 // set so the caller can mark the AST node with the float flag.
-static uint64_t parseNumLexeme(const std::string &s, bool &isNegOut,
-                               bool &isFloatOut) {
+uint64_t Parser::parseNumLexeme(const std::string &s, bool &isNegOut,
+                                  bool &isFloatOut) const {
 	bool neg = !s.empty() && s[0] == '-';
 	const std::string &abs = neg ? s.substr(1) : s;
 	isNegOut = neg;
@@ -30,8 +29,8 @@ static uint64_t parseNumLexeme(const std::string &s, bool &isNegOut,
 	case NumberResultKind::Int:
 		return r.intValue;
 	case NumberResultKind::BigInt:
-		throw std::runtime_error("integer literal `" + abs +
-		                         "` exceeds u64 range");
+		parseError("integer literal `" + abs +
+		            "` exceeds u64 range");
 	case NumberResultKind::Float: {
 		isFloatOut = true;
 		// pack the double's bit pattern into u64. memcpy keeps it
@@ -44,17 +43,36 @@ static uint64_t parseNumLexeme(const std::string &s, bool &isNegOut,
 		return bits;
 	}
 	case NumberResultKind::Failure:
-		throw std::runtime_error(std::string("invalid numeric literal `") +
-		                         abs +
-		                         "`: " + numberErrorMessage(r.failure.kind));
+		parseError(std::string("invalid numeric literal `") + abs +
+		            "`: " + numberErrorMessage(r.failure.kind));
 	}
-	throw std::runtime_error("unreachable");
+	parseError("unreachable number-literal classification");
 }
 
 Parser::Parser(std::vector<Token> tokens, TypePool &typePool_,
-               StringPool &stringPool_, NodeStore &nodes_)
+               StringPool &stringPool_, NodeStore &nodes_,
+               jam::Diagnostics *diagnostics, std::string filename)
     : tokens(std::move(tokens)), typePool(&typePool_), stringPool(&stringPool_),
-      nodes(&nodes_) {}
+      nodes(&nodes_), diagnostics_(diagnostics),
+      filename_(std::move(filename)) {}
+
+jam::SrcLoc Parser::currentLoc() const {
+	int line = 0;
+	if (!tokens.empty()) {
+		int idx = current < static_cast<int>(tokens.size()) ? current
+		                                                       : current - 1;
+		if (idx < 0) idx = 0;
+		line = tokens[idx].line;
+	}
+	return jam::SrcLoc{filename_, line};
+}
+
+void Parser::parseError(std::string message) const {
+	if (diagnostics_) {
+		diagnostics_->error(currentLoc(), std::move(message));
+	}
+	throw ParserAbort{};
+}
 
 Token Parser::peek() const { return tokens[current]; }
 
@@ -85,7 +103,7 @@ void Parser::consume(TokenType type, const std::string &message) {
 		advance();
 		return;
 	}
-	throw std::runtime_error(message);
+	parseError(message);
 }
 
 NodeIdx Parser::emit(AstNode n) {
@@ -121,7 +139,7 @@ std::string Parser::qualifiedName(NodeIdx chainRoot) const {
 		    stringPool->get(static_cast<StringIdx>(n.rhs));
 		return base + "." + member;
 	}
-	throw std::runtime_error("Invalid member access chain");
+	parseError("Invalid member access chain");
 }
 
 bool Parser::isQualifiedNameChain(NodeIdx chainRoot) const {
@@ -234,7 +252,18 @@ NodeIdx Parser::parsePrimary() {
 	// `Option(T)`/`Result(T, E)`; variant payload types may reference
 	// the generic params and get substituted at instantiation time.
 	if (match(TOK_ENUM)) { return parseEnumExpression(); }
-	if (match(TOK_IDENTIFIER)) {
+	// Builtin type names (`i32`, `u8`, `bool`, ...) appear in
+	// expression position only in const-decl RHS used as a type-alias
+	// argument: `const ListI32 = Vec(i32);`. We let the lexer's
+	// TOK_TYPE flow through as a synthetic Identifier so the regular
+	// Call-expression machinery handles `Vec(i32)` uniformly. Type-
+	// alias resolution at registerConsts in main.cpp recognises the
+	// shape (Call to a generic-yielding-type fn whose args resolve as
+	// types) and binds the alias. Anywhere else this Identifier hits
+	// astgen as a value, it falls through to the "unknown variable"
+	// diagnostic — same outcome as today's grammar would have given
+	// for `const X = i32;`.
+	if (match(TOK_TYPE) || match(TOK_IDENTIFIER)) {
 		std::string name = previous().lexeme;
 		StringIdx nameId = stringPool->intern(name);
 		NodeIdx expr = emit(AstNode{AstTag::Variable, 0, 0, 0, nameId, 0});
@@ -372,7 +401,7 @@ NodeIdx Parser::parsePrimary() {
 		return expr;
 	}
 
-	throw std::runtime_error("Expected primary expression");
+	parseError("Expected primary expression");
 }
 
 // Type grammar:
@@ -390,7 +419,7 @@ TypeIdx Parser::parseType() {
 		if (match(TOK_CONST)) {
 			ptrConst = true;
 		} else if (!match(TOK_MUT)) {
-			throw std::runtime_error(
+			parseError(
 			    "Expected `const` or `mut` after `*` (e.g. `*const T`, "
 			    "`*mut T`)");
 		}
@@ -440,13 +469,13 @@ TypeIdx Parser::parseType() {
 		if (s == "str") return typePool->internSlice(BuiltinType::U8);
 		if (s == "type") return BuiltinType::Type;
 		if (s == "noreturn") return BuiltinType::NoReturn;
-		throw std::runtime_error("Unknown base type: " + s);
+		parseError("Unknown base type: " + s);
 	}
 	if (match(TOK_IDENTIFIER)) {
 		const std::string &firstIdent = previous().lexeme;
 		if (firstIdent == "Self") {
 			if (structContextStack.empty()) {
-				throw std::runtime_error(
+				parseError(
 				    "`Self` is only valid inside a struct body");
 			}
 			return typePool->internNamed(
@@ -474,7 +503,7 @@ TypeIdx Parser::parseType() {
 		}
 		return typePool->internNamed(stringPool->intern(ident));
 	}
-	throw std::runtime_error("Expected type");
+	parseError("Expected type");
 }
 
 NodeIdx Parser::parseStructLiteral() {
@@ -608,7 +637,7 @@ NodeIdx Parser::parsePatternAtom() {
 			                    variantNameId});
 		}
 		current = saved;
-		throw std::runtime_error(
+		parseError(
 		    "Bare identifier patterns are not yet supported "
 		    "(use `EnumName.Variant`, an integer literal, or `_`)");
 	}
@@ -617,7 +646,7 @@ NodeIdx Parser::parsePatternAtom() {
 		bool isFloat = false;
 		uint64_t lo = parseNumLexeme(previous().lexeme, isNegative, isFloat);
 		if (isFloat) {
-			throw std::runtime_error(
+			parseError(
 			    "Float literals are not allowed in `match` patterns "
 			    "(use an integer literal or a `..=` range)");
 		}
@@ -628,7 +657,7 @@ NodeIdx Parser::parsePatternAtom() {
 			bool hiFloat = false;
 			uint64_t hi = parseNumLexeme(previous().lexeme, hiNeg, hiFloat);
 			if (hiFloat) {
-				throw std::runtime_error(
+				parseError(
 				    "Float literals are not allowed in `match` patterns");
 			}
 			// range bounds fit in u32; truncate gracefully.
@@ -645,7 +674,7 @@ NodeIdx Parser::parsePatternAtom() {
 	// token; we treat single-quote chars as TOK_NUMBER via the
 	// lexer in a future patch. For now, only TOK_NUMBER is accepted.
 	if (match(TOK_STRING_LITERAL)) {
-		throw std::runtime_error(
+		parseError(
 		    "Char literals in patterns are not yet supported");
 	}
 	// Wildcard `_` is lexed as TOK_IDENTIFIER; recognize it here.
@@ -653,7 +682,7 @@ NodeIdx Parser::parsePatternAtom() {
 		advance();
 		return emit(AstNode{AstTag::PatWildcard, 0, 0, 0, 0, 0});
 	}
-	throw std::runtime_error(
+	parseError(
 	    "Expected pattern (integer literal, range, or `_`)");
 }
 
@@ -730,7 +759,12 @@ NodeIdx Parser::parseExpression() {
 		consume(TOK_IDENTIFIER, "Expected variable name");
 		StringIdx name = stringPool->intern(previous().lexeme);
 
-		TypeIdx type = BuiltinType::U8;
+		// kNoType signals "infer from init"; astgenVarDecl lowers the
+		// init first in that case and takes its type. Previously this
+		// defaulted to `u8`, which silently allocated a 1-byte slot
+		// for any unannotated binding (including slices, bools, and
+		// f64) and stored wider values into it.
+		TypeIdx type = kNoType;
 		if (match(TOK_COLON)) { type = parseType(); }
 
 		consume(TOK_EQUAL,
@@ -1116,7 +1150,7 @@ std::unique_ptr<FunctionAST> Parser::parseFunction() {
 		do {
 			if (match(TOK_ELLIPSIS)) {
 				if (!isExtern) {
-					throw std::runtime_error(
+					parseError(
 					    "`...` is only allowed in extern fn declarations");
 				}
 				isVarArgs = true;
@@ -1312,17 +1346,17 @@ std::unique_ptr<EnumDeclAST> Parser::parseEnumDecl() {
 			try {
 				NumberResult r = parseNumberLiteral(previous().lexeme);
 				if (r.kind != NumberResultKind::Int) {
-					throw std::runtime_error(
+					parseError(
 					    "Enum discriminant must be a non-negative integer");
 				}
 				mag = r.intValue;
 			} catch (const std::exception &e) {
-				throw std::runtime_error(
+				parseError(
 				    std::string("Invalid enum discriminant: ") + e.what());
 			}
 			(void)neg;
 			if (mag > 255) {
-				throw std::runtime_error(
+				parseError(
 				    "Enum discriminant " + std::to_string(mag) +
 				    " is out of range; M2 enums are u8-tagged");
 			}
@@ -1338,11 +1372,11 @@ std::unique_ptr<EnumDeclAST> Parser::parseEnumDecl() {
 	consume(TOK_SEMI, "Expected ';' after enum declaration");
 
 	if (variants.empty()) {
-		throw std::runtime_error("Enum `" + name +
+		parseError("Enum `" + name +
 		                         "` must declare at least one variant");
 	}
 	if (variants.size() > 256) {
-		throw std::runtime_error(
+		parseError(
 		    "Enum `" + name +
 		    "` has more than 256 variants; M2 enums are u8-tagged");
 	}
@@ -1420,26 +1454,19 @@ std::unique_ptr<ConstDeclAST> Parser::parseConstDecl() {
 	if (match(TOK_COLON)) { declared = parseType(); }
 
 	consume(TOK_EQUAL, "Expected '=' in module-scope const declaration");
-	int saved = current;
-	TypeIdx aliased = kNoType;
-	try {
-		TypeIdx maybeType = parseType();
-		if (typePool->get(maybeType).kind == TypeKind::GenericCall &&
-		    check(TOK_SEMI)) {
-			aliased = maybeType;
-		} else {
-			current = saved;
-		}
-	} catch (...) { current = saved; }
-
-	if (aliased != kNoType) {
-		consume(TOK_SEMI, "Expected ';' after module-scope const declaration");
-		auto decl =
-		    std::make_unique<ConstDeclAST>(std::move(name), declared, kNoNode);
-		decl->AliasedType = aliased;
-		return decl;
-	}
-
+	// Parse RHS as an expression — no speculation. Type-alias intent
+	// (`const ListI32 = Vec(i32);`) is recognised at registration
+	// time in main.cpp::resolveExprAsType by *pattern-matching* the
+	// resulting AST (`Variable` for type-named bindings, direct
+	// `Call` of a generic-fn-returning-`type`). This is the same
+	// grammar shape Zig uses (`const Foo = Bar(i32);` parses as an
+	// expression in `lib/std/zig/parse.zig:820 parseVarDecl`), but
+	// the *semantic* dispatch is different: Zig comptime-evaluates
+	// the RHS in Sema and inspects the resulting value's type,
+	// which handles arbitrary expressions (if/else, member access,
+	// chained calls, 0-arg type-returning fns). Jam's pattern match
+	// covers only the common cases; richer forms are deferred until
+	// (and if) we add comptime evaluation.
 	NodeIdx init = parseLogicalOr();
 	consume(TOK_SEMI, "Expected ';' after module-scope const declaration");
 
@@ -1469,7 +1496,7 @@ std::unique_ptr<ModuleAST> Parser::parse() {
 				int peek = current + 1;
 				if (peek < static_cast<int>(tokens.size()) &&
 				    tokens[peek].type == TOK_OPEN_BRACE) {
-					throw std::runtime_error(
+					parseError(
 					    "`pub` is not allowed on destructuring imports");
 				}
 			}
@@ -1500,7 +1527,7 @@ std::unique_ptr<ModuleAST> Parser::parse() {
 					advance();
 					if (check(TOK_IMPORT)) {
 						if (isPub) {
-							throw std::runtime_error(
+							parseError(
 							    "`pub` is not allowed on imports");
 						}
 						current = saved;

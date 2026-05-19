@@ -1000,10 +1000,26 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 		JamBasicBlockRef savedBB = JamLLVMGetInsertBlock(getBuilder());
 		for (auto &im : insts) {
 			setCurrentSubst(bodySubst);
-			// Pass 2 continues from Pass 1's metadata — no duplicate
-			// parameter-mode / return-type lookups. `astgenBodyInto`
-			// appends the body in place.
-			astgenBodyInto(im.passOneJir, *im.clonePtr, mutCtx);
+			// Push a reference-trace frame so any astgen diagnostic
+			// raised while lowering this instantiation's body is
+			// annotated with the chain "in instantiation of
+			// `instName.method`". The frame is popped automatically
+			// when the iteration ends. We don't have a precise call
+			// site here (instantiation is triggered lazily inside
+			// type resolution); the file/line on the frame stays
+			// zero and the formatter skips it.
+			jam::Diagnostic::Trace traceFrame{
+			    /*loc=*/{}, /*decl=*/im.clonePtr->Name};
+			jam::RefTraceFrame guard(refTrace_, std::move(traceFrame));
+			try {
+				astgenBodyInto(im.passOneJir, *im.clonePtr, mutCtx);
+			} catch (const AstGenAnalysisFail &) {
+				// diagnostic already pushed; trace was attached via
+				// the helper. Continue with the next method so the
+				// user sees every error in this instantiation.
+				clearCurrentSubst();
+				continue;
+			}
 			auto diags = verifyJirFunction(
 			    im.passOneJir, &typePool, &stringPool,
 			    +[](void *c, TypeIdx t) -> TypeIdx {
@@ -1016,8 +1032,9 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 				    return t;
 			    },
 			    &mutCtx);
-			for (const auto &d : diags) {
-				std::cerr << "(instantiation) " << d << "\n";
+			for (auto &d : diags) {
+				if (d.loc.file.empty()) d.loc.file = currentFile_;
+				mutCtx.diagnostics().push(std::move(d));
 			}
 			jirDefineBody(im.passOneJir, mutCtx);
 			clearCurrentSubst();

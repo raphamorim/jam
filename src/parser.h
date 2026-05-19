@@ -10,10 +10,18 @@
 
 #include "ast.h"
 #include "ast_flat.h"
+#include "diagnostics.h"
 #include "token.h"
 #include <memory>
 #include <unordered_set>
 #include <vector>
+
+// Thrown by the parser after pushing a diagnostic — the parser
+// doesn't try to recover (would require synchronisation points the
+// grammar doesn't define), so a single bad token ends the parse and
+// main.cpp emits whatever is queued in the unified Diagnostics
+// channel.
+class ParserAbort {};
 
 class Parser {
   private:
@@ -32,6 +40,12 @@ class Parser {
 	void consume(TokenType type, const std::string &message);
 
 	NodeIdx emit(AstNode n);
+
+	// Decode a numeric literal lexeme into (magnitude, isNeg, isFloat).
+	// Member rather than free function so it can route over-large /
+	// malformed literals through `parseError` with the token's line.
+	uint64_t parseNumLexeme(const std::string &s, bool &isNegOut,
+	                         bool &isFloatOut) const;
 
 	NodeIdx parsePrimary();
 	NodeIdx parseUnary();
@@ -68,10 +82,22 @@ class Parser {
 
   public:
 	Parser(std::vector<Token> tokens, TypePool &typePool,
-	       StringPool &stringPool, NodeStore &nodes);
+	       StringPool &stringPool, NodeStore &nodes,
+	       jam::Diagnostics *diagnostics = nullptr,
+	       std::string filename = "");
 	std::unique_ptr<ModuleAST> parse();
 	std::vector<std::unique_ptr<StructDeclAST>> *sharedAnonStructs = nullptr;
 	std::vector<std::unique_ptr<EnumDeclAST>> *sharedAnonEnums = nullptr;
+
+  private:
+	jam::Diagnostics *diagnostics_ = nullptr;
+	std::string filename_;
+
+	// Build a SrcLoc anchored at the current token (or the most
+	// recently consumed token if `current` ran past the end). All
+	// parser error helpers funnel through here.
+	jam::SrcLoc currentLoc() const;
+	[[noreturn]] void parseError(std::string message) const;
 };
 
 #endif  // PARSER_H

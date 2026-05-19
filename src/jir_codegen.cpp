@@ -78,6 +78,18 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 	const JirInst &inst = lctx.jfn.getInst(r);
 
 	switch (inst.tag) {
+	case JirTag::Poison: {
+		// Error recovery: astgen pushed a diagnostic and synthesized
+		// this typed placeholder so the rest of the function could
+		// still be walked. Codegen lowers it to LLVM `undef`, but in
+		// practice we should never reach here — the driver checks
+		// `Diagnostics::hasErrors()` after astgen and bails before
+		// running jir_codegen.
+		JamTypeRef ty = (inst.ty == kNoType)
+		                    ? lctx.ctx.getVoidType()
+		                    : lctx.ctx.getLLVMType(inst.ty);
+		return JamLLVMGetUndef(ty);
+	}
 	case JirTag::Int: {
 		uint64_t val = static_cast<uint64_t>(inst.a) |
 		               (static_cast<uint64_t>(inst.b) << 32);

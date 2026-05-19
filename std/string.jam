@@ -41,8 +41,8 @@ pub fn endsWith(s: []u8, suffix: []u8) bool {
     if (suffix.len > s.len) {
         return false;
     }
-    var offset: u32 = s.len - suffix.len;
-    var i: u32 = 0;
+    var offset: u64 = s.len - suffix.len;
+    var i: u64 = 0;
     while (i < suffix.len) {
         if (s.ptr[offset + i] != suffix.ptr[i]) {
             return false;
@@ -62,11 +62,11 @@ pub fn find(s: []u8, needle: []u8) i32 {
     if (needle.len > s.len) {
         return -1;
     }
-    var limit: u32 = s.len - needle.len;
-    var i: u32 = 0;
+    var limit: u64 = s.len - needle.len;
+    var i: u64 = 0;
     while (i <= limit) {
         var matched: bool = true;
-        var j: u32 = 0;
+        var j: u64 = 0;
         while (j < needle.len) {
             if (s.ptr[i + j] != needle.ptr[j]) {
                 matched = false;

@@ -8,6 +8,7 @@
 #ifndef JIR_VERIFY_H
 #define JIR_VERIFY_H
 
+#include "diagnostics.h"
 #include "jir.h"
 
 #include <string>
@@ -52,7 +53,14 @@
 class TypePool;
 class StringPool;
 using JirVerifyResolver = TypeIdx (*)(void *ctx, TypeIdx ty);
-std::vector<std::string> verifyJirFunction(
+
+// Each diagnostic carries the offending JIR instruction's `srcLine`
+// in `loc.line` (file is left empty so the caller can stamp the
+// module's currentFile() before forwarding into the global
+// Diagnostics channel). The `message` text already contains
+// fn-name + ref + tag context so the user can pin which
+// instruction tripped the check.
+std::vector<jam::Diagnostic> verifyJirFunction(
     const JirFunction &jfn, const TypePool *types = nullptr,
     const StringPool *strings = nullptr,
     JirVerifyResolver resolver = nullptr, void *resolverCtx = nullptr);

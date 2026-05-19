@@ -13,6 +13,14 @@
 
 class JamCodegenContext;
 
+// Thrown when astgen can't finish analyzing a declaration. The
+// diagnostic was already pushed onto `JamCodegenContext::diagnostics()`
+// before the throw; catch sites (per-decl in main.cpp / generic
+// instantiation in codegen.cpp) recover by abandoning the current
+// decl so siblings still produce diagnostics. Mirrors Zig's
+// `error.AnalysisFail` (`src/AstGen.zig:60`).
+class AstGenAnalysisFail {};
+
 // AstGen — recursive, eager lowering of a FunctionAST into a typed
 // JirFunction. Mirrors Zig's `AstGen` (lib/std/zig/AstGen.zig) except
 // the output is typed from the start (Jam doesn't have comptime-as-

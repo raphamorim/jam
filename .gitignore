@@ -31,3 +31,4 @@ abi_tests
 codegen_error_tests
 init_tests
 output
+diagnostic_tests

@@ -174,6 +174,17 @@ enum class JirTag : uint8_t {
 	// — no metadata-driven emission, no scope-tracking outside
 	// AstGen. ty is kNoType (void).
 	DropBinding,
+
+	// ── Error recovery ──────────────────────────────────────
+	// Poison value: AstGen pushed a diagnostic for the expression
+	// at this position but synthesized a typed placeholder so the
+	// rest of the function can keep being analyzed. Lowers to LLVM
+	// `undef` at codegen time. Programs that produce any Poison
+	// instructions must not reach codegen — the driver checks
+	// `Diagnostics::hasErrors()` and bails first.
+	// `ty` = the type the consumer expected (kNoType is legal but
+	// degrades downstream type checking).
+	Poison,
 };
 
 // A single JIR instruction.
@@ -182,7 +193,7 @@ enum class JirTag : uint8_t {
 // copyable so dense instruction arrays are cache-friendly.
 struct JirInst {
 	JirTag tag = JirTag::Invalid;
-	uint8_t op = 0;                      // future use (currently unused)
+	uint8_t _pad = 0;                    // padding to keep `flags` 2-byte aligned
 	uint16_t flags = 0;                  // tag-specific flags
 	uint32_t srcLine = 0;                // for diagnostics: file:line:
 	JirRef a = kNoJirRef;

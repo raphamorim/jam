@@ -20,6 +20,7 @@ add_executable(jam
   src/astgen.cpp
   src/cabi.cpp
   src/codegen.cpp
+  src/diagnostics.cpp
   src/drop_registry.cpp
   src/init_analysis.cpp
   src/jam_llvm.cpp

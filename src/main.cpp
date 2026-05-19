@@ -6,16 +6,14 @@
  */
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -35,41 +33,40 @@
 #include "target.h"
 #include <filesystem>
 
-static std::atomic<bool> gSpinnerActive{false};
-
-static void runSpinner(std::string title) {
-	static const char *frames[8] = {
-	    "\xE2\xA3\xBE", "\xE2\xA3\xBD", "\xE2\xA3\xBB", "\xE2\xA2\xBF",
-	    "\xE2\xA1\xBF", "\xE2\xA3\x9F", "\xE2\xA3\xAF", "\xE2\xA3\xB7",
-	};
-	int i = 0;
-	while (gSpinnerActive.load()) {
-		std::cerr << "\r\033[38;5;205m" << frames[i] << "\033[0m " << title
-		          << "\033[K" << std::flush;
-		i = (i + 1) % 8;
-		std::this_thread::sleep_for(std::chrono::milliseconds(80));
-	}
-	std::cerr << "\r\033[K" << std::flush;
-}
-
-class SpinnerGuard {
-	std::thread t;
-	bool started = false;
+// Terminal progress reporting via OSC 9;4. Supported by ConEmu,
+// Windows Terminal, iTerm2, WezTerm, Ghostty, etc. — renders as a
+// taskbar / tab indicator (no inline animation that fights with
+// diagnostic output). Unsupported terminals silently drop the
+// escape sequence.
+//
+// States: 0=remove, 1=normal+percent, 2=error, 3=indeterminate,
+// 4=warning. We use 3 during compile, 2 on error, 0 on success.
+class ProgressGuard {
+	bool active = false;
 
   public:
-	SpinnerGuard(bool enabled, std::string title) {
+	ProgressGuard(bool enabled) {
 		if (!enabled) return;
 		if (!isatty(STDERR_FILENO)) return;
-		gSpinnerActive = true;
-		t = std::thread(runSpinner, std::move(title));
-		started = true;
+		active = true;
+		std::cerr << "\033]9;4;3;\033\\" << std::flush;
 	}
-	~SpinnerGuard() { stop(); }
-	void stop() {
-		if (started) {
-			gSpinnerActive = false;
-			if (t.joinable()) t.join();
-			started = false;
+	~ProgressGuard() { clear(); }
+
+	void error() {
+		if (active) {
+			std::cerr << "\033]9;4;2;\033\\" << std::flush;
+			active = false;
+		}
+	}
+	// Stop without flagging error — same exit as success.
+	void stop() { clear(); }
+
+  private:
+	void clear() {
+		if (active) {
+			std::cerr << "\033]9;4;0;\033\\" << std::flush;
+			active = false;
 		}
 	}
 };
@@ -79,11 +76,11 @@ static int compileAndRun(const std::string &filename,
                          bool emitIR, bool testMode, JamOptLevel optLevel,
                          JamLTO lto, JamStrip strip,
                          const std::vector<std::string> &linkLibs) {
-	SpinnerGuard spinner(!testMode, "Jam Making");
+	ProgressGuard progress(!testMode);
 
 	std::ifstream file(filename);
 	if (!file.is_open()) {
-		spinner.stop();
+		progress.error();
 		std::cerr << "Could not open file: " << filename << std::endl;
 		return 1;
 	}
@@ -93,6 +90,7 @@ static int compileAndRun(const std::string &filename,
 	std::string source = buffer.str();
 
 	JamCodegenContext codegenCtx("jam_module");
+	codegenCtx.setCurrentFile(filename);
 	Lexer lexer(source);
 	std::vector<Token> tokens = lexer.scanTokens();
 
@@ -100,10 +98,19 @@ static int compileAndRun(const std::string &filename,
 	std::vector<std::unique_ptr<EnumDeclAST>> sharedAnonEnums;
 
 	Parser parser(tokens, codegenCtx.getTypePool(), codegenCtx.getStringPool(),
-	              codegenCtx.getNodeStore());
+	              codegenCtx.getNodeStore(), &codegenCtx.diagnostics(),
+	              filename);
 	parser.sharedAnonStructs = &sharedAnonStructs;
 	parser.sharedAnonEnums = &sharedAnonEnums;
-	std::unique_ptr<ModuleAST> module = parser.parse();
+	std::unique_ptr<ModuleAST> module;
+	try {
+		module = parser.parse();
+	} catch (const ParserAbort &) {
+		// diagnostic already pushed
+		progress.error();
+		codegenCtx.diagnostics().emit(std::cerr);
+		return 1;
+	}
 	std::filesystem::path sourcePath(filename);
 	std::string baseDir = sourcePath.parent_path().string();
 	if (baseDir.empty()) { baseDir = "."; }
@@ -371,16 +378,113 @@ static int compileAndRun(const std::string &filename,
 	// only need to teach the codegen context about them — no LLVM
 	// globals get emitted.
 	//
-	// a const whose RHS is a generic-instantiation type
-	// expression (e.g. `const BoxI32 = Box(i32);`) is a *type alias*
-	// instead. The parser flagged these by setting AliasedType; we
-	// register them in the type-alias table so subsequent type lookups
-	// (`var b: BoxI32`) resolve to the instantiated struct.
+	// A const whose RHS is a type-call expression (e.g.
+	// `const BoxI32 = Box(i32);`) is a *type alias*. We detect this
+	// at registration time by walking the InitExpr AST: if the
+	// expression is a Call whose callee is a registered generic with
+	// return type `type`, we evaluate each arg as a type and bind
+	// the result via `registerTypeAlias`. Matches Zig's "types are
+	// values" model: the parser stays grammar-only; the
+	// type-vs-value decision lives at semantic time.
+	const NodeStore &ns = codegenCtx.getNodeStore();
+
+	// Look up a function by source-level name across the main module
+	// and any imported pub fns. Functions aren't yet in the codegen
+	// context's registry at this point (that happens in pass 1d).
+	auto lookupGenericFn =
+	    [&](const std::string &name) -> const FunctionAST * {
+		for (auto &fn : module->Functions) {
+			if (fn->Name == name) return fn.get();
+		}
+		for (const auto &kv : resolver.getLoadedModules()) {
+			if (kv.first == "std") continue;
+			for (auto &fn : kv.second->Functions) {
+				if (fn->isPub && fn->Name == name) return fn.get();
+			}
+		}
+		return nullptr;
+	};
+
+	std::function<TypeIdx(NodeIdx)> resolveExprAsType =
+	    [&](NodeIdx exprIdx) -> TypeIdx {
+		const AstNode &n = ns.get(exprIdx);
+		if (n.tag == AstTag::Variable) {
+			const std::string &name = codegenCtx.getStringPool().get(
+			    static_cast<StringIdx>(n.lhs));
+			// Builtin scalar names.
+			if (name == "u8") return BuiltinType::U8;
+			if (name == "i8") return BuiltinType::I8;
+			if (name == "u16") return BuiltinType::U16;
+			if (name == "i16") return BuiltinType::I16;
+			if (name == "u32") return BuiltinType::U32;
+			if (name == "i32") return BuiltinType::I32;
+			if (name == "u64") return BuiltinType::U64;
+			if (name == "i64") return BuiltinType::I64;
+			if (name == "f32") return BuiltinType::F32;
+			if (name == "f64") return BuiltinType::F64;
+			if (name == "bool" || name == "u1") return BuiltinType::Bool;
+			if (name == "type") return BuiltinType::Type;
+			if (name == "noreturn") return BuiltinType::NoReturn;
+			// A bare identifier in a type-resolution context names
+			// a Named user type (struct / enum / union). The
+			// downstream type lookup at use-site decides whether the
+			// reference resolves; from here we just produce the
+			// Named TypeIdx.
+			TypeIdx named = codegenCtx.getTypePool().internNamed(
+			    codegenCtx.getStringPool().intern(name));
+			return named;
+		}
+		if (n.tag == AstTag::Call) {
+			// Indirect-call form (`expr.method()`) is never a type
+			// alias. Direct-call form has the callee name in `lhs`.
+			if ((n.flags & 1) != 0) return kNoType;
+			const std::string &calleeName =
+			    codegenCtx.getStringPool().get(static_cast<StringIdx>(n.lhs));
+			const FunctionAST *fn = lookupGenericFn(calleeName);
+			if (fn == nullptr) return kNoType;
+			if (!fn->isGeneric()) return kNoType;
+			if (fn->ReturnType != BuiltinType::Type) return kNoType;
+			ExtraIdx argsExtra = static_cast<ExtraIdx>(n.rhs);
+			uint32_t argCount = ns.getExtra(argsExtra);
+			std::vector<TypeIdx> argTypes;
+			argTypes.reserve(argCount);
+			for (uint32_t i = 0; i < argCount; i++) {
+				NodeIdx argIdx =
+				    static_cast<NodeIdx>(ns.getExtra(argsExtra + 1 + i));
+				TypeIdx argTy = resolveExprAsType(argIdx);
+				if (argTy == kNoType) return kNoType;
+				argTypes.push_back(argTy);
+			}
+			return codegenCtx.getTypePool().internGenericCall(
+			    codegenCtx.getStringPool().intern(calleeName),
+			    std::move(argTypes));
+		}
+		return kNoType;
+	};
+
 	auto registerConsts = [&](ModuleAST *m) {
 		for (auto &c : m->Consts) {
 			if (c->AliasedType != kNoType) {
 				codegenCtx.registerTypeAlias(c->Name, c->AliasedType);
 				continue;
+			}
+			if (c->InitExpr != kNoNode) {
+				TypeIdx maybeAlias = resolveExprAsType(c->InitExpr);
+				if (maybeAlias != kNoType) {
+					const TypeKey &k =
+					    codegenCtx.getTypePool().get(maybeAlias);
+					// Only bind as alias when the resolved type is
+					// an actual user-visible category — generic
+					// instantiations, struct/enum/union names. A bare
+					// builtin (i32) or a Named lookup that doesn't
+					// resolve fall through to value-const behavior.
+					if (k.kind == TypeKind::GenericCall) {
+						c->AliasedType = maybeAlias;
+						codegenCtx.registerTypeAlias(c->Name,
+						                              c->AliasedType);
+						continue;
+					}
+				}
 			}
 			codegenCtx.registerModuleConst(c->Name, c->InitExpr,
 			                               c->DeclaredType);
@@ -586,39 +690,70 @@ static int compileAndRun(const std::string &filename,
 	// here in pass 1d; struct methods (pass 1c) and imported pub fns
 	// (pass 1a) declare earlier so their bodies — also emitted via
 	// JIR — can reference each other across pass boundaries.
+	// Per-decl recovery: if astgen on one function throws
+	// AstGenAnalysisFail, the diagnostic was already pushed to
+	// codegenCtx.diagnostics(). We keep going so the user sees every
+	// error in one pass instead of having to fix-rebuild-fix. Mirrors
+	// Zig's per-decl `error.AnalysisFail` boundary (`Sema.zig` calls
+	// AstGen per-decl and continues on AnalysisFail).
 	for (auto &function : module->Functions) {
 		if (function->isTest && !testMode) continue;
 		if (!function->isTest && testMode && function->Name == "main") {
 			continue;
 		}
 		if (function->isGeneric()) continue;
-		JirFunction jfn = astgenFunction(*function, codegenCtx);
-		jfn.name = mangledFunctionName(
-		    *function, codegenCtx.getTypePool(),
-		    codegenCtx.getStringPool());
-		jirDeclarePrototype(jfn, codegenCtx);
-		jirFunctions.push_back(std::move(jfn));
+		try {
+			JirFunction jfn = astgenFunction(*function, codegenCtx);
+			jfn.name = mangledFunctionName(
+			    *function, codegenCtx.getTypePool(),
+			    codegenCtx.getStringPool());
+			jirDeclarePrototype(jfn, codegenCtx);
+			jirFunctions.push_back(std::move(jfn));
+		} catch (const AstGenAnalysisFail &) {
+			// diagnostic already pushed
+		}
 	}
 	for (auto &s : module->Structs) {
 		for (auto &m : s->Methods) {
-			JirFunction jfn = astgenFunction(*m, codegenCtx);
-			jfn.name = mangledFunctionName(
-			    *m, codegenCtx.getTypePool(),
-			    codegenCtx.getStringPool());
-			jirFunctions.push_back(std::move(jfn));
+			try {
+				JirFunction jfn = astgenFunction(*m, codegenCtx);
+				jfn.name = mangledFunctionName(
+				    *m, codegenCtx.getTypePool(),
+				    codegenCtx.getStringPool());
+				jirFunctions.push_back(std::move(jfn));
+			} catch (const AstGenAnalysisFail &) {
+				// diagnostic already pushed
+			}
 		}
 	}
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
 		if (path == "std") continue;
 		for (auto &func : importedModule->Functions) {
 			if (func->isPub && !func->isGeneric()) {
-				JirFunction jfn = astgenFunction(*func, codegenCtx);
-				jfn.name = mangledFunctionName(
-				    *func, codegenCtx.getTypePool(),
-				    codegenCtx.getStringPool());
-				jirFunctions.push_back(std::move(jfn));
+				try {
+					JirFunction jfn =
+					    astgenFunction(*func, codegenCtx);
+					jfn.name = mangledFunctionName(
+					    *func, codegenCtx.getTypePool(),
+					    codegenCtx.getStringPool());
+					jirFunctions.push_back(std::move(jfn));
+				} catch (const AstGenAnalysisFail &) {
+					// diagnostic already pushed
+				}
 			}
 		}
+	}
+
+	// Astgen accumulated every per-decl diagnostic onto the
+	// codegen context's global Diagnostics collector. If any
+	// declaration failed, emit the whole batch now (sorted by
+	// file:line) and bail before downstream passes — the verifier
+	// and codegen will trip on the JirFunctions that *did* succeed
+	// when their callees are missing prototypes.
+	if (codegenCtx.diagnostics().hasErrors()) {
+		progress.error();
+		codegenCtx.diagnostics().emit(std::cerr);
+		return 1;
 	}
 
 	// Verify each JirFunction's structural invariants before codegen
@@ -627,7 +762,6 @@ static int compileAndRun(const std::string &filename,
 	// that would otherwise show up as either silent miscompiles or
 	// LLVM-verifier crashes much later. Diagnostics are aborts: the
 	// function shouldn't reach jir_codegen if it's malformed.
-	bool anyVerifyFailed = false;
 	for (const JirFunction &jfn : jirFunctions) {
 		auto diags = verifyJirFunction(
 		    jfn, &codegenCtx.getTypePool(),
@@ -642,12 +776,18 @@ static int compileAndRun(const std::string &filename,
 			    return t;
 		    },
 		    &codegenCtx);
-		for (const auto &d : diags) {
-			std::cerr << filename << ": " << d << "\n";
-			anyVerifyFailed = true;
+		for (auto &d : diags) {
+			// jir_verify leaves file empty so the caller can stamp
+			// the unit's currentFile here.
+			if (d.loc.file.empty()) d.loc.file = filename;
+			codegenCtx.diagnostics().push(std::move(d));
 		}
 	}
-	if (anyVerifyFailed) return 1;
+	if (codegenCtx.diagnostics().hasErrors()) {
+		progress.error();
+		codegenCtx.diagnostics().emit(std::cerr);
+		return 1;
+	}
 
 	// Definite-init + mode-aware
 	// callsite analysis runs after every prototype is in scope but
@@ -668,20 +808,19 @@ static int compileAndRun(const std::string &filename,
 			}
 		}
 
-		std::vector<jam::init_analysis::Diagnostic> allDiags;
 		auto runAnalysis = [&](FunctionAST *function) {
 			if (function->isExtern) return;
 			auto diags = jam::init_analysis::analyze(
 			    *function, codegenCtx.getNodeStore(),
 			    codegenCtx.getStringPool(), tokens, &fnRegistry, &dropRegistry,
 			    &codegenCtx.getTypePool());
+			// Funnel each init-analysis diagnostic into the unified
+			// `jam::Diagnostics` channel so they share the same
+			// formatting / ordering as astgen errors.
 			for (auto &d : diags) {
-				std::cerr << filename << ":" << d.line
-				          << ": error: " << d.message << "\n";
+				jam::SrcLoc loc{filename, d.line};
+				codegenCtx.diagnostics().error(loc, d.message);
 			}
-			allDiags.insert(allDiags.end(),
-			                std::make_move_iterator(diags.begin()),
-			                std::make_move_iterator(diags.end()));
 		};
 		// Run init / drop analysis on every non-generic main-module
 		// function and struct method. The pipeline registered all of
@@ -697,7 +836,11 @@ static int compileAndRun(const std::string &filename,
 		for (auto &s : module->Structs) {
 			for (auto &m : s->Methods) runAnalysis(m.get());
 		}
-		if (!allDiags.empty()) { return 1; }
+		if (codegenCtx.diagnostics().hasErrors()) {
+			progress.error();
+			codegenCtx.diagnostics().emit(std::cerr);
+			return 1;
+		}
 
 		// Pass 2b: emit each JirFunction's LLVM body. Every prototype
 		// (main-module fns, struct methods, imported pub fns) was
@@ -910,10 +1053,10 @@ static int compileAndRun(const std::string &filename,
 	// Clean up the intermediate (object or bitcode) file.
 	std::remove(intermediate.c_str());
 
-	// Stop the spinner thread before either handing the terminal to the
-	// child process or printing the success line — otherwise the spinner
-	// would keep redrawing on top of whatever the program prints.
-	spinner.stop();
+	// Clear the OSC 9;4 progress indicator before either handing the
+	// terminal to the child process (test/run mode) or printing the
+	// success line, so the host terminal stops showing "in progress".
+	progress.stop();
 
 	if (testMode || runFlag) {
 		std::string runCmd = "./" + outputName;
@@ -1183,8 +1326,13 @@ int main(int argc, char *argv[]) {
 				          << arg << "`" << std::endl;
 				return 1;
 			}
+			if (!filename.empty()) {
+				std::cerr << "Error: `run` accepts only one source file; got `"
+				          << arg << "` after `" << filename << "`" << std::endl;
+				return 1;
+			}
 			filename = arg;
-			break;
+			continue;
 		}
 		// Compile-only / test-mode flags.
 		if (arg == "--help" || arg == "-h") {
@@ -1207,8 +1355,15 @@ int main(int argc, char *argv[]) {
 			stdPathOverride = argv[++i];
 			continue;
 		}
+		// Positional: source file or directory. Flags may follow it
+		// (`./jam.out foo.jam --emit-ir` is valid); seeing a second
+		// positional is an error.
+		if (!filename.empty()) {
+			std::cerr << "Error: unexpected extra argument `" << arg
+			          << "` (already have `" << filename << "`)" << std::endl;
+			return 1;
+		}
 		filename = arg;
-		break;
 	}
 
 	// `jam test` with no path means "run every test under cwd".

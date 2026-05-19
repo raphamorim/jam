@@ -9,6 +9,7 @@
 #define CODEGEN_H
 
 #include "ast_flat.h"
+#include "diagnostics.h"
 #include "drop_registry.h"
 #include "jam_llvm.h"
 #include <map>
@@ -176,6 +177,30 @@ class JamCodegenContext {
 	const jam::drops::DropRegistry *getDropRegistry() const {
 		return dropRegistry;
 	}
+
+	// Global diagnostics collector. Every pass that detects an error
+	// (parser, astgen, init_analysis, jir_verify, generic-instantiation
+	// codegen) pushes here instead of throwing or printing inline; the
+	// driver calls `emit` once at the end.
+	jam::Diagnostics &diagnostics() const { return diagnostics_; }
+
+	// User-facing filename of the unit being compiled. Used as the
+	// default SrcLoc::file for diagnostics that anchor to the current
+	// module. Set once in `compileAndRun`.
+	void setCurrentFile(std::string f) { currentFile_ = std::move(f); }
+	const std::string &currentFile() const { return currentFile_; }
+
+	// Active reference-trace stack: each frame records one
+	// generic-instantiation context we're currently lowering inside.
+	// When astgen pushes a diagnostic it copies this stack onto the
+	// Diagnostic so the user sees a chain like
+	//     note: in instantiation of `Vec(NoDefault).default`
+	//     note: in instantiation of `Pair(Vec(NoDefault), i32)`
+	// when an error surfaces deep inside a monomorphisation. Mirrors
+	// `Module.ErrorMsg.reference_trace` (`Module.zig:2099`).
+	std::vector<jam::Diagnostic::Trace> &refTrace() const {
+		return refTrace_;
+	}
 	// look up a drop method for an instantiated struct
 	// (e.g. Box__i32). Falls back to the pre-built drop registry.
 	// Returns nullptr if the struct has no drop method.
@@ -209,6 +234,14 @@ class JamCodegenContext {
 	// lowered). AstGen consults this to wire drop calls at scope exit;
 	// drop tracking itself lives in the per-function `AstGenCtx`.
 	const jam::drops::DropRegistry *dropRegistry = nullptr;
+
+	// Global diagnostics — mutable so const accessors (`diagnostics()`)
+	// can hand out a writable reference. Every push is a side-effect
+	// of running the const codegen API; this matches how every other
+	// `mutable` cache on this class works.
+	mutable jam::Diagnostics diagnostics_;
+	std::string currentFile_;
+	mutable std::vector<jam::Diagnostic::Trace> refTrace_;
 
 	// callsite ABI: when codegen for a call expression needs to know
 	// the callee's parameter modes (e.g. to decide whether to auto-take

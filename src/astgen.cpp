@@ -12,9 +12,9 @@
 #include "codegen.h"
 #include "mangling.h"
 
-#include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -65,7 +65,137 @@ struct AstGenCtx {
 	// / continue drop *down through* the enclosing loop's body
 	// scope; return drops every scope.
 	std::vector<std::vector<DropTrack>> dropScopes;
+	// Names declared at each currently-active lexical scope. Parallel
+	// to `dropScopes` so push/pop happen together — the redeclaration
+	// check in `astgenVarDecl` only consults the top frame, so sibling
+	// blocks (`if { const op = ...; }` and `if { const op = ...; }`
+	// at the same level) don't trip it. The function-body's frame is
+	// pushed by `astgenBodyInto`.
+	std::vector<std::unordered_set<std::string>> localScopes;
+	// Most-recently-entered AST node — `astgenExpr` updates this on
+	// every entry so error helpers without an explicit NodeIdx in
+	// scope (`failHere` and friends) can still emit a SrcLoc. Mirrors
+	// the implicit "current node" Zig keeps via the active
+	// `Ast.Node.Index` it threads through every helper.
+	NodeIdx currentNode = 0;
 };
+
+// `AstGenAnalysisFail` is declared in astgen.h so main.cpp and
+// codegen.cpp can catch it at decl / generic-instantiation
+// boundaries. The diagnostic itself was pushed to
+// `gctx.ctx.diagnostics()` before the throw.
+
+// Source location for an AST node. Falls back to line 0 when the
+// parser didn't record a line — never seen in practice.
+static jam::SrcLoc locOf(AstGenCtx &gctx, NodeIdx node) {
+	jam::SrcLoc loc;
+	loc.file = gctx.ctx.currentFile();
+	loc.line = gctx.ctx.getNodeStore().getLine(node);
+	return loc;
+}
+
+// Build a Diagnostic with the current reference-trace stack copied
+// in. Every astgen error helper funnels through here so the chain of
+// generic instantiations (if any) is preserved.
+static jam::Diagnostic makeDiag(AstGenCtx &gctx, NodeIdx node,
+                                 std::string message,
+                                 std::vector<jam::Diagnostic> notes) {
+	jam::Diagnostic d;
+	d.loc = locOf(gctx, node);
+	d.severity = jam::Diagnostic::Severity::Error;
+	d.message = std::move(message);
+	d.notes = std::move(notes);
+	d.referenceTrace = gctx.ctx.refTrace();
+	return d;
+}
+
+// Append a Diagnostic anchored at `node` and keep walking. The
+// caller is responsible for synthesising a poison value if the
+// expression position needs one. Mirrors `AstGen.zig:10113
+// appendErrorNode`.
+static void appendErrorNode(AstGenCtx &gctx, NodeIdx node,
+                            std::string message) {
+	gctx.ctx.diagnostics().push(
+	    makeDiag(gctx, node, std::move(message), {}));
+}
+
+// As `appendErrorNode`, but the diagnostic carries secondary notes.
+// Notes are typically built by the caller from related source
+// positions ("X was declared here", "did you mean Y?").
+static void appendErrorNodeNotes(AstGenCtx &gctx, NodeIdx node,
+                                  std::string message,
+                                  std::vector<jam::Diagnostic> notes) {
+	gctx.ctx.diagnostics().push(
+	    makeDiag(gctx, node, std::move(message), std::move(notes)));
+}
+
+// Append + bail the current decl. The catch site (one per function,
+// struct method, or generic instantiation) drops back to compiling
+// siblings, so a single broken function doesn't suppress diagnostics
+// from the rest of the file. Mirrors `AstGen.zig:10149 failNodeNotes`.
+[[noreturn]] static void failNode(AstGenCtx &gctx, NodeIdx node,
+                                   std::string message) {
+	appendErrorNode(gctx, node, std::move(message));
+	throw AstGenAnalysisFail{};
+}
+
+[[noreturn]] static void failNodeNotes(AstGenCtx &gctx, NodeIdx node,
+                                        std::string message,
+                                        std::vector<jam::Diagnostic> notes) {
+	appendErrorNodeNotes(gctx, node, std::move(message), std::move(notes));
+	throw AstGenAnalysisFail{};
+}
+
+// Versions that anchor at `gctx.currentNode` — used by helpers buried
+// deep inside the call tree that don't have the offending NodeIdx in
+// scope but know astgenExpr most recently entered some node.
+[[noreturn]] static void failHere(AstGenCtx &gctx, std::string message) {
+	failNode(gctx, gctx.currentNode, std::move(message));
+}
+
+static void appendErrorHere(AstGenCtx &gctx, std::string message) {
+	appendErrorNode(gctx, gctx.currentNode, std::move(message));
+}
+
+// Forward-declared so the recovery helpers can build Poison; the
+// real definition follows below alongside `emitAllocaHoisted`.
+static JirRef emit(AstGenCtx &gctx, JirInst inst);
+
+// Synthesize a typed Poison placeholder at the current cursor. Used
+// after `appendError*` to keep walking the tree without committing
+// to a specific value — codegen lowers Poison to LLVM `undef`, but
+// the driver short-circuits before codegen runs whenever
+// `Diagnostics::hasErrors()` is true, so the undef is unreachable
+// in well-formed builds and serves only as a placeholder for
+// downstream typecheck.
+//
+// This is Jam-specific, not borrowed from Zig: Zig's `ZIR.unreachable_value`
+// represents the actual `unreachable` keyword and `ZIR.generic_poison`
+// is for unresolved generic-type parameters during pre-instantiation;
+// neither plays the "skip past an error and keep analyzing" role.
+// The closest analog elsewhere is Roslyn's `BoundBadNode` /
+// LLVM's `undef`-after-error recovery.
+static JirRef emitPoison(AstGenCtx &gctx, TypeIdx ty) {
+	JirInst inst{};
+	inst.tag = JirTag::Poison;
+	inst.ty = ty;
+	return emit(gctx, inst);
+}
+
+// Combined: push a recoverable diagnostic anchored at `node` and
+// hand back a typed Poison so the caller can continue typechecking.
+static JirRef recoverNode(AstGenCtx &gctx, NodeIdx node,
+                          std::string message, TypeIdx ty) {
+	appendErrorNode(gctx, node, std::move(message));
+	return emitPoison(gctx, ty);
+}
+
+// As `recoverNode` but anchored at `gctx.currentNode`.
+static JirRef recoverHere(AstGenCtx &gctx, std::string message,
+                          TypeIdx ty) {
+	appendErrorHere(gctx, std::move(message));
+	return emitPoison(gctx, ty);
+}
 
 // Helper: append `inst` to the function's instruction array AND to
 // the current block's insts list. Returns the new ref.
@@ -187,8 +317,12 @@ static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
                        const std::vector<JirRef> &argRefs);
 
 // Push an empty drop scope (called when entering a structured body).
+// We push a parallel `localScopes` frame so each lexical block has
+// its own redeclaration namespace — sibling `if` / `else` arms can
+// each declare their own `const op`.
 static inline void pushDropScope(AstGenCtx &gctx) {
 	gctx.dropScopes.emplace_back();
+	gctx.localScopes.emplace_back();
 }
 
 // Emit drops for every scope from the top of `dropScopes` down to (and
@@ -216,6 +350,7 @@ static inline void popDropScopeEmitting(AstGenCtx &gctx) {
 		emitDrops(gctx, scope);
 	}
 	gctx.dropScopes.pop_back();
+	if (!gctx.localScopes.empty()) gctx.localScopes.pop_back();
 }
 
 // Pop the top scope WITHOUT emitting drops (used when the divergent
@@ -223,6 +358,7 @@ static inline void popDropScopeEmitting(AstGenCtx &gctx) {
 // declared in the scope).
 static inline void popDropScope(AstGenCtx &gctx) {
 	if (!gctx.dropScopes.empty()) gctx.dropScopes.pop_back();
+	if (!gctx.localScopes.empty()) gctx.localScopes.pop_back();
 }
 
 // AstGen for a `NumberLit` AST node, materializing the appropriate
@@ -425,39 +561,165 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 	const NodeStore &ns = gctx.ctx.getNodeStore();
 	ExtraIdx extra = static_cast<ExtraIdx>(n.lhs);
 	StringIdx nameId = static_cast<StringIdx>(ns.getExtra(extra));
-	TypeIdx type = static_cast<TypeIdx>(ns.getExtra(extra + 1));
+	TypeIdx declared = static_cast<TypeIdx>(ns.getExtra(extra + 1));
 	NodeIdx initIdx = static_cast<NodeIdx>(ns.getExtra(extra + 2));
 	const std::string &name = gctx.ctx.getStringPool().get(nameId);
 
-	JirInst alloca{};
-	alloca.tag = JirTag::Alloca;
-	alloca.ty = type;
-	JirRef allocaRef = emitAllocaHoisted(gctx, alloca);
+	// Reject re-declaration within the same lexical scope only. Looser
+	// than Zig (which forbids ALL shadowing, including inner blocks
+	// shadowing outer bindings and even shadowing of primitive type
+	// names — see `AstGen.zig:12099 detectLocalShadowing` that walks
+	// the entire scope chain). Jam's `localScopes` stack only inspects
+	// the innermost frame, so the user's reported bug (`const a = X;
+	// var a = Y;` at the same level) is rejected but
+	//     fn f() { var x = 1; if (c) { var x = 2; } }
+	// still compiles — intentional inner-block shadow.
+	if (!gctx.localScopes.empty() &&
+	    gctx.localScopes.back().count(name) != 0) {
+		failHere(gctx, "redeclaration of `" + name +
+		                 "` in the same scope");
+	}
 
-	// Register the binding *before* lowering the initializer so
-	// self-referential inits like `var head = Node { next: &head }`
-	// can find the slot for `&head`. The slot's bytes are still
-	// undefined until the Store below; users are responsible for
-	// the resulting semantics.
-	gctx.locals[name] = allocaRef;
-	gctx.localTypes[name] = type;
+	// Type resolution.
+	//   * declared (`var x: T = E;`) — lower E with T as the expected
+	//     hint so literal-narrowing settles at T; verify the result
+	//     type matches T.
+	//   * inferred (`var x = E;`) — lower E with no hint, take the
+	//     result's type as the binding's type. Self-referential inits
+	//     like `var head = Node { next: &head };` need a declared
+	//     type so the slot pre-exists; we reject them with a clear
+	//     error when inferred.
+	//
+	// Shallower than Zig: Zig's `alloc_inferred` + `block_ptr`
+	// result-location (`AstGen.zig:3014`, `Sema.zig:3483`) unifies
+	// the types of *every* store into the inferred slot so
+	// `var x = if (c) @as(i32,1) else @as(i32,2);` works. Jam
+	// commits to whatever single type comes back from astgenExpr
+	// — sufficient for the v1 grammar (no `if`-expression in
+	// value position outside `match`), but cases that would need
+	// peer-typing across multiple stores must use an explicit
+	// `: T` annotation.
+	TypeIdx type;
+	JirRef allocaRef;
+	JirRef initRef;
+	if (declared == kNoType) {
+		// Lower init first so we have a concrete type to allocate.
+		initRef = astgenExpr(gctx, initIdx, kNoType);
+		type = gctx.jfn.getInst(initRef).ty;
+		if (type == kNoType) {
+			failHere(gctx,
+			          "could not infer type of `" + name +
+			              "`; add an explicit `: T` annotation");
+		}
+		JirInst alloca{};
+		alloca.tag = JirTag::Alloca;
+		alloca.ty = type;
+		allocaRef = emitAllocaHoisted(gctx, alloca);
+		gctx.locals[name] = allocaRef;
+		gctx.localTypes[name] = type;
+		if (!gctx.localScopes.empty()) {
+			gctx.localScopes.back().insert(name);
+		}
+	} else {
+		type = declared;
+		JirInst alloca{};
+		alloca.tag = JirTag::Alloca;
+		alloca.ty = type;
+		allocaRef = emitAllocaHoisted(gctx, alloca);
+		// Register the binding *before* lowering the initializer so
+		// self-referential inits like
+		//     var head: Node = Node { next: &head };
+		// can find the slot for `&head`. The slot's bytes are
+		// undefined until the Store below; users are responsible
+		// for the resulting semantics.
+		gctx.locals[name] = allocaRef;
+		gctx.localTypes[name] = type;
+		if (!gctx.localScopes.empty()) {
+			gctx.localScopes.back().insert(name);
+		}
 
-	JirRef initRef = astgenExpr(gctx, initIdx, type);
+		initRef = astgenExpr(gctx, initIdx, type);
 
-	// `var x: f32 = 3;` is rejected: a float-typed slot needs either a
-	// float literal (`3.0`) or an explicit `as` cast on the integer
-	// source. Struct / array literals coerce silently at the field
-	// site, so this check fires only on the direct var / const init
-	// boundary.
-	{
+		// Type-check the init against the declared type. The
+		// astgenNumberLit path already narrows integer literals to
+		// the declared int width when `expected` is an Int, so
+		// `var x: i32 = 5;` lands as ik=I32. Anything else that
+		// doesn't match is a real mismatch — including
+		// `var x: f32 = 3;` (int into float), `var x: bool = 1.0;`
+		// (float into bool), `var x: u8 = "s";` (slice into u8),
+		// etc.
+		//
+		// Both sides are resolved through generic-call / type-alias
+		// chains first so `var a: Identity(i32) = 42;` compares
+		// `i32 == i32` instead of the unresolved `GenericCall ≠ Int`.
+		// Pointer-target types are also resolved per-side so
+		// `var p: *const T = &x` (where `T` is an alias) matches.
+		std::function<TypeIdx(TypeIdx)> resolveForCmp =
+		    [&](TypeIdx t) -> TypeIdx {
+			if (t == kNoType) return t;
+			const TypeKey &k = gctx.ctx.getTypePool().get(t);
+			// Generic substitution wins (inside an instantiated
+			// method body, `T` resolves to whatever the
+			// instantiation supplied).
+			if (k.kind == TypeKind::Named) {
+				const std::string &name = gctx.ctx.getStringPool().get(
+				    static_cast<StringIdx>(k.a));
+				TypeIdx sub = gctx.ctx.lookupCurrentSubst(name);
+				if (sub != kNoType) return resolveForCmp(sub);
+			}
+			if (k.kind == TypeKind::GenericCall) {
+				TypeIdx r = gctx.ctx.resolveGenericCall(t);
+				if (r != kNoType) return resolveForCmp(r);
+			}
+			if (k.kind == TypeKind::Named) {
+				TypeIdx a = gctx.ctx.lookupTypeAlias(
+				    gctx.ctx.getStringPool().get(
+				        static_cast<StringIdx>(k.a)));
+				if (a != kNoType) return resolveForCmp(a);
+			}
+			return t;
+		};
 		TypeIdx initTy = gctx.jfn.getInst(initRef).ty;
-		const TypeKey &dk = gctx.ctx.getTypePool().get(type);
-		const TypeKey &ik = gctx.ctx.getTypePool().get(initTy);
-		if (dk.kind == TypeKind::Float && ik.kind == TypeKind::Int) {
-			throw std::runtime_error(
-			    "cannot assign integer to float-typed `" + name +
-			    "`; use a float literal (e.g. `3.0`) or an explicit "
-			    "`as` cast");
+		TypeIdx declRes = resolveForCmp(type);
+		TypeIdx initRes = resolveForCmp(initTy);
+		// Pointer-shape leniency (Jam-specific, *not* Zig-equivalent):
+		// PtrSingle(T) and PtrMany(T) share the runtime representation
+		// (a plain `ptr`), so `&arr[i]` (which lowers to PtrSingle(T))
+		// is accepted in a PtrMany(T) slot as a zero-cost retag. Zig's
+		// `Sema.coerceInMemoryAllowedPtrs` (`Sema.zig:25447`) requires
+		// the source pointer size to match the destination or one to be
+		// `.C`; `*T → [*]T` is only allowed when the source is a
+		// pointer-to-array. Jam's rule is broader because we don't
+		// currently distinguish pointer-to-array from pointer-to-element
+		// at the JIR level — revisit when an Array-pointer kind lands.
+		auto pointerCompatible = [&](TypeIdx a, TypeIdx b) -> bool {
+			if (a == kNoType || b == kNoType) return false;
+			const TypeKey &ka = gctx.ctx.getTypePool().get(a);
+			const TypeKey &kb = gctx.ctx.getTypePool().get(b);
+			bool aPtr = ka.kind == TypeKind::PtrSingle ||
+			             ka.kind == TypeKind::PtrMany;
+			bool bPtr = kb.kind == TypeKind::PtrSingle ||
+			             kb.kind == TypeKind::PtrMany;
+			return aPtr && bPtr && ka.a == kb.a;
+		};
+		bool typesMatch = (declRes == initRes) ||
+		                  pointerCompatible(declRes, initRes);
+		if (initTy != kNoType && !typesMatch) {
+			const TypeKey &dk = gctx.ctx.getTypePool().get(declRes);
+			const TypeKey &ik = gctx.ctx.getTypePool().get(initRes);
+			// Specialize the message for the two patterns users hit
+			// most often; everything else gets the generic mismatch.
+			if (dk.kind == TypeKind::Float &&
+			    ik.kind == TypeKind::Int) {
+				failHere(gctx,
+				          "cannot assign integer to float-typed `" +
+				              name +
+				              "`; use a float literal (e.g. `3.0`) "
+				              "or an explicit `as` cast");
+			}
+			failHere(gctx,
+			          "type mismatch in `" + name +
+			              "`: declared and initialised values disagree");
 		}
 	}
 
@@ -497,7 +759,9 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n) {
 	if (const auto *mc = gctx.ctx.getModuleConst(name)) {
 		return astgenExpr(gctx, mc->initExpr, mc->declaredType);
 	}
-	throw std::runtime_error("astgen: unknown variable `" + name + "`");
+	// Recoverable: emit a Poison so the rest of the function still
+	// gets analyzed (and additional errors reported in the same pass).
+	return recoverHere(gctx, "unknown variable `" + name + "`", kNoType);
 }
 
 // Resolve `node` as an *lvalue* — return a JirRef whose value is a
@@ -518,7 +782,7 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 		    static_cast<StringIdx>(n.lhs));
 		auto it = gctx.locals.find(name);
 		if (it == gctx.locals.end()) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: unknown lvalue variable `" + name + "`");
 		}
 		outLeafTy = gctx.localTypes[name];
@@ -530,7 +794,7 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 		TypeIdx pty = gctx.jfn.getInst(ptrRef).ty;
 		const TypeKey &k = gctx.ctx.getTypePool().get(pty);
 		if (k.kind != TypeKind::PtrSingle && k.kind != TypeKind::PtrMany) {
-			throw std::runtime_error("astgen: cannot deref non-pointer");
+			failHere(gctx, "astgen: cannot deref non-pointer");
 		}
 		outLeafTy = static_cast<TypeIdx>(k.a);
 		return ptrRef;
@@ -548,7 +812,7 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 			TypeIdx fieldTy =
 			    gctx.ctx.getUnionFieldType(uinfo->name, memberName);
 			if (fieldTy == kNoType) {
-				throw std::runtime_error(
+				failHere(gctx, 
 				    "astgen: union `" + uinfo->name + "` has no field `" +
 				    memberName + "`");
 			}
@@ -563,12 +827,12 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 		}
 		const auto *info = gctx.ctx.lookupStruct(baseTy);
 		if (info == nullptr) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: lvalue field access on non-struct");
 		}
 		int idx = gctx.ctx.getFieldIndex(info->name, memberName);
 		if (idx < 0) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: unknown field `" + memberName + "` on `" +
 			    info->name + "`");
 		}
@@ -601,7 +865,7 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 		    k.kind == TypeKind::PtrMany) {
 			elemTy = static_cast<TypeIdx>(k.a);
 		} else {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: lvalue index on non-array/slice/ptr-many");
 		}
 		// For pointer-typed base variables, the alloca holds the
@@ -643,8 +907,7 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 		return emit(gctx, ia);
 	}
 	default:
-		throw std::runtime_error(
-		    "astgen: lvalue form not yet supported in JIR path");
+		failNode(gctx, node, "this expression is not assignable");
 	}
 }
 
@@ -675,7 +938,7 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 	TypeIdx ty = static_cast<TypeIdx>(n.lhs);
 	if (ty == kNoType) ty = expected;
 	if (ty == kNoType) {
-		throw std::runtime_error(
+		failHere(gctx, 
 		    "astgen: struct literal without target type");
 	}
 
@@ -687,7 +950,7 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 		ExtraIdx fieldsExtra = static_cast<ExtraIdx>(n.rhs);
 		uint32_t fieldCount = ns.getExtra(fieldsExtra);
 		if (fieldCount != 1) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: union literal must list exactly one field");
 		}
 		StringIdx nameId = static_cast<StringIdx>(
@@ -699,7 +962,7 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 		TypeIdx fieldTy =
 		    gctx.ctx.getUnionFieldType(uinfo->name, fieldName);
 		if (fieldTy == kNoType) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: union `" + uinfo->name + "` has no field `" +
 			    fieldName + "`");
 		}
@@ -732,12 +995,12 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 			// "not exported" / "does not exist" / "unknown handle"
 			// diagnostic; bare names fall back to the generic message.
 			if (name.find('.') != std::string::npos) {
-				throw std::runtime_error(
+				failHere(gctx, 
 				    gctx.ctx.formatNamespaceLookupError("struct", name));
 			}
-			throw std::runtime_error("unknown struct `" + name + "`");
+			failHere(gctx, "unknown struct `" + name + "`");
 		}
-		throw std::runtime_error(
+		failHere(gctx, 
 		    "astgen: struct literal type is not a known struct");
 	}
 
@@ -754,8 +1017,12 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 		const std::string &fieldName = gctx.ctx.getStringPool().get(nameId);
 		int idx = gctx.ctx.getFieldIndex(info->name, fieldName);
 		if (idx < 0) {
-			throw std::runtime_error("astgen: unknown struct field `" +
-			                         fieldName + "`");
+			// Recoverable: record the bad field name and skip it so
+			// other malformed fields in the same literal still get
+			// reported in this pass.
+			appendErrorHere(gctx, "unknown struct field `" +
+			                          fieldName + "`");
+			continue;
 		}
 		TypeIdx expectedField = info->fields[idx].second;
 		JirRef fieldVal = astgenExpr(gctx, exprIdx, expectedField);
@@ -783,7 +1050,7 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 	// literals must initialise every field.
 	for (size_t i = 0; i < ordered.size(); i++) {
 		if (ordered[i] == kNoJirRef) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: struct literal missing field `" +
 			    info->fields[i].first + "`");
 		}
@@ -826,7 +1093,7 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 		if (const auto *einfo = gctx.ctx.getEnum(baseName)) {
 			int vidx = gctx.ctx.getEnumVariantIndex(baseName, member);
 			if (vidx < 0) {
-				throw std::runtime_error("astgen: enum `" + baseName +
+				failHere(gctx, "astgen: enum `" + baseName +
 				                         "` has no variant `" + member + "`");
 			}
 			uint32_t disc = einfo->variants[vidx].discriminant;
@@ -866,7 +1133,7 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 	const TypeKey &bk = gctx.ctx.getTypePool().get(baseTy);
 	if (bk.kind == TypeKind::Slice) {
 		if (member != "ptr" && member != "len") {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: slice has no field `" + member + "`");
 		}
 		unsigned fieldIdx = (member == "ptr") ? 0 : 1;
@@ -893,7 +1160,7 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 		TypeIdx fieldTy =
 		    gctx.ctx.getUnionFieldType(uinfo->name, member);
 		if (fieldTy == kNoType) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: union `" + uinfo->name + "` has no field `" +
 			    member + "`");
 		}
@@ -915,13 +1182,14 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 
 	const auto *info = gctx.ctx.lookupStruct(baseTy);
 	if (info == nullptr) {
-		throw std::runtime_error(
+		failHere(gctx, 
 		    "astgen: cannot access field of non-struct type");
 	}
 	int idx = gctx.ctx.getFieldIndex(info->name, member);
 	if (idx < 0) {
-		throw std::runtime_error("astgen: unknown field `" + member +
-		                         "` on `" + info->name + "`");
+		return recoverHere(gctx, "unknown field `" + member + "` on `" +
+		                              info->name + "`",
+		                    kNoType);
 	}
 	JirInst inst{};
 	inst.tag = JirTag::FieldAccess;
@@ -955,7 +1223,7 @@ static JirRef astgenArrayLit(AstGenCtx &gctx, const AstNode &n,
 		elemTy = gctx.jfn.getInst(elems[0]).ty;
 	}
 	if (elemTy == kNoType) {
-		throw std::runtime_error(
+		failHere(gctx, 
 		    "astgen: array literal element type could not be inferred");
 	}
 	TypeIdx arrTy = gctx.ctx.getTypePool().intern(
@@ -990,7 +1258,7 @@ static JirRef astgenArrayRepeat(AstGenCtx &gctx, const AstNode &n,
 
 	const AstNode &cn = ns.get(countIdx);
 	if (cn.tag != AstTag::NumberLit) {
-		throw std::runtime_error(
+		failHere(gctx, 
 		    "astgen: array-repeat count must be a constant integer literal");
 	}
 	uint64_t count = static_cast<uint64_t>(cn.lhs) |
@@ -1038,7 +1306,7 @@ static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 	    k.kind == TypeKind::PtrMany) {
 		elemTy = static_cast<TypeIdx>(k.a);
 	} else {
-		throw std::runtime_error(
+		failHere(gctx, 
 		    "astgen: cannot index value of this type");
 	}
 	JirInst inst{};
@@ -1099,7 +1367,7 @@ static JirRef astgenDeref(AstGenCtx &gctx, const AstNode &n) {
 	TypeIdx ptrTy = gctx.jfn.getInst(ptrRef).ty;
 	const TypeKey &k = gctx.ctx.getTypePool().get(ptrTy);
 	if (k.kind != TypeKind::PtrSingle && k.kind != TypeKind::PtrMany) {
-		throw std::runtime_error("astgen: cannot dereference non-pointer");
+		failHere(gctx, "astgen: cannot dereference non-pointer");
 	}
 	TypeIdx pointee = static_cast<TypeIdx>(k.a);
 	JirInst inst{};
@@ -1277,7 +1545,7 @@ static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 		if (sw > dw) return emitCast(JirTag::FPTrunc);
 		return val;
 	}
-	throw std::runtime_error("astgen: unsupported `as` cast between these types");
+	failHere(gctx, "astgen: unsupported `as` cast between these types");
 }
 
 // AstGen for `UnaryOp`. Three forms:
@@ -1331,11 +1599,11 @@ static JirRef astgenUnaryOp(AstGenCtx &gctx, const AstNode &n,
 		return emit(gctx, inst);
 	}
 	default:
-		throw std::runtime_error("astgen: unknown UnaryOp");
+		failHere(gctx, "astgen: unknown UnaryOp");
 	}
 }
 
-// AstGen for `BinaryOp`. Phase 3b: integer arithmetic + comparison.
+// AstGen for `BinaryOp` — integer arithmetic + comparison.
 // Each binary op chooses the right JirTag based on the operand type
 // (integer vs float) and signedness (for SDiv/UDiv, SLT/ULT, etc.).
 static JirRef astgenBinaryOp(AstGenCtx &gctx, const AstNode &n,
@@ -1365,7 +1633,7 @@ static JirRef astgenBinaryOp(AstGenCtx &gctx, const AstNode &n,
 		const TypeKey &rk = gctx.ctx.getTypePool().get(rhsType);
 		if (lk.kind == TypeKind::Float && rk.kind == TypeKind::Float &&
 		    lk.a != rk.a) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "mismatched float widths in binary op; use an explicit "
 			    "`as` cast to align them");
 		}
@@ -1496,9 +1764,9 @@ static JirRef astgenBinaryOp(AstGenCtx &gctx, const AstNode &n,
 		isCmp = true;
 		break;
 	default:
-		throw std::runtime_error(
-		    "astgen: unsupported BinaryOp for Phase 3b (op = " +
-		    std::to_string(static_cast<int>(op)) + ")");
+		failHere(gctx, "unsupported binary operator (internal op = " +
+		                 std::to_string(static_cast<int>(op)) +
+		                 ") — please file a bug");
 	}
 
 	JirInst inst{};
@@ -1734,7 +2002,7 @@ static void astgenWhile(AstGenCtx &gctx, const AstNode &n) {
 
 static void astgenBreak(AstGenCtx &gctx) {
 	if (gctx.loopStack.empty()) {
-		throw std::runtime_error("astgen: `break` outside of loop");
+		failHere(gctx, "astgen: `break` outside of loop");
 	}
 	emitDropsThroughScope(gctx,
 	                       gctx.loopStack.back().bodyScopeIdx);
@@ -1743,7 +2011,7 @@ static void astgenBreak(AstGenCtx &gctx) {
 
 static void astgenContinue(AstGenCtx &gctx) {
 	if (gctx.loopStack.empty()) {
-		throw std::runtime_error("astgen: `continue` outside of loop");
+		failHere(gctx, "astgen: `continue` outside of loop");
 	}
 	emitDropsThroughScope(gctx,
 	                       gctx.loopStack.back().bodyScopeIdx);
@@ -2064,14 +2332,14 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 			einfo = gctx.ctx.getEnum(recvName);
 		}
 		if (einfo == nullptr) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: pattern receiver doesn't resolve to an enum");
 		}
 		const std::string &variantName =
 		    gctx.ctx.getStringPool().get(variantNameId);
 		int vidx = gctx.ctx.getEnumVariantIndex(enumName, variantName);
 		if (vidx < 0) {
-			throw std::runtime_error("astgen: unknown variant `" + enumName +
+			failHere(gctx, "astgen: unknown variant `" + enumName +
 			                         "." + variantName + "`");
 		}
 
@@ -2115,7 +2383,7 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 			gctx.currentBlock = bindB;
 			const auto &variant = einfo->variants[vidx];
 			if (bindingCount != variant.payloadTypes.size()) {
-				throw std::runtime_error(
+				failHere(gctx, 
 				    "astgen: pattern binds " + std::to_string(bindingCount) +
 				    " field(s), variant has " +
 				    std::to_string(variant.payloadTypes.size()));
@@ -2177,8 +2445,7 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 		emitBr(gctx, armBlock);
 		return;
 	default:
-		throw std::runtime_error(
-		    "astgen: pattern form not yet supported in JIR path");
+		failNode(gctx, patIdx, "this pattern form is not supported");
 	}
 }
 
@@ -2473,7 +2740,7 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n) {
 		receiverName = einfo->name;
 		einfoForVariant = einfo;
 	} else {
-		throw std::runtime_error(
+		failHere(gctx, 
 		    "astgen: TypeMethodCall receiver doesn't resolve to a "
 		    "struct or enum");
 	}
@@ -2592,8 +2859,8 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n) {
 	// callee's FunctionAST via the same registry path.
 	const FunctionAST *fn = gctx.ctx.getFunctionAST(qualified);
 	if (fn == nullptr) {
-		throw std::runtime_error("astgen: unknown method `" + qualified +
-		                         "`");
+		return recoverHere(gctx, "unknown method `" + qualified + "`",
+		                    kNoType);
 	}
 	std::vector<JirRef> argRefs;
 	argRefs.reserve(argCount);
@@ -2628,7 +2895,7 @@ static JirRef astgenAtCall(AstGenCtx &gctx, const AstNode &n) {
 		inst.ty = BuiltinType::U8;
 		return emit(gctx, inst);
 	}
-	throw std::runtime_error("astgen: unknown intrinsic `@" + name + "`");
+	return recoverHere(gctx, "unknown intrinsic `@" + name + "`", kNoType);
 }
 
 // AstGen for `Call`. Materializes each arg with the callee's parameter
@@ -2648,7 +2915,7 @@ static JirRef astgenAssertCall(AstGenCtx &gctx, const AstNode &n) {
 	ExtraIdx argsExtra = static_cast<ExtraIdx>(n.rhs);
 	uint32_t argCount = ns.getExtra(argsExtra);
 	if (argCount != 2) {
-		throw std::runtime_error(
+		failHere(gctx, 
 		    "astgen: assert expects exactly 2 arguments");
 	}
 	NodeIdx actualIdx = static_cast<NodeIdx>(ns.getExtra(argsExtra + 1));
@@ -2907,7 +3174,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 		NodeIdx calleeNodeIdx = static_cast<NodeIdx>(n.lhs);
 		const AstNode &cn = ns.get(calleeNodeIdx);
 		if (cn.tag != AstTag::MemberAccess) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: indirect call must be on a `.method` callee");
 		}
 		NodeIdx recvExprIdx = static_cast<NodeIdx>(cn.lhs);
@@ -2930,14 +3197,14 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 		} else if (const auto *einfo = gctx.ctx.lookupEnum(recvTy)) {
 			recvName = einfo->name;
 		} else {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "astgen: indirect-call receiver is not a struct/enum");
 		}
 		std::string qualified = recvName + "." + methodName;
 		const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
 		if (method == nullptr) {
-			throw std::runtime_error("astgen: unknown method `" + qualified +
-			                         "`");
+			return recoverHere(gctx, "unknown method `" + qualified + "`",
+			                    kNoType);
 		}
 		ParamMode mode = method->Args.empty() ? ParamMode::Let
 		                                       : method->Args[0].Mode;
@@ -3088,7 +3355,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 					// We address them all uniformly via a payload-area
 					// pointer + byte offset GEP through i8.
 					if (argCount > variant.payloadTypes.size()) {
-						throw std::runtime_error(
+						failHere(gctx, 
 						    "astgen: too many args for variant `" +
 						    canonicalType + "." + methodName + "`");
 					}
@@ -3178,7 +3445,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 				// instantiation's T (e.g. NoDefault) doesn't define
 				// `default`. Naming both type and method gives the
 				// user a precise pointer to the missing piece.
-				throw std::runtime_error("type `" + canonicalType +
+				failHere(gctx, "type `" + canonicalType +
 				                         "` has no method `" + methodName +
 				                         "`");
 			}
@@ -3237,11 +3504,11 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 	if (fn == nullptr) {
 		// Qualified callees (`lib.priv`) get the precise pub-access
 		// diagnostic via formatNamespaceLookupError.
-		if (callee.find('.') != std::string::npos) {
-			throw std::runtime_error(
-			    gctx.ctx.formatNamespaceLookupError("function", callee));
-		}
-		throw std::runtime_error("astgen: unknown function `" + callee + "`");
+		std::string msg = (callee.find('.') != std::string::npos)
+		                      ? gctx.ctx.formatNamespaceLookupError(
+		                            "function", callee)
+		                      : "unknown function `" + callee + "`";
+		return recoverHere(gctx, std::move(msg), kNoType);
 	}
 
 	std::vector<JirRef> argRefs;
@@ -3262,6 +3529,14 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected) {
 	const AstNode &n = gctx.ctx.getNodeStore().get(node);
 	int line = gctx.ctx.getNodeStore().getLine(node);
+	// Stamp the current node so error helpers without an explicit
+	// NodeIdx in scope can still produce a SrcLoc anchored at the
+	// expression we're working on. We never need to restore on exit:
+	// the *last* entered node is the right anchor for any error
+	// raised before we successfully return, and successful returns
+	// either get overwritten by the next sibling's astgenExpr call
+	// or fall out of scope entirely.
+	gctx.currentNode = node;
 	JirRef result = kNoJirRef;
 	switch (n.tag) {
 	case AstTag::NumberLit:
@@ -3351,7 +3626,7 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected) {
 		astgenContinue(gctx);
 		return kNoJirRef;
 	default:
-		throw std::runtime_error(
+		failHere(gctx, 
 		    "astgen: unsupported AST node (tag = " +
 		    std::to_string(static_cast<int>(n.tag)) + ")");
 	}
@@ -3473,11 +3748,11 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 			u.tag = JirTag::Unreachable;
 			emit(gctx, u);
 		} else if (fn.ReturnType == BuiltinType::NoReturn) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "fn `" + fn.Name + "` is declared `noreturn` but its "
 			    "body falls through without diverging");
 		} else if (fn.ReturnType != kNoType) {
-			throw std::runtime_error(
+			failHere(gctx, 
 			    "fn `" + fn.Name + "` has non-void return type but a "
 			    "path reaches the function end without returning a value");
 		} else {

@@ -27,6 +27,7 @@ const char *tagName(JirTag t) {
 	case JirTag::Float: return "Float";
 	case JirTag::Bool: return "Bool";
 	case JirTag::Str: return "Str";
+	case JirTag::Poison: return "Poison";
 	case JirTag::Alloca: return "Alloca";
 	case JirTag::Load: return "Load";
 	case JirTag::Store: return "Store";
@@ -105,7 +106,7 @@ struct Verifier {
 	const StringPool *strings;
 	JirVerifyResolver resolver;
 	void *resolverCtx;
-	std::vector<std::string> diags;
+	std::vector<jam::Diagnostic> diags;
 	// For def-before-use: as we walk blocks in order, mark each
 	// instruction as "defined" the moment we step past it.
 	std::vector<bool> defined;
@@ -133,17 +134,23 @@ struct Verifier {
 		    (r < jfn.insts.size())
 		        ? tagName(jfn.insts[r].tag)
 		        : "?";
-		diags.push_back("jir-verify: fn `" + jfn.name + "` ref #" +
-		                std::to_string(r) + " (" + tag + ") line " +
-		                std::to_string(line) + ": " + msg);
+		jam::Diagnostic d;
+		d.loc.line = static_cast<int>(line);
+		d.severity = jam::Diagnostic::Severity::Error;
+		d.message = "jir-verify: fn `" + jfn.name + "` ref #" +
+		             std::to_string(r) + " (" + tag + "): " + msg;
+		diags.push_back(std::move(d));
 	}
 
 	void blockErr(JirBlockRef b, const std::string &msg) {
 		std::string name = (b < jfn.blocks.size())
 		                       ? jfn.blocks[b].name
 		                       : "?";
-		diags.push_back("jir-verify: fn `" + jfn.name + "` block #" +
-		                std::to_string(b) + " (" + name + "): " + msg);
+		jam::Diagnostic d;
+		d.severity = jam::Diagnostic::Severity::Error;
+		d.message = "jir-verify: fn `" + jfn.name + "` block #" +
+		             std::to_string(b) + " (" + name + "): " + msg;
+		diags.push_back(std::move(d));
 	}
 
 	// Check that JirRef `r` (0-based interpretation: kNoJirRef OK iff
@@ -243,7 +250,8 @@ struct Verifier {
 		case JirTag::Invalid:
 			err(r, "Invalid tag in live instruction stream");
 			return;
-		// Constants — no operand refs.
+		// Constants and the Poison placeholder — no operand refs.
+		case JirTag::Poison:
 		case JirTag::Int:
 		case JirTag::Float:
 		case JirTag::Bool:
@@ -432,11 +440,11 @@ struct Verifier {
 
 }  // namespace
 
-std::vector<std::string> verifyJirFunction(const JirFunction &jfn,
-                                            const TypePool *types,
-                                            const StringPool *strings,
-                                            JirVerifyResolver resolver,
-                                            void *resolverCtx) {
+std::vector<jam::Diagnostic> verifyJirFunction(const JirFunction &jfn,
+                                                const TypePool *types,
+                                                const StringPool *strings,
+                                                JirVerifyResolver resolver,
+                                                void *resolverCtx) {
 	Verifier v(jfn, types, strings, resolver, resolverCtx);
 
 	// Walk blocks in declaration order, mirroring jir_codegen's pass.
