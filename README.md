@@ -26,7 +26,9 @@ brew install --HEAD jam
 
 ## Contributing
 
-[Donate monthly](https://github.com/sponsors/raphamorim).
+1. [Donate monthly](https://github.com/sponsors/raphamorim).
+
+2. No AI Policy (issues and pull requests). You can comment in your native language if you are not confortable with English.
 
 ## References
 
