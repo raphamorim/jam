@@ -47,7 +47,7 @@ using JirExtraIdx = uint32_t;
 enum class JirTag : uint8_t {
 	Invalid = 0,
 
-	// ── Constants ──────────────────────────────────────────────
+	// Constants
 	// Int: `a` = lo32, `b` = hi32 of u64 value; `ty` = int type.
 	// Float: `a` = lo32, `b` = hi32 of f32/f64 bit pattern; `ty` = f32/f64.
 	// Bool: `a` = 0 or 1; `ty` = i1.
@@ -57,7 +57,7 @@ enum class JirTag : uint8_t {
 	Bool,
 	Str,
 
-	// ── Storage ────────────────────────────────────────────────
+	// Storage
 	// Alloca: `ty` = pointee type. Result type is implicitly ptr-to-`ty`.
 	// Load:   `a` = ptr ref; `ty` = loaded type.
 	// Store:  `a` = ptr ref, `b` = value ref. No result.
@@ -65,35 +65,35 @@ enum class JirTag : uint8_t {
 	Load,
 	Store,
 
-	// ── Integer arithmetic ─────────────────────────────────────
+	// Integer arithmetic
 	// Binary form: `a` = lhs ref, `b` = rhs ref, `ty` = result type.
 	Add, Sub, Mul,
 	SDiv, UDiv, SRem, URem,
 
-	// ── Float arithmetic ───────────────────────────────────────
+	// Float arithmetic
 	FAdd, FSub, FMul, FDiv, FRem,
 	FNeg,                                // unary: `a` = operand
 
-	// ── Integer comparison ─────────────────────────────────────
+	// Integer comparison
 	// Binary form; `ty` is always i1.
 	ICmpEq, ICmpNe,
 	ICmpSlt, ICmpSle, ICmpSgt, ICmpSge,
 	ICmpUlt, ICmpUle, ICmpUgt, ICmpUge,
 
-	// ── Float comparison ───────────────────────────────────────
+	// Float comparison
 	// Ordered predicates (NaN inputs ⇒ false) to match Jam's strict
 	// float typing policy. `ty` is always i1.
 	FCmpOeq, FCmpOne,
 	FCmpOlt, FCmpOle, FCmpOgt, FCmpOge,
 
-	// ── Bitwise / shift ────────────────────────────────────────
+	// Bitwise / shift
 	BitAnd, BitOr, BitXor, BitNot,
 	Shl, AShr, LShr,
 
-	// ── Logical (short-circuit handled by control flow) ────────
+	// Logical (short-circuit handled by control flow)
 	LogNot,                              // unary
 
-	// ── Type conversions ──────────────────────────────────────
+	// Type conversions
 	// All take `a` = operand ref, `ty` = destination type.
 	ZExt, SExt, Trunc,
 	SIToFP, UIToFP,
@@ -101,7 +101,7 @@ enum class JirTag : uint8_t {
 	FPExt, FPTrunc,
 	BitCast,
 
-	// ── Control flow ──────────────────────────────────────────
+	// Control flow
 	// Br:          `a` = JirBlockRef target. No result.
 	// CondBr:      `a` = cond ref; `b` = ExtraIdx → [thenBlock, elseBlock].
 	// Switch:      `a` = scrut ref; `b` = ExtraIdx →
@@ -121,17 +121,17 @@ enum class JirTag : uint8_t {
 	Ret,
 	Unreachable,
 
-	// ── Function call ─────────────────────────────────────────
+	// Function call
 	// Call: `a` = StringIdx (callee qualified name);
 	//       `b` = ExtraIdx → [argCount, arg0, arg1, ...]
 	//       `ty` = return type (kNoType for void).
 	Call,
 
-	// ── Function parameter access ─────────────────────────────
+	// Function parameter access
 	// Param: `a` = parameter index; `ty` = param type.
 	Param,
 
-	// ── Aggregates ────────────────────────────────────────────
+	// Aggregates
 	// StructLit:    `b` = ExtraIdx → [fieldCount, field0_val, field1_val, ...];
 	//               `ty` = struct type.
 	// FieldAccess:  `a` = base ref, `b` = field index; `ty` = field type.
@@ -155,16 +155,16 @@ enum class JirTag : uint8_t {
 	//            array/slice/ptr-many elements.
 	IndexAddr,
 
-	// ── Address-of / dereference ─────────────────────────────
+	// Address-of / dereference
 	AddrOf,                              // `a` = lvalue ref
 	Deref,                               // `a` = ptr ref
 
-	// ── Pattern binding payload extraction ──────────────────
+	// Pattern binding payload extraction
 	// For enum-variant pattern bindings, the codegen needs to load
 	// the bound payload field. Encoded explicitly in JIR.
 	EnumPayload,                         // `a` = enum value ref, `b` = field index
 
-	// ── Drop ─────────────────────────────────────────────────
+	// Drop
 	// Explicit destructor call for a tracked binding. Emitted by
 	// AstGen at scope-exit points (return / break / continue /
 	// fall-through). `a` = the binding's alloca JirRef; `b` =
@@ -175,7 +175,7 @@ enum class JirTag : uint8_t {
 	// AstGen. ty is kNoType (void).
 	DropBinding,
 
-	// ── Error recovery ──────────────────────────────────────
+	// Error recovery
 	// Poison value: AstGen pushed a diagnostic for the expression
 	// at this position but synthesized a typed placeholder so the
 	// rest of the function can keep being analyzed. Lowers to LLVM
