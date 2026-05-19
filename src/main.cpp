@@ -25,8 +25,8 @@
 #include "jam_llvm.h"
 #include "jir_codegen.h"
 #include "jir_verify.h"
-#include "mangling.h"
 #include "lexer.h"
+#include "mangling.h"
 #include "module_resolver.h"
 #include "parser.h"
 #include "symbol_table.h"
@@ -383,16 +383,14 @@ static int compileAndRun(const std::string &filename,
 	// at registration time by walking the InitExpr AST: if the
 	// expression is a Call whose callee is a registered generic with
 	// return type `type`, we evaluate each arg as a type and bind
-	// the result via `registerTypeAlias`. Matches Zig's "types are
-	// values" model: the parser stays grammar-only; the
-	// type-vs-value decision lives at semantic time.
+	// the result via `registerTypeAlias`. The parser stays grammar-
+	// only; the type-vs-value decision lives at semantic time.
 	const NodeStore &ns = codegenCtx.getNodeStore();
 
 	// Look up a function by source-level name across the main module
 	// and any imported pub fns. Functions aren't yet in the codegen
 	// context's registry at this point (that happens in pass 1d).
-	auto lookupGenericFn =
-	    [&](const std::string &name) -> const FunctionAST * {
+	auto lookupGenericFn = [&](const std::string &name) -> const FunctionAST * {
 		for (auto &fn : module->Functions) {
 			if (fn->Name == name) return fn.get();
 		}
@@ -409,8 +407,8 @@ static int compileAndRun(const std::string &filename,
 	    [&](NodeIdx exprIdx) -> TypeIdx {
 		const AstNode &n = ns.get(exprIdx);
 		if (n.tag == AstTag::Variable) {
-			const std::string &name = codegenCtx.getStringPool().get(
-			    static_cast<StringIdx>(n.lhs));
+			const std::string &name =
+			    codegenCtx.getStringPool().get(static_cast<StringIdx>(n.lhs));
 			// Builtin scalar names.
 			if (name == "u8") return BuiltinType::U8;
 			if (name == "i8") return BuiltinType::I8;
@@ -471,8 +469,7 @@ static int compileAndRun(const std::string &filename,
 			if (c->InitExpr != kNoNode) {
 				TypeIdx maybeAlias = resolveExprAsType(c->InitExpr);
 				if (maybeAlias != kNoType) {
-					const TypeKey &k =
-					    codegenCtx.getTypePool().get(maybeAlias);
+					const TypeKey &k = codegenCtx.getTypePool().get(maybeAlias);
 					// Only bind as alias when the resolved type is
 					// an actual user-visible category — generic
 					// instantiations, struct/enum/union names. A bare
@@ -480,8 +477,7 @@ static int compileAndRun(const std::string &filename,
 					// resolve fall through to value-const behavior.
 					if (k.kind == TypeKind::GenericCall) {
 						c->AliasedType = maybeAlias;
-						codegenCtx.registerTypeAlias(c->Name,
-						                              c->AliasedType);
+						codegenCtx.registerTypeAlias(c->Name, c->AliasedType);
 						continue;
 					}
 				}
@@ -498,10 +494,9 @@ static int compileAndRun(const std::string &filename,
 
 	// Two-pass codegen: declare every function's prototype first, then
 	// emit bodies. Without this, calling a function defined later in the
-	// file (or another module) would fail with "Unknown function". This
-	// is also how Zig handles forward references — top-down reads naturally
-	// (main on top, helpers below) without a manual "forward declarations"
-	// section.
+	// file (or another module) would fail with "Unknown function". The
+	// two-pass shape lets source read naturally top-down (main on top,
+	// helpers below) without a manual "forward declarations" section.
 
 	// Pass 1a: prototypes for pub functions in imported modules.
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
@@ -509,9 +504,8 @@ static int compileAndRun(const std::string &filename,
 		for (auto &func : importedModule->Functions) {
 			if (func->isPub && !func->isGeneric()) {
 				JirFunction jfn = astgenMetadata(*func, codegenCtx);
-				jfn.name = mangledFunctionName(
-				    *func, codegenCtx.getTypePool(),
-				    codegenCtx.getStringPool());
+				jfn.name = mangledFunctionName(*func, codegenCtx.getTypePool(),
+				                               codegenCtx.getStringPool());
 				jirDeclarePrototype(jfn, codegenCtx);
 			}
 			// Generic functions are still registered so call sites can
@@ -588,9 +582,8 @@ static int compileAndRun(const std::string &filename,
 		// name — Jam allows `fn add_u8(...)` and `tfn add_u8()` to coexist,
 		// and the bare-name lookup in astgenCall must resolve to the
 		// regular function, not its similarly-named test.
-		const std::string regName = function->isTest
-		                                 ? "__test_" + function->Name
-		                                 : function->Name;
+		const std::string regName =
+		    function->isTest ? "__test_" + function->Name : function->Name;
 		codegenCtx.registerFunctionAST(regName, function.get());
 		// Non-generic main-module functions get their LLVM prototype
 		// emitted by `jirDeclarePrototype` in pass 1d, alongside their
@@ -661,9 +654,8 @@ static int compileAndRun(const std::string &filename,
 			}
 			{
 				JirFunction jfn = astgenMetadata(*m, codegenCtx);
-				jfn.name = mangledFunctionName(
-				    *m, codegenCtx.getTypePool(),
-				    codegenCtx.getStringPool());
+				jfn.name = mangledFunctionName(*m, codegenCtx.getTypePool(),
+				                               codegenCtx.getStringPool());
 				jirDeclarePrototype(jfn, codegenCtx);
 			}
 			codegenCtx.registerFunctionAST(s->Name + "." + m->Name, m.get());
@@ -693,9 +685,7 @@ static int compileAndRun(const std::string &filename,
 	// Per-decl recovery: if astgen on one function throws
 	// AstGenAnalysisFail, the diagnostic was already pushed to
 	// codegenCtx.diagnostics(). We keep going so the user sees every
-	// error in one pass instead of having to fix-rebuild-fix. Mirrors
-	// Zig's per-decl `error.AnalysisFail` boundary (`Sema.zig` calls
-	// AstGen per-decl and continues on AnalysisFail).
+	// error in one pass instead of having to fix-rebuild-fix.
 	for (auto &function : module->Functions) {
 		if (function->isTest && !testMode) continue;
 		if (!function->isTest && testMode && function->Name == "main") {
@@ -704,9 +694,8 @@ static int compileAndRun(const std::string &filename,
 		if (function->isGeneric()) continue;
 		try {
 			JirFunction jfn = astgenFunction(*function, codegenCtx);
-			jfn.name = mangledFunctionName(
-			    *function, codegenCtx.getTypePool(),
-			    codegenCtx.getStringPool());
+			jfn.name = mangledFunctionName(*function, codegenCtx.getTypePool(),
+			                               codegenCtx.getStringPool());
 			jirDeclarePrototype(jfn, codegenCtx);
 			jirFunctions.push_back(std::move(jfn));
 		} catch (const AstGenAnalysisFail &) {
@@ -717,9 +706,8 @@ static int compileAndRun(const std::string &filename,
 		for (auto &m : s->Methods) {
 			try {
 				JirFunction jfn = astgenFunction(*m, codegenCtx);
-				jfn.name = mangledFunctionName(
-				    *m, codegenCtx.getTypePool(),
-				    codegenCtx.getStringPool());
+				jfn.name = mangledFunctionName(*m, codegenCtx.getTypePool(),
+				                               codegenCtx.getStringPool());
 				jirFunctions.push_back(std::move(jfn));
 			} catch (const AstGenAnalysisFail &) {
 				// diagnostic already pushed
@@ -731,11 +719,10 @@ static int compileAndRun(const std::string &filename,
 		for (auto &func : importedModule->Functions) {
 			if (func->isPub && !func->isGeneric()) {
 				try {
-					JirFunction jfn =
-					    astgenFunction(*func, codegenCtx);
-					jfn.name = mangledFunctionName(
-					    *func, codegenCtx.getTypePool(),
-					    codegenCtx.getStringPool());
+					JirFunction jfn = astgenFunction(*func, codegenCtx);
+					jfn.name =
+					    mangledFunctionName(*func, codegenCtx.getTypePool(),
+					                        codegenCtx.getStringPool());
 					jirFunctions.push_back(std::move(jfn));
 				} catch (const AstGenAnalysisFail &) {
 					// diagnostic already pushed
@@ -764,8 +751,7 @@ static int compileAndRun(const std::string &filename,
 	// function shouldn't reach jir_codegen if it's malformed.
 	for (const JirFunction &jfn : jirFunctions) {
 		auto diags = verifyJirFunction(
-		    jfn, &codegenCtx.getTypePool(),
-		    &codegenCtx.getStringPool(),
+		    jfn, &codegenCtx.getTypePool(), &codegenCtx.getStringPool(),
 		    +[](void *c, TypeIdx t) -> TypeIdx {
 			    auto *cc = static_cast<JamCodegenContext *>(c);
 			    const TypeKey &k = cc->getTypePool().get(t);
@@ -828,8 +814,8 @@ static int compileAndRun(const std::string &filename,
 		// emitted in pass 2b.
 		for (auto &function : module->Functions) {
 			if (function->isTest && !testMode) continue;
-			if (!function->isTest && testMode &&
-			    function->Name == "main") continue;
+			if (!function->isTest && testMode && function->Name == "main")
+				continue;
 			if (function->isGeneric()) continue;
 			runAnalysis(function.get());
 		}

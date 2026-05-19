@@ -196,11 +196,8 @@ class JamCodegenContext {
 	// Diagnostic so the user sees a chain like
 	//     note: in instantiation of `Vec(NoDefault).default`
 	//     note: in instantiation of `Pair(Vec(NoDefault), i32)`
-	// when an error surfaces deep inside a monomorphisation. Mirrors
-	// `Module.ErrorMsg.reference_trace` (`Module.zig:2099`).
-	std::vector<jam::Diagnostic::Trace> &refTrace() const {
-		return refTrace_;
-	}
+	// when an error surfaces deep inside a monomorphisation.
+	std::vector<jam::Diagnostic::Trace> &refTrace() const { return refTrace_; }
 	// look up a drop method for an instantiated struct
 	// (e.g. Box__i32). Falls back to the pre-built drop registry.
 	// Returns nullptr if the struct has no drop method.
@@ -213,6 +210,7 @@ class JamCodegenContext {
 		}
 		return nullptr;
 	}
+
   private:
 	JamContextRef ctx;
 	JamModuleRef mod;

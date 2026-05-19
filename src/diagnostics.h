@@ -21,10 +21,6 @@ namespace jam {
 // offset will be tacked on as additional fields when the parser
 // records token ranges per node — none of the call sites change
 // when that happens because they only handle SrcLoc by value.
-//
-// Modeled after Zig's `Module.SrcLoc` (`src/Module.zig:2156`),
-// trimmed of the LazySrcLoc indirection that Zig uses to defer
-// expensive position computation until error reporting.
 struct SrcLoc {
 	// Display filename — already-formatted relative path the user
 	// recognises. We keep it as a plain std::string for now; a
@@ -36,12 +32,10 @@ struct SrcLoc {
 
 // One diagnostic emitted by any phase of the compiler (parser,
 // astgen, init_analysis, jir_verify, …).
-//
-// Mirrors Zig's `Module.ErrorMsg` (`src/Module.zig:2095`):
 //   * `notes` carry secondary messages that may live in a different
 //     file/line — used for "X was declared here" / "did you mean Y?".
 //   * `referenceTrace` records the generic-instantiation chain that
-//     led to a Sema/AstGen failure inside a monomorphisation.
+//     led to an astgen failure inside a monomorphisation.
 struct Diagnostic {
 	enum class Severity : uint8_t { Error, Warning, Note };
 
@@ -50,10 +44,8 @@ struct Diagnostic {
 		std::string decl;  // e.g. "Vec(NoDefault).default"
 		// `hidden` counts trace frames that were elided when the
 		// chain exceeded a (future) `--reference-trace=N` limit.
-		// Mirrors `Module.ErrorMsg.Trace.hidden` in Zig 0.10.1
-		// (`src/Module.zig:2104`); kept at 0 today because Jam
-		// always materialises the full live stack at error time
-		// — no truncation yet.
+		// Kept at 0 today: the full live stack is always
+		// materialised at error time — no truncation yet.
 		uint32_t hidden = 0;
 	};
 
@@ -72,13 +64,9 @@ struct Diagnostic {
 // Scope: this is a stack of *currently-active* instantiation frames.
 // It captures nested instantiation (A→B→C while all three are still
 // in flight) but does NOT capture references from already-completed
-// decls (Zig's `Sema.failWithOwnedErrorMsg` walks a persistent
-// `Module.reference_table: ?Decl.Index → Decl.Index` and follows
-// referrer chains backwards through finished work). Jam doesn't
-// build that table; the stack covers the practical case where
-// instantiation errors fire mid-stack, and Zig-style historical
-// reference chains are a follow-up if/when a real reference-graph
-// pass exists.
+// decls. The stack covers the practical case where instantiation
+// errors fire mid-stack; cross-decl historical reference chains are
+// a follow-up if/when a real reference-graph pass exists.
 class RefTraceFrame {
   public:
 	RefTraceFrame(std::vector<Diagnostic::Trace> &stack, Diagnostic::Trace f)
@@ -102,9 +90,9 @@ class Diagnostics {
 	void error(SrcLoc loc, std::string message);
 	void warning(SrcLoc loc, std::string message);
 	void errorWithNotes(SrcLoc loc, std::string message,
-	                     std::vector<Diagnostic> notes);
+	                    std::vector<Diagnostic> notes);
 	void errorWithTrace(SrcLoc loc, std::string message,
-	                     std::vector<Diagnostic::Trace> referenceTrace);
+	                    std::vector<Diagnostic::Trace> referenceTrace);
 
 	// Push a fully-built diagnostic (used by helpers that already
 	// have notes / trace assembled).
@@ -114,8 +102,7 @@ class Diagnostics {
 	std::size_t errorCount() const;
 	const std::vector<Diagnostic> &all() const { return diags_; }
 
-
-	// Format the report in Zig-CLI shape:
+	// Format the report:
 	//     file:line: error: message
 	//         note: ...
 	//         in instantiation of `decl` at file:line

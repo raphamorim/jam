@@ -37,12 +37,9 @@ inline std::string mangledFunctionName(const FunctionAST &fn,
 		const Param &p = fn.Args[0];
 		if (p.Name == "self" && p.Mode == ParamMode::Mut) {
 			const TypeKey &k = types.get(p.Type);
-			if (k.kind == TypeKind::Struct ||
-			    k.kind == TypeKind::Named) {
+			if (k.kind == TypeKind::Struct || k.kind == TypeKind::Named) {
 				StringIdx ni = static_cast<StringIdx>(k.a);
-				if (ni != kNoString) {
-					return "__drop_" + strings.get(ni);
-				}
+				if (ni != kNoString) { return "__drop_" + strings.get(ni); }
 			}
 		}
 	}

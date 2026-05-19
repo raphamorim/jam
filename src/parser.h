@@ -45,7 +45,7 @@ class Parser {
 	// Member rather than free function so it can route over-large /
 	// malformed literals through `parseError` with the token's line.
 	uint64_t parseNumLexeme(const std::string &s, bool &isNegOut,
-	                         bool &isFloatOut) const;
+	                        bool &isFloatOut) const;
 
 	NodeIdx parsePrimary();
 	NodeIdx parseUnary();
@@ -83,8 +83,7 @@ class Parser {
   public:
 	Parser(std::vector<Token> tokens, TypePool &typePool,
 	       StringPool &stringPool, NodeStore &nodes,
-	       jam::Diagnostics *diagnostics = nullptr,
-	       std::string filename = "");
+	       jam::Diagnostics *diagnostics = nullptr, std::string filename = "");
 	std::unique_ptr<ModuleAST> parse();
 	std::vector<std::unique_ptr<StructDeclAST>> *sharedAnonStructs = nullptr;
 	std::vector<std::unique_ptr<EnumDeclAST>> *sharedAnonEnums = nullptr;

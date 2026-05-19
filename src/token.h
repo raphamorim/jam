@@ -46,14 +46,15 @@ enum TokenType {
 	TOK_CLOSE_BRACKET,
 	TOK_STRING_LITERAL,
 	TOK_WHILE,
-	TOK_LOOP,       // `loop { ... }` — infinite loop, syntactically noreturn unless body breaks
+	TOK_LOOP,  // `loop { ... }` — infinite loop, syntactically noreturn unless
+	           // body breaks
 	TOK_FOR,
 	TOK_BREAK,
 	TOK_CONTINUE,
 	TOK_IN,
 	TOK_EXTERN,     // extern keyword (import C function)
 	TOK_EXPORT,     // export keyword (C ABI export)
-	TOK_PUB,        // pub keyword (visible to Jam modules, like Zig)
+	TOK_PUB,        // pub keyword (visible across Jam modules)
 	TOK_IMPORT,     // import keyword
 	TOK_DOT,        // . for member access
 	TOK_AND,        // && (logical AND, short-circuit)

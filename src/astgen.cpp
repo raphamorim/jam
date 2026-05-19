@@ -45,8 +45,8 @@ struct LoopFrame {
 // order so drop calls are emitted in REVERSE order at scope exit.
 struct DropTrack {
 	std::string varName;
-	JirRef slot;       // alloca for the variable
-	TypeIdx type;      // source-level type
+	JirRef slot;             // alloca for the variable
+	TypeIdx type;            // source-level type
 	std::string llvmFnName;  // canonical drop fn (legacy mangles to `__drop_T`)
 };
 
@@ -74,9 +74,7 @@ struct AstGenCtx {
 	std::vector<std::unordered_set<std::string>> localScopes;
 	// Most-recently-entered AST node — `astgenExpr` updates this on
 	// every entry so error helpers without an explicit NodeIdx in
-	// scope (`failHere` and friends) can still emit a SrcLoc. Mirrors
-	// the implicit "current node" Zig keeps via the active
-	// `Ast.Node.Index` it threads through every helper.
+	// scope (`failHere` and friends) can still emit a SrcLoc.
 	NodeIdx currentNode = 0;
 };
 
@@ -98,8 +96,8 @@ static jam::SrcLoc locOf(AstGenCtx &gctx, NodeIdx node) {
 // in. Every astgen error helper funnels through here so the chain of
 // generic instantiations (if any) is preserved.
 static jam::Diagnostic makeDiag(AstGenCtx &gctx, NodeIdx node,
-                                 std::string message,
-                                 std::vector<jam::Diagnostic> notes) {
+                                std::string message,
+                                std::vector<jam::Diagnostic> notes) {
 	jam::Diagnostic d;
 	d.loc = locOf(gctx, node);
 	d.severity = jam::Diagnostic::Severity::Error;
@@ -111,20 +109,18 @@ static jam::Diagnostic makeDiag(AstGenCtx &gctx, NodeIdx node,
 
 // Append a Diagnostic anchored at `node` and keep walking. The
 // caller is responsible for synthesising a poison value if the
-// expression position needs one. Mirrors `AstGen.zig:10113
-// appendErrorNode`.
+// expression position needs one.
 static void appendErrorNode(AstGenCtx &gctx, NodeIdx node,
                             std::string message) {
-	gctx.ctx.diagnostics().push(
-	    makeDiag(gctx, node, std::move(message), {}));
+	gctx.ctx.diagnostics().push(makeDiag(gctx, node, std::move(message), {}));
 }
 
 // As `appendErrorNode`, but the diagnostic carries secondary notes.
 // Notes are typically built by the caller from related source
 // positions ("X was declared here", "did you mean Y?").
 static void appendErrorNodeNotes(AstGenCtx &gctx, NodeIdx node,
-                                  std::string message,
-                                  std::vector<jam::Diagnostic> notes) {
+                                 std::string message,
+                                 std::vector<jam::Diagnostic> notes) {
 	gctx.ctx.diagnostics().push(
 	    makeDiag(gctx, node, std::move(message), std::move(notes)));
 }
@@ -132,16 +128,16 @@ static void appendErrorNodeNotes(AstGenCtx &gctx, NodeIdx node,
 // Append + bail the current decl. The catch site (one per function,
 // struct method, or generic instantiation) drops back to compiling
 // siblings, so a single broken function doesn't suppress diagnostics
-// from the rest of the file. Mirrors `AstGen.zig:10149 failNodeNotes`.
+// from the rest of the file.
 [[noreturn]] static void failNode(AstGenCtx &gctx, NodeIdx node,
-                                   std::string message) {
+                                  std::string message) {
 	appendErrorNode(gctx, node, std::move(message));
 	throw AstGenAnalysisFail{};
 }
 
 [[noreturn]] static void failNodeNotes(AstGenCtx &gctx, NodeIdx node,
-                                        std::string message,
-                                        std::vector<jam::Diagnostic> notes) {
+                                       std::string message,
+                                       std::vector<jam::Diagnostic> notes) {
 	appendErrorNodeNotes(gctx, node, std::move(message), std::move(notes));
 	throw AstGenAnalysisFail{};
 }
@@ -168,13 +164,6 @@ static JirRef emit(AstGenCtx &gctx, JirInst inst);
 // `Diagnostics::hasErrors()` is true, so the undef is unreachable
 // in well-formed builds and serves only as a placeholder for
 // downstream typecheck.
-//
-// This is Jam-specific, not borrowed from Zig: Zig's `ZIR.unreachable_value`
-// represents the actual `unreachable` keyword and `ZIR.generic_poison`
-// is for unresolved generic-type parameters during pre-instantiation;
-// neither plays the "skip past an error and keep analyzing" role.
-// The closest analog elsewhere is Roslyn's `BoundBadNode` /
-// LLVM's `undef`-after-error recovery.
 static JirRef emitPoison(AstGenCtx &gctx, TypeIdx ty) {
 	JirInst inst{};
 	inst.tag = JirTag::Poison;
@@ -184,15 +173,14 @@ static JirRef emitPoison(AstGenCtx &gctx, TypeIdx ty) {
 
 // Combined: push a recoverable diagnostic anchored at `node` and
 // hand back a typed Poison so the caller can continue typechecking.
-static JirRef recoverNode(AstGenCtx &gctx, NodeIdx node,
-                          std::string message, TypeIdx ty) {
+static JirRef recoverNode(AstGenCtx &gctx, NodeIdx node, std::string message,
+                          TypeIdx ty) {
 	appendErrorNode(gctx, node, std::move(message));
 	return emitPoison(gctx, ty);
 }
 
 // As `recoverNode` but anchored at `gctx.currentNode`.
-static JirRef recoverHere(AstGenCtx &gctx, std::string message,
-                          TypeIdx ty) {
+static JirRef recoverHere(AstGenCtx &gctx, std::string message, TypeIdx ty) {
 	appendErrorHere(gctx, std::move(message));
 	return emitPoison(gctx, ty);
 }
@@ -219,12 +207,10 @@ static JirRef emit(AstGenCtx &gctx, JirInst inst) {
 // other ref.
 static JirRef emitAllocaHoisted(AstGenCtx &gctx, JirInst alloca) {
 	JirRef r = gctx.jfn.pushInst(alloca);
-	auto &entryInsts =
-	    gctx.jfn.getBlockMut(/*entry=*/1).insts;
+	auto &entryInsts = gctx.jfn.getBlockMut(/*entry=*/1).insts;
 	std::size_t insertAt = entryInsts.size();
 	while (insertAt > 0) {
-		JirTag prev =
-		    gctx.jfn.getInst(entryInsts[insertAt - 1]).tag;
+		JirTag prev = gctx.jfn.getInst(entryInsts[insertAt - 1]).tag;
 		if (prev != JirTag::Br && prev != JirTag::CondBr &&
 		    prev != JirTag::Switch && prev != JirTag::Ret &&
 		    prev != JirTag::Unreachable) {
@@ -232,9 +218,8 @@ static JirRef emitAllocaHoisted(AstGenCtx &gctx, JirInst alloca) {
 		}
 		insertAt--;
 	}
-	entryInsts.insert(entryInsts.begin() +
-	                       static_cast<std::ptrdiff_t>(insertAt),
-	                   r);
+	entryInsts.insert(
+	    entryInsts.begin() + static_cast<std::ptrdiff_t>(insertAt), r);
 	return r;
 }
 
@@ -246,9 +231,8 @@ static bool blockHasTerminator(const JirBlock &block, const JirFunction &jfn) {
 	if (block.insts.empty()) return false;
 	JirRef last = block.insts.back();
 	JirTag t = jfn.getInst(last).tag;
-	return t == JirTag::Ret || t == JirTag::Unreachable ||
-	       t == JirTag::Br || t == JirTag::CondBr ||
-	       t == JirTag::Switch;
+	return t == JirTag::Ret || t == JirTag::Unreachable || t == JirTag::Br ||
+	       t == JirTag::CondBr || t == JirTag::Switch;
 }
 
 // Count blocks that branch into `target` via Br / CondBr / Switch.
@@ -273,8 +257,7 @@ static std::size_t predecessorCount(const JirFunction &jfn,
 		case JirTag::CondBr: {
 			JirExtraIdx ex = last.b;
 			if (ex + 2 <= jfn.extra.size()) {
-				if (static_cast<JirBlockRef>(jfn.extra[ex]) == target)
-					count++;
+				if (static_cast<JirBlockRef>(jfn.extra[ex]) == target) count++;
 				if (static_cast<JirBlockRef>(jfn.extra[ex + 1]) == target)
 					count++;
 			}
@@ -288,8 +271,7 @@ static std::size_t predecessorCount(const JirFunction &jfn,
 			for (uint32_t i = 0; i < caseCount; i++) {
 				JirExtraIdx caseSlot = ex + 2 + i * 4 + 3;
 				if (caseSlot < jfn.extra.size() &&
-				    static_cast<JirBlockRef>(jfn.extra[caseSlot]) ==
-				        target) {
+				    static_cast<JirBlockRef>(jfn.extra[caseSlot]) == target) {
 					count++;
 				}
 			}
@@ -311,8 +293,7 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected);
 static void emitBr(AstGenCtx &gctx, JirBlockRef target);
 static void emitCondBr(AstGenCtx &gctx, JirRef cond, JirBlockRef thenB,
                        JirBlockRef elseB);
-static void emitDrops(AstGenCtx &gctx,
-                      const std::vector<DropTrack> &bindings);
+static void emitDrops(AstGenCtx &gctx, const std::vector<DropTrack> &bindings);
 static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
                        const std::vector<JirRef> &argRefs);
 
@@ -331,7 +312,7 @@ static inline void pushDropScope(AstGenCtx &gctx) {
 // in the calling AST walker (and will pop on its own as the structured
 // bodies return).
 static inline void emitDropsThroughScope(AstGenCtx &gctx,
-                                          std::size_t targetIdx) {
+                                         std::size_t targetIdx) {
 	if (gctx.dropScopes.size() <= targetIdx) return;
 	for (std::size_t i = gctx.dropScopes.size(); i > targetIdx; i--) {
 		emitDrops(gctx, gctx.dropScopes[i - 1]);
@@ -345,8 +326,7 @@ static inline void emitDropsThroughScope(AstGenCtx &gctx,
 static inline void popDropScopeEmitting(AstGenCtx &gctx) {
 	if (gctx.dropScopes.empty()) return;
 	const auto &scope = gctx.dropScopes.back();
-	if (!blockHasTerminator(gctx.jfn.getBlock(gctx.currentBlock),
-	                        gctx.jfn)) {
+	if (!blockHasTerminator(gctx.jfn.getBlock(gctx.currentBlock), gctx.jfn)) {
 		emitDrops(gctx, scope);
 	}
 	gctx.dropScopes.pop_back();
@@ -365,15 +345,14 @@ static inline void popDropScope(AstGenCtx &gctx) {
 // JIR `Int` or `Float` constant.
 static JirRef astgenNumberLit(AstGenCtx &gctx, const AstNode &n,
                               TypeIdx expected) {
-	uint64_t val = static_cast<uint64_t>(n.lhs) |
-	               (static_cast<uint64_t>(n.rhs) << 32);
+	uint64_t val =
+	    static_cast<uint64_t>(n.lhs) | (static_cast<uint64_t>(n.rhs) << 32);
 	bool isNeg = (n.flags & 1) != 0;
 	bool isFloat = (n.flags & 2) != 0;
 
 	JirInst inst{};
-	inst.srcLine = gctx.jfn.insts.empty()
-	                   ? 0
-	                   : static_cast<uint32_t>(0);  // patched below
+	inst.srcLine =
+	    gctx.jfn.insts.empty() ? 0 : static_cast<uint32_t>(0);  // patched below
 
 	if (isFloat) {
 		inst.tag = JirTag::Float;
@@ -462,8 +441,8 @@ static JirRef astgenBoolLit(AstGenCtx &gctx, const AstNode &n) {
 static void astgenReturn(AstGenCtx &gctx, const AstNode &n) {
 	JirRef valRef = kNoJirRef;
 	if (n.lhs != 0) {
-		valRef = astgenExpr(gctx, static_cast<NodeIdx>(n.lhs),
-		                    gctx.jfn.returnType);
+		valRef =
+		    astgenExpr(gctx, static_cast<NodeIdx>(n.lhs), gctx.jfn.returnType);
 	}
 	// Drop every active scope before exiting the function.
 	emitDropsThroughScope(gctx, 0);
@@ -486,8 +465,7 @@ static std::string lookupDropFnLLVMName(AstGenCtx &gctx, TypeIdx ty) {
 	std::string typeName;
 	if (k.kind == TypeKind::Struct || k.kind == TypeKind::Named ||
 	    k.kind == TypeKind::Enum) {
-		typeName = gctx.ctx.getStringPool().get(
-		    static_cast<StringIdx>(k.a));
+		typeName = gctx.ctx.getStringPool().get(static_cast<StringIdx>(k.a));
 	} else {
 		return "";
 	}
@@ -498,8 +476,7 @@ static std::string lookupDropFnLLVMName(AstGenCtx &gctx, TypeIdx ty) {
 	// mangling change can't silently desync.
 	auto resolveName = [&](const std::string &name) -> std::string {
 		const FunctionAST *fn = nullptr;
-		const jam::drops::DropRegistry *reg =
-		    gctx.ctx.getDropRegistry();
+		const jam::drops::DropRegistry *reg = gctx.ctx.getDropRegistry();
 		if (reg != nullptr) {
 			auto it = reg->find(name);
 			if (it != reg->end()) fn = it->second;
@@ -515,15 +492,14 @@ static std::string lookupDropFnLLVMName(AstGenCtx &gctx, TypeIdx ty) {
 	if (aliasTarget != kNoType) {
 		const TypeKey &ak0 = gctx.ctx.getTypePool().get(aliasTarget);
 		if (ak0.kind == TypeKind::GenericCall) {
-			TypeIdx resolved =
-			    gctx.ctx.resolveGenericCall(aliasTarget);
+			TypeIdx resolved = gctx.ctx.resolveGenericCall(aliasTarget);
 			if (resolved != kNoType) aliasTarget = resolved;
 		}
 		const TypeKey &ak = gctx.ctx.getTypePool().get(aliasTarget);
 		if (ak.kind == TypeKind::Named || ak.kind == TypeKind::Struct ||
 		    ak.kind == TypeKind::Enum) {
-			std::string aliasName = gctx.ctx.getStringPool().get(
-			    static_cast<StringIdx>(ak.a));
+			std::string aliasName =
+			    gctx.ctx.getStringPool().get(static_cast<StringIdx>(ak.a));
 			r = resolveName(aliasName);
 			if (!r.empty()) return r;
 		}
@@ -534,8 +510,7 @@ static std::string lookupDropFnLLVMName(AstGenCtx &gctx, TypeIdx ty) {
 // Emit drop calls for every binding in `bindings` in REVERSE order
 // (LIFO — last-pushed dropped first). The argument is &binding (the
 // alloca pointer itself, since `fn drop(self: mut T)` takes a *T).
-static void emitDrops(AstGenCtx &gctx,
-                      const std::vector<DropTrack> &bindings) {
+static void emitDrops(AstGenCtx &gctx, const std::vector<DropTrack> &bindings) {
 	// Emit explicit DropBinding JIR instructions in reverse declaration
 	// order. Each carries the binding's alloca JirRef and the LLVM
 	// symbol of the drop fn as a StringIdx. Codegen mechanically
@@ -543,8 +518,7 @@ static void emitDrops(AstGenCtx &gctx,
 	// AddrOf+pack ceremony, no metadata fallback.
 	for (auto it = bindings.rbegin(); it != bindings.rend(); ++it) {
 		const DropTrack &d = *it;
-		StringIdx symId =
-		    gctx.ctx.getStringPool().intern(d.llvmFnName);
+		StringIdx symId = gctx.ctx.getStringPool().intern(d.llvmFnName);
 		JirInst drop{};
 		drop.tag = JirTag::DropBinding;
 		drop.a = d.slot;
@@ -565,19 +539,13 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 	NodeIdx initIdx = static_cast<NodeIdx>(ns.getExtra(extra + 2));
 	const std::string &name = gctx.ctx.getStringPool().get(nameId);
 
-	// Reject re-declaration within the same lexical scope only. Looser
-	// than Zig (which forbids ALL shadowing, including inner blocks
-	// shadowing outer bindings and even shadowing of primitive type
-	// names — see `AstGen.zig:12099 detectLocalShadowing` that walks
-	// the entire scope chain). Jam's `localScopes` stack only inspects
-	// the innermost frame, so the user's reported bug (`const a = X;
-	// var a = Y;` at the same level) is rejected but
+	// Reject re-declaration within the same lexical scope only. We
+	// inspect the innermost `localScopes` frame, so `const a = X;
+	// var a = Y;` at the same level errors, but
 	//     fn f() { var x = 1; if (c) { var x = 2; } }
-	// still compiles — intentional inner-block shadow.
-	if (!gctx.localScopes.empty() &&
-	    gctx.localScopes.back().count(name) != 0) {
-		failHere(gctx, "redeclaration of `" + name +
-		                 "` in the same scope");
+	// still compiles — intentional inner-block shadowing is allowed.
+	if (!gctx.localScopes.empty() && gctx.localScopes.back().count(name) != 0) {
+		failHere(gctx, "redeclaration of `" + name + "` in the same scope");
 	}
 
 	// Type resolution.
@@ -590,15 +558,11 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 	//     type so the slot pre-exists; we reject them with a clear
 	//     error when inferred.
 	//
-	// Shallower than Zig: Zig's `alloc_inferred` + `block_ptr`
-	// result-location (`AstGen.zig:3014`, `Sema.zig:3483`) unifies
-	// the types of *every* store into the inferred slot so
-	// `var x = if (c) @as(i32,1) else @as(i32,2);` works. Jam
-	// commits to whatever single type comes back from astgenExpr
-	// — sufficient for the v1 grammar (no `if`-expression in
-	// value position outside `match`), but cases that would need
-	// peer-typing across multiple stores must use an explicit
-	// `: T` annotation.
+	// Inference commits to whatever single type comes back from
+	// astgenExpr — sufficient for the v1 grammar (no `if`-expression
+	// in value position outside `match`). Cases that would need
+	// peer-typing across multiple stores into the same slot must
+	// use an explicit `: T` annotation.
 	TypeIdx type;
 	JirRef allocaRef;
 	JirRef initRef;
@@ -607,9 +571,8 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 		initRef = astgenExpr(gctx, initIdx, kNoType);
 		type = gctx.jfn.getInst(initRef).ty;
 		if (type == kNoType) {
-			failHere(gctx,
-			          "could not infer type of `" + name +
-			              "`; add an explicit `: T` annotation");
+			failHere(gctx, "could not infer type of `" + name +
+			                   "`; add an explicit `: T` annotation");
 		}
 		JirInst alloca{};
 		alloca.tag = JirTag::Alloca;
@@ -617,9 +580,7 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 		allocaRef = emitAllocaHoisted(gctx, alloca);
 		gctx.locals[name] = allocaRef;
 		gctx.localTypes[name] = type;
-		if (!gctx.localScopes.empty()) {
-			gctx.localScopes.back().insert(name);
-		}
+		if (!gctx.localScopes.empty()) { gctx.localScopes.back().insert(name); }
 	} else {
 		type = declared;
 		JirInst alloca{};
@@ -634,9 +595,7 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 		// for the resulting semantics.
 		gctx.locals[name] = allocaRef;
 		gctx.localTypes[name] = type;
-		if (!gctx.localScopes.empty()) {
-			gctx.localScopes.back().insert(name);
-		}
+		if (!gctx.localScopes.empty()) { gctx.localScopes.back().insert(name); }
 
 		initRef = astgenExpr(gctx, initIdx, type);
 
@@ -662,8 +621,8 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 			// method body, `T` resolves to whatever the
 			// instantiation supplied).
 			if (k.kind == TypeKind::Named) {
-				const std::string &name = gctx.ctx.getStringPool().get(
-				    static_cast<StringIdx>(k.a));
+				const std::string &name =
+				    gctx.ctx.getStringPool().get(static_cast<StringIdx>(k.a));
 				TypeIdx sub = gctx.ctx.lookupCurrentSubst(name);
 				if (sub != kNoType) return resolveForCmp(sub);
 			}
@@ -673,8 +632,7 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 			}
 			if (k.kind == TypeKind::Named) {
 				TypeIdx a = gctx.ctx.lookupTypeAlias(
-				    gctx.ctx.getStringPool().get(
-				        static_cast<StringIdx>(k.a)));
+				    gctx.ctx.getStringPool().get(static_cast<StringIdx>(k.a)));
 				if (a != kNoType) return resolveForCmp(a);
 			}
 			return t;
@@ -682,44 +640,38 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 		TypeIdx initTy = gctx.jfn.getInst(initRef).ty;
 		TypeIdx declRes = resolveForCmp(type);
 		TypeIdx initRes = resolveForCmp(initTy);
-		// Pointer-shape leniency (Jam-specific, *not* Zig-equivalent):
-		// PtrSingle(T) and PtrMany(T) share the runtime representation
-		// (a plain `ptr`), so `&arr[i]` (which lowers to PtrSingle(T))
-		// is accepted in a PtrMany(T) slot as a zero-cost retag. Zig's
-		// `Sema.coerceInMemoryAllowedPtrs` (`Sema.zig:25447`) requires
-		// the source pointer size to match the destination or one to be
-		// `.C`; `*T → [*]T` is only allowed when the source is a
-		// pointer-to-array. Jam's rule is broader because we don't
-		// currently distinguish pointer-to-array from pointer-to-element
-		// at the JIR level — revisit when an Array-pointer kind lands.
+		// Pointer-shape leniency: PtrSingle(T) and PtrMany(T) share
+		// the runtime representation (a plain `ptr`), so `&arr[i]`
+		// (which lowers to PtrSingle(T)) is accepted in a PtrMany(T)
+		// slot as a zero-cost retag. The rule is permissive because
+		// we don't currently distinguish pointer-to-array from
+		// pointer-to-element at the JIR level — revisit when an
+		// Array-pointer kind lands and the source can carry its
+		// length statically.
 		auto pointerCompatible = [&](TypeIdx a, TypeIdx b) -> bool {
 			if (a == kNoType || b == kNoType) return false;
 			const TypeKey &ka = gctx.ctx.getTypePool().get(a);
 			const TypeKey &kb = gctx.ctx.getTypePool().get(b);
-			bool aPtr = ka.kind == TypeKind::PtrSingle ||
-			             ka.kind == TypeKind::PtrMany;
-			bool bPtr = kb.kind == TypeKind::PtrSingle ||
-			             kb.kind == TypeKind::PtrMany;
+			bool aPtr =
+			    ka.kind == TypeKind::PtrSingle || ka.kind == TypeKind::PtrMany;
+			bool bPtr =
+			    kb.kind == TypeKind::PtrSingle || kb.kind == TypeKind::PtrMany;
 			return aPtr && bPtr && ka.a == kb.a;
 		};
-		bool typesMatch = (declRes == initRes) ||
-		                  pointerCompatible(declRes, initRes);
+		bool typesMatch =
+		    (declRes == initRes) || pointerCompatible(declRes, initRes);
 		if (initTy != kNoType && !typesMatch) {
 			const TypeKey &dk = gctx.ctx.getTypePool().get(declRes);
 			const TypeKey &ik = gctx.ctx.getTypePool().get(initRes);
 			// Specialize the message for the two patterns users hit
 			// most often; everything else gets the generic mismatch.
-			if (dk.kind == TypeKind::Float &&
-			    ik.kind == TypeKind::Int) {
-				failHere(gctx,
-				          "cannot assign integer to float-typed `" +
-				              name +
-				              "`; use a float literal (e.g. `3.0`) "
-				              "or an explicit `as` cast");
+			if (dk.kind == TypeKind::Float && ik.kind == TypeKind::Int) {
+				failHere(gctx, "cannot assign integer to float-typed `" + name +
+				                   "`; use a float literal (e.g. `3.0`) "
+				                   "or an explicit `as` cast");
 			}
-			failHere(gctx,
-			          "type mismatch in `" + name +
-			              "`: declared and initialised values disagree");
+			failHere(gctx, "type mismatch in `" + name +
+			                   "`: declared and initialised values disagree");
 		}
 	}
 
@@ -735,8 +687,7 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 	std::string dropName = lookupDropFnLLVMName(gctx, type);
 	if (!dropName.empty()) {
 		if (gctx.dropScopes.empty()) pushDropScope(gctx);
-		gctx.dropScopes.back().push_back(
-		    {name, allocaRef, type, dropName});
+		gctx.dropScopes.back().push_back({name, allocaRef, type, dropName});
 	}
 }
 
@@ -778,12 +729,11 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 	const AstNode &n = ns.get(node);
 	switch (n.tag) {
 	case AstTag::Variable: {
-		const std::string &name = gctx.ctx.getStringPool().get(
-		    static_cast<StringIdx>(n.lhs));
+		const std::string &name =
+		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
 		auto it = gctx.locals.find(name);
 		if (it == gctx.locals.end()) {
-			failHere(gctx, 
-			    "astgen: unknown lvalue variable `" + name + "`");
+			failHere(gctx, "astgen: unknown lvalue variable `" + name + "`");
 		}
 		outLeafTy = gctx.localTypes[name];
 		return it->second;
@@ -801,20 +751,18 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 	}
 	case AstTag::MemberAccess: {
 		TypeIdx baseTy = kNoType;
-		JirRef basePtr = astgenLvalue(
-		    gctx, static_cast<NodeIdx>(n.lhs), baseTy);
+		JirRef basePtr =
+		    astgenLvalue(gctx, static_cast<NodeIdx>(n.lhs), baseTy);
 		StringIdx memberId = static_cast<StringIdx>(n.rhs);
-		const std::string &memberName =
-		    gctx.ctx.getStringPool().get(memberId);
+		const std::string &memberName = gctx.ctx.getStringPool().get(memberId);
 		// Union field lvalue: every field shares the union's address,
 		// so the field pointer IS the union pointer — just retype it.
 		if (const auto *uinfo = gctx.ctx.lookupUnion(baseTy)) {
 			TypeIdx fieldTy =
 			    gctx.ctx.getUnionFieldType(uinfo->name, memberName);
 			if (fieldTy == kNoType) {
-				failHere(gctx, 
-				    "astgen: union `" + uinfo->name + "` has no field `" +
-				    memberName + "`");
+				failHere(gctx, "astgen: union `" + uinfo->name +
+				                   "` has no field `" + memberName + "`");
 			}
 			outLeafTy = fieldTy;
 			TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
@@ -827,14 +775,12 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 		}
 		const auto *info = gctx.ctx.lookupStruct(baseTy);
 		if (info == nullptr) {
-			failHere(gctx, 
-			    "astgen: lvalue field access on non-struct");
+			failHere(gctx, "astgen: lvalue field access on non-struct");
 		}
 		int idx = gctx.ctx.getFieldIndex(info->name, memberName);
 		if (idx < 0) {
-			failHere(gctx, 
-			    "astgen: unknown field `" + memberName + "` on `" +
-			    info->name + "`");
+			failHere(gctx, "astgen: unknown field `" + memberName + "` on `" +
+			                   info->name + "`");
 		}
 		outLeafTy = info->fields[idx].second;
 		TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
@@ -855,8 +801,8 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 	}
 	case AstTag::Index: {
 		TypeIdx baseTy = kNoType;
-		JirRef basePtr = astgenLvalue(
-		    gctx, static_cast<NodeIdx>(n.lhs), baseTy);
+		JirRef basePtr =
+		    astgenLvalue(gctx, static_cast<NodeIdx>(n.lhs), baseTy);
 		NodeIdx idxIdx = static_cast<NodeIdx>(n.rhs);
 		JirRef idxRef = astgenExpr(gctx, idxIdx, BuiltinType::U64);
 		const TypeKey &k = gctx.ctx.getTypePool().get(baseTy);
@@ -865,8 +811,7 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 		    k.kind == TypeKind::PtrMany) {
 			elemTy = static_cast<TypeIdx>(k.a);
 		} else {
-			failHere(gctx, 
-			    "astgen: lvalue index on non-array/slice/ptr-many");
+			failHere(gctx, "astgen: lvalue index on non-array/slice/ptr-many");
 		}
 		// For pointer-typed base variables, the alloca holds the
 		// *pointer* itself — we need to load it first so the GEP
@@ -938,8 +883,7 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 	TypeIdx ty = static_cast<TypeIdx>(n.lhs);
 	if (ty == kNoType) ty = expected;
 	if (ty == kNoType) {
-		failHere(gctx, 
-		    "astgen: struct literal without target type");
+		failHere(gctx, "astgen: struct literal without target type");
 	}
 
 	// Union literal: exactly one field, stored into a slot of the
@@ -950,21 +894,15 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 		ExtraIdx fieldsExtra = static_cast<ExtraIdx>(n.rhs);
 		uint32_t fieldCount = ns.getExtra(fieldsExtra);
 		if (fieldCount != 1) {
-			failHere(gctx, 
-			    "astgen: union literal must list exactly one field");
+			failHere(gctx, "astgen: union literal must list exactly one field");
 		}
-		StringIdx nameId = static_cast<StringIdx>(
-		    ns.getExtra(fieldsExtra + 1));
-		NodeIdx exprIdx = static_cast<NodeIdx>(
-		    ns.getExtra(fieldsExtra + 2));
-		const std::string &fieldName =
-		    gctx.ctx.getStringPool().get(nameId);
-		TypeIdx fieldTy =
-		    gctx.ctx.getUnionFieldType(uinfo->name, fieldName);
+		StringIdx nameId = static_cast<StringIdx>(ns.getExtra(fieldsExtra + 1));
+		NodeIdx exprIdx = static_cast<NodeIdx>(ns.getExtra(fieldsExtra + 2));
+		const std::string &fieldName = gctx.ctx.getStringPool().get(nameId);
+		TypeIdx fieldTy = gctx.ctx.getUnionFieldType(uinfo->name, fieldName);
 		if (fieldTy == kNoType) {
-			failHere(gctx, 
-			    "astgen: union `" + uinfo->name + "` has no field `" +
-			    fieldName + "`");
+			failHere(gctx, "astgen: union `" + uinfo->name +
+			                   "` has no field `" + fieldName + "`");
 		}
 		JirRef fieldVal = astgenExpr(gctx, exprIdx, fieldTy);
 		// Alloca the union, store the field's value into its slot,
@@ -995,13 +933,12 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 			// "not exported" / "does not exist" / "unknown handle"
 			// diagnostic; bare names fall back to the generic message.
 			if (name.find('.') != std::string::npos) {
-				failHere(gctx, 
-				    gctx.ctx.formatNamespaceLookupError("struct", name));
+				failHere(gctx,
+				         gctx.ctx.formatNamespaceLookupError("struct", name));
 			}
 			failHere(gctx, "unknown struct `" + name + "`");
 		}
-		failHere(gctx, 
-		    "astgen: struct literal type is not a known struct");
+		failHere(gctx, "astgen: struct literal type is not a known struct");
 	}
 
 	ExtraIdx fieldsExtra = static_cast<ExtraIdx>(n.rhs);
@@ -1020,8 +957,7 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 			// Recoverable: record the bad field name and skip it so
 			// other malformed fields in the same literal still get
 			// reported in this pass.
-			appendErrorHere(gctx, "unknown struct field `" +
-			                          fieldName + "`");
+			appendErrorHere(gctx, "unknown struct field `" + fieldName + "`");
 			continue;
 		}
 		TypeIdx expectedField = info->fields[idx].second;
@@ -1035,8 +971,7 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 		if (vt != expectedField && vt != kNoType) {
 			const TypeKey &fk = gctx.ctx.getTypePool().get(expectedField);
 			const TypeKey &vk = gctx.ctx.getTypePool().get(vt);
-			if (fk.kind == TypeKind::Float &&
-			    vk.kind == TypeKind::Int) {
+			if (fk.kind == TypeKind::Float && vk.kind == TypeKind::Int) {
 				JirInst c{};
 				c.tag = vk.b != 0 ? JirTag::SIToFP : JirTag::UIToFP;
 				c.a = fieldVal;
@@ -1050,9 +985,8 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 	// literals must initialise every field.
 	for (size_t i = 0; i < ordered.size(); i++) {
 		if (ordered[i] == kNoJirRef) {
-			failHere(gctx, 
-			    "astgen: struct literal missing field `" +
-			    info->fields[i].first + "`");
+			failHere(gctx, "astgen: struct literal missing field `" +
+			                   info->fields[i].first + "`");
 		}
 	}
 
@@ -1060,8 +994,7 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 	packed.reserve(1 + ordered.size());
 	packed.push_back(static_cast<uint32_t>(ordered.size()));
 	for (JirRef r : ordered) packed.push_back(r);
-	JirExtraIdx extra =
-	    gctx.jfn.pushExtra(packed.data(), packed.size());
+	JirExtraIdx extra = gctx.jfn.pushExtra(packed.data(), packed.size());
 
 	JirInst inst{};
 	inst.tag = JirTag::StructLit;
@@ -1085,8 +1018,8 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 
 	const AstNode &baseNode = ns.get(baseIdx);
 	if (baseNode.tag == AstTag::Variable) {
-		const std::string &baseName = gctx.ctx.getStringPool().get(
-		    static_cast<StringIdx>(baseNode.lhs));
+		const std::string &baseName =
+		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(baseNode.lhs));
 		// Enum-variant unit reference: emit JirTag::StructLit with a
 		// single field (the tag) for payloaded enums; for unit-only
 		// enums, the tag value IS the runtime form (i8).
@@ -1094,22 +1027,20 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 			int vidx = gctx.ctx.getEnumVariantIndex(baseName, member);
 			if (vidx < 0) {
 				failHere(gctx, "astgen: enum `" + baseName +
-				                         "` has no variant `" + member + "`");
+				                   "` has no variant `" + member + "`");
 			}
 			uint32_t disc = einfo->variants[vidx].discriminant;
 			TypeIdx enumTy = gctx.ctx.getTypePool().intern(
 			    TypeKey{TypeKind::Named, 0, 0,
-			            static_cast<uint32_t>(gctx.ctx.getStringPool().intern(
-			                baseName)),
+			            static_cast<uint32_t>(
+			                gctx.ctx.getStringPool().intern(baseName)),
 			            0});
 			JirInst tag{};
 			tag.tag = JirTag::Int;
 			tag.a = disc;
 			tag.ty = BuiltinType::U8;
 			JirRef tagRef = emit(gctx, tag);
-			if (!einfo->hasPayloadVariant) {
-				return tagRef;
-			}
+			if (!einfo->hasPayloadVariant) { return tagRef; }
 			// Payloaded enum: build a {tag, payload-undef} struct.
 			// We carry the enum's TypeIdx so codegen materialises the
 			// right struct shape.
@@ -1133,8 +1064,7 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 	const TypeKey &bk = gctx.ctx.getTypePool().get(baseTy);
 	if (bk.kind == TypeKind::Slice) {
 		if (member != "ptr" && member != "len") {
-			failHere(gctx, 
-			    "astgen: slice has no field `" + member + "`");
+			failHere(gctx, "astgen: slice has no field `" + member + "`");
 		}
 		unsigned fieldIdx = (member == "ptr") ? 0 : 1;
 		TypeIdx fieldTy;
@@ -1157,12 +1087,10 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 	// fieldTy — opaque pointers let us hand back any field-typed
 	// value from the same storage.
 	if (const auto *uinfo = gctx.ctx.lookupUnion(baseTy)) {
-		TypeIdx fieldTy =
-		    gctx.ctx.getUnionFieldType(uinfo->name, member);
+		TypeIdx fieldTy = gctx.ctx.getUnionFieldType(uinfo->name, member);
 		if (fieldTy == kNoType) {
-			failHere(gctx, 
-			    "astgen: union `" + uinfo->name + "` has no field `" +
-			    member + "`");
+			failHere(gctx, "astgen: union `" + uinfo->name +
+			                   "` has no field `" + member + "`");
 		}
 		JirInst alloca{};
 		alloca.tag = JirTag::Alloca;
@@ -1182,14 +1110,13 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 
 	const auto *info = gctx.ctx.lookupStruct(baseTy);
 	if (info == nullptr) {
-		failHere(gctx, 
-		    "astgen: cannot access field of non-struct type");
+		failHere(gctx, "astgen: cannot access field of non-struct type");
 	}
 	int idx = gctx.ctx.getFieldIndex(info->name, member);
 	if (idx < 0) {
-		return recoverHere(gctx, "unknown field `" + member + "` on `" +
-		                              info->name + "`",
-		                    kNoType);
+		return recoverHere(
+		    gctx, "unknown field `" + member + "` on `" + info->name + "`",
+		    kNoType);
 	}
 	JirInst inst{};
 	inst.tag = JirTag::FieldAccess;
@@ -1223,8 +1150,8 @@ static JirRef astgenArrayLit(AstGenCtx &gctx, const AstNode &n,
 		elemTy = gctx.jfn.getInst(elems[0]).ty;
 	}
 	if (elemTy == kNoType) {
-		failHere(gctx, 
-		    "astgen: array literal element type could not be inferred");
+		failHere(gctx,
+		         "astgen: array literal element type could not be inferred");
 	}
 	TypeIdx arrTy = gctx.ctx.getTypePool().intern(
 	    TypeKey{TypeKind::Array, 0, 0, elemTy, count});
@@ -1233,8 +1160,7 @@ static JirRef astgenArrayLit(AstGenCtx &gctx, const AstNode &n,
 	packed.reserve(1 + elems.size());
 	packed.push_back(count);
 	for (JirRef r : elems) packed.push_back(r);
-	JirExtraIdx extra =
-	    gctx.jfn.pushExtra(packed.data(), packed.size());
+	JirExtraIdx extra = gctx.jfn.pushExtra(packed.data(), packed.size());
 
 	JirInst inst{};
 	inst.tag = JirTag::ArrayLit;
@@ -1258,11 +1184,12 @@ static JirRef astgenArrayRepeat(AstGenCtx &gctx, const AstNode &n,
 
 	const AstNode &cn = ns.get(countIdx);
 	if (cn.tag != AstTag::NumberLit) {
-		failHere(gctx, 
+		failHere(
+		    gctx,
 		    "astgen: array-repeat count must be a constant integer literal");
 	}
-	uint64_t count = static_cast<uint64_t>(cn.lhs) |
-	                 (static_cast<uint64_t>(cn.rhs) << 32);
+	uint64_t count =
+	    static_cast<uint64_t>(cn.lhs) | (static_cast<uint64_t>(cn.rhs) << 32);
 
 	// Resolve element type. From the array TypeKey if we have it; else
 	// from the first compile of the value.
@@ -1306,8 +1233,7 @@ static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 	    k.kind == TypeKind::PtrMany) {
 		elemTy = static_cast<TypeIdx>(k.a);
 	} else {
-		failHere(gctx, 
-		    "astgen: cannot index value of this type");
+		failHere(gctx, "astgen: cannot index value of this type");
 	}
 	JirInst inst{};
 	inst.tag = JirTag::Index;
@@ -1396,8 +1322,7 @@ static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 		}
 	}
 	const TypeKey &dst = gctx.ctx.getTypePool().get(dstTy);
-	TypeIdx hint =
-	    (dst.kind == TypeKind::Int) ? dstTy : kNoType;
+	TypeIdx hint = (dst.kind == TypeKind::Int) ? dstTy : kNoType;
 	JirRef val = astgenExpr(gctx, operandIdx, hint);
 	TypeIdx srcTy = gctx.jfn.getInst(val).ty;
 	if (srcTy == dstTy) return val;
@@ -1480,8 +1405,7 @@ static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 	// enums the runtime form is already i8, so the cast is just a
 	// width adjustment. For payloaded enums it's an ExtractValue(0)
 	// followed by the same width adjustment.
-	if ((src.kind == TypeKind::Named ||
-	     src.kind == TypeKind::Enum) &&
+	if ((src.kind == TypeKind::Named || src.kind == TypeKind::Enum) &&
 	    dst.kind == TypeKind::Int) {
 		if (const auto *einfo = gctx.ctx.lookupEnum(srcTy)) {
 			JirRef tagRef = val;
@@ -1511,8 +1435,7 @@ static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 	// Pointer ↔ pointer cast: in opaque-pointer LLVM the runtime
 	// representation is identical, so just retag at the JIR level.
 	auto isPtr = [](const TypeKey &k) {
-		return k.kind == TypeKind::PtrSingle ||
-		       k.kind == TypeKind::PtrMany;
+		return k.kind == TypeKind::PtrSingle || k.kind == TypeKind::PtrMany;
 	};
 	if (isPtr(src) && isPtr(dst)) {
 		JirInst inst{};
@@ -1633,9 +1556,9 @@ static JirRef astgenBinaryOp(AstGenCtx &gctx, const AstNode &n,
 		const TypeKey &rk = gctx.ctx.getTypePool().get(rhsType);
 		if (lk.kind == TypeKind::Float && rk.kind == TypeKind::Float &&
 		    lk.a != rk.a) {
-			failHere(gctx, 
-			    "mismatched float widths in binary op; use an explicit "
-			    "`as` cast to align them");
+			failHere(gctx,
+			         "mismatched float widths in binary op; use an explicit "
+			         "`as` cast to align them");
 		}
 		if (lk.kind == TypeKind::Int && rk.kind == TypeKind::Int &&
 		    lk.a != rk.a) {
@@ -1675,7 +1598,8 @@ static JirRef astgenBinaryOp(AstGenCtx &gctx, const AstNode &n,
 		// LogOr:  result = lhs ? true : rhs
 		// Use an alloca for the result slot; codegen folds to phi at -O2.
 		bool isAnd = op == BinOp::LogAnd;
-		// Re-emit operands as bools: lhsRef is already i1 (we cast expected to bool).
+		// Re-emit operands as bools: lhsRef is already i1 (we cast expected to
+		// bool).
 		(void)lhsRef;
 		(void)rhsRef;
 		(void)resultTy;
@@ -1721,20 +1645,36 @@ static JirRef astgenBinaryOp(AstGenCtx &gctx, const AstNode &n,
 	}
 
 	switch (op) {
-	case BinOp::Add: tag = isFloat ? JirTag::FAdd : JirTag::Add; break;
-	case BinOp::Sub: tag = isFloat ? JirTag::FSub : JirTag::Sub; break;
-	case BinOp::Mul: tag = isFloat ? JirTag::FMul : JirTag::Mul; break;
+	case BinOp::Add:
+		tag = isFloat ? JirTag::FAdd : JirTag::Add;
+		break;
+	case BinOp::Sub:
+		tag = isFloat ? JirTag::FSub : JirTag::Sub;
+		break;
+	case BinOp::Mul:
+		tag = isFloat ? JirTag::FMul : JirTag::Mul;
+		break;
 	case BinOp::Div:
 		tag = isFloat ? JirTag::FDiv : (isSigned ? JirTag::SDiv : JirTag::UDiv);
 		break;
 	case BinOp::Mod:
 		tag = isFloat ? JirTag::FRem : (isSigned ? JirTag::SRem : JirTag::URem);
 		break;
-	case BinOp::BitAnd: tag = JirTag::BitAnd; break;
-	case BinOp::BitOr:  tag = JirTag::BitOr; break;
-	case BinOp::BitXor: tag = JirTag::BitXor; break;
-	case BinOp::Shl:    tag = JirTag::Shl; break;
-	case BinOp::Shr:    tag = isSigned ? JirTag::AShr : JirTag::LShr; break;
+	case BinOp::BitAnd:
+		tag = JirTag::BitAnd;
+		break;
+	case BinOp::BitOr:
+		tag = JirTag::BitOr;
+		break;
+	case BinOp::BitXor:
+		tag = JirTag::BitXor;
+		break;
+	case BinOp::Shl:
+		tag = JirTag::Shl;
+		break;
+	case BinOp::Shr:
+		tag = isSigned ? JirTag::AShr : JirTag::LShr;
+		break;
 	case BinOp::Eq:
 		tag = isFloat ? JirTag::FCmpOeq : JirTag::ICmpEq;
 		isCmp = true;
@@ -1765,8 +1705,8 @@ static JirRef astgenBinaryOp(AstGenCtx &gctx, const AstNode &n,
 		break;
 	default:
 		failHere(gctx, "unsupported binary operator (internal op = " +
-		                 std::to_string(static_cast<int>(op)) +
-		                 ") — please file a bug");
+		                   std::to_string(static_cast<int>(op)) +
+		                   ") — please file a bug");
 	}
 
 	JirInst inst{};
@@ -1825,8 +1765,8 @@ static void astgenIf(AstGenCtx &gctx, const AstNode &n) {
 
 	JirRef condRef = astgenExpr(gctx, condIdx, BuiltinType::Bool);
 	JirBlockRef thenB = gctx.jfn.pushBlock("then");
-	JirBlockRef elseB = (elseCount > 0) ? gctx.jfn.pushBlock("else")
-	                                    : kNoJirBlock;
+	JirBlockRef elseB =
+	    (elseCount > 0) ? gctx.jfn.pushBlock("else") : kNoJirBlock;
 	JirBlockRef mergeB = gctx.jfn.pushBlock("ifend");
 
 	emitCondBr(gctx, condRef, thenB, (elseCount > 0) ? elseB : mergeB);
@@ -1849,8 +1789,8 @@ static void astgenIf(AstGenCtx &gctx, const AstNode &n) {
 		gctx.currentBlock = elseB;
 		pushDropScope(gctx);
 		for (uint32_t i = 0; i < elseCount; i++) {
-			NodeIdx s = static_cast<NodeIdx>(
-			    ns.getExtra(extra + 2 + thenCount + i));
+			NodeIdx s =
+			    static_cast<NodeIdx>(ns.getExtra(extra + 2 + thenCount + i));
 			astgenExpr(gctx, s, kNoType);
 		}
 		popDropScopeEmitting(gctx);
@@ -1923,8 +1863,7 @@ static void astgenFor(AstGenCtx &gctx, const AstNode &n) {
 	// destroyed before each step / break.
 	gctx.currentBlock = bodyB;
 	pushDropScope(gctx);
-	gctx.loopStack.push_back(
-	    {stepB, exitB, gctx.dropScopes.size() - 1});
+	gctx.loopStack.push_back({stepB, exitB, gctx.dropScopes.size() - 1});
 	for (uint32_t i = 0; i < bodyCount; i++) {
 		NodeIdx s = static_cast<NodeIdx>(ns.getExtra(extra + 4 + i));
 		astgenExpr(gctx, s, kNoType);
@@ -1985,8 +1924,7 @@ static void astgenWhile(AstGenCtx &gctx, const AstNode &n) {
 
 	gctx.currentBlock = bodyB;
 	pushDropScope(gctx);
-	gctx.loopStack.push_back(
-	    {condB, exitB, gctx.dropScopes.size() - 1});
+	gctx.loopStack.push_back({condB, exitB, gctx.dropScopes.size() - 1});
 	for (uint32_t i = 0; i < bodyCount; i++) {
 		NodeIdx s = static_cast<NodeIdx>(ns.getExtra(extra + 1 + i));
 		astgenExpr(gctx, s, kNoType);
@@ -2004,8 +1942,7 @@ static void astgenBreak(AstGenCtx &gctx) {
 	if (gctx.loopStack.empty()) {
 		failHere(gctx, "astgen: `break` outside of loop");
 	}
-	emitDropsThroughScope(gctx,
-	                       gctx.loopStack.back().bodyScopeIdx);
+	emitDropsThroughScope(gctx, gctx.loopStack.back().bodyScopeIdx);
 	emitBr(gctx, gctx.loopStack.back().breakBlock);
 }
 
@@ -2013,8 +1950,7 @@ static void astgenContinue(AstGenCtx &gctx) {
 	if (gctx.loopStack.empty()) {
 		failHere(gctx, "astgen: `continue` outside of loop");
 	}
-	emitDropsThroughScope(gctx,
-	                       gctx.loopStack.back().bodyScopeIdx);
+	emitDropsThroughScope(gctx, gctx.loopStack.back().bodyScopeIdx);
 	emitBr(gctx, gctx.loopStack.back().continueBlock);
 }
 
@@ -2070,8 +2006,8 @@ static TypeIdx inferTailType(const AstGenCtx &gctx, NodeIdx idx) {
 	const AstNode &n = gctx.ctx.getNodeStore().get(idx);
 	switch (n.tag) {
 	case AstTag::NumberLit: {
-		uint64_t val = static_cast<uint64_t>(n.lhs) |
-		               (static_cast<uint64_t>(n.rhs) << 32);
+		uint64_t val =
+		    static_cast<uint64_t>(n.lhs) | (static_cast<uint64_t>(n.rhs) << 32);
 		bool isNeg = (n.flags & 1) != 0;
 		bool isFloat = (n.flags & 2) != 0;
 		if (isFloat) return BuiltinType::F64;
@@ -2089,8 +2025,8 @@ static TypeIdx inferTailType(const AstGenCtx &gctx, NodeIdx idx) {
 	case AstTag::BoolLit:
 		return BuiltinType::Bool;
 	case AstTag::Variable: {
-		const std::string &name = gctx.ctx.getStringPool().get(
-		    static_cast<StringIdx>(n.lhs));
+		const std::string &name =
+		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
 		auto it = gctx.localTypes.find(name);
 		if (it != gctx.localTypes.end()) return it->second;
 		return kNoType;
@@ -2111,10 +2047,9 @@ static bool stmtDiverges(const AstGenCtx &gctx, NodeIdx node) {
 		return true;
 	}
 	if (n.tag == AstTag::Call && (n.flags & 1) == 0) {
-		const std::string &callee = gctx.ctx.getStringPool().get(
-		    static_cast<StringIdx>(n.lhs));
-		if (const FunctionAST *fn =
-		        gctx.ctx.getFunctionAST(callee)) {
+		const std::string &callee =
+		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
+		if (const FunctionAST *fn = gctx.ctx.getFunctionAST(callee)) {
 			return fn->ReturnType == BuiltinType::NoReturn;
 		}
 	}
@@ -2156,20 +2091,17 @@ struct SwitchCase {
 //                         `EnumInfo` is supplied so we can resolve the
 //                         variant name without re-doing the lookup
 //                         later.
-static bool collectSwitchCases(const NodeStore &ns,
-                               JamCodegenContext &ctx,
-                               NodeIdx patIdx,
-                               JirBlockRef armBlock,
-                               TypeIdx scrutTy,
-                               bool scrutIsEnum,
+static bool collectSwitchCases(const NodeStore &ns, JamCodegenContext &ctx,
+                               NodeIdx patIdx, JirBlockRef armBlock,
+                               TypeIdx scrutTy, bool scrutIsEnum,
                                const JamCodegenContext::EnumInfo *einfo,
                                std::vector<SwitchCase> &out) {
 	const AstNode &p = ns.get(patIdx);
 	switch (p.tag) {
 	case AstTag::PatLit: {
 		if (scrutIsEnum) return false;
-		uint64_t val = static_cast<uint64_t>(p.lhs) |
-		               (static_cast<uint64_t>(p.rhs) << 32);
+		uint64_t val =
+		    static_cast<uint64_t>(p.lhs) | (static_cast<uint64_t>(p.rhs) << 32);
 		bool isNeg = (p.flags & 1) != 0;
 		if (isNeg) {
 			// Two's-complement encoding at the scrut's width; the
@@ -2188,8 +2120,7 @@ static bool collectSwitchCases(const NodeStore &ns,
 		bool hasBindings = (p.flags & 1) != 0;
 		if (hasBindings) return false;
 		StringIdx variantNameId = static_cast<StringIdx>(p.rhs);
-		const std::string &variantName =
-		    ctx.getStringPool().get(variantNameId);
+		const std::string &variantName = ctx.getStringPool().get(variantNameId);
 		int vidx = ctx.getEnumVariantIndex(einfo->name, variantName);
 		if (vidx < 0) return false;
 		uint64_t disc = einfo->variants[vidx].discriminant;
@@ -2202,7 +2133,7 @@ static bool collectSwitchCases(const NodeStore &ns,
 		for (uint32_t i = 0; i < cnt; i++) {
 			NodeIdx sub = static_cast<NodeIdx>(ns.getExtra(ex + 1 + i));
 			if (!collectSwitchCases(ns, ctx, sub, armBlock, scrutTy,
-			                         scrutIsEnum, einfo, out)) {
+			                        scrutIsEnum, einfo, out)) {
 				return false;
 			}
 		}
@@ -2224,9 +2155,8 @@ static bool collectSwitchCases(const NodeStore &ns,
 // payload bindings introduced by the pattern. The bindings' slot
 // allocas are emitted in `outBindings` order so arm-body code can
 // install them by Load via Variable.
-static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
-                                 JirRef scrut, TypeIdx scrutTy,
-                                 JirBlockRef armBlock,
+static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx, JirRef scrut,
+                                 TypeIdx scrutTy, JirBlockRef armBlock,
                                  JirBlockRef nextBlock,
                                  ArmBindings *outBindings) {
 	const NodeStore &ns = gctx.ctx.getNodeStore();
@@ -2254,8 +2184,8 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 
 	switch (p.tag) {
 	case AstTag::PatLit: {
-		uint64_t val = static_cast<uint64_t>(p.lhs) |
-		               (static_cast<uint64_t>(p.rhs) << 32);
+		uint64_t val =
+		    static_cast<uint64_t>(p.lhs) | (static_cast<uint64_t>(p.rhs) << 32);
 		bool isNeg = (p.flags & 1) != 0;
 		JirRef k = emitInt(val, isNeg);
 		JirRef cmp = emitCmp(JirTag::ICmpEq, scrut, k);
@@ -2268,13 +2198,13 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 		uint64_t hi = static_cast<uint64_t>(p.rhs);
 		JirRef loK = emitInt(lo, false);
 		JirRef hiK = emitInt(hi, false);
-		JirRef geLo = emitCmp(signedCmp ? JirTag::ICmpSge : JirTag::ICmpUge,
-		                       scrut, loK);
+		JirRef geLo =
+		    emitCmp(signedCmp ? JirTag::ICmpSge : JirTag::ICmpUge, scrut, loK);
 		JirBlockRef checkHi = gctx.jfn.pushBlock("range.hi");
 		emitCondBr(gctx, geLo, checkHi, nextBlock);
 		gctx.currentBlock = checkHi;
-		JirRef leHi = emitCmp(signedCmp ? JirTag::ICmpSle : JirTag::ICmpUle,
-		                       scrut, hiK);
+		JirRef leHi =
+		    emitCmp(signedCmp ? JirTag::ICmpSle : JirTag::ICmpUle, scrut, hiK);
 		emitCondBr(gctx, leHi, armBlock, nextBlock);
 		return;
 	}
@@ -2283,11 +2213,10 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 		uint32_t cnt = ns.getExtra(ex);
 		for (uint32_t i = 0; i < cnt; i++) {
 			NodeIdx sub = static_cast<NodeIdx>(ns.getExtra(ex + 1 + i));
-			JirBlockRef tryNext = (i + 1 == cnt)
-			                           ? nextBlock
-			                           : gctx.jfn.pushBlock("or.next");
-			astgenPatternCompare(gctx, sub, scrut, scrutTy, armBlock,
-			                     tryNext, outBindings);
+			JirBlockRef tryNext =
+			    (i + 1 == cnt) ? nextBlock : gctx.jfn.pushBlock("or.next");
+			astgenPatternCompare(gctx, sub, scrut, scrutTy, armBlock, tryNext,
+			                     outBindings);
 			if (i + 1 != cnt) gctx.currentBlock = tryNext;
 		}
 		return;
@@ -2317,8 +2246,8 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 		}
 
 		std::string enumName;
-		const auto *einfo = static_cast<const decltype(gctx.ctx.getEnum(""))>(
-		    nullptr);
+		const auto *einfo =
+		    static_cast<const decltype(gctx.ctx.getEnum(""))>(nullptr);
 		if (typeIdxReceiver) {
 			TypeIdx ty = static_cast<TypeIdx>(recvSlot);
 			if (const auto *info = gctx.ctx.lookupEnum(ty)) {
@@ -2326,21 +2255,21 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 				einfo = info;
 			}
 		} else {
-			std::string recvName = gctx.ctx.getStringPool().get(
-			    static_cast<StringIdx>(recvSlot));
+			std::string recvName =
+			    gctx.ctx.getStringPool().get(static_cast<StringIdx>(recvSlot));
 			enumName = recvName;
 			einfo = gctx.ctx.getEnum(recvName);
 		}
 		if (einfo == nullptr) {
-			failHere(gctx, 
-			    "astgen: pattern receiver doesn't resolve to an enum");
+			failHere(gctx,
+			         "astgen: pattern receiver doesn't resolve to an enum");
 		}
 		const std::string &variantName =
 		    gctx.ctx.getStringPool().get(variantNameId);
 		int vidx = gctx.ctx.getEnumVariantIndex(enumName, variantName);
 		if (vidx < 0) {
-			failHere(gctx, "astgen: unknown variant `" + enumName +
-			                         "." + variantName + "`");
+			failHere(gctx, "astgen: unknown variant `" + enumName + "." +
+			                   variantName + "`");
 		}
 
 		// Extract the tag as a u8. For payloaded enums the tag is
@@ -2383,10 +2312,10 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 			gctx.currentBlock = bindB;
 			const auto &variant = einfo->variants[vidx];
 			if (bindingCount != variant.payloadTypes.size()) {
-				failHere(gctx, 
-				    "astgen: pattern binds " + std::to_string(bindingCount) +
-				    " field(s), variant has " +
-				    std::to_string(variant.payloadTypes.size()));
+				failHere(gctx, "astgen: pattern binds " +
+				                   std::to_string(bindingCount) +
+				                   " field(s), variant has " +
+				                   std::to_string(variant.payloadTypes.size()));
 			}
 
 			// Spill scrut to a local alloca so EnumPayload can take its
@@ -2403,8 +2332,8 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 
 			uint64_t off = 0;
 			for (uint32_t b = 0; b < bindingCount; b++) {
-				StringIdx bindNameId = static_cast<StringIdx>(
-				    ns.getExtra(bindingsStart + b));
+				StringIdx bindNameId =
+				    static_cast<StringIdx>(ns.getExtra(bindingsStart + b));
 				const std::string &bindName =
 				    gctx.ctx.getStringPool().get(bindNameId);
 				TypeIdx fieldTy = variant.payloadTypes[b];
@@ -2429,8 +2358,7 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx,
 				bindStore.b = payloadRef;
 				emit(gctx, bindStore);
 				if (outBindings) {
-					outBindings->push_back(
-					    {bindName, bindSlot, fieldTy});
+					outBindings->push_back({bindName, bindSlot, fieldTy});
 				}
 				off += s;
 			}
@@ -2470,8 +2398,8 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		uint32_t bc = ns.getExtra(armsExtra + pos + 1);
 		a.body.reserve(bc);
 		for (uint32_t j = 0; j < bc; j++) {
-			a.body.push_back(static_cast<NodeIdx>(
-			    ns.getExtra(armsExtra + pos + 2 + j)));
+			a.body.push_back(
+			    static_cast<NodeIdx>(ns.getExtra(armsExtra + pos + 2 + j)));
 		}
 		pos += 2 + bc;
 		if (ns.get(a.patIdx).tag == AstTag::PatWildcard) {
@@ -2522,8 +2450,8 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 
 	std::vector<ArmBindings> armBindings(armCount);
 	JirBlockRef defaultB = (wildcardArmIdx >= 0)
-	                            ? armBlocks[wildcardArmIdx]
-	                            : gctx.jfn.pushBlock("nomatch");
+	                           ? armBlocks[wildcardArmIdx]
+	                           : gctx.jfn.pushBlock("nomatch");
 
 	// Try the Switch lowering first. Every non-wildcard arm has to be
 	// a pattern that resolves to a single integer-equality test (or a
@@ -2542,9 +2470,8 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		const NodeStore &ns = gctx.ctx.getNodeStore();
 		for (uint32_t i = 0; i < armCount; i++) {
 			if (static_cast<int>(i) == wildcardArmIdx) continue;
-			if (!collectSwitchCases(ns, gctx.ctx, arms[i].patIdx,
-			                         armBlocks[i], scrutTy, scrutIsEnum,
-			                         einfo, switchCases)) {
+			if (!collectSwitchCases(ns, gctx.ctx, arms[i].patIdx, armBlocks[i],
+			                        scrutTy, scrutIsEnum, einfo, switchCases)) {
 				tryingSwitch = false;
 				break;
 			}
@@ -2586,8 +2513,7 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 			packed.push_back(sc.isSigned ? 1u : 0u);
 			packed.push_back(static_cast<uint32_t>(sc.target));
 		}
-		JirExtraIdx extraIdx =
-		    gctx.jfn.pushExtra(packed.data(), packed.size());
+		JirExtraIdx extraIdx = gctx.jfn.pushExtra(packed.data(), packed.size());
 		JirInst sw{};
 		sw.tag = JirTag::Switch;
 		sw.a = caseScrut;
@@ -2609,10 +2535,10 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		bool emittedAnyDispatch = false;
 		for (uint32_t i = 0; i < armCount; i++) {
 			if (static_cast<int>(i) == wildcardArmIdx) continue;
-			JirBlockRef next = (i + 1 < armCount &&
-			                    static_cast<int>(i + 1) != wildcardArmIdx)
-			                       ? gctx.jfn.pushBlock("matchnext")
-			                       : defaultB;
+			JirBlockRef next =
+			    (i + 1 < armCount && static_cast<int>(i + 1) != wildcardArmIdx)
+			        ? gctx.jfn.pushBlock("matchnext")
+			        : defaultB;
 			astgenPatternCompare(gctx, arms[i].patIdx, scrut, scrutTy,
 			                     armBlocks[i], next, &armBindings[i]);
 			if (next != defaultB) gctx.currentBlock = next;
@@ -2621,9 +2547,7 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		// All arms were wildcards (only a `_` arm, or none). Emit an
 		// unconditional Br from the entry block into the default
 		// block.
-		if (!emittedAnyDispatch) {
-			emitBr(gctx, defaultB);
-		}
+		if (!emittedAnyDispatch) { emitBr(gctx, defaultB); }
 		// If the last non-wildcard arm fell through, we need its
 		// `next` to terminate. The compare loop above already wired
 		// the final next to `defaultB`. When there's no catch-all
@@ -2675,9 +2599,7 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 			} else {
 				astgenExpr(gctx, stmt, kNoType);
 			}
-			if (isTail && divergent) {
-				armDiverged = true;
-			}
+			if (isTail && divergent) { armDiverged = true; }
 		}
 		// A noreturn-call tail (like `abort()`) leaves the arm with no
 		// LLVM terminator even though semantically control can't flow
@@ -2701,8 +2623,7 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 			gctx.localTypes.erase(bind.name);
 		}
 		for (const auto &kv : saved) gctx.locals[kv.first] = kv.second;
-		for (const auto &kv : savedTypes)
-			gctx.localTypes[kv.first] = kv.second;
+		for (const auto &kv : savedTypes) gctx.localTypes[kv.first] = kv.second;
 	}
 
 	gctx.currentBlock = mergeB;
@@ -2728,8 +2649,7 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n) {
 	ExtraIdx extra = static_cast<ExtraIdx>(n.rhs);
 	StringIdx methodNameId = static_cast<StringIdx>(ns.getExtra(extra));
 	uint32_t argCount = ns.getExtra(extra + 1);
-	const std::string &methodName =
-	    gctx.ctx.getStringPool().get(methodNameId);
+	const std::string &methodName = gctx.ctx.getStringPool().get(methodNameId);
 
 	std::string receiverName;
 	const auto *einfoForVariant =
@@ -2740,9 +2660,8 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n) {
 		receiverName = einfo->name;
 		einfoForVariant = einfo;
 	} else {
-		failHere(gctx, 
-		    "astgen: TypeMethodCall receiver doesn't resolve to a "
-		    "struct or enum");
+		failHere(gctx, "astgen: TypeMethodCall receiver doesn't resolve to a "
+		               "struct or enum");
 	}
 
 	// Enum-variant constructor: `Option(i32).Some(42)` — the method
@@ -2750,23 +2669,20 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n) {
 	// {tag, payload} aggregate. v1 supports single-payload variants
 	// (the dominant case for Option/Result/either-style enums).
 	if (einfoForVariant != nullptr) {
-		int vidx =
-		    gctx.ctx.getEnumVariantIndex(receiverName, methodName);
+		int vidx = gctx.ctx.getEnumVariantIndex(receiverName, methodName);
 		if (vidx >= 0) {
 			const auto &variant = einfoForVariant->variants[vidx];
-			TypeIdx enumTy = gctx.ctx.getTypePool().intern(TypeKey{
-			    TypeKind::Named, 0, 0,
-			    static_cast<uint32_t>(
-			        gctx.ctx.getStringPool().intern(receiverName)),
-			    0});
+			TypeIdx enumTy = gctx.ctx.getTypePool().intern(
+			    TypeKey{TypeKind::Named, 0, 0,
+			            static_cast<uint32_t>(
+			                gctx.ctx.getStringPool().intern(receiverName)),
+			            0});
 			JirInst tag{};
 			tag.tag = JirTag::Int;
 			tag.a = static_cast<uint32_t>(variant.discriminant);
 			tag.ty = BuiltinType::U8;
 			JirRef tagRef = emit(gctx, tag);
-			if (!einfoForVariant->hasPayloadVariant) {
-				return tagRef;
-			}
+			if (!einfoForVariant->hasPayloadVariant) { return tagRef; }
 			// Payloaded enum: alloca enum struct, store tag at field 0,
 			// store each payload arg at the payload area.
 			JirInst alloca{};
@@ -2859,8 +2775,7 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n) {
 	// callee's FunctionAST via the same registry path.
 	const FunctionAST *fn = gctx.ctx.getFunctionAST(qualified);
 	if (fn == nullptr) {
-		return recoverHere(gctx, "unknown method `" + qualified + "`",
-		                    kNoType);
+		return recoverHere(gctx, "unknown method `" + qualified + "`", kNoType);
 	}
 	std::vector<JirRef> argRefs;
 	argRefs.reserve(argCount);
@@ -2915,8 +2830,7 @@ static JirRef astgenAssertCall(AstGenCtx &gctx, const AstNode &n) {
 	ExtraIdx argsExtra = static_cast<ExtraIdx>(n.rhs);
 	uint32_t argCount = ns.getExtra(argsExtra);
 	if (argCount != 2) {
-		failHere(gctx, 
-		    "astgen: assert expects exactly 2 arguments");
+		failHere(gctx, "astgen: assert expects exactly 2 arguments");
 	}
 	NodeIdx actualIdx = static_cast<NodeIdx>(ns.getExtra(argsExtra + 1));
 	NodeIdx expectedIdx = static_cast<NodeIdx>(ns.getExtra(argsExtra + 2));
@@ -2968,27 +2882,25 @@ static JirRef astgenAssertCall(AstGenCtx &gctx, const AstNode &n) {
 		// up parameter types. We mark it varArgs so the prototype
 		// matches the C signature.
 		auto fakePrintf = std::make_unique<FunctionAST>(
-		    "printf", std::vector<Param>{Param{
-		                  "fmt", BuiltinType::U64, ParamMode::Let}},
+		    "printf",
+		    std::vector<Param>{Param{"fmt", BuiltinType::U64, ParamMode::Let}},
 		    BuiltinType::I32, std::vector<NodeIdx>{},
 		    /*isExtern=*/true, /*isExport=*/false, /*isPub=*/false,
 		    /*isTest=*/false, /*isVarArgs=*/true);
 		printfAST = fakePrintf.get();
 		gctx.ctx.registerFunctionAST("printf", fakePrintf.release());
 		// Also declare the LLVM prototype so the call resolves.
-		JamTypeRef i8PtrType =
-		    JamLLVMPointerType(gctx.ctx.getInt8Type(), 0);
+		JamTypeRef i8PtrType = JamLLVMPointerType(gctx.ctx.getInt8Type(), 0);
 		JamTypeRef paramTypes[1] = {i8PtrType};
-		JamTypeRef ft = JamLLVMFunctionType(
-		    gctx.ctx.getInt32Type(), paramTypes, 1, /*isVarArgs=*/true);
-		JamFunctionRef pf = JamLLVMAddFunction(
-		    gctx.ctx.getModule(), "printf", ft);
+		JamTypeRef ft = JamLLVMFunctionType(gctx.ctx.getInt32Type(), paramTypes,
+		                                    1, /*isVarArgs=*/true);
+		JamFunctionRef pf =
+		    JamLLVMAddFunction(gctx.ctx.getModule(), "printf", ft);
 		JamLLVMApplyDefaultFnAttrs(pf, /*isExtern=*/true);
 	}
 
 	// Build the format-string slice "Assertion failed\n" as a JIR Str.
-	StringIdx msgId =
-	    gctx.ctx.getStringPool().intern("Assertion failed\n");
+	StringIdx msgId = gctx.ctx.getStringPool().intern("Assertion failed\n");
 	TypeIdx sliceTy = gctx.ctx.getTypePool().intern(
 	    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
 	JirInst strInst{};
@@ -3020,18 +2932,18 @@ static JirRef astgenAssertCall(AstGenCtx &gctx, const AstNode &n) {
 	const FunctionAST *exitAST = gctx.ctx.getFunctionAST("exit");
 	if (exitAST == nullptr) {
 		auto fakeExit = std::make_unique<FunctionAST>(
-		    "exit", std::vector<Param>{Param{"code", BuiltinType::I32,
-		                                     ParamMode::Let}},
+		    "exit",
+		    std::vector<Param>{Param{"code", BuiltinType::I32, ParamMode::Let}},
 		    kNoType, std::vector<NodeIdx>{},
 		    /*isExtern=*/true, /*isExport=*/false, /*isPub=*/false,
 		    /*isTest=*/false, /*isVarArgs=*/false);
 		exitAST = fakeExit.get();
 		gctx.ctx.registerFunctionAST("exit", fakeExit.release());
 		JamTypeRef exitParamTypes[1] = {gctx.ctx.getInt32Type()};
-		JamTypeRef et = JamLLVMFunctionType(
-		    gctx.ctx.getVoidType(), exitParamTypes, 1, false);
-		JamFunctionRef ef = JamLLVMAddFunction(
-		    gctx.ctx.getModule(), "exit", et);
+		JamTypeRef et = JamLLVMFunctionType(gctx.ctx.getVoidType(),
+		                                    exitParamTypes, 1, false);
+		JamFunctionRef ef =
+		    JamLLVMAddFunction(gctx.ctx.getModule(), "exit", et);
 		JamLLVMApplyDefaultFnAttrs(ef, /*isExtern=*/true);
 	}
 	JirInst exitCode{};
@@ -3074,7 +2986,7 @@ static JirRef astgenAssertCall(AstGenCtx &gctx, const AstNode &n) {
 // substitution happens. Every call-dispatch path goes through
 // here. Don't add a second one.
 static std::string resolvePrefix(JamCodegenContext &ctx,
-                                  const std::string &prefix) {
+                                 const std::string &prefix) {
 	TypeIdx ty = ctx.lookupCurrentSubst(prefix);
 	if (ty == kNoType) return prefix;
 	if (const auto *sinfo = ctx.lookupStruct(ty)) return sinfo->name;
@@ -3089,8 +3001,7 @@ static std::string resolvePrefix(JamCodegenContext &ctx,
 // param's TypeIdx as the expected hint so literals settle at the
 // right width.
 static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
-	jam::abi::ParamABI pabi =
-	    jam::abi::classifyParam(p.Mode, p.Type, gctx.ctx);
+	jam::abi::ParamABI pabi = jam::abi::classifyParam(p.Mode, p.Type, gctx.ctx);
 	if (pabi.kind != jam::abi::ParamABI::Kind::ByPointer) {
 		return astgenExpr(gctx, argIdx, p.Type);
 	}
@@ -3112,7 +3023,8 @@ static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 			return astgenLvalue(gctx, argIdx, leafTy);
 		case AstTag::AddressOf:
 			return astgenExpr(gctx, argIdx, kNoType);
-		default: break;
+		default:
+			break;
 		}
 	}
 	JirRef val = astgenExpr(gctx, argIdx, p.Type);
@@ -3131,16 +3043,14 @@ static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 
 static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
                        const std::vector<JirRef> &argRefs) {
-	std::string mangled = mangledFunctionName(
-	    *fn, gctx.ctx.getTypePool(), gctx.ctx.getStringPool());
-	StringIdx calleeId =
-	    gctx.ctx.getStringPool().intern(mangled);
+	std::string mangled = mangledFunctionName(*fn, gctx.ctx.getTypePool(),
+	                                          gctx.ctx.getStringPool());
+	StringIdx calleeId = gctx.ctx.getStringPool().intern(mangled);
 	std::vector<uint32_t> packed;
 	packed.reserve(1 + argRefs.size());
 	packed.push_back(static_cast<uint32_t>(argRefs.size()));
 	for (JirRef r : argRefs) packed.push_back(r);
-	JirExtraIdx extra =
-	    gctx.jfn.pushExtra(packed.data(), packed.size());
+	JirExtraIdx extra = gctx.jfn.pushExtra(packed.data(), packed.size());
 	JirInst call{};
 	call.tag = JirTag::Call;
 	call.a = calleeId;
@@ -3174,8 +3084,8 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 		NodeIdx calleeNodeIdx = static_cast<NodeIdx>(n.lhs);
 		const AstNode &cn = ns.get(calleeNodeIdx);
 		if (cn.tag != AstTag::MemberAccess) {
-			failHere(gctx, 
-			    "astgen: indirect call must be on a `.method` callee");
+			failHere(gctx,
+			         "astgen: indirect call must be on a `.method` callee");
 		}
 		NodeIdx recvExprIdx = static_cast<NodeIdx>(cn.lhs);
 		StringIdx methodNameId = static_cast<StringIdx>(cn.rhs);
@@ -3197,17 +3107,17 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 		} else if (const auto *einfo = gctx.ctx.lookupEnum(recvTy)) {
 			recvName = einfo->name;
 		} else {
-			failHere(gctx, 
-			    "astgen: indirect-call receiver is not a struct/enum");
+			failHere(gctx,
+			         "astgen: indirect-call receiver is not a struct/enum");
 		}
 		std::string qualified = recvName + "." + methodName;
 		const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
 		if (method == nullptr) {
 			return recoverHere(gctx, "unknown method `" + qualified + "`",
-			                    kNoType);
+			                   kNoType);
 		}
-		ParamMode mode = method->Args.empty() ? ParamMode::Let
-		                                       : method->Args[0].Mode;
+		ParamMode mode =
+		    method->Args.empty() ? ParamMode::Let : method->Args[0].Mode;
 		JirRef recvArg = recvVal;
 		if (mode == ParamMode::Mut || mode == ParamMode::Move) {
 			// Re-lower the receiver as an lvalue so the method sees
@@ -3245,8 +3155,8 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 			NodeIdx argIdx =
 			    static_cast<NodeIdx>(ns.getExtra(argsExtra + 1 + i));
 			TypeIdx expectArg = (1 + i < method->Args.size())
-			                         ? method->Args[1 + i].Type
-			                         : kNoType;
+			                        ? method->Args[1 + i].Type
+			                        : kNoType;
 			argRefs.push_back(astgenExpr(gctx, argIdx, expectArg));
 		}
 		return emitCall(gctx, method, argRefs);
@@ -3257,9 +3167,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 
 	// Builtin: `assert(actual, expected)` — handled via JIR inline,
 	// not as a regular function call.
-	if (callee == "assert") {
-		return astgenAssertCall(gctx, n);
-	}
+	if (callee == "assert") { return astgenAssertCall(gctx, n); }
 
 	// Single-dot qualified call: try in order
 	//   1. `inst.method(args)` — instance dispatch on a local variable
@@ -3274,8 +3182,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 			// `Self.method(...)` inside an instantiated generic body
 			// resolves through the substitution context set up by
 			// instantiateStructExpr before lowering the body.
-			std::string resolvedPrefix =
-			    resolvePrefix(gctx.ctx, prefix);
+			std::string resolvedPrefix = resolvePrefix(gctx.ctx, prefix);
 
 			// Type-alias / type-name static dispatch: if `prefix` names
 			// a registered struct (or aliases one), rewrite the call to
@@ -3283,11 +3190,9 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 			std::string canonicalType;
 			const auto *enumForVariant =
 			    static_cast<const decltype(gctx.ctx.getEnum(""))>(nullptr);
-			TypeIdx aliasTarget =
-			    gctx.ctx.lookupTypeAlias(resolvedPrefix);
+			TypeIdx aliasTarget = gctx.ctx.lookupTypeAlias(resolvedPrefix);
 			if (aliasTarget != kNoType) {
-				if (const auto *sinfo =
-				        gctx.ctx.lookupStruct(aliasTarget)) {
+				if (const auto *sinfo = gctx.ctx.lookupStruct(aliasTarget)) {
 					canonicalType = sinfo->name;
 				} else if (const auto *einfo =
 				               gctx.ctx.lookupEnum(aliasTarget)) {
@@ -3296,8 +3201,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 				}
 			}
 			if (canonicalType.empty()) {
-				if (const auto *sinfo =
-				        gctx.ctx.getStruct(resolvedPrefix)) {
+				if (const auto *sinfo = gctx.ctx.getStruct(resolvedPrefix)) {
 					canonicalType = sinfo->name;
 				} else if (const auto *einfo =
 				               gctx.ctx.getEnum(resolvedPrefix)) {
@@ -3308,25 +3212,21 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 			// Enum-variant constructor (`Result.Ok(x)`-style Call):
 			// the suffix is a variant name on the resolved enum.
 			if (enumForVariant != nullptr) {
-				int vidx = gctx.ctx.getEnumVariantIndex(canonicalType,
-				                                       methodName);
+				int vidx =
+				    gctx.ctx.getEnumVariantIndex(canonicalType, methodName);
 				if (vidx >= 0) {
-					const auto &variant =
-					    enumForVariant->variants[vidx];
-					TypeIdx enumTy = gctx.ctx.getTypePool().intern(
-					    TypeKey{TypeKind::Named, 0, 0,
-					            static_cast<uint32_t>(
-					                gctx.ctx.getStringPool().intern(
-					                    canonicalType)),
-					            0});
+					const auto &variant = enumForVariant->variants[vidx];
+					TypeIdx enumTy = gctx.ctx.getTypePool().intern(TypeKey{
+					    TypeKind::Named, 0, 0,
+					    static_cast<uint32_t>(
+					        gctx.ctx.getStringPool().intern(canonicalType)),
+					    0});
 					JirInst tag{};
 					tag.tag = JirTag::Int;
 					tag.a = static_cast<uint32_t>(variant.discriminant);
 					tag.ty = BuiltinType::U8;
 					JirRef tagRef = emit(gctx, tag);
-					if (!enumForVariant->hasPayloadVariant) {
-						return tagRef;
-					}
+					if (!enumForVariant->hasPayloadVariant) { return tagRef; }
 					// Build {tag, payload-undef|val} via alloca + FieldAddr
 					// stores, then load. Mirrors the TypeMethodCall path.
 					JirInst alloca{};
@@ -3334,8 +3234,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 					alloca.ty = enumTy;
 					JirRef slot = emitAllocaHoisted(gctx, alloca);
 					TypeIdx u8PtrTy = gctx.ctx.getTypePool().intern(
-					    TypeKey{TypeKind::PtrSingle, 0, 0,
-					            BuiltinType::U8, 0});
+					    TypeKey{TypeKind::PtrSingle, 0, 0, BuiltinType::U8, 0});
 					JirInst tagFA{};
 					tagFA.tag = JirTag::FieldAddr;
 					tagFA.a = slot;
@@ -3355,15 +3254,14 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 					// We address them all uniformly via a payload-area
 					// pointer + byte offset GEP through i8.
 					if (argCount > variant.payloadTypes.size()) {
-						failHere(gctx, 
-						    "astgen: too many args for variant `" +
-						    canonicalType + "." + methodName + "`");
+						failHere(gctx, "astgen: too many args for variant `" +
+						                   canonicalType + "." + methodName +
+						                   "`");
 					}
 					if (!variant.payloadTypes.empty() && argCount >= 1) {
 						TypeIdx payAreaPtrTy =
 						    gctx.ctx.getTypePool().intern(TypeKey{
-						        TypeKind::PtrSingle, 0, 0,
-						        BuiltinType::U8, 0});
+						        TypeKind::PtrSingle, 0, 0, BuiltinType::U8, 0});
 						JirInst payAreaFA{};
 						payAreaFA.tag = JirTag::FieldAddr;
 						payAreaFA.a = slot;
@@ -3387,8 +3285,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 							off = (off + a - 1) / a * a;
 							NodeIdx argIdxN = static_cast<NodeIdx>(
 							    ns.getExtra(argsExtra + 1 + i));
-							JirRef payVal =
-							    astgenExpr(gctx, argIdxN, fieldTy);
+							JirRef payVal = astgenExpr(gctx, argIdxN, fieldTy);
 							JirInst gepInst{};
 							gepInst.tag = JirTag::IndexAddr;
 							gepInst.a = payAreaPtr;
@@ -3416,10 +3313,8 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 				}
 			}
 			if (!canonicalType.empty()) {
-				std::string qualified =
-				    canonicalType + "." + methodName;
-				const FunctionAST *method =
-				    gctx.ctx.getFunctionAST(qualified);
+				std::string qualified = canonicalType + "." + methodName;
+				const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
 				if (method != nullptr) {
 					std::vector<JirRef> argRefs;
 					argRefs.reserve(argCount);
@@ -3445,9 +3340,8 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 				// instantiation's T (e.g. NoDefault) doesn't define
 				// `default`. Naming both type and method gives the
 				// user a precise pointer to the missing piece.
-				failHere(gctx, "type `" + canonicalType +
-				                         "` has no method `" + methodName +
-				                         "`");
+				failHere(gctx, "type `" + canonicalType + "` has no method `" +
+				                   methodName + "`");
 			}
 
 			auto it = gctx.locals.find(prefix);
@@ -3466,8 +3360,8 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 						JirRef recvRef;
 						if (mode == ParamMode::Mut || mode == ParamMode::Move) {
 							TypeIdx pointee = instTy;
-							TypeIdx ptrTy = gctx.ctx.getTypePool().intern(TypeKey{
-							    TypeKind::PtrSingle, 0, 0, pointee, 0});
+							TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
+							    TypeKey{TypeKind::PtrSingle, 0, 0, pointee, 0});
 							JirInst ao{};
 							ao.tag = JirTag::AddrOf;
 							ao.a = it->second;
@@ -3486,10 +3380,9 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 						for (uint32_t i = 0; i < argCount; i++) {
 							NodeIdx argIdx = static_cast<NodeIdx>(
 							    ns.getExtra(argsExtra + 1 + i));
-							TypeIdx expectArg =
-							    (1 + i < method->Args.size())
-							        ? method->Args[1 + i].Type
-							        : kNoType;
+							TypeIdx expectArg = (1 + i < method->Args.size())
+							                        ? method->Args[1 + i].Type
+							                        : kNoType;
 							argRefs.push_back(
 							    astgenExpr(gctx, argIdx, expectArg));
 						}
@@ -3504,10 +3397,10 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 	if (fn == nullptr) {
 		// Qualified callees (`lib.priv`) get the precise pub-access
 		// diagnostic via formatNamespaceLookupError.
-		std::string msg = (callee.find('.') != std::string::npos)
-		                      ? gctx.ctx.formatNamespaceLookupError(
-		                            "function", callee)
-		                      : "unknown function `" + callee + "`";
+		std::string msg =
+		    (callee.find('.') != std::string::npos)
+		        ? gctx.ctx.formatNamespaceLookupError("function", callee)
+		        : "unknown function `" + callee + "`";
 		return recoverHere(gctx, std::move(msg), kNoType);
 	}
 
@@ -3626,9 +3519,8 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected) {
 		astgenContinue(gctx);
 		return kNoJirRef;
 	default:
-		failHere(gctx, 
-		    "astgen: unsupported AST node (tag = " +
-		    std::to_string(static_cast<int>(n.tag)) + ")");
+		failHere(gctx, "astgen: unsupported AST node (tag = " +
+		                   std::to_string(static_cast<int>(n.tag)) + ")");
 	}
 	if (result != kNoJirRef && line > 0) {
 		gctx.jfn.getInstMut(result).srcLine = static_cast<uint32_t>(line);
@@ -3695,8 +3587,7 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 	//     pointer-to-pointee rather than a by-value Param.
 	for (size_t i = 0; i < fn.Args.size(); i++) {
 		const Param &p = fn.Args[i];
-		jam::abi::ParamABI pabi =
-		    jam::abi::classifyParam(p.Mode, p.Type, ctx);
+		jam::abi::ParamABI pabi = jam::abi::classifyParam(p.Mode, p.Type, ctx);
 		bool byPtr = pabi.kind == jam::abi::ParamABI::Kind::ByPointer;
 		JirInst paramInst{};
 		paramInst.tag = JirTag::Param;
@@ -3723,9 +3614,7 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 		}
 	}
 
-	for (NodeIdx stmt : fn.Body) {
-		astgenExpr(gctx, stmt, kNoType);
-	}
+	for (NodeIdx stmt : fn.Body) { astgenExpr(gctx, stmt, kNoType); }
 
 	// Implicit fall-through terminator. Three cases for a tail block
 	// without an explicit terminator:
@@ -3748,13 +3637,15 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 			u.tag = JirTag::Unreachable;
 			emit(gctx, u);
 		} else if (fn.ReturnType == BuiltinType::NoReturn) {
-			failHere(gctx, 
-			    "fn `" + fn.Name + "` is declared `noreturn` but its "
-			    "body falls through without diverging");
+			failHere(gctx, "fn `" + fn.Name +
+			                   "` is declared `noreturn` but its "
+			                   "body falls through without diverging");
 		} else if (fn.ReturnType != kNoType) {
-			failHere(gctx, 
-			    "fn `" + fn.Name + "` has non-void return type but a "
-			    "path reaches the function end without returning a value");
+			failHere(
+			    gctx,
+			    "fn `" + fn.Name +
+			        "` has non-void return type but a "
+			        "path reaches the function end without returning a value");
 		} else {
 			emitDropsThroughScope(gctx, 0);
 			JirInst ret{};

@@ -17,14 +17,13 @@ class JamCodegenContext;
 // diagnostic was already pushed onto `JamCodegenContext::diagnostics()`
 // before the throw; catch sites (per-decl in main.cpp / generic
 // instantiation in codegen.cpp) recover by abandoning the current
-// decl so siblings still produce diagnostics. Mirrors Zig's
-// `error.AnalysisFail` (`src/AstGen.zig:60`).
+// decl so siblings still produce diagnostics.
 class AstGenAnalysisFail {};
 
 // AstGen — recursive, eager lowering of a FunctionAST into a typed
-// JirFunction. Mirrors Zig's `AstGen` (lib/std/zig/AstGen.zig) except
-// the output is typed from the start (Jam doesn't have comptime-as-
-// runtime-values, so the ZIR/AIR split isn't needed).
+// JirFunction. The output is typed from the start (Jam has no
+// comptime-as-runtime-values, so a separate untyped-then-typed IR
+// split isn't needed).
 //
 // Each AST node visited:
 //   * pushes zero or more `JirInst`s into the function's instruction
@@ -36,7 +35,7 @@ class AstGenAnalysisFail {};
 //
 // Generic instantiation, peer-type resolution, divergence analysis,
 // and constant folding all happen here. The downstream `jirCodegen`
-// is a mechanical AIR-to-LLVM walk.
+// is a mechanical JIR-to-LLVM walk.
 JirFunction astgenFunction(const FunctionAST &fn, JamCodegenContext &ctx);
 
 // Populate only a JirFunction's *signature* — name, return type,

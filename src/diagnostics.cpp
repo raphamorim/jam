@@ -28,7 +28,7 @@ void Diagnostics::warning(SrcLoc loc, std::string message) {
 }
 
 void Diagnostics::errorWithNotes(SrcLoc loc, std::string message,
-                                  std::vector<Diagnostic> notes) {
+                                 std::vector<Diagnostic> notes) {
 	Diagnostic d;
 	d.loc = std::move(loc);
 	d.severity = Diagnostic::Severity::Error;
@@ -38,7 +38,7 @@ void Diagnostics::errorWithNotes(SrcLoc loc, std::string message,
 }
 
 void Diagnostics::errorWithTrace(SrcLoc loc, std::string message,
-                                  std::vector<Diagnostic::Trace> trace) {
+                                 std::vector<Diagnostic::Trace> trace) {
 	Diagnostic d;
 	d.loc = std::move(loc);
 	d.severity = Diagnostic::Severity::Error;
@@ -68,21 +68,22 @@ namespace {
 
 const char *severityLabel(Diagnostic::Severity s) {
 	switch (s) {
-	case Diagnostic::Severity::Error: return "error";
-	case Diagnostic::Severity::Warning: return "warning";
-	case Diagnostic::Severity::Note: return "note";
+	case Diagnostic::Severity::Error:
+		return "error";
+	case Diagnostic::Severity::Warning:
+		return "warning";
+	case Diagnostic::Severity::Note:
+		return "note";
 	}
 	return "error";
 }
 
 // Order diagnostics by source position so the report is stable
-// regardless of which pass produced them in which order. Zig itself
-// does *not* sort — `Compilation.printAllErrorsToStderr` walks the
-// failed_* hashmaps in insertion / hash order — but Jam's tests
-// assert on stderr substrings and need a deterministic line ordering
-// to stay green, and a user reading multi-error output benefits from
-// reading them top-down. Errors come before warnings at the same
-// location, both before notes.
+// regardless of which pass produced them in which order. The test
+// suite asserts on stderr substrings and needs a deterministic line
+// ordering to stay green, and a user reading multi-error output
+// benefits from top-down reads. Errors come before warnings at the
+// same location, both before notes.
 bool less(const Diagnostic &a, const Diagnostic &b) {
 	if (a.loc.file != b.loc.file) return a.loc.file < b.loc.file;
 	if (a.loc.line != b.loc.line) return a.loc.line < b.loc.line;
@@ -109,14 +110,12 @@ void emitOne(std::ostream &out, const Diagnostic &d, int indent = 0) {
 		emitOne(out, nd, indent + 4);
 	}
 	for (const auto &frame : d.referenceTrace) {
-		out << pad << "    note: in instantiation of `" << frame.decl
-		    << "`";
+		out << pad << "    note: in instantiation of `" << frame.decl << "`";
 		if (!frame.loc.file.empty() && frame.loc.line > 0) {
 			out << " at " << frame.loc.file << ":" << frame.loc.line;
 		}
 		if (frame.hidden > 0) {
-			out << " (" << frame.hidden
-			    << " more references hidden)";
+			out << " (" << frame.hidden << " more references hidden)";
 		}
 		out << "\n";
 	}

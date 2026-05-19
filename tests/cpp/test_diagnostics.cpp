@@ -49,11 +49,10 @@ bool stderrContains(const CompileResult &r, const std::string &substr) {
 // to assert that EVERY error in a batch is reported (not just the
 // first one).
 std::size_t countOccurrences(const std::string &hay,
-                              const std::string &needle) {
+                             const std::string &needle) {
 	std::size_t n = 0;
 	for (std::size_t pos = 0;
-	     (pos = hay.find(needle, pos)) != std::string::npos;
-	     ++pos) {
+	     (pos = hay.find(needle, pos)) != std::string::npos; ++pos) {
 		++n;
 	}
 	return n;
@@ -62,43 +61,39 @@ std::size_t countOccurrences(const std::string &hay,
 // ── Line-number tests ──────────────────────────────────────────
 
 void testUnknownFunctionHasLine() {
-	auto r = compileSource("diag_unknown_fn",
-	                       "fn main() i32 {\n"
-	                       "    foobar();\n"
-	                       "    return 0;\n"
-	                       "}\n");
+	auto r = compileSource("diag_unknown_fn", "fn main() i32 {\n"
+	                                          "    foobar();\n"
+	                                          "    return 0;\n"
+	                                          "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":2: error:"));
 	ASSERT_TRUE(stderrContains(r, "unknown function `foobar`"));
 }
 
 void testUnknownVariableHasLine() {
-	auto r = compileSource("diag_unknown_var",
-	                       "fn main() i32 {\n"
-	                       "    return badName;\n"
-	                       "}\n");
+	auto r = compileSource("diag_unknown_var", "fn main() i32 {\n"
+	                                           "    return badName;\n"
+	                                           "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":2: error:"));
 	ASSERT_TRUE(stderrContains(r, "unknown variable `badName`"));
 }
 
 void testBreakOutsideLoopHasLine() {
-	auto r = compileSource("diag_break_loop",
-	                       "fn main() i32 {\n"
-	                       "    break;\n"
-	                       "    return 0;\n"
-	                       "}\n");
+	auto r = compileSource("diag_break_loop", "fn main() i32 {\n"
+	                                          "    break;\n"
+	                                          "    return 0;\n"
+	                                          "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":2: error:"));
 	ASSERT_TRUE(stderrContains(r, "`break` outside of loop"));
 }
 
 void testContinueOutsideLoopHasLine() {
-	auto r = compileSource("diag_continue_loop",
-	                       "fn main() i32 {\n"
-	                       "    continue;\n"
-	                       "    return 0;\n"
-	                       "}\n");
+	auto r = compileSource("diag_continue_loop", "fn main() i32 {\n"
+	                                             "    continue;\n"
+	                                             "    return 0;\n"
+	                                             "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":2: error:"));
 	ASSERT_TRUE(stderrContains(r, "`continue` outside of loop"));
@@ -134,11 +129,10 @@ void testUseAfterMoveHasLine() {
 // ── Multi-error reporting ───────────────────────────────────────
 
 void testMultipleErrorsAllReported() {
-	auto r = compileSource("diag_multi",
-	                       "fn first() i32 { return foo(); }\n"
-	                       "fn second() i32 { return bar(); }\n"
-	                       "fn third() i32 { break; return 0; }\n"
-	                       "fn main() i32 { return 0; }\n");
+	auto r = compileSource("diag_multi", "fn first() i32 { return foo(); }\n"
+	                                     "fn second() i32 { return bar(); }\n"
+	                                     "fn third() i32 { break; return 0; }\n"
+	                                     "fn main() i32 { return 0; }\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	// Each of the three error lines should appear once.
 	ASSERT_TRUE(stderrContains(r, ":1: error:"));
@@ -150,10 +144,10 @@ void testMultipleErrorsAllReported() {
 }
 
 void testMultiErrorsSortedByLine() {
-	auto r = compileSource("diag_multi_sorted",
-	                       "fn a() i32 { return zzz(); }\n"
-	                       "fn b() i32 { return aaa(); }\n"
-	                       "fn main() i32 { return 0; }\n");
+	auto r =
+	    compileSource("diag_multi_sorted", "fn a() i32 { return zzz(); }\n"
+	                                       "fn b() i32 { return aaa(); }\n"
+	                                       "fn main() i32 { return 0; }\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	// Line 1's error must appear before line 2's, regardless of
 	// function name alphabet — Diagnostics::emit sorts by location.
@@ -166,20 +160,19 @@ void testMultiErrorsSortedByLine() {
 // ── Reference trace for generic instantiation ──────────────────
 
 void testGenericInstantiationCarriesRefTrace() {
-	auto r = compileSource(
-	    "diag_ref_trace",
-	    "fn Box(T: type) type {\n"
-	    "    return struct {\n"
-	    "        val: T,\n"
-	    "        fn pickBad(self: Self) i32 {\n"
-	    "            return self.notAField;\n"
-	    "        }\n"
-	    "    };\n"
-	    "}\n"
-	    "fn main() i32 {\n"
-	    "    var b: Box(i32) = { val: 7 };\n"
-	    "    return b.pickBad();\n"
-	    "}\n");
+	auto r =
+	    compileSource("diag_ref_trace", "fn Box(T: type) type {\n"
+	                                    "    return struct {\n"
+	                                    "        val: T,\n"
+	                                    "        fn pickBad(self: Self) i32 {\n"
+	                                    "            return self.notAField;\n"
+	                                    "        }\n"
+	                                    "    };\n"
+	                                    "}\n"
+	                                    "fn main() i32 {\n"
+	                                    "    var b: Box(i32) = { val: 7 };\n"
+	                                    "    return b.pickBad();\n"
+	                                    "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	// Underlying error inside the instantiated body — line 5 in
 	// source. Reference trace adds "in instantiation of
@@ -192,10 +185,9 @@ void testGenericInstantiationCarriesRefTrace() {
 
 void testBrokenDeclDoesNotMaskNextDecl() {
 	auto r = compileSource(
-	    "diag_recovery",
-	    "fn broken() i32 { return missingFn(); }\n"
-	    "fn alsoBroken() i32 { return anotherMissingFn(); }\n"
-	    "fn main() i32 { return 0; }\n");
+	    "diag_recovery", "fn broken() i32 { return missingFn(); }\n"
+	                     "fn alsoBroken() i32 { return anotherMissingFn(); }\n"
+	                     "fn main() i32 { return 0; }\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	// Both decls must produce an error (a single throw would have
 	// reported only the first).
@@ -210,13 +202,12 @@ void testBrokenDeclDoesNotMaskNextDecl() {
 // first failNode would bail the whole decl and we'd see only one
 // error — Zig's recoverable-error model lets us report them all.
 void testRecoveryWithinSingleDecl() {
-	auto r = compileSource("diag_recover_within",
-	                       "fn main() i32 {\n"
-	                       "    var a: i32 = foo();\n"
-	                       "    var b: i32 = bar();\n"
-	                       "    var c: i32 = baz();\n"
-	                       "    return a + b + c;\n"
-	                       "}\n");
+	auto r = compileSource("diag_recover_within", "fn main() i32 {\n"
+	                                              "    var a: i32 = foo();\n"
+	                                              "    var b: i32 = bar();\n"
+	                                              "    var c: i32 = baz();\n"
+	                                              "    return a + b + c;\n"
+	                                              "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":2: error:"));
 	ASSERT_TRUE(stderrContains(r, ":3: error:"));
@@ -227,12 +218,12 @@ void testRecoveryWithinSingleDecl() {
 }
 
 void testRecoveryAcrossDifferentErrorClasses() {
-	auto r = compileSource("diag_recover_mixed",
-	                       "fn main() i32 {\n"
-	                       "    var p: i32 = unknownThing;\n"
-	                       "    var q: i32 = alsoMissing();\n"
-	                       "    return p + q;\n"
-	                       "}\n");
+	auto r =
+	    compileSource("diag_recover_mixed", "fn main() i32 {\n"
+	                                        "    var p: i32 = unknownThing;\n"
+	                                        "    var q: i32 = alsoMissing();\n"
+	                                        "    return p + q;\n"
+	                                        "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":2: error:"));
 	ASSERT_TRUE(stderrContains(r, ":3: error:"));
@@ -241,16 +232,15 @@ void testRecoveryAcrossDifferentErrorClasses() {
 }
 
 void testUnknownMethodIsRecoverable() {
-	auto r = compileSource(
-	    "diag_recover_method",
-	    "const Point = struct { x: i32 };\n"
-	    "fn other() i32 { return 99; }\n"
-	    "fn main() i32 {\n"
-	    "    var p: Point = { x: 1 };\n"
-	    "    var a: i32 = p.bogusMethod();\n"
-	    "    var b: i32 = p.alsoBogus();\n"
-	    "    return a + b;\n"
-	    "}\n");
+	auto r = compileSource("diag_recover_method",
+	                       "const Point = struct { x: i32 };\n"
+	                       "fn other() i32 { return 99; }\n"
+	                       "fn main() i32 {\n"
+	                       "    var p: Point = { x: 1 };\n"
+	                       "    var a: i32 = p.bogusMethod();\n"
+	                       "    var b: i32 = p.alsoBogus();\n"
+	                       "    return a + b;\n"
+	                       "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	// Both unknown-method calls in the same function should report.
 	ASSERT_TRUE(stderrContains(r, "bogusMethod"));
@@ -260,59 +250,54 @@ void testUnknownMethodIsRecoverable() {
 // ── Parser errors now carry :line: too ─────────────────────────
 
 void testParserErrorHasLine() {
-	auto r = compileSource("diag_parser_line",
-	                       "fn main() i32 {\n"
-	                       "    return *;\n"
-	                       "}\n");
+	auto r = compileSource("diag_parser_line", "fn main() i32 {\n"
+	                                           "    return *;\n"
+	                                           "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":2:"));
 }
 
 void testRedeclarationInSameScopeRejected() {
-	auto r = compileSource("diag_redecl_same_scope",
-	                       "fn main() {\n"
-	                       "    const a = true;\n"
-	                       "    var a = true;\n"
-	                       "}\n");
+	auto r = compileSource("diag_redecl_same_scope", "fn main() {\n"
+	                                                 "    const a = true;\n"
+	                                                 "    var a = true;\n"
+	                                                 "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":3:"));
 	ASSERT_TRUE(stderrContains(r, "redeclaration of `a`"));
 }
 
 void testRedeclarationAcrossSiblingScopesAllowed() {
-	auto r = compileSource(
-	    "diag_redecl_siblings",
-	    "fn main(x: i32) i32 {\n"
-	    "    if (x == 0) {\n"
-	    "        const op: u32 = 1;\n"
-	    "        return op as i32;\n"
-	    "    }\n"
-	    "    if (x == 1) {\n"
-	    "        const op: u32 = 2;\n"
-	    "        return op as i32;\n"
-	    "    }\n"
-	    "    return 99;\n"
-	    "}\n");
+	auto r =
+	    compileSource("diag_redecl_siblings", "fn main(x: i32) i32 {\n"
+	                                          "    if (x == 0) {\n"
+	                                          "        const op: u32 = 1;\n"
+	                                          "        return op as i32;\n"
+	                                          "    }\n"
+	                                          "    if (x == 1) {\n"
+	                                          "        const op: u32 = 2;\n"
+	                                          "        return op as i32;\n"
+	                                          "    }\n"
+	                                          "    return 99;\n"
+	                                          "}\n");
 	ASSERT_TRUE(r.exitCode == 0);
 }
 
 void testTypeMismatchBoolEqualsFloatRejected() {
-	auto r = compileSource("diag_bool_eq_float",
-	                       "fn main() {\n"
-	                       "    const a: bool = 1.0;\n"
-	                       "}\n");
+	auto r = compileSource("diag_bool_eq_float", "fn main() {\n"
+	                                             "    const a: bool = 1.0;\n"
+	                                             "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":2:"));
 	ASSERT_TRUE(stderrContains(r, "type mismatch in `a`"));
 }
 
 void testTypeInferenceAllocatesCorrectWidth() {
-	auto r = compileSource("diag_var_infer",
-	                       "fn main() i32 {\n"
-	                       "    var b = true;\n"
-	                       "    var f = 3.14;\n"
-	                       "    return 0;\n"
-	                       "}\n");
+	auto r = compileSource("diag_var_infer", "fn main() i32 {\n"
+	                                         "    var b = true;\n"
+	                                         "    var f = 3.14;\n"
+	                                         "    return 0;\n"
+	                                         "}\n");
 	// Both inferred-type bindings should compile cleanly; before
 	// the fix they silently allocated a 1-byte slot regardless of
 	// init type. We can't introspect alloca widths from stderr, so
@@ -322,11 +307,11 @@ void testTypeInferenceAllocatesCorrectWidth() {
 }
 
 void testIntegerOverflowLiteralHasLine() {
-	auto r = compileSource("diag_intover",
-	                       "fn main() i32 {\n"
-	                       "    var v: u32 = 99999999999999999999;\n"
-	                       "    return 0;\n"
-	                       "}\n");
+	auto r =
+	    compileSource("diag_intover", "fn main() i32 {\n"
+	                                  "    var v: u32 = 99999999999999999999;\n"
+	                                  "    return 0;\n"
+	                                  "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":2:"));
 	ASSERT_TRUE(stderrContains(r, "exceeds u64 range"));
@@ -335,10 +320,9 @@ void testIntegerOverflowLiteralHasLine() {
 // ── Output format is stable ────────────────────────────────────
 
 void testDiagnosticFormatIsFileLineError() {
-	auto r = compileSource("diag_format",
-	                       "fn main() i32 {\n"
-	                       "    return undefined_thing;\n"
-	                       "}\n");
+	auto r = compileSource("diag_format", "fn main() i32 {\n"
+	                                      "    return undefined_thing;\n"
+	                                      "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	// Format: "<path>:<line>: error: <message>"
 	// — file colon line colon error colon message.
@@ -350,8 +334,7 @@ void testDiagnosticFormatIsFileLineError() {
 		// ":<digits>: error:" somewhere after it.
 		auto tmp = line.find("/tmp/");
 		auto err = line.find(": error:");
-		if (tmp != std::string::npos && err != std::string::npos &&
-		    err > tmp) {
+		if (tmp != std::string::npos && err != std::string::npos && err > tmp) {
 			foundShape = true;
 			break;
 		}
@@ -384,31 +367,26 @@ class DiagnosticTests {
 		framework.addTest(
 		    "Diagnostics - generic instantiation carries ref trace",
 		    testGenericInstantiationCarriesRefTrace);
-		framework.addTest(
-		    "Diagnostics - broken decl does not mask next decl",
-		    testBrokenDeclDoesNotMaskNextDecl);
-		framework.addTest(
-		    "Diagnostics - within-decl multi-error (Poison)",
-		    testRecoveryWithinSingleDecl);
-		framework.addTest(
-		    "Diagnostics - recovery across error classes",
-		    testRecoveryAcrossDifferentErrorClasses);
-		framework.addTest(
-		    "Diagnostics - unknown method is recoverable",
-		    testUnknownMethodIsRecoverable);
+		framework.addTest("Diagnostics - broken decl does not mask next decl",
+		                  testBrokenDeclDoesNotMaskNextDecl);
+		framework.addTest("Diagnostics - within-decl multi-error (Poison)",
+		                  testRecoveryWithinSingleDecl);
+		framework.addTest("Diagnostics - recovery across error classes",
+		                  testRecoveryAcrossDifferentErrorClasses);
+		framework.addTest("Diagnostics - unknown method is recoverable",
+		                  testUnknownMethodIsRecoverable);
 		framework.addTest("Diagnostics - parser error carries :line:",
 		                  testParserErrorHasLine);
-		framework.addTest("Diagnostics - integer-overflow literal carries :line:",
-		                  testIntegerOverflowLiteralHasLine);
 		framework.addTest(
-		    "Diagnostics - redeclaration in same scope rejected",
-		    testRedeclarationInSameScopeRejected);
+		    "Diagnostics - integer-overflow literal carries :line:",
+		    testIntegerOverflowLiteralHasLine);
+		framework.addTest("Diagnostics - redeclaration in same scope rejected",
+		                  testRedeclarationInSameScopeRejected);
 		framework.addTest(
 		    "Diagnostics - redeclaration across sibling scopes OK",
 		    testRedeclarationAcrossSiblingScopesAllowed);
-		framework.addTest(
-		    "Diagnostics - bool var = float literal rejected",
-		    testTypeMismatchBoolEqualsFloatRejected);
+		framework.addTest("Diagnostics - bool var = float literal rejected",
+		                  testTypeMismatchBoolEqualsFloatRejected);
 		framework.addTest(
 		    "Diagnostics - inferred var width correct for bool / float",
 		    testTypeInferenceAllocatesCorrectWidth);

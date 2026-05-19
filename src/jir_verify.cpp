@@ -15,87 +15,160 @@
 namespace {
 
 bool isTerminator(JirTag t) {
-	return t == JirTag::Br || t == JirTag::CondBr ||
-	       t == JirTag::Switch || t == JirTag::Ret ||
-	       t == JirTag::Unreachable;
+	return t == JirTag::Br || t == JirTag::CondBr || t == JirTag::Switch ||
+	       t == JirTag::Ret || t == JirTag::Unreachable;
 }
 
 const char *tagName(JirTag t) {
 	switch (t) {
-	case JirTag::Invalid: return "Invalid";
-	case JirTag::Int: return "Int";
-	case JirTag::Float: return "Float";
-	case JirTag::Bool: return "Bool";
-	case JirTag::Str: return "Str";
-	case JirTag::Poison: return "Poison";
-	case JirTag::Alloca: return "Alloca";
-	case JirTag::Load: return "Load";
-	case JirTag::Store: return "Store";
-	case JirTag::Add: return "Add";
-	case JirTag::Sub: return "Sub";
-	case JirTag::Mul: return "Mul";
-	case JirTag::SDiv: return "SDiv";
-	case JirTag::UDiv: return "UDiv";
-	case JirTag::SRem: return "SRem";
-	case JirTag::URem: return "URem";
-	case JirTag::FAdd: return "FAdd";
-	case JirTag::FSub: return "FSub";
-	case JirTag::FMul: return "FMul";
-	case JirTag::FDiv: return "FDiv";
-	case JirTag::FRem: return "FRem";
-	case JirTag::FNeg: return "FNeg";
-	case JirTag::ICmpEq: return "ICmpEq";
-	case JirTag::ICmpNe: return "ICmpNe";
-	case JirTag::ICmpSlt: return "ICmpSlt";
-	case JirTag::ICmpSle: return "ICmpSle";
-	case JirTag::ICmpSgt: return "ICmpSgt";
-	case JirTag::ICmpSge: return "ICmpSge";
-	case JirTag::ICmpUlt: return "ICmpUlt";
-	case JirTag::ICmpUle: return "ICmpUle";
-	case JirTag::ICmpUgt: return "ICmpUgt";
-	case JirTag::ICmpUge: return "ICmpUge";
-	case JirTag::FCmpOeq: return "FCmpOeq";
-	case JirTag::FCmpOne: return "FCmpOne";
-	case JirTag::FCmpOlt: return "FCmpOlt";
-	case JirTag::FCmpOle: return "FCmpOle";
-	case JirTag::FCmpOgt: return "FCmpOgt";
-	case JirTag::FCmpOge: return "FCmpOge";
-	case JirTag::BitAnd: return "BitAnd";
-	case JirTag::BitOr: return "BitOr";
-	case JirTag::BitXor: return "BitXor";
-	case JirTag::BitNot: return "BitNot";
-	case JirTag::Shl: return "Shl";
-	case JirTag::AShr: return "AShr";
-	case JirTag::LShr: return "LShr";
-	case JirTag::LogNot: return "LogNot";
-	case JirTag::ZExt: return "ZExt";
-	case JirTag::SExt: return "SExt";
-	case JirTag::Trunc: return "Trunc";
-	case JirTag::SIToFP: return "SIToFP";
-	case JirTag::UIToFP: return "UIToFP";
-	case JirTag::FPToSI: return "FPToSI";
-	case JirTag::FPToUI: return "FPToUI";
-	case JirTag::FPExt: return "FPExt";
-	case JirTag::FPTrunc: return "FPTrunc";
-	case JirTag::BitCast: return "BitCast";
-	case JirTag::Br: return "Br";
-	case JirTag::CondBr: return "CondBr";
-	case JirTag::Switch: return "Switch";
-	case JirTag::Ret: return "Ret";
-	case JirTag::Unreachable: return "Unreachable";
-	case JirTag::Call: return "Call";
-	case JirTag::Param: return "Param";
-	case JirTag::StructLit: return "StructLit";
-	case JirTag::FieldAccess: return "FieldAccess";
-	case JirTag::ExtractValue: return "ExtractValue";
-	case JirTag::ArrayLit: return "ArrayLit";
-	case JirTag::Index: return "Index";
-	case JirTag::FieldAddr: return "FieldAddr";
-	case JirTag::IndexAddr: return "IndexAddr";
-	case JirTag::AddrOf: return "AddrOf";
-	case JirTag::Deref: return "Deref";
-	case JirTag::EnumPayload: return "EnumPayload";
-	case JirTag::DropBinding: return "DropBinding";
+	case JirTag::Invalid:
+		return "Invalid";
+	case JirTag::Int:
+		return "Int";
+	case JirTag::Float:
+		return "Float";
+	case JirTag::Bool:
+		return "Bool";
+	case JirTag::Str:
+		return "Str";
+	case JirTag::Poison:
+		return "Poison";
+	case JirTag::Alloca:
+		return "Alloca";
+	case JirTag::Load:
+		return "Load";
+	case JirTag::Store:
+		return "Store";
+	case JirTag::Add:
+		return "Add";
+	case JirTag::Sub:
+		return "Sub";
+	case JirTag::Mul:
+		return "Mul";
+	case JirTag::SDiv:
+		return "SDiv";
+	case JirTag::UDiv:
+		return "UDiv";
+	case JirTag::SRem:
+		return "SRem";
+	case JirTag::URem:
+		return "URem";
+	case JirTag::FAdd:
+		return "FAdd";
+	case JirTag::FSub:
+		return "FSub";
+	case JirTag::FMul:
+		return "FMul";
+	case JirTag::FDiv:
+		return "FDiv";
+	case JirTag::FRem:
+		return "FRem";
+	case JirTag::FNeg:
+		return "FNeg";
+	case JirTag::ICmpEq:
+		return "ICmpEq";
+	case JirTag::ICmpNe:
+		return "ICmpNe";
+	case JirTag::ICmpSlt:
+		return "ICmpSlt";
+	case JirTag::ICmpSle:
+		return "ICmpSle";
+	case JirTag::ICmpSgt:
+		return "ICmpSgt";
+	case JirTag::ICmpSge:
+		return "ICmpSge";
+	case JirTag::ICmpUlt:
+		return "ICmpUlt";
+	case JirTag::ICmpUle:
+		return "ICmpUle";
+	case JirTag::ICmpUgt:
+		return "ICmpUgt";
+	case JirTag::ICmpUge:
+		return "ICmpUge";
+	case JirTag::FCmpOeq:
+		return "FCmpOeq";
+	case JirTag::FCmpOne:
+		return "FCmpOne";
+	case JirTag::FCmpOlt:
+		return "FCmpOlt";
+	case JirTag::FCmpOle:
+		return "FCmpOle";
+	case JirTag::FCmpOgt:
+		return "FCmpOgt";
+	case JirTag::FCmpOge:
+		return "FCmpOge";
+	case JirTag::BitAnd:
+		return "BitAnd";
+	case JirTag::BitOr:
+		return "BitOr";
+	case JirTag::BitXor:
+		return "BitXor";
+	case JirTag::BitNot:
+		return "BitNot";
+	case JirTag::Shl:
+		return "Shl";
+	case JirTag::AShr:
+		return "AShr";
+	case JirTag::LShr:
+		return "LShr";
+	case JirTag::LogNot:
+		return "LogNot";
+	case JirTag::ZExt:
+		return "ZExt";
+	case JirTag::SExt:
+		return "SExt";
+	case JirTag::Trunc:
+		return "Trunc";
+	case JirTag::SIToFP:
+		return "SIToFP";
+	case JirTag::UIToFP:
+		return "UIToFP";
+	case JirTag::FPToSI:
+		return "FPToSI";
+	case JirTag::FPToUI:
+		return "FPToUI";
+	case JirTag::FPExt:
+		return "FPExt";
+	case JirTag::FPTrunc:
+		return "FPTrunc";
+	case JirTag::BitCast:
+		return "BitCast";
+	case JirTag::Br:
+		return "Br";
+	case JirTag::CondBr:
+		return "CondBr";
+	case JirTag::Switch:
+		return "Switch";
+	case JirTag::Ret:
+		return "Ret";
+	case JirTag::Unreachable:
+		return "Unreachable";
+	case JirTag::Call:
+		return "Call";
+	case JirTag::Param:
+		return "Param";
+	case JirTag::StructLit:
+		return "StructLit";
+	case JirTag::FieldAccess:
+		return "FieldAccess";
+	case JirTag::ExtractValue:
+		return "ExtractValue";
+	case JirTag::ArrayLit:
+		return "ArrayLit";
+	case JirTag::Index:
+		return "Index";
+	case JirTag::FieldAddr:
+		return "FieldAddr";
+	case JirTag::IndexAddr:
+		return "IndexAddr";
+	case JirTag::AddrOf:
+		return "AddrOf";
+	case JirTag::Deref:
+		return "Deref";
+	case JirTag::EnumPayload:
+		return "EnumPayload";
+	case JirTag::DropBinding:
+		return "DropBinding";
 	}
 	return "?";
 }
@@ -111,10 +184,10 @@ struct Verifier {
 	// instruction as "defined" the moment we step past it.
 	std::vector<bool> defined;
 
-	Verifier(const JirFunction &f, const TypePool *tp,
-	         const StringPool *sp, JirVerifyResolver r, void *rctx)
-	    : jfn(f), types(tp), strings(sp), resolver(r),
-	      resolverCtx(rctx), defined(f.insts.size(), false) {
+	Verifier(const JirFunction &f, const TypePool *tp, const StringPool *sp,
+	         JirVerifyResolver r, void *rctx)
+	    : jfn(f), types(tp), strings(sp), resolver(r), resolverCtx(rctx),
+	      defined(f.insts.size(), false) {
 		defined[0] = true;  // sentinel always usable as kNoJirRef
 	}
 
@@ -131,51 +204,45 @@ struct Verifier {
 	void err(JirRef r, const std::string &msg) {
 		uint32_t line = (r < jfn.insts.size()) ? jfn.insts[r].srcLine : 0;
 		std::string tag =
-		    (r < jfn.insts.size())
-		        ? tagName(jfn.insts[r].tag)
-		        : "?";
+		    (r < jfn.insts.size()) ? tagName(jfn.insts[r].tag) : "?";
 		jam::Diagnostic d;
 		d.loc.line = static_cast<int>(line);
 		d.severity = jam::Diagnostic::Severity::Error;
 		d.message = "jir-verify: fn `" + jfn.name + "` ref #" +
-		             std::to_string(r) + " (" + tag + "): " + msg;
+		            std::to_string(r) + " (" + tag + "): " + msg;
 		diags.push_back(std::move(d));
 	}
 
 	void blockErr(JirBlockRef b, const std::string &msg) {
-		std::string name = (b < jfn.blocks.size())
-		                       ? jfn.blocks[b].name
-		                       : "?";
+		std::string name = (b < jfn.blocks.size()) ? jfn.blocks[b].name : "?";
 		jam::Diagnostic d;
 		d.severity = jam::Diagnostic::Severity::Error;
 		d.message = "jir-verify: fn `" + jfn.name + "` block #" +
-		             std::to_string(b) + " (" + name + "): " + msg;
+		            std::to_string(b) + " (" + name + "): " + msg;
 		diags.push_back(std::move(d));
 	}
 
 	// Check that JirRef `r` (0-based interpretation: kNoJirRef OK iff
 	// optional) points within `insts` and was defined in an earlier
 	// block (or earlier in this block).
-	void checkRef(JirRef r, bool optional, JirRef siteRef,
-	              const char *what) {
+	void checkRef(JirRef r, bool optional, JirRef siteRef, const char *what) {
 		if (r == kNoJirRef) {
 			if (!optional) {
 				err(siteRef, std::string("required operand `") + what +
-				                "` is kNoJirRef");
+				                 "` is kNoJirRef");
 			}
 			return;
 		}
 		if (r >= jfn.insts.size()) {
-			err(siteRef,
-			    std::string("operand `") + what + "` ref " +
-			        std::to_string(r) + " out of bounds (max " +
-			        std::to_string(jfn.insts.size() - 1) + ")");
+			err(siteRef, std::string("operand `") + what + "` ref " +
+			                 std::to_string(r) + " out of bounds (max " +
+			                 std::to_string(jfn.insts.size() - 1) + ")");
 			return;
 		}
 		if (!defined[r]) {
 			err(siteRef, std::string("operand `") + what + "` ref " +
-			                std::to_string(r) +
-			                " used before its defining block");
+			                 std::to_string(r) +
+			                 " used before its defining block");
 		}
 	}
 
@@ -185,21 +252,19 @@ struct Verifier {
 			return;
 		}
 		if (b >= jfn.blocks.size()) {
-			err(siteRef,
-			    std::string("block ref `") + what + "` " +
-			        std::to_string(b) + " out of bounds (max " +
-			        std::to_string(jfn.blocks.size() - 1) + ")");
+			err(siteRef, std::string("block ref `") + what + "` " +
+			                 std::to_string(b) + " out of bounds (max " +
+			                 std::to_string(jfn.blocks.size() - 1) + ")");
 		}
 	}
 
-	void checkExtraSlice(JirExtraIdx start, std::size_t len,
-	                     JirRef siteRef, const char *what) {
+	void checkExtraSlice(JirExtraIdx start, std::size_t len, JirRef siteRef,
+	                     const char *what) {
 		if (start + len > jfn.extra.size()) {
 			err(siteRef,
-			    std::string("extra slice `") + what +
-			        "` overflows: needs [" + std::to_string(start) +
-			        ".." + std::to_string(start + len) + ") but pool size is " +
-			        std::to_string(jfn.extra.size()));
+			    std::string("extra slice `") + what + "` overflows: needs [" +
+			        std::to_string(start) + ".." + std::to_string(start + len) +
+			        ") but pool size is " + std::to_string(jfn.extra.size()));
 		}
 	}
 
@@ -341,10 +406,10 @@ struct Verifier {
 			checkRef(inst.b, false, r, "b");
 			if (!refTypesMatch(inst.a, inst.b)) {
 				err(r, std::string("operand type mismatch for ") +
-				          tagName(inst.tag) + " (a.ty=" +
-				          std::to_string(jfn.insts[inst.a].ty) +
-				          " b.ty=" +
-				          std::to_string(jfn.insts[inst.b].ty) + ")");
+				           tagName(inst.tag) +
+				           " (a.ty=" + std::to_string(jfn.insts[inst.a].ty) +
+				           " b.ty=" + std::to_string(jfn.insts[inst.b].ty) +
+				           ")");
 			}
 			return;
 		// Shifts: LHS is the value being shifted (any int width),
@@ -374,8 +439,7 @@ struct Verifier {
 			checkRef(inst.a, false, r, "cond");
 			checkExtraSlice(inst.b, 2, r, "branches");
 			if (inst.b + 2 <= jfn.extra.size()) {
-				JirBlockRef thenB =
-				    static_cast<JirBlockRef>(jfn.extra[inst.b]);
+				JirBlockRef thenB = static_cast<JirBlockRef>(jfn.extra[inst.b]);
 				JirBlockRef elseB =
 				    static_cast<JirBlockRef>(jfn.extra[inst.b + 1]);
 				checkBlockRef(thenB, r, "then");
@@ -389,14 +453,13 @@ struct Verifier {
 				err(r, "Switch extra header out of bounds");
 				return;
 			}
-			JirBlockRef defaultB =
-			    static_cast<JirBlockRef>(jfn.extra[inst.b]);
+			JirBlockRef defaultB = static_cast<JirBlockRef>(jfn.extra[inst.b]);
 			uint32_t caseCount = jfn.extra[inst.b + 1];
 			checkBlockRef(defaultB, r, "default");
 			checkExtraSlice(inst.b, 2 + caseCount * 4, r, "switch");
 			for (uint32_t i = 0; i < caseCount; i++) {
-				JirBlockRef caseB = static_cast<JirBlockRef>(
-				    jfn.extra[inst.b + 2 + i * 4 + 3]);
+				JirBlockRef caseB =
+				    static_cast<JirBlockRef>(jfn.extra[inst.b + 2 + i * 4 + 3]);
 				checkBlockRef(caseB, r, "case-block");
 			}
 			return;
@@ -413,8 +476,7 @@ struct Verifier {
 			uint32_t argCount = jfn.extra[inst.b];
 			checkExtraSlice(inst.b, 1 + argCount, r, "call-args");
 			for (uint32_t i = 0; i < argCount; i++) {
-				JirRef ar =
-				    static_cast<JirRef>(jfn.extra[inst.b + 1 + i]);
+				JirRef ar = static_cast<JirRef>(jfn.extra[inst.b + 1 + i]);
 				checkRef(ar, false, r, "call-arg");
 			}
 			return;
@@ -428,8 +490,7 @@ struct Verifier {
 			uint32_t count = jfn.extra[inst.b];
 			checkExtraSlice(inst.b, 1 + count, r, "agg-fields");
 			for (uint32_t i = 0; i < count; i++) {
-				JirRef fr =
-				    static_cast<JirRef>(jfn.extra[inst.b + 1 + i]);
+				JirRef fr = static_cast<JirRef>(jfn.extra[inst.b + 1 + i]);
 				checkRef(fr, false, r, "agg-field");
 			}
 			return;
@@ -441,10 +502,10 @@ struct Verifier {
 }  // namespace
 
 std::vector<jam::Diagnostic> verifyJirFunction(const JirFunction &jfn,
-                                                const TypePool *types,
-                                                const StringPool *strings,
-                                                JirVerifyResolver resolver,
-                                                void *resolverCtx) {
+                                               const TypePool *types,
+                                               const StringPool *strings,
+                                               JirVerifyResolver resolver,
+                                               void *resolverCtx) {
 	Verifier v(jfn, types, strings, resolver, resolverCtx);
 
 	// Walk blocks in declaration order, mirroring jir_codegen's pass.
@@ -461,11 +522,9 @@ std::vector<jam::Diagnostic> verifyJirFunction(const JirFunction &jfn,
 	for (JirBlockRef b = 1; b < jfn.blocks.size(); b++) {
 		if (b == 1) continue;
 		for (JirRef r : jfn.blocks[b].insts) {
-			if (r < jfn.insts.size() &&
-			    jfn.insts[r].tag == JirTag::Alloca) {
-				v.blockErr(b,
-				           "Alloca outside entry block — use "
-				           "emitAllocaHoisted");
+			if (r < jfn.insts.size() && jfn.insts[r].tag == JirTag::Alloca) {
+				v.blockErr(b, "Alloca outside entry block — use "
+				              "emitAllocaHoisted");
 			}
 		}
 	}

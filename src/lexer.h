@@ -20,8 +20,8 @@ class Lexer {
 	int line = 1;
 	// Byte offset where the current token began — captured at the top
 	// of each scan-loop iteration and recorded onto every emitted
-	// Token. Matches Zig's `Ast.TokenList = { tag, start }` shape:
-	// the persistent per-token info is just the start offset.
+	// Token. The persistent per-token info is just the start offset;
+	// line and column are recomputed from this when needed.
 	uint32_t tokenStart = 0;
 
 	bool isAtEnd() const;

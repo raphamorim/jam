@@ -60,9 +60,10 @@ using JirVerifyResolver = TypeIdx (*)(void *ctx, TypeIdx ty);
 // Diagnostics channel). The `message` text already contains
 // fn-name + ref + tag context so the user can pin which
 // instruction tripped the check.
-std::vector<jam::Diagnostic> verifyJirFunction(
-    const JirFunction &jfn, const TypePool *types = nullptr,
-    const StringPool *strings = nullptr,
-    JirVerifyResolver resolver = nullptr, void *resolverCtx = nullptr);
+std::vector<jam::Diagnostic>
+verifyJirFunction(const JirFunction &jfn, const TypePool *types = nullptr,
+                  const StringPool *strings = nullptr,
+                  JirVerifyResolver resolver = nullptr,
+                  void *resolverCtx = nullptr);
 
 #endif  // JIR_VERIFY_H

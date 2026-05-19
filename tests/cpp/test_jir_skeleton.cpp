@@ -81,7 +81,8 @@ class JirSkeletonTests {
 		                  testPushBlockReturnsMonotonicRefs);
 		framework.addTest("JIR - extra pool appends and reads",
 		                  testExtraPoolAppendsAndReads);
-		framework.addTest("JIR - instruction size is small", testInstSizeIsSmall);
+		framework.addTest("JIR - instruction size is small",
+		                  testInstSizeIsSmall);
 	}
 };
 

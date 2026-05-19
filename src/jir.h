@@ -19,9 +19,9 @@ class FunctionAST;
 
 // JIR (Jam IR) — a single typed flat intermediate representation
 // produced by AstGen from the parsed AST and consumed by codegen to
-// emit LLVM IR. JIR mixes responsibilities that Zig's pipeline splits
-// between ZIR (untyped) and AIR (typed); Jam doesn't yet have
-// comptime-as-values, so the two-pass split isn't needed.
+// emit LLVM IR. The IR is typed from the start: Jam doesn't have
+// comptime-as-values, so a separate untyped lowering pass isn't
+// needed.
 //
 // Pipeline (target):
 //   Source → Tokens → AST → AstGen → JIR → Codegen → LLVM IR
@@ -67,38 +67,68 @@ enum class JirTag : uint8_t {
 
 	// Integer arithmetic
 	// Binary form: `a` = lhs ref, `b` = rhs ref, `ty` = result type.
-	Add, Sub, Mul,
-	SDiv, UDiv, SRem, URem,
+	Add,
+	Sub,
+	Mul,
+	SDiv,
+	UDiv,
+	SRem,
+	URem,
 
 	// Float arithmetic
-	FAdd, FSub, FMul, FDiv, FRem,
-	FNeg,                                // unary: `a` = operand
+	FAdd,
+	FSub,
+	FMul,
+	FDiv,
+	FRem,
+	FNeg,  // unary: `a` = operand
 
 	// Integer comparison
 	// Binary form; `ty` is always i1.
-	ICmpEq, ICmpNe,
-	ICmpSlt, ICmpSle, ICmpSgt, ICmpSge,
-	ICmpUlt, ICmpUle, ICmpUgt, ICmpUge,
+	ICmpEq,
+	ICmpNe,
+	ICmpSlt,
+	ICmpSle,
+	ICmpSgt,
+	ICmpSge,
+	ICmpUlt,
+	ICmpUle,
+	ICmpUgt,
+	ICmpUge,
 
 	// Float comparison
 	// Ordered predicates (NaN inputs ⇒ false) to match Jam's strict
 	// float typing policy. `ty` is always i1.
-	FCmpOeq, FCmpOne,
-	FCmpOlt, FCmpOle, FCmpOgt, FCmpOge,
+	FCmpOeq,
+	FCmpOne,
+	FCmpOlt,
+	FCmpOle,
+	FCmpOgt,
+	FCmpOge,
 
 	// Bitwise / shift
-	BitAnd, BitOr, BitXor, BitNot,
-	Shl, AShr, LShr,
+	BitAnd,
+	BitOr,
+	BitXor,
+	BitNot,
+	Shl,
+	AShr,
+	LShr,
 
 	// Logical (short-circuit handled by control flow)
-	LogNot,                              // unary
+	LogNot,  // unary
 
 	// Type conversions
 	// All take `a` = operand ref, `ty` = destination type.
-	ZExt, SExt, Trunc,
-	SIToFP, UIToFP,
-	FPToSI, FPToUI,
-	FPExt, FPTrunc,
+	ZExt,
+	SExt,
+	Trunc,
+	SIToFP,
+	UIToFP,
+	FPToSI,
+	FPToUI,
+	FPExt,
+	FPTrunc,
 	BitCast,
 
 	// Control flow
@@ -108,11 +138,11 @@ enum class JirTag : uint8_t {
 	//                  [defaultBlock, caseCount,
 	//                   case0_lo, case0_hi, case0_signed, case0_block,
 	//                   case1_..., ...]
-	//              Canonical multi-way branch. astgen today lowers match
-	//              to chained CondBr — Switch is the dense-integer path
-	//              jir_codegen is ready for (same shape Rust's
-	//              MIR::TerminatorKind::SwitchInt and Zig's
-	//              air.switch_br use).
+	//              Canonical multi-way branch. astgen emits Switch
+	//              when every arm pattern is a single integer or
+	//              unit-enum-variant; jir_codegen specialises down
+	//              to icmp+cond_br for trivial shapes and otherwise
+	//              emits LLVM `switch`.
 	// Ret:         `a` = value ref (or kNoJirRef for void).
 	// Unreachable: no operands.
 	Br,
@@ -156,13 +186,13 @@ enum class JirTag : uint8_t {
 	IndexAddr,
 
 	// Address-of / dereference
-	AddrOf,                              // `a` = lvalue ref
-	Deref,                               // `a` = ptr ref
+	AddrOf,  // `a` = lvalue ref
+	Deref,   // `a` = ptr ref
 
 	// Pattern binding payload extraction
 	// For enum-variant pattern bindings, the codegen needs to load
 	// the bound payload field. Encoded explicitly in JIR.
-	EnumPayload,                         // `a` = enum value ref, `b` = field index
+	EnumPayload,  // `a` = enum value ref, `b` = field index
 
 	// Drop
 	// Explicit destructor call for a tracked binding. Emitted by
@@ -193,18 +223,18 @@ enum class JirTag : uint8_t {
 // copyable so dense instruction arrays are cache-friendly.
 struct JirInst {
 	JirTag tag = JirTag::Invalid;
-	uint8_t _pad = 0;                    // padding to keep `flags` 2-byte aligned
-	uint16_t flags = 0;                  // tag-specific flags
-	uint32_t srcLine = 0;                // for diagnostics: file:line:
+	uint8_t _pad = 0;      // padding to keep `flags` 2-byte aligned
+	uint16_t flags = 0;    // tag-specific flags
+	uint32_t srcLine = 0;  // for diagnostics: file:line:
 	JirRef a = kNoJirRef;
 	JirRef b = kNoJirRef;
-	TypeIdx ty = kNoType;                // result type (kNoType for void / control)
+	TypeIdx ty = kNoType;  // result type (kNoType for void / control)
 };
 
 // A basic block within a JirFunction. Holds a list of JirRef
 // instruction indices into the function's `insts` array.
 struct JirBlock {
-	std::string name;                    // diagnostic label
+	std::string name;  // diagnostic label
 	std::vector<JirRef> insts;
 };
 

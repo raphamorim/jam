@@ -431,8 +431,8 @@ std::vector<Token> Lexer::scanTokens() {
 
 		// Snapshot the byte offset of the token we're about to scan.
 		// Every `addToken` call below reads this via member state, so
-		// each emitted Token carries its start offset — matches Zig's
-		// `Ast.TokenList.start` field.
+		// each emitted Token carries its start offset, used downstream
+		// for source-range and column resolution.
 		tokenStart = static_cast<uint32_t>(current);
 		char c = advance();
 

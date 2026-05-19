@@ -50,11 +50,10 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r);
 // `jirDeclarePrototype` so the prototype + caller-side ABI policy
 // lives in one block.
 jam::abi::ReturnABI jirClassifyReturn(const JirFunction &jfn,
-                                       const JamCodegenContext &ctx);
-bool jirReturnIsSret(const JirFunction &jfn,
-                      const JamCodegenContext &ctx);
+                                      const JamCodegenContext &ctx);
+bool jirReturnIsSret(const JirFunction &jfn, const JamCodegenContext &ctx);
 jam::abi::ParamABI jirClassifyParam(const JirFunction &jfn, size_t i,
-                                     const JamCodegenContext &ctx);
+                                    const JamCodegenContext &ctx);
 
 // Public entry: look up the cached LLVM value for `r`, or emit it
 // (recursing for any unrelated subexpressions) and cache the result.
@@ -85,9 +84,8 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// practice we should never reach here — the driver checks
 		// `Diagnostics::hasErrors()` after astgen and bails before
 		// running jir_codegen.
-		JamTypeRef ty = (inst.ty == kNoType)
-		                    ? lctx.ctx.getVoidType()
-		                    : lctx.ctx.getLLVMType(inst.ty);
+		JamTypeRef ty = (inst.ty == kNoType) ? lctx.ctx.getVoidType()
+		                                     : lctx.ctx.getLLVMType(inst.ty);
 		return JamLLVMGetUndef(ty);
 	}
 	case JirTag::Int: {
@@ -109,17 +107,16 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		return JamLLVMConstReal(ty, d);
 	}
 	case JirTag::Bool:
-		return JamLLVMConstInt(lctx.ctx.getInt1Type(),
-		                      inst.a != 0 ? 1 : 0, false);
+		return JamLLVMConstInt(lctx.ctx.getInt1Type(), inst.a != 0 ? 1 : 0,
+		                       false);
 	case JirTag::Str: {
 		StringIdx sid = static_cast<StringIdx>(inst.a);
 		const std::string &val = lctx.ctx.getStringPool().get(sid);
-		JamValueRef strConst = JamLLVMConstString(
-		    lctx.ctx.getContext(), val.c_str(),
-		    static_cast<unsigned>(val.length()), true);
-		JamTypeRef arrTy =
-		    JamLLVMArrayType(lctx.ctx.getInt8Type(),
-		                     static_cast<uint64_t>(val.length() + 1));
+		JamValueRef strConst =
+		    JamLLVMConstString(lctx.ctx.getContext(), val.c_str(),
+		                       static_cast<unsigned>(val.length()), true);
+		JamTypeRef arrTy = JamLLVMArrayType(
+		    lctx.ctx.getInt8Type(), static_cast<uint64_t>(val.length() + 1));
 		JamValueRef strGlobal =
 		    JamLLVMAddGlobal(lctx.ctx.getModule(), arrTy, "str");
 		JamLLVMSetGlobalConstant(strGlobal, true);
@@ -127,11 +124,11 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 
 		JamTypeRef sliceTy = lctx.ctx.getLLVMType(inst.ty);
 		JamTypeRef i8PtrTy = JamLLVMPointerType(lctx.ctx.getInt8Type(), 0);
-		JamValueRef strPtr = JamLLVMBuildBitCast(
-		    lctx.ctx.getBuilder(), strGlobal, i8PtrTy, "str_ptr");
+		JamValueRef strPtr = JamLLVMBuildBitCast(lctx.ctx.getBuilder(),
+		                                         strGlobal, i8PtrTy, "str_ptr");
 		JamValueRef slice = JamLLVMGetUndef(sliceTy);
-		slice = JamLLVMBuildInsertValue(lctx.ctx.getBuilder(), slice, strPtr,
-		                                0, "slice_ptr");
+		slice = JamLLVMBuildInsertValue(lctx.ctx.getBuilder(), slice, strPtr, 0,
+		                                "slice_ptr");
 		slice = JamLLVMBuildInsertValue(
 		    lctx.ctx.getBuilder(), slice,
 		    JamLLVMConstInt(lctx.ctx.getInt64Type(),
@@ -147,8 +144,8 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// When the function uses sret, the source-level param at JIR
 		// index `i` lives at LLVM index `i + 1` (the sret slot owns
 		// LLVM index 0).
-		JamFunctionRef f = JamLLVMGetFunction(
-		    lctx.ctx.getModule(), lctx.jfn.name.c_str());
+		JamFunctionRef f =
+		    JamLLVMGetFunction(lctx.ctx.getModule(), lctx.jfn.name.c_str());
 		unsigned argOffset = jirReturnIsSret(lctx.jfn, lctx.ctx) ? 1u : 0u;
 		return JamLLVMGetParam(f, inst.a + argOffset);
 	}
@@ -156,8 +153,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
 		uint64_t align = lctx.ctx.typeAlign(inst.ty);
 		std::string nm = "v" + std::to_string(r);
-		return JamLLVMBuildAlloca(lctx.ctx.getBuilder(), ty, align,
-		                          nm.c_str());
+		return JamLLVMBuildAlloca(lctx.ctx.getBuilder(), ty, align, nm.c_str());
 	}
 	case JirTag::Load: {
 		JamValueRef ptr = emitInst(lctx, inst.a);
@@ -238,106 +234,96 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 	}
 	// === Integer comparison ===
 	case JirTag::ICmpEq:
-		return buildICmp(lctx, JAM_ICMP_EQ,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "eq");
+		return buildICmp(lctx, JAM_ICMP_EQ, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "eq");
 	case JirTag::ICmpNe:
-		return buildICmp(lctx, JAM_ICMP_NE,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "ne");
+		return buildICmp(lctx, JAM_ICMP_NE, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "ne");
 	case JirTag::ICmpSlt:
-		return buildICmp(lctx, JAM_ICMP_SLT,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "slt");
+		return buildICmp(lctx, JAM_ICMP_SLT, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "slt");
 	case JirTag::ICmpSle:
-		return buildICmp(lctx, JAM_ICMP_SLE,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "sle");
+		return buildICmp(lctx, JAM_ICMP_SLE, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "sle");
 	case JirTag::ICmpSgt:
-		return buildICmp(lctx, JAM_ICMP_SGT,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "sgt");
+		return buildICmp(lctx, JAM_ICMP_SGT, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "sgt");
 	case JirTag::ICmpSge:
-		return buildICmp(lctx, JAM_ICMP_SGE,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "sge");
+		return buildICmp(lctx, JAM_ICMP_SGE, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "sge");
 	case JirTag::ICmpUlt:
-		return buildICmp(lctx, JAM_ICMP_ULT,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "ult");
+		return buildICmp(lctx, JAM_ICMP_ULT, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "ult");
 	case JirTag::ICmpUle:
-		return buildICmp(lctx, JAM_ICMP_ULE,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "ule");
+		return buildICmp(lctx, JAM_ICMP_ULE, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "ule");
 	case JirTag::ICmpUgt:
-		return buildICmp(lctx, JAM_ICMP_UGT,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "ugt");
+		return buildICmp(lctx, JAM_ICMP_UGT, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "ugt");
 	case JirTag::ICmpUge:
-		return buildICmp(lctx, JAM_ICMP_UGE,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "uge");
+		return buildICmp(lctx, JAM_ICMP_UGE, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "uge");
 	// === Float comparison ===
 	case JirTag::FCmpOeq:
-		return buildFCmp(lctx, JAM_FCMP_OEQ,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "oeq");
+		return buildFCmp(lctx, JAM_FCMP_OEQ, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "oeq");
 	case JirTag::FCmpOne:
-		return buildFCmp(lctx, JAM_FCMP_UNE,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "one");
+		return buildFCmp(lctx, JAM_FCMP_UNE, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "one");
 	case JirTag::FCmpOlt:
-		return buildFCmp(lctx, JAM_FCMP_OLT,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "olt");
+		return buildFCmp(lctx, JAM_FCMP_OLT, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "olt");
 	case JirTag::FCmpOle:
-		return buildFCmp(lctx, JAM_FCMP_OLE,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "ole");
+		return buildFCmp(lctx, JAM_FCMP_OLE, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "ole");
 	case JirTag::FCmpOgt:
-		return buildFCmp(lctx, JAM_FCMP_OGT,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "ogt");
+		return buildFCmp(lctx, JAM_FCMP_OGT, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "ogt");
 	case JirTag::FCmpOge:
-		return buildFCmp(lctx, JAM_FCMP_OGE,
-		                 emitInst(lctx, inst.a), emitInst(lctx, inst.b), "oge");
+		return buildFCmp(lctx, JAM_FCMP_OGE, emitInst(lctx, inst.a),
+		                 emitInst(lctx, inst.b), "oge");
 	// === Bitwise / shift ===
 	case JirTag::BitAnd:
-		return JamLLVMBuildAnd(lctx.ctx.getBuilder(),
-		                       emitInst(lctx, inst.a),
+		return JamLLVMBuildAnd(lctx.ctx.getBuilder(), emitInst(lctx, inst.a),
 		                       emitInst(lctx, inst.b), "and");
 	case JirTag::BitOr:
-		return JamLLVMBuildOr(lctx.ctx.getBuilder(),
-		                      emitInst(lctx, inst.a),
+		return JamLLVMBuildOr(lctx.ctx.getBuilder(), emitInst(lctx, inst.a),
 		                      emitInst(lctx, inst.b), "or");
 	case JirTag::BitXor:
-		return JamLLVMBuildXor(lctx.ctx.getBuilder(),
-		                       emitInst(lctx, inst.a),
+		return JamLLVMBuildXor(lctx.ctx.getBuilder(), emitInst(lctx, inst.a),
 		                       emitInst(lctx, inst.b), "xor");
 	case JirTag::Shl:
-		return JamLLVMBuildShl(lctx.ctx.getBuilder(),
-		                       emitInst(lctx, inst.a),
+		return JamLLVMBuildShl(lctx.ctx.getBuilder(), emitInst(lctx, inst.a),
 		                       emitInst(lctx, inst.b), "shl");
 	case JirTag::AShr:
-		return JamLLVMBuildAShr(lctx.ctx.getBuilder(),
-		                        emitInst(lctx, inst.a),
+		return JamLLVMBuildAShr(lctx.ctx.getBuilder(), emitInst(lctx, inst.a),
 		                        emitInst(lctx, inst.b), "ashr");
 	case JirTag::LShr:
-		return JamLLVMBuildLShr(lctx.ctx.getBuilder(),
-		                        emitInst(lctx, inst.a),
+		return JamLLVMBuildLShr(lctx.ctx.getBuilder(), emitInst(lctx, inst.a),
 		                        emitInst(lctx, inst.b), "lshr");
 	case JirTag::BitNot: {
 		// LLVM has no NOT op; emit XOR with all-ones of the operand's type.
 		JamValueRef v = emitInst(lctx, inst.a);
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
-		JamValueRef ones = JamLLVMConstInt(ty, ~static_cast<uint64_t>(0),
-		                                   true);
+		JamValueRef ones = JamLLVMConstInt(ty, ~static_cast<uint64_t>(0), true);
 		return JamLLVMBuildXor(lctx.ctx.getBuilder(), v, ones, "not");
 	}
 	case JirTag::LogNot: {
 		// Boolean inversion: XOR with i1 1. Operand is already i1.
 		JamValueRef v = emitInst(lctx, inst.a);
-		JamValueRef one =
-		    JamLLVMConstInt(lctx.ctx.getInt1Type(), 1, false);
+		JamValueRef one = JamLLVMConstInt(lctx.ctx.getInt1Type(), 1, false);
 		return JamLLVMBuildXor(lctx.ctx.getBuilder(), v, one, "lnot");
 	}
 	// === Type conversions ===
 	case JirTag::ZExt: {
 		JamValueRef v = emitInst(lctx, inst.a);
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
-		return JamLLVMBuildIntCast(lctx.ctx.getBuilder(), v, ty, false,
-		                           "zext");
+		return JamLLVMBuildIntCast(lctx.ctx.getBuilder(), v, ty, false, "zext");
 	}
 	case JirTag::SExt: {
 		JamValueRef v = emitInst(lctx, inst.a);
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
-		return JamLLVMBuildIntCast(lctx.ctx.getBuilder(), v, ty, true,
-		                           "sext");
+		return JamLLVMBuildIntCast(lctx.ctx.getBuilder(), v, ty, true, "sext");
 	}
 	case JirTag::Trunc: {
 		JamValueRef v = emitInst(lctx, inst.a);
@@ -383,11 +369,10 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		uint32_t count = lctx.jfn.getExtra(extra);
 		JamValueRef agg = JamLLVMGetUndef(ty);
 		for (uint32_t i = 0; i < count; i++) {
-			JirRef fr =
-			    static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
+			JirRef fr = static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
 			JamValueRef fv = emitInst(lctx, fr);
-			agg = JamLLVMBuildInsertValue(lctx.ctx.getBuilder(), agg, fv,
-			                              i, "field");
+			agg = JamLLVMBuildInsertValue(lctx.ctx.getBuilder(), agg, fv, i,
+			                              "field");
 		}
 		return agg;
 	}
@@ -403,11 +388,10 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		uint32_t count = lctx.jfn.getExtra(extra);
 		JamValueRef agg = JamLLVMGetUndef(ty);
 		for (uint32_t i = 0; i < count; i++) {
-			JirRef er =
-			    static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
+			JirRef er = static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
 			JamValueRef ev = emitInst(lctx, er);
-			agg = JamLLVMBuildInsertValue(lctx.ctx.getBuilder(), agg, ev,
-			                              i, "elem");
+			agg = JamLLVMBuildInsertValue(lctx.ctx.getBuilder(), agg, ev, i,
+			                              "elem");
 		}
 		return agg;
 	}
@@ -423,8 +407,8 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// Coerce index to i64 (the GEP wrappers expect a sized integer).
 		JamTypeRef idxLLVMTy = JamLLVMTypeOf(idxVal);
 		if (idxLLVMTy != i64) {
-			idxVal = JamLLVMBuildIntCast(lctx.ctx.getBuilder(), idxVal,
-			                             i64, false, "idx.cast");
+			idxVal = JamLLVMBuildIntCast(lctx.ctx.getBuilder(), idxVal, i64,
+			                             false, "idx.cast");
 		}
 
 		JamTypeRef baseLLVMTy = lctx.ctx.getLLVMType(baseInst.ty);
@@ -433,8 +417,8 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		if (basek.kind == TypeKind::Slice) {
 			// SSA slice value: extract the pointer field (0), GEP by elem.
 			JamValueRef base = emitInst(lctx, inst.a);
-			JamValueRef ptr = JamLLVMBuildExtractValue(
-			    lctx.ctx.getBuilder(), base, 0, "slice.ptr");
+			JamValueRef ptr = JamLLVMBuildExtractValue(lctx.ctx.getBuilder(),
+			                                           base, 0, "slice.ptr");
 			JamValueRef gep = JamLLVMBuildPtrGEP(
 			    lctx.ctx.getBuilder(), elemLLVMTy, ptr, idxVal, "idx.gep");
 			return JamLLVMBuildLoad(lctx.ctx.getBuilder(), elemLLVMTy, gep,
@@ -450,13 +434,12 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// Array case: spill the SSA value to a temp alloca and GEP.
 		JamValueRef base = emitInst(lctx, inst.a);
 		uint64_t align = lctx.ctx.typeAlign(baseInst.ty);
-		JamValueRef tmp = JamLLVMBuildAlloca(lctx.ctx.getBuilder(),
-		                                     baseLLVMTy, align, "arr.tmp");
+		JamValueRef tmp = JamLLVMBuildAlloca(lctx.ctx.getBuilder(), baseLLVMTy,
+		                                     align, "arr.tmp");
 		JamLLVMBuildStore(lctx.ctx.getBuilder(), base, tmp);
 		JamValueRef gep = JamLLVMBuildArrayGEP(
 		    lctx.ctx.getBuilder(), baseLLVMTy, tmp, idxVal, "idx.gep");
-		return JamLLVMBuildLoad(lctx.ctx.getBuilder(), elemLLVMTy, gep,
-		                        "idx");
+		return JamLLVMBuildLoad(lctx.ctx.getBuilder(), elemLLVMTy, gep, "idx");
 	}
 	case JirTag::AddrOf: {
 		// AstGen plants the alloca's own JirRef into `a` when taking
@@ -479,18 +462,16 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		if (baseIsAllocaLike) {
 			pointeeTy = baseInst.ty;
 		} else {
-			const TypeKey &k =
-			    lctx.ctx.getTypePool().get(baseInst.ty);
-			if (k.kind != TypeKind::PtrSingle &&
-			    k.kind != TypeKind::PtrMany) {
+			const TypeKey &k = lctx.ctx.getTypePool().get(baseInst.ty);
+			if (k.kind != TypeKind::PtrSingle && k.kind != TypeKind::PtrMany) {
 				throw std::runtime_error(
 				    "jirCodegen: FieldAddr base must be a pointer");
 			}
 			pointeeTy = static_cast<TypeIdx>(k.a);
 		}
 		JamTypeRef structTy = lctx.ctx.getLLVMType(pointeeTy);
-		return JamLLVMBuildStructGEP(lctx.ctx.getBuilder(), structTy,
-		                             basePtr, inst.b, "fieldp");
+		return JamLLVMBuildStructGEP(lctx.ctx.getBuilder(), structTy, basePtr,
+		                             inst.b, "fieldp");
 	}
 	case JirTag::IndexAddr: {
 		JamValueRef basePtr = emitInst(lctx, inst.a);
@@ -502,32 +483,31 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		if (baseIsAllocaLike) {
 			pointeeTy = baseInst.ty;
 		} else {
-			const TypeKey &k =
-			    lctx.ctx.getTypePool().get(baseInst.ty);
-			pointeeTy = (k.kind == TypeKind::PtrSingle ||
-			             k.kind == TypeKind::PtrMany)
-			                 ? static_cast<TypeIdx>(k.a)
-			                 : baseInst.ty;
+			const TypeKey &k = lctx.ctx.getTypePool().get(baseInst.ty);
+			pointeeTy =
+			    (k.kind == TypeKind::PtrSingle || k.kind == TypeKind::PtrMany)
+			        ? static_cast<TypeIdx>(k.a)
+			        : baseInst.ty;
 		}
 		const TypeKey &pk = lctx.ctx.getTypePool().get(pointeeTy);
 		JamValueRef idxVal = emitInst(lctx, inst.b);
 		JamTypeRef i64 = lctx.ctx.getInt64Type();
 		if (JamLLVMTypeOf(idxVal) != i64) {
-			idxVal = JamLLVMBuildIntCast(lctx.ctx.getBuilder(), idxVal,
-			                             i64, false, "idx.cast");
+			idxVal = JamLLVMBuildIntCast(lctx.ctx.getBuilder(), idxVal, i64,
+			                             false, "idx.cast");
 		}
 		const TypeKey &resKey = lctx.ctx.getTypePool().get(inst.ty);
 		TypeIdx elemTy = static_cast<TypeIdx>(resKey.a);
 		JamTypeRef elemLLVM = lctx.ctx.getLLVMType(elemTy);
 		if (pk.kind == TypeKind::Array) {
 			JamTypeRef arrLLVM = lctx.ctx.getLLVMType(pointeeTy);
-			return JamLLVMBuildArrayGEP(lctx.ctx.getBuilder(), arrLLVM,
-			                            basePtr, idxVal, "idx.addr");
+			return JamLLVMBuildArrayGEP(lctx.ctx.getBuilder(), arrLLVM, basePtr,
+			                            idxVal, "idx.addr");
 		}
 		// Slice / PtrMany / PtrSingle to a single elem: treat as a
 		// many-item pointer and PtrGEP by element-sized stride.
-		return JamLLVMBuildPtrGEP(lctx.ctx.getBuilder(), elemLLVM,
-		                          basePtr, idxVal, "idx.addr");
+		return JamLLVMBuildPtrGEP(lctx.ctx.getBuilder(), elemLLVM, basePtr,
+		                          idxVal, "idx.addr");
 	}
 	case JirTag::Deref: {
 		JamValueRef ptr = emitInst(lctx, inst.a);
@@ -540,13 +520,12 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// Mechanically emit `call void <symbol>(ptr <alloca>)`.
 		JamValueRef bindingPtr = emitInst(lctx, inst.a);
 		StringIdx symId = static_cast<StringIdx>(inst.b);
-		const std::string &symbol =
-		    lctx.ctx.getStringPool().get(symId);
+		const std::string &symbol = lctx.ctx.getStringPool().get(symId);
 		JamFunctionRef f =
 		    JamLLVMGetFunction(lctx.ctx.getModule(), symbol.c_str());
 		if (!f) {
-			throw std::runtime_error("jirCodegen: drop callee `" +
-			                         symbol + "` not declared");
+			throw std::runtime_error("jirCodegen: drop callee `" + symbol +
+			                         "` not declared");
 		}
 		JamValueRef args[1] = {bindingPtr};
 		JamLLVMBuildCall(lctx.ctx.getBuilder(), f, args, 1, "");
@@ -565,12 +544,10 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamValueRef fieldPtr = payloadAreaPtr;
 		if (inst.b != 0) {
 			JamValueRef off = JamLLVMConstInt(
-			    lctx.ctx.getInt64Type(),
-			    static_cast<uint64_t>(inst.b), false);
+			    lctx.ctx.getInt64Type(), static_cast<uint64_t>(inst.b), false);
 			fieldPtr = JamLLVMBuildPtrGEP(
-			    lctx.ctx.getBuilder(),
-			    lctx.ctx.getInt8Type(), payloadAreaPtr, off,
-			    "enum.payload.off");
+			    lctx.ctx.getBuilder(), lctx.ctx.getInt8Type(), payloadAreaPtr,
+			    off, "enum.payload.off");
 		}
 		JamTypeRef fieldTy = lctx.ctx.getLLVMType(inst.ty);
 		return JamLLVMBuildLoad(lctx.ctx.getBuilder(), fieldTy, fieldPtr,
@@ -584,13 +561,12 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// instantiated cloned methods keep their qualified
 		// `Vec__i32.push` form). Codegen does a single lookup.
 		StringIdx calleeId = static_cast<StringIdx>(inst.a);
-		const std::string &symbol =
-		    lctx.ctx.getStringPool().get(calleeId);
+		const std::string &symbol = lctx.ctx.getStringPool().get(calleeId);
 		JamFunctionRef f =
 		    JamLLVMGetFunction(lctx.ctx.getModule(), symbol.c_str());
 		if (!f) {
-			throw std::runtime_error("jirCodegen: unknown callee `" +
-			                         symbol + "`");
+			throw std::runtime_error("jirCodegen: unknown callee `" + symbol +
+			                         "`");
 		}
 		JirExtraIdx extra = static_cast<JirExtraIdx>(inst.b);
 		uint32_t argCount = lctx.jfn.getExtra(extra);
@@ -605,13 +581,12 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 			// the pointee type. Result is loaded back after the call.
 			JamTypeRef pointee = JamLLVMFunctionSretPointeeType(f);
 			uint64_t align = lctx.ctx.typeAlign(inst.ty);
-			sretSlot = JamLLVMBuildAlloca(lctx.ctx.getBuilder(), pointee,
-			                              align, "sret.slot");
+			sretSlot = JamLLVMBuildAlloca(lctx.ctx.getBuilder(), pointee, align,
+			                              "sret.slot");
 			args.push_back(sretSlot);
 		}
 		for (uint32_t i = 0; i < argCount; i++) {
-			JirRef ar =
-			    static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
+			JirRef ar = static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
 			args.push_back(emitInst(lctx, ar));
 		}
 		if (calleeUsesSret) {
@@ -619,15 +594,14 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 			// the sret slot. Load it so the JirRef → LLVM value map
 			// holds the materialized return value.
 			JamLLVMBuildCall(lctx.ctx.getBuilder(), f, args.data(),
-			                  static_cast<unsigned>(args.size()), "");
+			                 static_cast<unsigned>(args.size()), "");
 			JamTypeRef retLlvmTy = lctx.ctx.getLLVMType(inst.ty);
-			return JamLLVMBuildLoad(lctx.ctx.getBuilder(), retLlvmTy,
-			                         sretSlot, "sret.val");
+			return JamLLVMBuildLoad(lctx.ctx.getBuilder(), retLlvmTy, sretSlot,
+			                        "sret.val");
 		}
 		const char *resultName = (inst.ty == kNoType) ? "" : "call";
 		return JamLLVMBuildCall(lctx.ctx.getBuilder(), f, args.data(),
-		                        static_cast<unsigned>(args.size()),
-		                        resultName);
+		                        static_cast<unsigned>(args.size()), resultName);
 	}
 	// === Control ===
 	case JirTag::Br: {
@@ -638,13 +612,11 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 	case JirTag::CondBr: {
 		JamValueRef cond = emitInst(lctx, inst.a);
 		JirExtraIdx extra = static_cast<JirExtraIdx>(inst.b);
-		JirBlockRef thenB =
-		    static_cast<JirBlockRef>(lctx.jfn.getExtra(extra));
+		JirBlockRef thenB = static_cast<JirBlockRef>(lctx.jfn.getExtra(extra));
 		JirBlockRef elseB =
 		    static_cast<JirBlockRef>(lctx.jfn.getExtra(extra + 1));
-		JamLLVMBuildCondBr(lctx.ctx.getBuilder(), cond,
-		                  lctx.blockMap.at(thenB),
-		                  lctx.blockMap.at(elseB));
+		JamLLVMBuildCondBr(lctx.ctx.getBuilder(), cond, lctx.blockMap.at(thenB),
+		                   lctx.blockMap.at(elseB));
 		return nullptr;
 	}
 	case JirTag::Switch: {
@@ -681,24 +653,23 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 			JirBlockRef caseB =
 			    static_cast<JirBlockRef>(lctx.jfn.getExtra(base + 3));
 			uint64_t bits = lo | (hi << 32);
-			JamValueRef caseVal =
-			    JamLLVMConstInt(scrutLlvmTy, bits, isSigned);
+			JamValueRef caseVal = JamLLVMConstInt(scrutLlvmTy, bits, isSigned);
 			return std::tuple{caseVal, caseB, bits};
 		};
 
 		if (caseCount == 1) {
 			auto [caseVal, caseB, _bits] = readCase(0);
-			JamValueRef cmp = buildICmp(lctx, JAM_ICMP_EQ, scrut, caseVal,
-			                             "match.eq");
+			JamValueRef cmp =
+			    buildICmp(lctx, JAM_ICMP_EQ, scrut, caseVal, "match.eq");
 			JamLLVMBuildCondBr(lctx.ctx.getBuilder(), cmp,
-			                    lctx.blockMap.at(caseB),
-			                    lctx.blockMap.at(defaultB));
+			                   lctx.blockMap.at(caseB),
+			                   lctx.blockMap.at(defaultB));
 			return nullptr;
 		}
 
-		JamValueRef sw = JamLLVMBuildSwitch(
-		    lctx.ctx.getBuilder(), scrut, lctx.blockMap.at(defaultB),
-		    caseCount);
+		JamValueRef sw =
+		    JamLLVMBuildSwitch(lctx.ctx.getBuilder(), scrut,
+		                       lctx.blockMap.at(defaultB), caseCount);
 		for (uint32_t i = 0; i < caseCount; i++) {
 			auto [caseVal, caseB, _bits] = readCase(i);
 			JamLLVMAddCase(sw, caseVal, lctx.blockMap.at(caseB));
@@ -710,8 +681,8 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// `ptr sret(%T)` arg and emit `ret void`. The caller already
 		// owns the slot, so we don't allocate anything here.
 		if (jirReturnIsSret(lctx.jfn, lctx.ctx)) {
-			JamFunctionRef f = JamLLVMGetFunction(
-			    lctx.ctx.getModule(), lctx.jfn.name.c_str());
+			JamFunctionRef f =
+			    JamLLVMGetFunction(lctx.ctx.getModule(), lctx.jfn.name.c_str());
 			JamValueRef sretSlot = JamLLVMGetParam(f, 0);
 			if (inst.a != kNoJirRef) {
 				JamValueRef v = emitInst(lctx, inst.a);
@@ -732,38 +703,35 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamLLVMBuildUnreachable(lctx.ctx.getBuilder());
 		return nullptr;
 	default:
-		throw std::runtime_error(
-		    "jirCodegen: unsupported JIR tag (tag = " +
-		    std::to_string(static_cast<int>(inst.tag)) + ")");
+		throw std::runtime_error("jirCodegen: unsupported JIR tag (tag = " +
+		                         std::to_string(static_cast<int>(inst.tag)) +
+		                         ")");
 	}
 }
 
 // Single ABI source-of-truth used by both prototype emission and
 // call/body lowering. extern and test functions skip the classifier
 // for returns (extern follows the C ABI literally, tests are always
-// nullary-void). Mirrors Zig's `iterateParamTypes` + `firstParamSRet`
-// pattern: classification is a pure function of (mode, type, fn-kind),
-// so call sites and definitions never disagree.
+// nullary-void). Classification is a pure function of
+// (mode, type, fn-kind), so call sites and definitions never disagree.
 jam::abi::ReturnABI jirClassifyReturn(const JirFunction &jfn,
-                                       const JamCodegenContext &ctx) {
+                                      const JamCodegenContext &ctx) {
 	if (jfn.isExtern || jfn.isTest) {
-		return jam::abi::ReturnABI{
-		    jam::abi::ReturnABI::Kind::Direct,
-		    (jfn.isTest || jfn.returnType == kNoType)
-		        ? ctx.getVoidType()
-		        : ctx.getLLVMType(jfn.returnType),
-		    0};
+		return jam::abi::ReturnABI{jam::abi::ReturnABI::Kind::Direct,
+		                           (jfn.isTest || jfn.returnType == kNoType)
+		                               ? ctx.getVoidType()
+		                               : ctx.getLLVMType(jfn.returnType),
+		                           0};
 	}
 	if (jfn.returnType == kNoType) {
 		return jam::abi::ReturnABI{jam::abi::ReturnABI::Kind::Direct,
-		                            ctx.getVoidType(), 0};
+		                           ctx.getVoidType(), 0};
 	}
 	return jam::abi::classifyReturn(jfn.returnType, ctx);
 }
 
 // Does the LLVM signature have a leading `ptr sret(%T)` argument?
-bool jirReturnIsSret(const JirFunction &jfn,
-                      const JamCodegenContext &ctx) {
+bool jirReturnIsSret(const JirFunction &jfn, const JamCodegenContext &ctx) {
 	return jirClassifyReturn(jfn, ctx).kind ==
 	       jam::abi::ReturnABI::Kind::Indirect;
 }
@@ -772,14 +740,14 @@ bool jirReturnIsSret(const JirFunction &jfn,
 // preserves the user-written type verbatim (the user already wrote
 // what they want at the FFI boundary, e.g. `*const T` for an out-ptr).
 jam::abi::ParamABI jirClassifyParam(const JirFunction &jfn, size_t i,
-                                     const JamCodegenContext &ctx) {
+                                    const JamCodegenContext &ctx) {
 	TypeIdx t = jfn.paramTypes[i];
 	if (jfn.isExtern) {
 		return jam::abi::ParamABI{jam::abi::ParamABI::Kind::ByValue,
-		                           ctx.getLLVMType(t), 0};
+		                          ctx.getLLVMType(t), 0};
 	}
-	ParamMode mode = i < jfn.paramModes.size() ? jfn.paramModes[i]
-	                                           : ParamMode::Let;
+	ParamMode mode =
+	    i < jfn.paramModes.size() ? jfn.paramModes[i] : ParamMode::Let;
 	return jam::abi::classifyParam(mode, t, ctx);
 }
 
@@ -800,17 +768,17 @@ void jirDeclarePrototype(const JirFunction &jfn, JamCodegenContext &ctx) {
 	for (size_t i = 0; i < jfn.paramTypes.size(); i++) {
 		jam::abi::ParamABI pabi = jirClassifyParam(jfn, i, ctx);
 		if (pabi.kind == jam::abi::ParamABI::Kind::ByPointer) {
-			argTypes.push_back(JamLLVMPointerType(
-			    ctx.getLLVMType(jfn.paramTypes[i]), 0));
+			argTypes.push_back(
+			    JamLLVMPointerType(ctx.getLLVMType(jfn.paramTypes[i]), 0));
 		} else {
 			argTypes.push_back(pabi.llvmType);
 		}
 	}
 
 	JamTypeRef retType = sret ? ctx.getVoidType() : rabi.directType;
-	JamTypeRef ft = JamLLVMFunctionType(
-	    retType, argTypes.data(), static_cast<unsigned>(argTypes.size()),
-	    jfn.isVarArgs);
+	JamTypeRef ft = JamLLVMFunctionType(retType, argTypes.data(),
+	                                    static_cast<unsigned>(argTypes.size()),
+	                                    jfn.isVarArgs);
 	JamFunctionRef f =
 	    JamLLVMAddFunction(ctx.getModule(), jfn.name.c_str(), ft);
 	JamLLVMApplyDefaultFnAttrs(f, jfn.isExtern);
@@ -819,11 +787,10 @@ void jirDeclarePrototype(const JirFunction &jfn, JamCodegenContext &ctx) {
 	}
 	if (sret) {
 		JamLLVMAddParamAttrSret(f, 0, ctx.getLLVMType(jfn.returnType),
-		                         rabi.sretAlign);
+		                        rabi.sretAlign);
 	}
 
-	bool externalLinkage =
-	    jfn.isExtern || jfn.isExport || jfn.name == "main";
+	bool externalLinkage = jfn.isExtern || jfn.isExport || jfn.name == "main";
 	if (externalLinkage) {
 		JamLLVMSetLinkage(reinterpret_cast<JamValueRef>(f),
 		                  JAM_LINKAGE_EXTERNAL);
@@ -834,8 +801,8 @@ void jirDeclarePrototype(const JirFunction &jfn, JamCodegenContext &ctx) {
 		const unsigned argOffset = sret ? 1u : 0u;
 		for (size_t i = 0; i < jfn.paramTypes.size(); i++) {
 			if (jfn.paramTypes[i] == BuiltinType::Bool) {
-				JamLLVMAddParamAttrZeroExt(
-				    f, static_cast<unsigned>(i) + argOffset);
+				JamLLVMAddParamAttrZeroExt(f, static_cast<unsigned>(i) +
+				                                  argOffset);
 			}
 		}
 		if (!sret && jfn.returnType == BuiltinType::Bool) {

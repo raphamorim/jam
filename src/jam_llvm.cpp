@@ -14,9 +14,9 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/Instructions.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -94,10 +94,11 @@ void JamLLVMInitializeAllTargets(void) {
 
 JamContextRef JamLLVMCreateContext(void) {
 	auto *ctx = new llvm::LLVMContext();
-	// Drop SSA value names at construction time. Clang and Zig both emit
-	// IR with auto-numbered temporaries (`%0`, `%1`, …) instead of the
-	// source-named values our codegen passes through. Names cost LLVM
-	// memory (string storage on every Value) and don't affect codegen at
+	// Drop SSA value names at construction time. Most production LLVM
+	// frontends emit IR with auto-numbered temporaries (`%0`, `%1`, …)
+	// instead of the source-named values our codegen passes through.
+	// Names cost LLVM memory (string storage on every Value) and don't
+	// affect codegen at
 	// all — they only show up in printed IR. Discarding them here makes
 	// `--emit-ir` output match what production compilers print without
 	// having to plumb empty strings through every CreateAlloca/CreateGEP
@@ -506,7 +507,6 @@ JamFunctionRef JamLLVMGetBasicBlockParent(JamBasicBlockRef block) {
 JamValueRef JamLLVMGetBasicBlockTerminator(JamBasicBlockRef block) {
 	return WRAP_VALUE(UNWRAP_BLOCK(block)->getTerminator());
 }
-
 
 JamValueRef JamLLVMBuildAlloca(JamBuilderRef builder, JamTypeRef type,
                                uint64_t alignBytes, const char *name) {
@@ -994,8 +994,7 @@ JamLLVMCreateTargetMachine(const char *triple, const char *cpu,
 	// Emit each function/global into its own section so the linker can drop
 	// the unreferenced ones at link time (-Wl,--gc-sections on ELF,
 	// -Wl,-dead_strip on Mach-O). Debug builds skip this — the extra section
-	// table entries cost compile time we don't want to pay there. Matches
-	// Zig's function_sections option (zig-0.10.1/src/Compilation.zig:939).
+	// table entries cost compile time we don't want to pay there.
 	if (optLevel != JAM_OPT_NONE) {
 		opt.FunctionSections = true;
 		opt.DataSections = true;
@@ -1016,8 +1015,9 @@ JamLLVMCreateTargetMachine(const char *triple, const char *cpu,
 	case JAM_OPT_AGGRESSIVE:
 		cgOpt = llvm::CodeGenOptLevel::Aggressive;
 		break;
-	// Codegen-level has no "size" tier — Zig also uses Aggressive for
-	// ReleaseSmall (zig-0.10.1/src/codegen/llvm.zig opt_level branch).
+	// Codegen-level has no "size" tier — size optimization happens in
+	// the IR pipeline and via function attributes, while codegen stays
+	// at Aggressive for the actual machine emission.
 	case JAM_OPT_SIZE:
 		cgOpt = llvm::CodeGenOptLevel::Aggressive;
 		break;
@@ -1081,11 +1081,9 @@ bool JamLLVMEmitObjectFile(JamModuleRef mod, JamTargetMachineRef tm,
 	// LLVM's codegen passes (instruction selection, register allocation),
 	// leaving every IR-level pass — inlining, GVN, mem2reg, SROA, loop opts,
 	// vectorization, MergeFunctions, globaldce — disabled. That made
-	// `--release` little better than `-O0` for real programs.
-	//
-	// Mirrors Zig's release pipeline (see
-	// misc/references/zig-0.10.1/src/zig_llvm.cpp
-	// ZigLLVMTargetMachineEmitToFile).
+	// `--release` little better than `-O0` for real programs. The
+	// configuration below builds a full new-PM optimization pipeline so
+	// release builds actually optimize.
 	llvm::PipelineTuningOptions pto;
 	pto.LoopUnrolling = !isDebug;
 	pto.SLPVectorization = !isDebug;

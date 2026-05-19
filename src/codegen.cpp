@@ -1008,8 +1008,8 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 			// site here (instantiation is triggered lazily inside
 			// type resolution); the file/line on the frame stays
 			// zero and the formatter skips it.
-			jam::Diagnostic::Trace traceFrame{
-			    /*loc=*/{}, /*decl=*/im.clonePtr->Name};
+			jam::Diagnostic::Trace traceFrame{/*loc=*/{},
+			                                  /*decl=*/im.clonePtr->Name};
 			jam::RefTraceFrame guard(refTrace_, std::move(traceFrame));
 			try {
 				astgenBodyInto(im.passOneJir, *im.clonePtr, mutCtx);

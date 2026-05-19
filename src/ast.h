@@ -164,8 +164,7 @@ class UnionDeclAST {
 // evaluable at codegen time). At each use site, the init expression is
 // codegen'd inline with `DeclaredType` as the expected type — a small
 // inlining pass that costs nothing at runtime and lets the optimizer
-// fold across uses just like a literal would. This is the same model
-// Zig uses for `pub const` of comptime-known values.
+// fold across uses just like a literal would.
 class ConstDeclAST {
   public:
 	std::string Name;

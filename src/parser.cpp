@@ -18,7 +18,7 @@
 // the parsed `double` is returned via `bit_cast`, and `isFloatOut` is
 // set so the caller can mark the AST node with the float flag.
 uint64_t Parser::parseNumLexeme(const std::string &s, bool &isNegOut,
-                                  bool &isFloatOut) const {
+                                bool &isFloatOut) const {
 	bool neg = !s.empty() && s[0] == '-';
 	const std::string &abs = neg ? s.substr(1) : s;
 	isNegOut = neg;
@@ -29,8 +29,7 @@ uint64_t Parser::parseNumLexeme(const std::string &s, bool &isNegOut,
 	case NumberResultKind::Int:
 		return r.intValue;
 	case NumberResultKind::BigInt:
-		parseError("integer literal `" + abs +
-		            "` exceeds u64 range");
+		parseError("integer literal `" + abs + "` exceeds u64 range");
 	case NumberResultKind::Float: {
 		isFloatOut = true;
 		// pack the double's bit pattern into u64. memcpy keeps it
@@ -44,7 +43,7 @@ uint64_t Parser::parseNumLexeme(const std::string &s, bool &isNegOut,
 	}
 	case NumberResultKind::Failure:
 		parseError(std::string("invalid numeric literal `") + abs +
-		            "`: " + numberErrorMessage(r.failure.kind));
+		           "`: " + numberErrorMessage(r.failure.kind));
 	}
 	parseError("unreachable number-literal classification");
 }
@@ -59,8 +58,8 @@ Parser::Parser(std::vector<Token> tokens, TypePool &typePool_,
 jam::SrcLoc Parser::currentLoc() const {
 	int line = 0;
 	if (!tokens.empty()) {
-		int idx = current < static_cast<int>(tokens.size()) ? current
-		                                                       : current - 1;
+		int idx =
+		    current < static_cast<int>(tokens.size()) ? current : current - 1;
 		if (idx < 0) idx = 0;
 		line = tokens[idx].line;
 	}
@@ -68,9 +67,7 @@ jam::SrcLoc Parser::currentLoc() const {
 }
 
 void Parser::parseError(std::string message) const {
-	if (diagnostics_) {
-		diagnostics_->error(currentLoc(), std::move(message));
-	}
+	if (diagnostics_) { diagnostics_->error(currentLoc(), std::move(message)); }
 	throw ParserAbort{};
 }
 
@@ -119,9 +116,7 @@ NodeIdx Parser::emit(AstNode n) {
 	// line lets `file:line:` prefixes appear on errors thrown deep in
 	// codegen even though the AST itself is positionless.
 	int line = 0;
-	if (n.mainToken < tokens.size()) {
-		line = tokens[n.mainToken].line;
-	}
+	if (n.mainToken < tokens.size()) { line = tokens[n.mainToken].line; }
 	return nodes->addNodeAt(n, line);
 }
 
@@ -419,9 +414,8 @@ TypeIdx Parser::parseType() {
 		if (match(TOK_CONST)) {
 			ptrConst = true;
 		} else if (!match(TOK_MUT)) {
-			parseError(
-			    "Expected `const` or `mut` after `*` (e.g. `*const T`, "
-			    "`*mut T`)");
+			parseError("Expected `const` or `mut` after `*` (e.g. `*const T`, "
+			           "`*mut T`)");
 		}
 		// Optional `[]` promotes to many-item form. We need to commit to
 		// "many" only when the next two tokens are exactly `[ ]`; a `[`
@@ -475,8 +469,7 @@ TypeIdx Parser::parseType() {
 		const std::string &firstIdent = previous().lexeme;
 		if (firstIdent == "Self") {
 			if (structContextStack.empty()) {
-				parseError(
-				    "`Self` is only valid inside a struct body");
+				parseError("`Self` is only valid inside a struct body");
 			}
 			return typePool->internNamed(
 			    stringPool->intern(structContextStack.back()));
@@ -637,18 +630,16 @@ NodeIdx Parser::parsePatternAtom() {
 			                    variantNameId});
 		}
 		current = saved;
-		parseError(
-		    "Bare identifier patterns are not yet supported "
-		    "(use `EnumName.Variant`, an integer literal, or `_`)");
+		parseError("Bare identifier patterns are not yet supported "
+		           "(use `EnumName.Variant`, an integer literal, or `_`)");
 	}
 	if (match(TOK_NUMBER)) {
 		bool isNegative = false;
 		bool isFloat = false;
 		uint64_t lo = parseNumLexeme(previous().lexeme, isNegative, isFloat);
 		if (isFloat) {
-			parseError(
-			    "Float literals are not allowed in `match` patterns "
-			    "(use an integer literal or a `..=` range)");
+			parseError("Float literals are not allowed in `match` patterns "
+			           "(use an integer literal or a `..=` range)");
 		}
 		// Inclusive range `lo..=hi`?
 		if (match(TOK_DOTDOT_EQ)) {
@@ -674,16 +665,14 @@ NodeIdx Parser::parsePatternAtom() {
 	// token; we treat single-quote chars as TOK_NUMBER via the
 	// lexer in a future patch. For now, only TOK_NUMBER is accepted.
 	if (match(TOK_STRING_LITERAL)) {
-		parseError(
-		    "Char literals in patterns are not yet supported");
+		parseError("Char literals in patterns are not yet supported");
 	}
 	// Wildcard `_` is lexed as TOK_IDENTIFIER; recognize it here.
 	if (check(TOK_IDENTIFIER) && peek().lexeme == "_") {
 		advance();
 		return emit(AstNode{AstTag::PatWildcard, 0, 0, 0, 0, 0});
 	}
-	parseError(
-	    "Expected pattern (integer literal, range, or `_`)");
+	parseError("Expected pattern (integer literal, range, or `_`)");
 }
 
 NodeIdx Parser::parsePattern() {
@@ -1039,9 +1028,8 @@ NodeIdx Parser::parseMultiplication() {
 }
 
 // Parse a postfix `as Type` chain on top of any unary expression. The
-// cast binds tightly — `5 + (x as u32)` not `(5 + x) as u32` — matching
-// the convention from C/Rust/Zig where `as` sits just above primary
-// expressions.
+// cast binds tightly — `5 + (x as u32)` not `(5 + x) as u32` — placing
+// the cast just above primary expressions in the precedence table.
 static NodeIdx parseAsChain(Parser *self, NodeIdx expr, NodeStore &nodes,
                             bool (Parser::*matchTok)(TokenType),
                             TypeIdx (Parser::*parseType)());
@@ -1351,14 +1339,13 @@ std::unique_ptr<EnumDeclAST> Parser::parseEnumDecl() {
 				}
 				mag = r.intValue;
 			} catch (const std::exception &e) {
-				parseError(
-				    std::string("Invalid enum discriminant: ") + e.what());
+				parseError(std::string("Invalid enum discriminant: ") +
+				           e.what());
 			}
 			(void)neg;
 			if (mag > 255) {
-				parseError(
-				    "Enum discriminant " + std::to_string(mag) +
-				    " is out of range; M2 enums are u8-tagged");
+				parseError("Enum discriminant " + std::to_string(mag) +
+				           " is out of range; M2 enums are u8-tagged");
 			}
 			v.Discriminant = static_cast<uint32_t>(mag);
 			nextDiscrim = v.Discriminant + 1;
@@ -1372,13 +1359,11 @@ std::unique_ptr<EnumDeclAST> Parser::parseEnumDecl() {
 	consume(TOK_SEMI, "Expected ';' after enum declaration");
 
 	if (variants.empty()) {
-		parseError("Enum `" + name +
-		                         "` must declare at least one variant");
+		parseError("Enum `" + name + "` must declare at least one variant");
 	}
 	if (variants.size() > 256) {
-		parseError(
-		    "Enum `" + name +
-		    "` has more than 256 variants; M2 enums are u8-tagged");
+		parseError("Enum `" + name +
+		           "` has more than 256 variants; M2 enums are u8-tagged");
 	}
 	return std::make_unique<EnumDeclAST>(name, std::move(variants));
 }
@@ -1456,17 +1441,12 @@ std::unique_ptr<ConstDeclAST> Parser::parseConstDecl() {
 	consume(TOK_EQUAL, "Expected '=' in module-scope const declaration");
 	// Parse RHS as an expression — no speculation. Type-alias intent
 	// (`const ListI32 = Vec(i32);`) is recognised at registration
-	// time in main.cpp::resolveExprAsType by *pattern-matching* the
+	// time in main.cpp::resolveExprAsType by pattern-matching the
 	// resulting AST (`Variable` for type-named bindings, direct
-	// `Call` of a generic-fn-returning-`type`). This is the same
-	// grammar shape Zig uses (`const Foo = Bar(i32);` parses as an
-	// expression in `lib/std/zig/parse.zig:820 parseVarDecl`), but
-	// the *semantic* dispatch is different: Zig comptime-evaluates
-	// the RHS in Sema and inspects the resulting value's type,
-	// which handles arbitrary expressions (if/else, member access,
-	// chained calls, 0-arg type-returning fns). Jam's pattern match
-	// covers only the common cases; richer forms are deferred until
-	// (and if) we add comptime evaluation.
+	// `Call` of a generic-fn-returning-`type`). The pattern match
+	// covers the common cases; richer forms (if/else types, member
+	// access on types, chained calls, 0-arg type-returning fns)
+	// are deferred until comptime evaluation lands.
 	NodeIdx init = parseLogicalOr();
 	consume(TOK_SEMI, "Expected ';' after module-scope const declaration");
 
@@ -1496,8 +1476,7 @@ std::unique_ptr<ModuleAST> Parser::parse() {
 				int peek = current + 1;
 				if (peek < static_cast<int>(tokens.size()) &&
 				    tokens[peek].type == TOK_OPEN_BRACE) {
-					parseError(
-					    "`pub` is not allowed on destructuring imports");
+					parseError("`pub` is not allowed on destructuring imports");
 				}
 			}
 		}
@@ -1527,8 +1506,7 @@ std::unique_ptr<ModuleAST> Parser::parse() {
 					advance();
 					if (check(TOK_IMPORT)) {
 						if (isPub) {
-							parseError(
-							    "`pub` is not allowed on imports");
+							parseError("`pub` is not allowed on imports");
 						}
 						current = saved;
 						module->Imports.push_back(parseImportDecl());

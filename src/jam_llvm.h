@@ -225,17 +225,19 @@ JAM_EXTERN_C void
 JamLLVMPositionBuilderBeforeTerminator(JamBuilderRef builder,
                                        JamBasicBlockRef block);
 
-JAM_EXTERN_C JamValueRef JamLLVMBuildZExt(JamBuilderRef builder, JamValueRef val,
-                                          JamTypeRef destType, const char *name);
-JAM_EXTERN_C JamValueRef JamLLVMBuildSExt(JamBuilderRef builder, JamValueRef val,
-                                          JamTypeRef destType, const char *name);
+JAM_EXTERN_C JamValueRef JamLLVMBuildZExt(JamBuilderRef builder,
+                                          JamValueRef val, JamTypeRef destType,
+                                          const char *name);
+JAM_EXTERN_C JamValueRef JamLLVMBuildSExt(JamBuilderRef builder,
+                                          JamValueRef val, JamTypeRef destType,
+                                          const char *name);
 
 // Stack alloca with an explicit alignment in bytes. Pass 0 to fall back to
 // LLVM's data-layout-derived inference, but prefer passing the type's real
 // alignment (via JamCodegenContext::typeAlign). LLVM's getPrefTypeAlign
-// over-aligns aggregates relative to what C/C++/Zig produce on the same
-// target — Zig works around this the same way (see Zig codegen/llvm.zig
-// `buildAllocaInner` which always calls `setAlignment` on the result).
+// over-aligns aggregates relative to what other LLVM-based compilers
+// produce on the same target — explicitly setting the alignment from
+// our own type model keeps layout consistent with C/C++ peer code.
 JAM_EXTERN_C JamValueRef JamLLVMBuildAlloca(JamBuilderRef builder,
                                             JamTypeRef type,
                                             uint64_t alignBytes,
@@ -393,31 +395,26 @@ JAM_EXTERN_C char *JamLLVMGetHostCPUName(void);
 JAM_EXTERN_C char *JamLLVMGetHostCPUFeatures(void);
 
 // Optimization levels selected at TargetMachine creation. Default for jam is
-// `None` to match Zig's Debug / rustc's `opt-level=0` — Debug compiles 5-10×
-// faster than -O2 because LLVM's machine codegen + the full new-PM module
-// pipeline are the dominant cost. The IR-level pipeline (inlining, GVN, SROA,
-// vectorization, MergeFunctions, globaldce, …) is driven by these values
-// inside JamLLVMEmitObjectFile.
+// `None` — debug builds compile 5-10× faster than -O2 because LLVM's machine
+// codegen + the full new-PM module pipeline are the dominant cost. The IR-
+// level pipeline (inlining, GVN, SROA, vectorization, MergeFunctions,
+// globaldce, …) is driven by these values inside JamLLVMEmitObjectFile.
 //
-// Maps to rustc's `-C opt-level=N` values; see compile_codegen_options in the
-// rustc source for the same mapping. SIZE/SMALL still run codegen at
-// Aggressive (instruction selection / regalloc have no "size" tier) — size
-// optimization happens at the IR-pipeline level and via function attributes.
+// SIZE/SMALL still run codegen at Aggressive (instruction selection / regalloc
+// have no "size" tier) — size optimization happens at the IR-pipeline level
+// and via function attributes.
 typedef enum {
-	JAM_OPT_NONE = 0,        // -O0  (rustc `0`)
-	JAM_OPT_LESS = 1,        // -O1  (rustc `1`)
-	JAM_OPT_DEFAULT = 2,     // -O2  (rustc `2`, LLVM default)
-	JAM_OPT_AGGRESSIVE = 3,  // -O3  (rustc `3`, Zig "ReleaseFast")
-	JAM_OPT_SIZE = 4,        // -Os  (rustc `s` — moderate size; optsize attr)
-	JAM_OPT_SMALL = 5,       // -Oz  (rustc `z`, Zig "ReleaseSmall";
-	                         //       minsize + optsize attrs)
+	JAM_OPT_NONE = 0,        // -O0
+	JAM_OPT_LESS = 1,        // -O1
+	JAM_OPT_DEFAULT = 2,     // -O2  (LLVM default)
+	JAM_OPT_AGGRESSIVE = 3,  // -O3
+	JAM_OPT_SIZE = 4,        // -Os  (moderate size; optsize attr)
+	JAM_OPT_SMALL = 5,       // -Oz  (minsize + optsize attrs)
 } JamOptLevel;
 
 // Link-time optimization mode. When enabled, jam emits LLVM bitcode (.bc)
 // instead of an object file, and clang/lld re-runs the optimization pipeline
 // across the bitcode plus any LTO-compatible static libraries at link time.
-// Matches rustc's `-C lto={off,thin,fat}` and Zig's want_lto plumbing
-// (zig-0.10.1/src/Compilation.zig:1248-1273).
 //
 // Useful even though jam already compiles to a single combined module:
 // link-time LTO lets the optimizer see across into libc++/libc/static
