@@ -16,6 +16,12 @@
 enum TokenType {
 	TOK_EOF = 0,
 	TOK_FN,
+	// `cfn` declares a method whose calls are synthesized by the
+	// compiler instead of being typed by the user. The shape on disk
+	// is identical to a regular function (same args / body / return);
+	// the difference is opt-in for the compiler hooks (`drop`, `at`,
+	// `default`). A `fn drop(self)` without `cfn` is just a method.
+	TOK_CFN,
 	TOK_IDENTIFIER,
 	TOK_COLON,
 	TOK_OPEN_BRACE,

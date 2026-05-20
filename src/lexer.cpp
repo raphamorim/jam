@@ -98,6 +98,8 @@ void Lexer::identifier() {
 	// Check for keywords
 	if (text == "fn") {
 		addToken(TOK_FN);
+	} else if (text == "cfn") {
+		addToken(TOK_CFN);
 	} else if (text == "return") {
 		addToken(TOK_RETURN);
 	} else if (text == "const") {

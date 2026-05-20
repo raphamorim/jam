@@ -8,7 +8,7 @@ const { assert } = import("test");
 const Counter = struct {
     value: u32,
     sink: *mut u32,
-    fn drop(self: mut Counter) {
+    cfn drop(self: mut Counter) {
         var p: *mut u32 = self.sink;
         p.* = p.* + 1;
     }

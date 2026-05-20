@@ -14,7 +14,7 @@ const Counter = struct {
 // `var c: Counter = ...;` goes out of scope, the codegen synthesizes a
 // call to drop(&c). We bump the sink-pointed value so we can observe it
 // from the test harness.
-fn drop(self: mut Counter) {
+cfn drop(self: mut Counter) {
     // Pointer-deref assignment is only supported on a pointer-typed local
     // today, so move the field into a temp before reading/writing.
     var p: *mut u32 = self.sink;

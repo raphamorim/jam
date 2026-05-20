@@ -74,6 +74,22 @@ pub fn Vec(T: type) type {
             return Option(T).Some(self.ptr[i]);
         }
 
+        // `cfn at` / `cfn setAt` are the value-shaped hooks the
+        // compiler dispatches `v[i]` (rvalue) and `v[i] = x`
+        // (lvalue) to. Both signatures are pure value semantics —
+        // no `*mut T` return, no `&` in any body, no address ever
+        // produced. The implementation uses slice-indexing through
+        // the private `self.ptr` field, which is a structured
+        // primitive op (not pointer arithmetic).
+        //
+        // Bounds-checked reads remain on `get(i) -> Option(T)`.
+        cfn at(self: Self, i: u32) T {
+            return self.ptr[i];
+        }
+        cfn setAt(self: mut Self, i: u32, value: T) {
+            self.ptr[i] = value;
+        }
+
         // Reset length to zero without releasing the buffer. Lets
         // callers reuse one Vec across many iterations of a hot
         // loop (per-frame audio drain, per-sector decode scratch)
@@ -154,7 +170,10 @@ pub fn Vec(T: type) type {
             self.capacity = newCap;
         }
 
-        fn drop(self: mut Self) {
+        // `cfn drop` is what hooks Vec into MVS auto-cleanup. A
+        // plain `fn drop` would not auto-fire at scope exit; only
+        // the cfn variant is registered with the drop registry.
+        cfn drop(self: mut Self) {
             free(self.ptr as *mut[] u8);
         }
     };

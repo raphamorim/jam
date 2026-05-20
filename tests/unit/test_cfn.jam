@@ -1,0 +1,65 @@
+// `cfn` marker — opts a method into the compiler-synthesized-call
+// set (drop, at, default). A plain `fn` with one of those names is
+// just an ordinary method: no auto-fire at scope exit for `drop`,
+// no `v[i]` desugar for `at`. These tests pin that behavior.
+
+const { assert } = import("test");
+
+// cfn drop fires on scope exit
+
+const CfnDropTarget = struct {
+    sink: *mut u32,
+    cfn drop(self: mut CfnDropTarget) {
+        var p: *mut u32 = self.sink;
+        p.* = p.* + 1;
+    }
+};
+
+fn makeAndDropCfn(sink: *mut u32) {
+    var d: CfnDropTarget = CfnDropTarget { sink: sink };
+    // d falls out of scope here — cfn drop must run.
+}
+
+tfn cfnDropAutoFires() {
+    var counter: u32 = 0;
+    var p: *mut u32 = &counter;
+    makeAndDropCfn(p);
+    assert(counter, 1);
+}
+
+// fn drop (no cfn) does NOT auto-fire
+
+const PlainDropTarget = struct {
+    sink: *mut u32,
+    // Same shape as a drop method but declared `fn`, not `cfn`. The
+    // compiler must treat this as an ordinary instance method —
+    // never synthesize a call at scope exit.
+    fn drop(self: mut PlainDropTarget) {
+        var p: *mut u32 = self.sink;
+        p.* = p.* + 1;
+    }
+};
+
+fn makeAndDropPlain(sink: *mut u32) {
+    var d: PlainDropTarget = PlainDropTarget { sink: sink };
+    // Falls out of scope — no auto-call. Caller still observes 0.
+}
+
+tfn plainDropDoesNotAutoFire() {
+    var counter: u32 = 0;
+    var p: *mut u32 = &counter;
+    makeAndDropPlain(p);
+    // If the compiler synthesized a call to PlainDropTarget.drop
+    // here, counter would be 1.
+    assert(counter, 0);
+}
+
+// Explicit call to a plain `fn drop` still works as a regular
+// instance method — the name isn't reserved, just the marker.
+tfn plainDropCallableExplicitly() {
+    var counter: u32 = 0;
+    var p: *mut u32 = &counter;
+    var d: PlainDropTarget = PlainDropTarget { sink: p };
+    d.drop();
+    assert(counter, 1);
+}

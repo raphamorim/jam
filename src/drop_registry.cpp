@@ -13,12 +13,18 @@ namespace jam {
 namespace drops {
 
 // Inspect a candidate function and, if it has the drop-fn shape
-// (`fn drop(self: mut <Struct>)`), add it to the registry under the
-// struct's name. Used by both the top-level-function scan and the
-// struct-method scan below.
+// (`cfn drop(self: mut <Struct>)`), add it to the registry under
+// the struct's name. Used by both the top-level-function scan and
+// the struct-method scan below.
+//
+// `cfn` (not plain `fn`) is required: only methods opted into the
+// compiler-synthesized-call set get auto-fired at scope exit. A
+// plain `fn drop(self)` is treated as an ordinary method the user
+// invokes explicitly — no implicit destructor call.
 static void considerDropCandidate(const FunctionAST *fn, const TypePool &types,
                                   const StringPool &strings,
                                   DropRegistry &registry) {
+	if (!fn->isCfn) return;
 	if (fn->Name != "drop") return;
 	if (fn->Args.size() != 1) return;
 	const Param &p = fn->Args[0];

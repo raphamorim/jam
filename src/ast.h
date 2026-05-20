@@ -58,14 +58,19 @@ class FunctionAST {
 	bool isPub;
 	bool isTest;
 	bool isVarArgs;
+	// Declared with `cfn` instead of `fn` — opts the method into
+	// the compiler-synthesized-call set (drop / at / default). A
+	// regular `fn` shaped like one of those names is just a method;
+	// `cfn` is what wires it to the compiler's hooks.
+	bool isCfn;
 
 	FunctionAST(std::string Name, std::vector<Param> Args, TypeIdx ReturnType,
 	            std::vector<NodeIdx> Body, bool isExtern = false,
 	            bool isExport = false, bool isPub = false, bool isTest = false,
-	            bool isVarArgs = false)
+	            bool isVarArgs = false, bool isCfn = false)
 	    : Name(std::move(Name)), Args(std::move(Args)), ReturnType(ReturnType),
 	      Body(std::move(Body)), isExtern(isExtern), isExport(isExport),
-	      isPub(isPub), isTest(isTest), isVarArgs(isVarArgs) {}
+	      isPub(isPub), isTest(isTest), isVarArgs(isVarArgs), isCfn(isCfn) {}
 
 	// a function is generic iff any of its parameters has
 	// type `type` (the meta-type) or its return type is `type`. Generic

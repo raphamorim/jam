@@ -1,6 +1,6 @@
 const { assert } = import("test");
 
-// MVS P8.2a: two `fn drop(self: mut T)` for different types coexist
+// Two `fn drop(self: mut T)` for different types coexist
 // because the codegen mangles each to `__drop_<TypeName>` at the LLVM
 // level. Each fires for its own type at scope exit.
 
@@ -12,12 +12,12 @@ const B = struct {
     sink: *mut u32,
 };
 
-fn drop(self: mut A) {
+cfn drop(self: mut A) {
     var p: *mut u32 = self.sink;
     p.* = p.* + 10;
 }
 
-fn drop(self: mut B) {
+cfn drop(self: mut B) {
     var p: *mut u32 = self.sink;
     p.* = p.* + 100;
 }

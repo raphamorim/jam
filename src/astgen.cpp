@@ -296,6 +296,14 @@ static void emitCondBr(AstGenCtx &gctx, JirRef cond, JirBlockRef thenB,
 static void emitDrops(AstGenCtx &gctx, const std::vector<DropTrack> &bindings);
 static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
                        const std::vector<JirRef> &argRefs);
+// `v[i]` desugar dispatch — see `emitStructCfnDispatch` for the body.
+// Forward-declared so astgenAssign (in this file, above the
+// definition) can call it for `v[i] = x` → setAt routing.
+static JirRef emitStructCfnDispatch(AstGenCtx &gctx,
+                                    const JamCodegenContext::StructInfo *sinfo,
+                                    const char *methodName, JirRef recv,
+                                    JirRef idx,
+                                    const std::vector<JirRef> &extraArgs);
 
 // Push an empty drop scope (called when entering a structured body).
 // We push a parallel `localScopes` frame so each lexical block has
@@ -806,6 +814,11 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 		NodeIdx idxIdx = static_cast<NodeIdx>(n.rhs);
 		JirRef idxRef = astgenExpr(gctx, idxIdx, BuiltinType::U64);
 		const TypeKey &k = gctx.ctx.getTypePool().get(baseTy);
+
+		// Struct indexing in lvalue position is handled exclusively
+		// via the assignment path (astgenAssign dispatches to
+		// `cfn setAt`). Nothing to do here — fall through to the
+		// built-in array / slice / ptr-many index-address logic.
 		TypeIdx elemTy = kNoType;
 		if (k.kind == TypeKind::Array || k.kind == TypeKind::Slice ||
 		    k.kind == TypeKind::PtrMany) {
@@ -856,12 +869,86 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 	}
 }
 
-// AstGen for `Assign`. Targets: Variable / Deref via lvalue helper.
-// Member/Index lvalue writes still need pointer-producing JIR ops —
-// added in a follow-up alongside slice/struct-field GEP instructions.
+// AstGen for `Assign`. Two paths:
+//   1. Target is an Index on a struct value (e.g. `v[i] = x` where
+//      `v: Vec(i32)`). Dispatch to the struct's `cfn setAt` method —
+//      that's how value-shaped indexed assignment works without
+//      producing a pointer / borrow. No `astgenLvalue` step needed
+//      because there's no pointer-producing JIR op involved; the
+//      setter takes (recv, i, value) by value and stores internally
+//      via plain slice-indexing through its own `self.ptr`.
+//   2. Anything else — the original lvalue-pointer-then-Store path.
+//      Variable / Deref / MemberAccess / Index on arrays-slices-
+//      ptr-many all go through here.
 static void astgenAssign(AstGenCtx &gctx, const AstNode &n) {
 	NodeIdx targetIdx = static_cast<NodeIdx>(n.lhs);
 	NodeIdx valueIdx = static_cast<NodeIdx>(n.rhs);
+
+	// `v[i] = x` on a struct → `v.setAt(i, x)`.
+	const AstNode &target = gctx.ctx.getNodeStore().get(targetIdx);
+	if (target.tag == AstTag::Index) {
+		NodeIdx baseIdx = static_cast<NodeIdx>(target.lhs);
+		NodeIdx idxIdx = static_cast<NodeIdx>(target.rhs);
+		// Peek the base's type by lowering it as an rvalue. For a
+		// struct with a `cfn setAt`, the receiver-prep below will
+		// re-lower as lvalue (mut/move self) or spill (non-
+		// addressable rvalue) — same shape as the indirect-call
+		// path. For non-struct bases (arrays / slices / ptr-many),
+		// we fall back to the existing lvalue-pointer-store path
+		// without having done extra work the next call can't
+		// observe (the rvalue lowering is side-effect-free for
+		// Variable / Index / MemberAccess / Deref bases).
+		JirRef baseRef = astgenExpr(gctx, baseIdx, kNoType);
+		TypeIdx baseTy = gctx.jfn.getInst(baseRef).ty;
+		const auto *sinfo = gctx.ctx.lookupStruct(baseTy);
+		if (sinfo != nullptr) {
+			const std::string qualified = sinfo->name + ".setAt";
+			const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
+			if (method != nullptr && method->isCfn &&
+			    method->Args.size() >= 3) {
+				JirRef idxRef = astgenExpr(gctx, idxIdx, BuiltinType::U64);
+				// setAt's value parameter type tells us what to
+				// lower the RHS as.
+				TypeIdx valParamTy = method->Args[2].Type;
+				JirRef valRef = astgenExpr(gctx, valueIdx, valParamTy);
+				// Receiver-prep: setAt's self is mut/move, so we
+				// hand it a *Self pointer.
+				ParamMode mode = method->Args[0].Mode;
+				JirRef recv = baseRef;
+				if (mode == ParamMode::Mut || mode == ParamMode::Move) {
+					const AstNode &baseNode =
+					    gctx.ctx.getNodeStore().get(baseIdx);
+					TypeIdx leafTyR = kNoType;
+					switch (baseNode.tag) {
+					case AstTag::Variable:
+					case AstTag::MemberAccess:
+					case AstTag::Index:
+					case AstTag::Deref:
+						recv = astgenLvalue(gctx, baseIdx, leafTyR);
+						break;
+					default: {
+						JirInst alloca{};
+						alloca.tag = JirTag::Alloca;
+						alloca.ty = baseTy;
+						JirRef slot = emitAllocaHoisted(gctx, alloca);
+						JirInst store{};
+						store.tag = JirTag::Store;
+						store.a = slot;
+						store.b = baseRef;
+						emit(gctx, store);
+						recv = slot;
+						break;
+					}
+					}
+				}
+				emitStructCfnDispatch(gctx, sinfo, "setAt", recv, idxRef,
+				                      {valRef});
+				return;
+			}
+		}
+		// Not a struct, or no `cfn setAt` defined — fall through.
+	}
+
 	TypeIdx leafTy = kNoType;
 	JirRef ptrRef = astgenLvalue(gctx, targetIdx, leafTy);
 	JirRef valRef = astgenExpr(gctx, valueIdx, leafTy);
@@ -1218,9 +1305,62 @@ static JirRef astgenArrayRepeat(AstGenCtx &gctx, const AstNode &n,
 	return emit(gctx, inst);
 }
 
+// Look up and call a struct's `cfn` method by name. Returns the
+// call's result JirRef (whatever type the method returns), or
+// kNoJirRef when the struct doesn't define a matching cfn method.
+// Used by the `v[i]` desugar to dispatch to `at` (rvalue read) and
+// the `v[i] = x` desugar to dispatch to `setAt` (lvalue write).
+//
+// Both methods are value-shaped: `at(self, i) T` returns the
+// element by value (no pointer); `setAt(self: mut Self, i, value)`
+// performs the write. No pointer / address appears in any signature
+// — the language's borrow-free MVS model stays intact.
+//
+// `recv` must be a `*Self` pointer for mut/move self, or the Self
+// value for let/const self. Caller decides whether to re-lower or
+// spill based on the base AST shape. `extraArgs` holds any args
+// beyond (recv, idx) — empty for `at`, single-element [value] for
+// `setAt`.
+static JirRef emitStructCfnDispatch(AstGenCtx &gctx,
+                                    const JamCodegenContext::StructInfo *sinfo,
+                                    const char *methodName, JirRef recv,
+                                    JirRef idx,
+                                    const std::vector<JirRef> &extraArgs) {
+	std::string qualified = std::string(sinfo->name) + "." + methodName;
+	const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
+	// Method must be declared `cfn` to opt into the compiler's
+	// index-syntax dispatch. A plain `fn at` / `fn setAt` is just
+	// an ordinary instance method, called explicitly by the user.
+	if (method == nullptr || !method->isCfn ||
+	    method->Args.size() < 2 + extraArgs.size()) {
+		return kNoJirRef;
+	}
+	// Narrow the U64-typed index to the method's declared index
+	// parameter width (conventionally u32).
+	TypeIdx idxParamTy = method->Args[1].Type;
+	const TypeKey &idxKey = gctx.ctx.getTypePool().get(idxParamTy);
+	TypeIdx currentTy = gctx.jfn.getInst(idx).ty;
+	if (currentTy != idxParamTy && idxKey.kind == TypeKind::Int) {
+		const TypeKey &curKey = gctx.ctx.getTypePool().get(currentTy);
+		JirInst conv{};
+		conv.tag = (idxKey.a < curKey.a) ? JirTag::Trunc : JirTag::ZExt;
+		conv.a = idx;
+		conv.ty = idxParamTy;
+		idx = emit(gctx, conv);
+	}
+	std::vector<JirRef> argRefs;
+	argRefs.reserve(2 + extraArgs.size());
+	argRefs.push_back(recv);
+	argRefs.push_back(idx);
+	for (JirRef r : extraArgs) argRefs.push_back(r);
+	return emitCall(gctx, method, argRefs);
+}
+
 // AstGen for `Index`. Lowers to JirTag::Index whose codegen handles
 // the GEP+Load (for stored Variables/Arrays) or alloca-spill (for
 // SSA aggregates) shape. Element type comes from the base's TypeKey.
+// Struct receivers route through `at(self, i)` — see
+// `emitStructIndexAtCall`.
 static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 	NodeIdx baseIdx = static_cast<NodeIdx>(n.lhs);
 	NodeIdx idxIdx = static_cast<NodeIdx>(n.rhs);
@@ -1228,6 +1368,63 @@ static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 	JirRef idxRef = astgenExpr(gctx, idxIdx, BuiltinType::U64);
 	TypeIdx baseTy = gctx.jfn.getInst(baseRef).ty;
 	const TypeKey &k = gctx.ctx.getTypePool().get(baseTy);
+
+	// Struct dispatch: `v[i]` → `v.at(i)`. The `at` method is value-
+	// shaped — it returns T directly, no pointer wrapper. The call's
+	// result IS the index expression's value; nothing more to do.
+	// `lookupStruct` chases Struct / Named / GenericCall TypeKinds
+	// (an un-aliased `Vec(u8)` use-site annotation lands as the
+	// latter) and returns null for non-struct bases, so we fall
+	// through cleanly to arrays / slices / ptr-many below.
+	{
+		const auto *sinfo = gctx.ctx.lookupStruct(baseTy);
+		if (sinfo != nullptr) {
+			const std::string qualified = sinfo->name + ".at";
+			const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
+			if (method != nullptr && method->isCfn && !method->Args.empty()) {
+				// Receiver-prep mirrors the indirect-call path: for
+				// mut/move self, hand the method an addressable
+				// `*Self`. Re-lower addressable bases via
+				// astgenLvalue; spill non-addressable rvalues to a
+				// fresh alloca and use that. (`at` is typically
+				// `self: Self`, but Vec.at could legitimately take
+				// `mut self` if the type wants to lazily mutate on
+				// read — we support both.)
+				ParamMode mode = method->Args[0].Mode;
+				JirRef recv = baseRef;
+				if (mode == ParamMode::Mut || mode == ParamMode::Move) {
+					const AstNode &baseNode =
+					    gctx.ctx.getNodeStore().get(baseIdx);
+					TypeIdx leafTy = kNoType;
+					switch (baseNode.tag) {
+					case AstTag::Variable:
+					case AstTag::MemberAccess:
+					case AstTag::Index:
+					case AstTag::Deref:
+						recv = astgenLvalue(gctx, baseIdx, leafTy);
+						break;
+					default: {
+						JirInst alloca{};
+						alloca.tag = JirTag::Alloca;
+						alloca.ty = baseTy;
+						JirRef slot = emitAllocaHoisted(gctx, alloca);
+						JirInst store{};
+						store.tag = JirTag::Store;
+						store.a = slot;
+						store.b = baseRef;
+						emit(gctx, store);
+						recv = slot;
+						break;
+					}
+					}
+				}
+				JirRef atResult =
+				    emitStructCfnDispatch(gctx, sinfo, "at", recv, idxRef, {});
+				if (atResult != kNoJirRef) { return atResult; }
+			}
+		}
+	}
+
 	TypeIdx elemTy = kNoType;
 	if (k.kind == TypeKind::Array || k.kind == TypeKind::Slice ||
 	    k.kind == TypeKind::PtrMany) {

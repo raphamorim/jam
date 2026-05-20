@@ -1014,7 +1014,8 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 			auto cloned = std::make_unique<FunctionAST>(
 			    instMethodName, std::move(instArgs), instReturn,
 			    origMethod->Body, origMethod->isExtern, origMethod->isExport,
-			    origMethod->isPub, origMethod->isTest, origMethod->isVarArgs);
+			    origMethod->isPub, origMethod->isTest, origMethod->isVarArgs,
+			    origMethod->isCfn);
 			FunctionAST *clonePtr = cloned.get();
 			instantiatedMethods_.push_back(std::move(cloned));
 

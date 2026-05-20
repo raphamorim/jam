@@ -160,19 +160,19 @@ void testMultiErrorsSortedByLine() {
 // ── Reference trace for generic instantiation ──────────────────
 
 void testGenericInstantiationCarriesRefTrace() {
-	auto r =
-	    compileSource("diag_ref_trace", "fn Box(T: type) type {\n"
-	                                    "    return struct {\n"
-	                                    "        val: T,\n"
-	                                    "        fn pickBad(self: Self) i32 {\n"
-	                                    "            return self.notAField;\n"
-	                                    "        }\n"
-	                                    "    };\n"
-	                                    "}\n"
-	                                    "fn main() i32 {\n"
-	                                    "    var b: Box(i32) = Box(i32) { val: 7 };\n"
-	                                    "    return b.pickBad();\n"
-	                                    "}\n");
+	auto r = compileSource("diag_ref_trace",
+	                       "fn Box(T: type) type {\n"
+	                       "    return struct {\n"
+	                       "        val: T,\n"
+	                       "        fn pickBad(self: Self) i32 {\n"
+	                       "            return self.notAField;\n"
+	                       "        }\n"
+	                       "    };\n"
+	                       "}\n"
+	                       "fn main() i32 {\n"
+	                       "    var b: Box(i32) = Box(i32) { val: 7 };\n"
+	                       "    return b.pickBad();\n"
+	                       "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	// Underlying error inside the instantiated body — line 5 in
 	// source. Reference trace adds "in instantiation of

@@ -8,7 +8,7 @@ const Bumper = struct {
     sink: *mut u32,
 };
 
-fn drop(self: mut Bumper) {
+cfn drop(self: mut Bumper) {
     var p: *mut u32 = self.sink;
     p.* = p.* + 1;
 }

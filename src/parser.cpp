@@ -150,8 +150,8 @@ bool Parser::isQualifiedNameChain(NodeIdx chainRoot) const {
 // Walk the chain root (leftmost Variable in a Variable.member.member...
 // chain) and return its source-level name. Caller guarantees the chain
 // is a qualified-name shape.
-static std::string chainRootName(const NodeStore &ns,
-                                  const StringPool &pool, NodeIdx chainRoot) {
+static std::string chainRootName(const NodeStore &ns, const StringPool &pool,
+                                 NodeIdx chainRoot) {
 	const AstNode &n = ns.get(chainRoot);
 	if (n.tag == AstTag::Variable) {
 		return pool.get(static_cast<StringIdx>(n.lhs));
@@ -320,8 +320,8 @@ NodeIdx Parser::parsePrimary() {
 				typeNameId = stringPool->intern(structContextStack.back());
 			}
 			AstNode &litNode = nodes->getMut(lit);
-			litNode.lhs = static_cast<uint32_t>(
-			    typePool->internNamed(typeNameId));
+			litNode.lhs =
+			    static_cast<uint32_t>(typePool->internNamed(typeNameId));
 			return lit;
 		}
 
@@ -395,8 +395,7 @@ NodeIdx Parser::parsePrimary() {
 					std::string receiverName =
 					    isNamespacedTypecall ? qualifiedName(expr) : name;
 					TypeIdx genericTy = typePool->internGenericCall(
-					    stringPool->intern(receiverName),
-					    std::move(typeArgs));
+					    stringPool->intern(receiverName), std::move(typeArgs));
 					NodeIdx lit = parseStructLiteral();
 					AstNode &litNode = nodes->getMut(lit);
 					litNode.lhs = static_cast<uint32_t>(genericTy);
@@ -513,7 +512,8 @@ NodeIdx Parser::parsePrimary() {
 						callee = name;
 					}
 					StringIdx calleeId = stringPool->intern(callee);
-					expr = emit(AstNode{AstTag::Call, 0, 0, 0, calleeId, extra});
+					expr =
+					    emit(AstNode{AstTag::Call, 0, 0, 0, calleeId, extra});
 				}
 			} else {
 				expr = emit(AstNode{AstTag::Call, 0, 1, 0,
@@ -1292,7 +1292,18 @@ std::unique_ptr<FunctionAST> Parser::parseFunction() {
 		else break;
 	}
 
-	if (!isTest) { consume(TOK_FN, "Expected 'fn' keyword"); }
+	// Accept `cfn` as a marker for compiler-synthesized-call methods
+	// (drop / at / default). Same shape as `fn` otherwise — modifiers
+	// loop above is unchanged, the body is identical, only the flag
+	// on FunctionAST differs.
+	bool isCfn = false;
+	if (!isTest) {
+		if (match(TOK_CFN)) {
+			isCfn = true;
+		} else {
+			consume(TOK_FN, "Expected 'fn' or 'cfn' keyword");
+		}
+	}
 	consume(TOK_IDENTIFIER, "Expected function name");
 	std::string name(previous().text(source_));
 
@@ -1344,9 +1355,9 @@ std::unique_ptr<FunctionAST> Parser::parseFunction() {
 
 	if (isExtern) {
 		consume(TOK_SEMI, "Expected ';' after extern function declaration");
-		return std::make_unique<FunctionAST>(name, std::move(args), returnType,
-		                                     std::vector<NodeIdx>{}, true,
-		                                     isExport, isPub, false, isVarArgs);
+		return std::make_unique<FunctionAST>(
+		    name, std::move(args), returnType, std::vector<NodeIdx>{}, true,
+		    isExport, isPub, false, isVarArgs, isCfn);
 	}
 
 	consume(TOK_OPEN_BRACE, "Expected '{' before function body");
@@ -1359,17 +1370,18 @@ std::unique_ptr<FunctionAST> Parser::parseFunction() {
 
 	return std::make_unique<FunctionAST>(name, std::move(args), returnType,
 	                                     std::move(body), false, isExport,
-	                                     isPub, isTest, false);
+	                                     isPub, isTest, false, isCfn);
 }
 
 void Parser::parseStructBody(
     std::vector<std::pair<std::string, TypeIdx>> &fields,
     std::vector<std::unique_ptr<FunctionAST>> &methods) {
 	while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
-		// Method: `fn name(self: ..., ...) ReturnType { body }`. Methods
-		// can appear in any order relative to fields. parseFunction
-		// consumes the `fn` keyword itself.
-		if (check(TOK_FN)) {
+		// Method: `fn name(self: ..., ...) ReturnType { body }` (or
+		// `cfn name(...)` for compiler-synthesized-call methods).
+		// Methods can appear in any order relative to fields.
+		// parseFunction consumes the keyword itself.
+		if (check(TOK_FN) || check(TOK_CFN)) {
 			methods.push_back(parseFunction());
 			match(TOK_COMMA);  // optional trailing comma after a method
 			continue;

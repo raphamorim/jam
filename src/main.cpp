@@ -536,53 +536,41 @@ static int compileAndRun(const std::string &filename,
 	};
 	for (auto &s : module->Structs) {
 		for (auto &m : s->Methods) {
-			// Two privileged method names on top-level structs:
-			//   `drop`    — no-arg-cleanup; must take `self: mut Self`.
-			//   `default` — opt-in default constructor; takes no
-			//               parameters, returns `Self`. Used by anything
-			//               that expects a default value (struct-literal
-			//               omitted fields, generic type parameters that
-			//               require a default, future `var x: T;`).
-			// Anything else is rejected — there is no general user-
-			// defined static-method or instance-method support on top-
-			// level structs in v1.
-			if (m->Name == "default") {
+			// `cfn`-marked methods (drop / default / at / …) opt in
+			// to compiler-synthesized calls and must match the
+			// expected signature for their name. Plain `fn` methods
+			// are ordinary instance methods — no signature
+			// constraints, no rejection by name.
+			if (m->isCfn && m->Name == "default") {
 				if (!m->Args.empty()) {
 					std::cerr << filename
-					          << ": error: method `default` on struct `"
-					          << s->Name << "` must take no parameters\n";
+					          << ": error: cfn `default` on struct `" << s->Name
+					          << "` must take no parameters\n";
 					return 1;
 				}
 				std::string retStruct = resolveStructName(m->ReturnType);
 				if (retStruct != s->Name) {
-					std::cerr
-					    << filename << ": error: method `default` on struct `"
-					    << s->Name << "` must return `Self` (got `" << retStruct
-					    << "`)\n";
+					std::cerr << filename
+					          << ": error: cfn `default` on struct `" << s->Name
+					          << "` must return `Self` (got `" << retStruct
+					          << "`)\n";
 					return 1;
 				}
-			} else if (m->Name == "drop") {
+			} else if (m->isCfn && m->Name == "drop") {
 				if (m->Args.empty() || m->Args[0].Name != "self") {
-					std::cerr << filename << ": error: method `" << m->Name
+					std::cerr << filename << ": error: cfn `" << m->Name
 					          << "` on struct `" << s->Name
 					          << "` must take `self` as its first parameter\n";
 					return 1;
 				}
 				std::string selfStruct = resolveStructName(m->Args[0].Type);
 				if (selfStruct != s->Name) {
-					std::cerr << filename << ": error: method `" << m->Name
+					std::cerr << filename << ": error: cfn `" << m->Name
 					          << "` on struct `" << s->Name
 					          << "` has self type `" << selfStruct
 					          << "`; expected `" << s->Name << "`\n";
 					return 1;
 				}
-			} else {
-				std::cerr << filename
-				          << ": error: only `drop` and `default` "
-				             "methods are allowed on top-level "
-				             "structs (saw `"
-				          << s->Name << "." << m->Name << "`)\n";
-				return 1;
 			}
 			{
 				JirFunction jfn = astgenMetadata(*m, codegenCtx);

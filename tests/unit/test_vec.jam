@@ -248,3 +248,119 @@ tfn appendSliceAfterExistingData() {
     assert(unwrapU8(v.get(0), 0) as i32, 65);
     assert(unwrapU8(v.get(3), 0) as i32, 68);
 }
+
+// `v[i] = x` and `x = v[i]` route through the compiler's special
+// `at(self, i) *mut T` dispatch — no `.ptr` reach-through in user
+// code. The semantics match raw `*mut[] T` indexing (no bounds
+// check); bounds-checked reads remain available via `get(i)`.
+
+tfn indexedWriteAndRead() {
+    var v: VecI32 = VecI32.withCapacity(4);
+    v[0] = 10;
+    v[1] = 20;
+    v[2] = 30;
+    v[3] = 40;
+    // Direct reads through the same `at` path.
+    assert(v[0], 10);
+    assert(v[1], 20);
+    assert(v[2], 30);
+    assert(v[3], 40);
+}
+
+tfn indexedReadAfterPush() {
+    var v: VecI32 = VecI32.empty();
+    v.push(7);
+    v.push(8);
+    v.push(9);
+    // Pushed values are visible through indexed reads (the buffer
+    // is the same — push just bumps length).
+    assert(v[0], 7);
+    assert(v[1], 8);
+    assert(v[2], 9);
+}
+
+tfn indexedWriteVisibleThroughGet() {
+    var v: VecI32 = VecI32.empty();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    v[1] = 99;
+    // `get(i)` reads through the same backing store, so the
+    // indexed write is visible — confirms both sides agree on the
+    // pointer-math vs the Vec's element view.
+    assert(unwrapI32(v.get(1), 0), 99);
+}
+
+tfn indexedU8Vec() {
+    // VecU8 — different T, exercises generic instantiation of
+    // `at` plus the compiler's u64→u32 narrowing on the index.
+    var v: VecU8 = VecU8.withCapacity(3);
+    v[0] = 100;
+    v[1] = 200;
+    v[2] = 250;
+    assert(v[0] as i32, 100);
+    assert(v[1] as i32, 200);
+    assert(v[2] as i32, 250);
+}
+
+tfn indexedCompoundExpression() {
+    // The index can be an arbitrary u32-typed expression, not
+    // just a literal. Verifies the index parameter is lowered
+    // through the normal expression path before `at` is called.
+    var v: VecI32 = VecI32.withCapacity(8);
+    var i: u32 = 0;
+    while (i < 8) {
+        v[i] = (i as i32) * 10;
+        i = i + 1;
+    }
+    assert(v[0], 0);
+    assert(v[3], 30);
+    assert(v[7], 70);
+}
+
+// Inline `Vec(T)` (no alias) goes through the same `at` dispatch.
+// The use-site annotation produces a TypeKind::GenericCall instead
+// of TypeKind::Named, so the compiler's struct-dispatch lookup has
+// to chase through lookupStruct's GenericCall arm.
+
+tfn inlineVecTypeAnnotation() {
+    var v: Vec(i32) = Vec(i32).withCapacity(4);
+    v[0] = 11;
+    v[1] = 22;
+    v[2] = 33;
+    v[3] = 44;
+    assert(v[0], 11);
+    assert(v[3], 44);
+}
+
+tfn inlineVecU8WithCapacity() {
+    var v: Vec(u8) = Vec(u8).withCapacity(3);
+    v[0] = 1;
+    v[1] = 2;
+    v[2] = 3;
+    assert(v[0] as i32, 1);
+    assert(v[2] as i32, 3);
+}
+
+tfn inlineVecEmpty() {
+    // Empty constructor exercises the same instantiation path —
+    // confirms `at` is wired up regardless of which factory the
+    // Vec came from.
+    var v: Vec(i32) = Vec(i32).empty();
+    v.push(7);
+    v.push(8);
+    assert(v[0], 7);
+    assert(v[1], 8);
+    v[0] = 70;
+    assert(v[0], 70);
+}
+
+tfn inlineVecMethodsStillWork() {
+    // Non-index methods (push, len, get) still resolve when the
+    // declared type is the inline `Vec(T)` form.
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(100);
+    v.push(101);
+    assert(v.len() as i32, 2);
+    assert(unwrapU8(v.get(0), 0) as i32, 100);
+}
