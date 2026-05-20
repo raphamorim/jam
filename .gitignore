@@ -32,3 +32,5 @@ codegen_error_tests
 init_tests
 output
 diagnostic_tests
+analyzer_tests
+decl_tests

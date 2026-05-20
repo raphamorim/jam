@@ -17,9 +17,11 @@ add_definitions(${LLVM_DEFINITIONS})
 
 add_executable(jam
   src/abi.cpp
+  src/analyzer.cpp
   src/astgen.cpp
   src/cabi.cpp
   src/codegen.cpp
+  src/decl.cpp
   src/diagnostics.cpp
   src/drop_registry.cpp
   src/init_analysis.cpp

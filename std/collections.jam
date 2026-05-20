@@ -34,7 +34,7 @@ pub fn Vec(T: type) type {
             else if (s <= 1024) { cap = 4; }
             var bytes: u64 = (cap as u64) * s;
             var raw: *mut[] u8 = malloc(bytes);
-            return { ptr: raw as *mut[] T, length: 0, capacity: cap };
+            return Self { ptr: raw as *mut[] T, length: 0, capacity: cap };
         }
 
         // Pre-allocate `cap` slots up front. Useful when the caller
@@ -46,7 +46,7 @@ pub fn Vec(T: type) type {
             if (actualCap == 0) { actualCap = 1; }
             var bytes: u64 = (actualCap as u64) * @sizeOf(T);
             var raw: *mut[] u8 = malloc(bytes);
-            return { ptr: raw as *mut[] T, length: 0, capacity: actualCap };
+            return Self { ptr: raw as *mut[] T, length: 0, capacity: actualCap };
         }
 
         fn push(self: mut Self, value: T) {
@@ -72,6 +72,72 @@ pub fn Vec(T: type) type {
                 return Option(T).None();
             }
             return Option(T).Some(self.ptr[i]);
+        }
+
+        // Reset length to zero without releasing the buffer. Lets
+        // callers reuse one Vec across many iterations of a hot
+        // loop (per-frame audio drain, per-sector decode scratch)
+        // and pay malloc exactly once, at construction.
+        fn clear(self: mut Self) {
+            self.length = 0;
+        }
+
+        // Shrink to `newLen`. No-op when `newLen >= length`, so
+        // `truncate(0)` is the same as `clear()` and `truncate(N)`
+        // is safe regardless of current length. Capacity is left
+        // alone — Vec never shrinks its backing buffer.
+        fn truncate(self: mut Self, newLen: u32) {
+            if (newLen < self.length) {
+                self.length = newLen;
+            }
+        }
+
+        // Set length explicitly, clamped to `capacity`. The use
+        // case is "I just filled the first N slots via `.ptr` (a
+        // memcpy, an extern fill, a manual loop) and need the Vec
+        // bookkeeping to reflect that." Callers who need room
+        // first must `reserve` before writing.
+        fn setLen(self: mut Self, newLen: u32) {
+            if (newLen > self.capacity) {
+                self.length = self.capacity;
+            } else {
+                self.length = newLen;
+            }
+        }
+
+        // Ensure room for `additional` more elements beyond the
+        // current length. Doubles capacity until the bound is hit,
+        // then `realloc`s once — cheaper than letting `push` grow
+        // log(N) times when the final size is roughly known. No-op
+        // when the existing capacity already covers the request.
+        fn reserve(self: mut Self, additional: u32) {
+            var needed: u32 = self.length + additional;
+            if (needed <= self.capacity) {
+                return;
+            }
+            var newCap: u32 = self.capacity;
+            while (newCap < needed) {
+                newCap = newCap * 2;
+            }
+            var newBytes: u64 = (newCap as u64) * @sizeOf(T);
+            self.ptr = realloc(self.ptr as *mut[] u8, newBytes) as *mut[] T;
+            self.capacity = newCap;
+        }
+
+        // Bulk-append every element of `other`. One `reserve` up
+        // front means the copy loop never re-grows; -O3 should
+        // vectorize the loop for primitive element types. The
+        // input is `[]T`, so a string literal slices into a
+        // Vec(u8) and a `[N]T` array decays in the same call.
+        fn appendSlice(self: mut Self, other: []T) {
+            var n: u32 = other.len as u32;
+            self.reserve(n);
+            var i: u32 = 0;
+            while (i < n) {
+                self.ptr[self.length + i] = other.ptr[i];
+                i = i + 1;
+            }
+            self.length = self.length + n;
         }
 
         // Internal grow: doubles capacity via `realloc`. realloc

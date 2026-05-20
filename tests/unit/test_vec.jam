@@ -124,3 +124,127 @@ tfn withCapacityZeroClampsToOne() {
     v.push(42);
     assert(unwrapI32(v.get(0), 0), 42);
 }
+
+tfn clearResetsLength() {
+    var v: VecI32 = VecI32.empty();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    v.clear();
+    assert(v.len() as i32, 0);
+    // Buffer is reusable: pushing again works without reallocating.
+    v.push(99);
+    assert(v.len() as i32, 1);
+    assert(unwrapI32(v.get(0), 0), 99);
+}
+
+tfn clearKeepsCapacity() {
+    var v: VecI32 = VecI32.withCapacity(50);
+    v.push(7);
+    v.clear();
+    // clear() must not free or shrink — capacity survives.
+    assert(v.capacity as i32, 50);
+}
+
+tfn truncateShrinks() {
+    var v: VecI32 = VecI32.empty();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    v.push(40);
+    v.truncate(2);
+    assert(v.len() as i32, 2);
+    assert(unwrapI32(v.get(0), -1), 10);
+    assert(unwrapI32(v.get(1), -1), 20);
+    // Index 2 is past the new length even though the byte is still
+    // there in the buffer.
+    var sentinel: i32 = -42;
+    assert(unwrapI32(v.get(2), sentinel), sentinel);
+}
+
+tfn truncateNoOpWhenLarger() {
+    var v: VecI32 = VecI32.empty();
+    v.push(1);
+    v.push(2);
+    v.truncate(99);
+    assert(v.len() as i32, 2);
+}
+
+tfn setLenSetsExactLength() {
+    var v: VecI32 = VecI32.withCapacity(10);
+    // Caller fills the buffer through `.ptr` then announces how
+    // much they wrote.
+    v.ptr[0] = 100;
+    v.ptr[1] = 200;
+    v.ptr[2] = 300;
+    v.setLen(3);
+    assert(v.len() as i32, 3);
+    assert(unwrapI32(v.get(2), 0), 300);
+}
+
+tfn setLenClampsToCapacity() {
+    var v: VecI32 = VecI32.withCapacity(5);
+    // Overshooting must not silently corrupt — clamp to capacity.
+    v.setLen(99);
+    assert(v.len() as i32, 5);
+}
+
+tfn reserveGrowsCapacity() {
+    // Empty VecI32 starts at capacity 4; doubling to cover an
+    // extra 100 elements lands at 128 (4 → 8 → 16 → 32 → 64 → 128).
+    var v: VecI32 = VecI32.empty();
+    v.reserve(100);
+    assert(v.capacity as i32, 128);
+    assert(v.len() as i32, 0);
+}
+
+tfn reserveNoOpWhenEnough() {
+    var v: VecI32 = VecI32.withCapacity(100);
+    v.reserve(50);
+    // length 0 + additional 50 ≤ capacity 100, so no growth.
+    assert(v.capacity as i32, 100);
+}
+
+tfn reserveAccountsForCurrentLength() {
+    var v: VecI32 = VecI32.withCapacity(10);
+    v.push(1);
+    v.push(2);
+    // length 2 + additional 9 = 11 > 10, so grow once (10 → 20).
+    v.reserve(9);
+    assert(v.capacity as i32, 20);
+    assert(v.len() as i32, 2);
+}
+
+tfn appendSliceFromStringLiteral() {
+    var v: VecU8 = VecU8.empty();
+    var s: []u8 = "hi";
+    v.appendSlice(s);
+    assert(v.len() as i32, 2);
+    // 'h' == 104, 'i' == 105.
+    assert(unwrapU8(v.get(0), 0) as i32, 104);
+    assert(unwrapU8(v.get(1), 0) as i32, 105);
+}
+
+tfn appendSliceTriggersGrow() {
+    // VecU8 starts at capacity 8; appending 20 bytes forces grow
+    // through 8 → 16 → 32. Pre-reserved path means only one
+    // realloc, not log(N).
+    var v: VecU8 = VecU8.empty();
+    var s: []u8 = "abcdefghijklmnopqrst";
+    v.appendSlice(s);
+    assert(v.len() as i32, 20);
+    assert(v.capacity as i32, 32);
+    assert(unwrapU8(v.get(0), 0) as i32, 97);   // 'a'
+    assert(unwrapU8(v.get(19), 0) as i32, 116); // 't'
+}
+
+tfn appendSliceAfterExistingData() {
+    var v: VecU8 = VecU8.empty();
+    v.push(65);  // 'A'
+    v.push(66);  // 'B'
+    var s: []u8 = "CD";
+    v.appendSlice(s);
+    assert(v.len() as i32, 4);
+    assert(unwrapU8(v.get(0), 0) as i32, 65);
+    assert(unwrapU8(v.get(3), 0) as i32, 68);
+}
