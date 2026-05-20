@@ -103,7 +103,7 @@ void testUnknownFieldHasLine() {
 	auto r = compileSource("diag_unknown_field",
 	                       "const Point = struct { x: i32, y: i32 };\n"
 	                       "fn main() i32 {\n"
-	                       "    var p: Point = { x: 1, y: 2 };\n"
+	                       "    var p: Point = Point { x: 1, y: 2 };\n"
 	                       "    return p.zz;\n"
 	                       "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
@@ -170,7 +170,7 @@ void testGenericInstantiationCarriesRefTrace() {
 	                                    "    };\n"
 	                                    "}\n"
 	                                    "fn main() i32 {\n"
-	                                    "    var b: Box(i32) = { val: 7 };\n"
+	                                    "    var b: Box(i32) = Box(i32) { val: 7 };\n"
 	                                    "    return b.pickBad();\n"
 	                                    "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
@@ -236,7 +236,7 @@ void testUnknownMethodIsRecoverable() {
 	                       "const Point = struct { x: i32 };\n"
 	                       "fn other() i32 { return 99; }\n"
 	                       "fn main() i32 {\n"
-	                       "    var p: Point = { x: 1 };\n"
+	                       "    var p: Point = Point { x: 1 };\n"
 	                       "    var a: i32 = p.bogusMethod();\n"
 	                       "    var b: i32 = p.alsoBogus();\n"
 	                       "    return a + b;\n"
@@ -303,6 +303,181 @@ void testTypeInferenceAllocatesCorrectWidth() {
 	// init type. We can't introspect alloca widths from stderr, so
 	// just assert the program built — IR-level coverage lives in the
 	// hand-test `cat | --emit-ir` flow.
+	ASSERT_TRUE(r.exitCode == 0);
+}
+
+void testSelfReferentialStructIsCaught() {
+	// A struct whose own field is the same struct (without a pointer
+	// or slice indirection) is infinite-sized. The analyzer's
+	// `resolveTypeFieldsStruct` flips the struct's status to
+	// `FieldTypesWIP` before walking fields; re-entering during the
+	// field walk produces a "struct ... depends on itself" error.
+	auto r = compileSource("diag_selfref_struct", "const S = struct { x: S };\n"
+	                                              "fn main() {}\n");
+	ASSERT_TRUE(r.exitCode != 0);
+	ASSERT_TRUE(stderrContains(r, "`S` depends on itself"));
+}
+
+void testSelfReferentialStructViaPointerIsAllowed() {
+	// Indirect self-reference (through a pointer) is fine — the
+	// struct's size doesn't depend on its own size. This shape is
+	// the standard linked-list / tree node idiom.
+	auto r = compileSource("diag_selfref_struct_ptr",
+	                       "const Node = struct { next: *mut Node };\n"
+	                       "fn main() {}\n");
+	ASSERT_TRUE(r.exitCode == 0);
+}
+
+void testMultiStepStructCycleShowsReferenceTrace() {
+	// A two-step cycle: `A { b: B }`, `B { a: A }`. The closing
+	// error names `A`; the trace shows `B` as the intermediate
+	// reference. The user reading just the message wouldn't know
+	// the loop closed via B — the trace is what makes the cycle
+	// shape legible.
+	auto r = compileSource("diag_multistep_struct_cycle",
+	                       "const A = struct { b: B };\n"
+	                       "const B = struct { a: A };\n"
+	                       "fn main() {}\n");
+	ASSERT_TRUE(r.exitCode != 0);
+	ASSERT_TRUE(stderrContains(r, "`A` depends on itself"));
+	ASSERT_TRUE(stderrContains(r, "referenced by `B`"));
+}
+
+void testSelfReferentialEnumIsCaught() {
+	// A payloaded enum variant that carries the enum itself is
+	// infinite-sized — the analyzer's resolveTypeFieldsEnum walks
+	// payload TypeIdxs and, when it sees a direct enum/struct/union
+	// payload, triggers ensureEnumBody/Struct/Union which trips the
+	// matching BodyWIP / FieldTypesWIP cycle key.
+	auto r = compileSource("diag_selfref_enum",
+	                       "const E = enum { Nothing, Just(E) };\n"
+	                       "fn main() {}\n");
+	ASSERT_TRUE(r.exitCode != 0);
+	ASSERT_TRUE(stderrContains(r, "`E` depends on itself"));
+}
+
+void testSelfReferentialUnionIsCaught() {
+	auto r = compileSource("diag_selfref_union",
+	                       "const U = union { a: U, b: i32 };\n"
+	                       "fn main() {}\n");
+	ASSERT_TRUE(r.exitCode != 0);
+	ASSERT_TRUE(stderrContains(r, "`U` depends on itself"));
+}
+
+void testStructViaUnionCycleIsCaught() {
+	// Mixed struct→union→struct chain. The cycle key here is on the
+	// inner struct's FieldTypesWIP — the union's body fill triggers
+	// ensureStructBody, which re-enters S while it's still WIP.
+	auto r = compileSource("diag_struct_via_union",
+	                       "const U = union { s: S, b: i32 };\n"
+	                       "const S = struct { u: U };\n"
+	                       "fn main() {}\n");
+	ASSERT_TRUE(r.exitCode != 0);
+	ASSERT_TRUE(stderrContains(r, "depends on itself"));
+}
+
+void testThreeStepStructCycleShowsFullChain() {
+	// `A { b: B }`, `B { c: C }`, `C { a: A }`. The chain in the
+	// trace is the full ancestor list — both `B` and `C` show up.
+	auto r =
+	    compileSource("diag_three_step_cycle", "const A = struct { b: B };\n"
+	                                           "const B = struct { c: C };\n"
+	                                           "const C = struct { a: A };\n"
+	                                           "fn main() {}\n");
+	ASSERT_TRUE(r.exitCode != 0);
+	ASSERT_TRUE(stderrContains(r, "`A` depends on itself"));
+	ASSERT_TRUE(stderrContains(r, "referenced by `B`"));
+	ASSERT_TRUE(stderrContains(r, "referenced by `C`"));
+}
+
+void testChainedMethodCallOnLocal() {
+	// `t.field.method(args)` — multi-segment receiver where the root
+	// is a local. Pre-fix the parser collapsed the chain into the
+	// qualified name `t.field.method`, then the codegen looked for a
+	// function with that name and errored "unknown module handle `t`".
+	// The fix: parser emits the indirect-call form when the chain
+	// root isn't a known import handle and the chain has 2+ dots.
+	// Inner-with-methods would trip the top-level-struct method
+	// restriction (only drop/default allowed); we use two generic
+	// wrappers so methods are permitted on both layers.
+	auto r = compileSource(
+	    "diag_chained_call_local",
+	    "fn Inner(T: type) type {\n"
+	    "    return struct {\n"
+	    "        val: T,\n"
+	    "        fn get(self: Self) T { return self.val; }\n"
+	    "    };\n"
+	    "}\n"
+	    "fn Wrap(T: type) type {\n"
+	    "    return struct {\n"
+	    "        inner: Inner(T),\n"
+	    "        fn make(v: T) Self {\n"
+	    "            return Self { inner: Inner(T) { val: v } };\n"
+	    "        }\n"
+	    "    };\n"
+	    "}\n"
+	    "fn main() i32 {\n"
+	    "    var w: Wrap(i32) = Wrap(i32).make(7);\n"
+	    "    return w.inner.get();\n"
+	    "}\n");
+	ASSERT_TRUE(r.exitCode == 0);
+}
+
+void testTwoDotStaticCallStillWorks() {
+	// `Random.default()` style — single dot, type-static dispatch.
+	// Must keep working (regression guard for the parser fix).
+	auto r = compileSource("diag_static_call_one_dot",
+	                       "const Random = struct {\n"
+	                       "    n: i32,\n"
+	                       "    fn default() Self { return Self { n: 0 }; }\n"
+	                       "};\n"
+	                       "fn main() i32 {\n"
+	                       "    var r: Random = Random.default();\n"
+	                       "    return r.n;\n"
+	                       "}\n");
+	ASSERT_TRUE(r.exitCode == 0);
+}
+
+void testGenericMethodChainedThroughLocalField() {
+	// The case from the user's bug report: a struct has a field of
+	// generic-instantiated type, and an instance method is invoked
+	// through `local.field.method(args)`. The chain has two dots and
+	// `local` is in the locals table — must take the indirect-call
+	// path.
+	auto r = compileSource(
+	    "diag_generic_via_field",
+	    "const {Vec} = import(\"collections\");\n"
+	    "const Random = struct {\n"
+	    "    inner: Vec(i32),\n"
+	    "    fn default() Self { return Self { inner: Vec(i32).empty() }; }\n"
+	    "};\n"
+	    "fn main() i32 {\n"
+	    "    var t = Random.default();\n"
+	    "    t.inner.push(1);\n"
+	    "    t.inner.push(2);\n"
+	    "    return 0;\n"
+	    "}\n");
+	ASSERT_TRUE(r.exitCode == 0);
+}
+
+void testFunctionAndStructMayShareName() {
+	// `fn Counter(T: type) type` and `const Counter = struct {...}`
+	// can coexist — the function lives in the function namespace,
+	// the struct in the type namespace. The analyzer's kind-aware
+	// finder lands on the right Decl depending on the lookup
+	// context, so the struct's body still gets materialised even
+	// when the same-name function was registered first.
+	auto r = compileSource(
+	    "diag_fn_struct_same_name",
+	    "fn Counter(T: type) type { return struct { value: T }; }\n"
+	    "const Counter = struct {\n"
+	    "    n: i32,\n"
+	    "    fn default() Self { return Self { n: 0 }; }\n"
+	    "};\n"
+	    "fn main() i32 {\n"
+	    "    var c: Counter = Counter.default();\n"
+	    "    return c.n;\n"
+	    "}\n");
 	ASSERT_TRUE(r.exitCode == 0);
 }
 
@@ -390,6 +565,30 @@ class DiagnosticTests {
 		framework.addTest(
 		    "Diagnostics - inferred var width correct for bool / float",
 		    testTypeInferenceAllocatesCorrectWidth);
+		framework.addTest("Diagnostics - self-referential struct rejected",
+		                  testSelfReferentialStructIsCaught);
+		framework.addTest(
+		    "Diagnostics - self-referential struct via pointer ok",
+		    testSelfReferentialStructViaPointerIsAllowed);
+		framework.addTest("Diagnostics - function and struct may share a name",
+		                  testFunctionAndStructMayShareName);
+		framework.addTest(
+		    "Diagnostics - multi-step struct cycle shows ref trace",
+		    testMultiStepStructCycleShowsReferenceTrace);
+		framework.addTest("Diagnostics - three-step struct cycle full chain",
+		                  testThreeStepStructCycleShowsFullChain);
+		framework.addTest("Diagnostics - self-referential enum rejected",
+		                  testSelfReferentialEnumIsCaught);
+		framework.addTest("Diagnostics - self-referential union rejected",
+		                  testSelfReferentialUnionIsCaught);
+		framework.addTest("Diagnostics - struct-via-union cycle rejected",
+		                  testStructViaUnionCycleIsCaught);
+		framework.addTest("Parser - chained method call on local works",
+		                  testChainedMethodCallOnLocal);
+		framework.addTest("Parser - single-dot static call still works",
+		                  testTwoDotStaticCallStillWorks);
+		framework.addTest("Parser - local.field.method() on generic field",
+		                  testGenericMethodChainedThroughLocalField);
 		framework.addTest("Diagnostics - format is file:line: error:",
 		                  testDiagnosticFormatIsFileLineError);
 	}

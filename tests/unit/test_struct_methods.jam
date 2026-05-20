@@ -17,7 +17,7 @@ const Counter = struct {
 // Auto-drop on a binding of a type whose drop is defined inline.
 fn singleScopeWithInlineDrop() u32 {
     var hits: u32 = 0;
-    var c: Counter = { value: 17, sink: &hits };
+    var c: Counter = Counter { value: 17, sink: &hits };
     // c drops at function end → hits becomes 1.
     return c.value + hits;
 }
@@ -34,7 +34,7 @@ tfn inlineDropFiresAtScopeExit() {
 // Caller observes the drop via the sink. Same shape as
 // callerObservingDrop in test_drops.jam, just with the in-struct form.
 fn wrapsCounterInline(sink: *mut u32) u32 {
-    var c: Counter = { value: 5, sink: sink };
+    var c: Counter = Counter { value: 5, sink: sink };
     return c.value;
 }
 
@@ -52,7 +52,7 @@ tfn callerObservesInlineDrop() {
 // docs/STRUCT_METHODS.md as a v1.1 polish item. The test pins down
 // today's behavior so a future fix is intentional, not accidental.
 fn callsDropManually(sink: *mut u32) u32 {
-    var c: Counter = { value: 9, sink: sink };
+    var c: Counter = Counter { value: 9, sink: sink };
     Counter.drop(&c);
     // sink == 1 here (manual drop ran)
     return c.value;

@@ -17,10 +17,10 @@
 // Returns the 64-bit magnitude. For float literals the bit pattern of
 // the parsed `double` is returned via `bit_cast`, and `isFloatOut` is
 // set so the caller can mark the AST node with the float flag.
-uint64_t Parser::parseNumLexeme(const std::string &s, bool &isNegOut,
+uint64_t Parser::parseNumLexeme(std::string_view s, bool &isNegOut,
                                 bool &isFloatOut) const {
 	bool neg = !s.empty() && s[0] == '-';
-	const std::string &abs = neg ? s.substr(1) : s;
+	std::string_view abs = neg ? s.substr(1) : s;
 	isNegOut = neg;
 	isFloatOut = false;
 
@@ -29,7 +29,8 @@ uint64_t Parser::parseNumLexeme(const std::string &s, bool &isNegOut,
 	case NumberResultKind::Int:
 		return r.intValue;
 	case NumberResultKind::BigInt:
-		parseError("integer literal `" + abs + "` exceeds u64 range");
+		parseError("integer literal `" + std::string(abs) +
+		           "` exceeds u64 range");
 	case NumberResultKind::Float: {
 		isFloatOut = true;
 		// pack the double's bit pattern into u64. memcpy keeps it
@@ -42,17 +43,17 @@ uint64_t Parser::parseNumLexeme(const std::string &s, bool &isNegOut,
 		return bits;
 	}
 	case NumberResultKind::Failure:
-		parseError(std::string("invalid numeric literal `") + abs +
+		parseError(std::string("invalid numeric literal `") + std::string(abs) +
 		           "`: " + numberErrorMessage(r.failure.kind));
 	}
 	parseError("unreachable number-literal classification");
 }
 
-Parser::Parser(std::vector<Token> tokens, TypePool &typePool_,
-               StringPool &stringPool_, NodeStore &nodes_,
+Parser::Parser(std::vector<Token> tokens, const std::string &source,
+               TypePool &typePool_, StringPool &stringPool_, NodeStore &nodes_,
                jam::Diagnostics *diagnostics, std::string filename)
-    : tokens(std::move(tokens)), typePool(&typePool_), stringPool(&stringPool_),
-      nodes(&nodes_), diagnostics_(diagnostics),
+    : tokens(std::move(tokens)), source_(source), typePool(&typePool_),
+      stringPool(&stringPool_), nodes(&nodes_), diagnostics_(diagnostics),
       filename_(std::move(filename)) {}
 
 jam::SrcLoc Parser::currentLoc() const {
@@ -146,6 +147,29 @@ bool Parser::isQualifiedNameChain(NodeIdx chainRoot) const {
 	return false;
 }
 
+// Walk the chain root (leftmost Variable in a Variable.member.member...
+// chain) and return its source-level name. Caller guarantees the chain
+// is a qualified-name shape.
+static std::string chainRootName(const NodeStore &ns,
+                                  const StringPool &pool, NodeIdx chainRoot) {
+	const AstNode &n = ns.get(chainRoot);
+	if (n.tag == AstTag::Variable) {
+		return pool.get(static_cast<StringIdx>(n.lhs));
+	}
+	if (n.tag == AstTag::MemberAccess) {
+		return chainRootName(ns, pool, static_cast<NodeIdx>(n.lhs));
+	}
+	return std::string();
+}
+
+// Count the number of dots (== MemberAccess hops) in a qualified-name
+// chain. `foo` → 0, `foo.bar` → 1, `foo.bar.baz` → 2, etc.
+static int chainDotCount(const NodeStore &ns, NodeIdx chainRoot) {
+	const AstNode &n = ns.get(chainRoot);
+	if (n.tag != AstTag::MemberAccess) return 0;
+	return 1 + chainDotCount(ns, static_cast<NodeIdx>(n.lhs));
+}
+
 NodeIdx Parser::parsePrimary() {
 	// `match (…) { … }` is also valid in expression position so it can
 	// produce a value. The same call works for both statement and
@@ -160,7 +184,7 @@ NodeIdx Parser::parsePrimary() {
 	// + arbitrary value args arrive in Stage 2 with CTFE.
 	if (match(TOK_AT)) {
 		consume(TOK_IDENTIFIER, "Expected intrinsic name after '@'");
-		StringIdx nameId = stringPool->intern(previous().lexeme);
+		StringIdx nameId = stringPool->intern(previous().text(source_));
 		consume(TOK_OPEN_PAREN, "Expected '(' after '@name'");
 		TypeIdx tyArg = parseType();
 		consume(TOK_CLOSE_PAREN, "Expected ')' after '@' intrinsic argument");
@@ -174,7 +198,8 @@ NodeIdx Parser::parsePrimary() {
 		// set the magnitude is the bit pattern of a `double`).
 		bool isNegative = false;
 		bool isFloat = false;
-		uint64_t mag = parseNumLexeme(previous().lexeme, isNegative, isFloat);
+		uint64_t mag =
+		    parseNumLexeme(previous().text(source_), isNegative, isFloat);
 		uint16_t flags = 0;
 		if (isNegative) flags |= 1;
 		if (isFloat) flags |= 2;
@@ -193,6 +218,10 @@ NodeIdx Parser::parsePrimary() {
 		return emit(AstNode{AstTag::BoolLit, 0, 0, 0, 0, 0});
 	}
 	if (match(TOK_STRING_LITERAL)) {
+		// String literals carry decoded bytes (escape sequences
+		// resolved); `text(source_)` would return the raw `"..."`-
+		// bracketed source including escapes — wrong for callers
+		// that want the runtime string value.
 		StringIdx s = stringPool->intern(previous().lexeme);
 		return emit(AstNode{AstTag::StringLit, 0, 0, 0, s, 0});
 	}
@@ -208,7 +237,16 @@ NodeIdx Parser::parsePrimary() {
 		consume(TOK_CLOSE_PAREN, "Expected ')' after expression");
 		return expr;
 	}
-	if (match(TOK_OPEN_BRACE)) { return parseStructLiteral(); }
+	// Bare `{ field: val }` is no longer a valid expression. Struct
+	// literals always carry their type: `Foo { field: val }` or
+	// `Vec(i32) { field: val }` (handled when an identifier precedes
+	// the brace, in the TOK_IDENTIFIER branch below). A naked brace
+	// in expression position is a parse error.
+	if (check(TOK_OPEN_BRACE)) {
+		parseError("Struct literals must name their type: write "
+		           "`TypeName { ... }` (or `Self { ... }` inside a "
+		           "struct body)");
+	}
 	if (match(TOK_OPEN_BRACKET)) {
 		// Array literal `[a, b, c]`, array repeat `[expr; N]`, or empty
 		// `[]` (well-typed only against a slice or zero-length array
@@ -259,8 +297,34 @@ NodeIdx Parser::parsePrimary() {
 	// diagnostic — same outcome as today's grammar would have given
 	// for `const X = i32;`.
 	if (match(TOK_TYPE) || match(TOK_IDENTIFIER)) {
-		std::string name = previous().lexeme;
+		std::string name(previous().text(source_));
 		StringIdx nameId = stringPool->intern(name);
+
+		// Typed struct literal: `Name { field: val, ... }`. Only
+		// admitted in expression position when struct literals are
+		// allowed (see `allowStructLit_`); inside `if`/`while`/`for`/
+		// `match` heads the same shape stays as a Variable read
+		// followed by the head's `{` block opener.
+		if (allowStructLit_ && check(TOK_OPEN_BRACE)) {
+			advance();  // consume '{'
+			NodeIdx lit = parseStructLiteral();
+			// Resolve `Self` against the current struct context so
+			// `return Self { ... }` works inside a method body. For
+			// any other identifier we intern the Named TypeIdx as-is
+			// — codegen does the struct/enum lookup at use time.
+			StringIdx typeNameId = nameId;
+			if (name == "Self") {
+				if (structContextStack.empty()) {
+					parseError("`Self` is only valid inside a struct body");
+				}
+				typeNameId = stringPool->intern(structContextStack.back());
+			}
+			AstNode &litNode = nodes->getMut(lit);
+			litNode.lhs = static_cast<uint32_t>(
+			    typePool->internNamed(typeNameId));
+			return lit;
+		}
+
 		NodeIdx expr = emit(AstNode{AstTag::Variable, 0, 0, 0, nameId, 0});
 		bool chainStarted = false;
 
@@ -274,7 +338,8 @@ NodeIdx Parser::parsePrimary() {
 					                    static_cast<uint32_t>(expr), 0});
 				} else {
 					consume(TOK_IDENTIFIER, "Expected member name after '.'");
-					StringIdx mem = stringPool->intern(previous().lexeme);
+					StringIdx mem =
+					    stringPool->intern(previous().text(source_));
 					expr = emit(AstNode{AstTag::MemberAccess, 0, 0, 0,
 					                    static_cast<uint32_t>(expr), mem});
 				}
@@ -293,7 +358,8 @@ NodeIdx Parser::parsePrimary() {
 			// TOK_OPEN_PAREN: typecall on a generic — either bare
 			// `Foo(T).method(args)` (chainStarted=false) or namespace-
 			// qualified `handle.Foo(T).method(args)` when `handle` was
-			// bound by `import(...)`.
+			// bound by `import(...)`. Also the generic-struct-literal
+			// shape `Foo(T) { field: val }`.
 			bool isNamespacedTypecall =
 			    chainStarted && importHandles.count(name) > 0;
 			if (!chainStarted || isNamespacedTypecall) {
@@ -305,6 +371,36 @@ NodeIdx Parser::parsePrimary() {
 					else if (tt == TOK_CLOSE_PAREN) depth--;
 					if (depth == 0) break;
 					peekIdx++;
+				}
+				// Generic struct literal: `Foo(T) { ... }`. The matching
+				// `)` is immediately followed by `{`. Parse the parens
+				// as type arguments, intern as a GenericCall TypeIdx,
+				// then hand off to parseStructLiteral so the body uses
+				// the same name:value layout as a non-generic literal.
+				if (allowStructLit_ && depth == 0 &&
+				    peekIdx + 1 < (int)tokens.size() &&
+				    tokens[peekIdx].type == TOK_CLOSE_PAREN &&
+				    tokens[peekIdx + 1].type == TOK_OPEN_BRACE) {
+					advance();  // consume (
+					std::vector<TypeIdx> typeArgs;
+					if (!check(TOK_CLOSE_PAREN)) {
+						do {
+							typeArgs.push_back(parseType());
+						} while (match(TOK_COMMA));
+					}
+					consume(TOK_CLOSE_PAREN,
+					        "Expected ')' after type arguments");
+					consume(TOK_OPEN_BRACE,
+					        "Expected '{' after generic type arguments");
+					std::string receiverName =
+					    isNamespacedTypecall ? qualifiedName(expr) : name;
+					TypeIdx genericTy = typePool->internGenericCall(
+					    stringPool->intern(receiverName),
+					    std::move(typeArgs));
+					NodeIdx lit = parseStructLiteral();
+					AstNode &litNode = nodes->getMut(lit);
+					litNode.lhs = static_cast<uint32_t>(genericTy);
+					return lit;
 				}
 				if (depth == 0 && peekIdx + 3 < (int)tokens.size() &&
 				    tokens[peekIdx].type == TOK_CLOSE_PAREN &&
@@ -323,7 +419,7 @@ NodeIdx Parser::parsePrimary() {
 					consume(TOK_DOT, "Expected '.' after generic call");
 					consume(TOK_IDENTIFIER, "Expected method name after '.'");
 					StringIdx methodName =
-					    stringPool->intern(previous().lexeme);
+					    stringPool->intern(previous().text(source_));
 					consume(TOK_OPEN_PAREN, "Expected '(' after method name");
 
 					std::vector<NodeIdx> methodArgs;
@@ -377,20 +473,77 @@ NodeIdx Parser::parsePrimary() {
 			}
 
 			if (isQualifiedNameChain(expr)) {
-				std::string callee;
-				const AstNode &en = nodes->get(expr);
-				if (en.tag == AstTag::MemberAccess) {
-					callee = qualifiedName(expr);
+				// Qualified-name chains can be one of:
+				//   1. `mod.fn(...)` / `mod.submod.fn(...)` — module-
+				//      handle prefixed call; root is in `importHandles`.
+				//   2. `Type.method(...)` — static dispatch on a type
+				//      name; single dot, root is a struct/enum/alias.
+				//   3. `local.field.method(...)` — instance dispatch
+				//      with a multi-segment receiver path; root is a
+				//      local variable in the caller's scope.
+				//
+				// Cases 1 and 2 stay as direct calls (lhs = qualified
+				// StringIdx); astgen resolves them via the function
+				// registry or the Type.method handler. Case 3 only
+				// works through the indirect-call path (flags & 1):
+				// astgen needs the MemberAccess chain so it can lower
+				// `local.field` as a value-producing expression and
+				// dispatch the suffix as a method on that value.
+				//
+				// We can't tell at parse time whether the root is a
+				// local — the parser has no scope info. But we know
+				// (a) what's in `importHandles`, and (b) the dot
+				// count. A multi-dot chain whose root is NOT an
+				// import handle is case 3 by elimination: case 1
+				// would need an import handle, case 2 is single-dot.
+				int dotCount = chainDotCount(*nodes, expr);
+				std::string root = chainRootName(*nodes, *stringPool, expr);
+				bool rootIsImportHandle = importHandles.count(root) > 0;
+				bool isMultiDotLocalChain =
+				    dotCount >= 2 && !rootIsImportHandle;
+				if (isMultiDotLocalChain) {
+					expr = emit(AstNode{AstTag::Call, 0, 1, 0,
+					                    static_cast<uint32_t>(expr), extra});
 				} else {
-					callee = name;
+					std::string callee;
+					const AstNode &en = nodes->get(expr);
+					if (en.tag == AstTag::MemberAccess) {
+						callee = qualifiedName(expr);
+					} else {
+						callee = name;
+					}
+					StringIdx calleeId = stringPool->intern(callee);
+					expr = emit(AstNode{AstTag::Call, 0, 0, 0, calleeId, extra});
 				}
-				StringIdx calleeId = stringPool->intern(callee);
-				expr = emit(AstNode{AstTag::Call, 0, 0, 0, calleeId, extra});
 			} else {
 				expr = emit(AstNode{AstTag::Call, 0, 1, 0,
 				                    static_cast<uint32_t>(expr), extra});
 			}
 			chainStarted = true;
+		}
+
+		// Qualified-name struct literal: `lib.Private { field: val }`.
+		// After the chain loop finishes, if the expression is a
+		// MemberAccess chain rooted at a Variable (no calls/indices
+		// in between) and the next token is `{`, the chain names a
+		// type. Build the Named TypeIdx from the dotted form and
+		// parse the body. Same shape as the simple `Name { ... }`
+		// path above, but the type is the multi-segment qualified
+		// name so codegen looks it up via the import-handle alias.
+		// Mirrors Rust's `path::Type { ... }`.
+		if (allowStructLit_ && check(TOK_OPEN_BRACE) &&
+		    isQualifiedNameChain(expr)) {
+			const AstNode &exprNode = nodes->get(expr);
+			if (exprNode.tag == AstTag::MemberAccess) {
+				advance();  // consume '{'
+				std::string qname = qualifiedName(expr);
+				TypeIdx namedTy =
+				    typePool->internNamed(stringPool->intern(qname));
+				NodeIdx lit = parseStructLiteral();
+				AstNode &litNode = nodes->getMut(lit);
+				litNode.lhs = static_cast<uint32_t>(namedTy);
+				return lit;
+			}
 		}
 
 		return expr;
@@ -443,12 +596,13 @@ TypeIdx Parser::parseType() {
 		}
 		// `[N]T` — fixed-size array. No tag.
 		consume(TOK_NUMBER, "Expected size or `]` after `[`");
-		uint32_t len = static_cast<uint32_t>(std::stoul(previous().lexeme));
+		uint32_t len = static_cast<uint32_t>(
+		    std::stoul(std::string(previous().text(source_))));
 		consume(TOK_CLOSE_BRACKET, "Expected `]` after array size");
 		return typePool->internArray(parseType(), len);
 	}
 	if (match(TOK_TYPE)) {
-		const std::string &s = previous().lexeme;
+		std::string_view s = previous().text(source_);
 		if (s == "u8") return BuiltinType::U8;
 		if (s == "i8") return BuiltinType::I8;
 		if (s == "u16") return BuiltinType::U16;
@@ -463,10 +617,10 @@ TypeIdx Parser::parseType() {
 		if (s == "str") return typePool->internSlice(BuiltinType::U8);
 		if (s == "type") return BuiltinType::Type;
 		if (s == "noreturn") return BuiltinType::NoReturn;
-		parseError("Unknown base type: " + s);
+		parseError("Unknown base type: " + std::string(s));
 	}
 	if (match(TOK_IDENTIFIER)) {
-		const std::string &firstIdent = previous().lexeme;
+		std::string_view firstIdent = previous().text(source_);
 		if (firstIdent == "Self") {
 			if (structContextStack.empty()) {
 				parseError("`Self` is only valid inside a struct body");
@@ -478,10 +632,11 @@ TypeIdx Parser::parseType() {
 		// registers each main-module import's pub items under
 		// `<handle>.<name>` so the existing struct/enum/union/type-alias
 		// and generic-fn lookups resolve the qualified form transparently.
-		std::string ident = firstIdent;
+		std::string ident(firstIdent);
 		if (match(TOK_DOT)) {
 			consume(TOK_IDENTIFIER, "Expected type name after `.`");
-			ident = firstIdent + "." + previous().lexeme;
+			ident = std::string(firstIdent) + "." +
+			        std::string(previous().text(source_));
 		}
 		if (check(TOK_OPEN_PAREN)) {
 			advance();  // consume `(`
@@ -505,7 +660,7 @@ NodeIdx Parser::parseStructLiteral() {
 	std::vector<std::pair<StringIdx, NodeIdx>> fields;
 	while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
 		consume(TOK_IDENTIFIER, "Expected field name in struct literal");
-		StringIdx fieldName = stringPool->intern(previous().lexeme);
+		StringIdx fieldName = stringPool->intern(previous().text(source_));
 		consume(TOK_COLON, "Expected ':' after field name");
 		NodeIdx value = parseLogicalOr();
 		fields.emplace_back(fieldName, value);
@@ -525,7 +680,7 @@ NodeIdx Parser::parseStructLiteral() {
 }
 
 NodeIdx Parser::parsePatternAtom() {
-	if (check(TOK_IDENTIFIER) && peek().lexeme != "_") {
+	if (check(TOK_IDENTIFIER) && peek().text(source_) != "_") {
 		int peekIdx = current + 1;
 		if (peekIdx < (int)tokens.size() &&
 		    tokens[peekIdx].type == TOK_OPEN_PAREN) {
@@ -541,7 +696,7 @@ NodeIdx Parser::parsePatternAtom() {
 			    tokens[scan].type == TOK_CLOSE_PAREN &&
 			    tokens[scan + 1].type == TOK_DOT &&
 			    tokens[scan + 2].type == TOK_IDENTIFIER) {
-				std::string typeName = peek().lexeme;
+				std::string typeName(peek().text(source_));
 				advance();  // IDENT
 				advance();  // `(`
 				std::vector<TypeIdx> typeArgs;
@@ -554,7 +709,8 @@ NodeIdx Parser::parsePatternAtom() {
 				        "Expected ')' after generic type arguments");
 				consume(TOK_DOT, "Expected '.' after generic type");
 				consume(TOK_IDENTIFIER, "Expected variant name after `.`");
-				StringIdx variantNameId = stringPool->intern(previous().lexeme);
+				StringIdx variantNameId =
+				    stringPool->intern(previous().text(source_));
 				TypeIdx receiverTy = typePool->internGenericCall(
 				    stringPool->intern(typeName), std::move(typeArgs));
 
@@ -565,7 +721,7 @@ NodeIdx Parser::parsePatternAtom() {
 							consume(TOK_IDENTIFIER,
 							        "Expected binding name in variant payload");
 							bindings.push_back(
-							    stringPool->intern(previous().lexeme));
+							    stringPool->intern(previous().text(source_)));
 						} while (match(TOK_COMMA));
 					}
 					consume(TOK_CLOSE_PAREN,
@@ -591,13 +747,15 @@ NodeIdx Parser::parsePatternAtom() {
 		}
 	}
 
-	if (check(TOK_IDENTIFIER) && peek().lexeme != "_") {
+	if (check(TOK_IDENTIFIER) && peek().text(source_) != "_") {
 		int saved = current;
 		advance();  // consume enum name
 		if (match(TOK_DOT)) {
 			consume(TOK_IDENTIFIER, "Expected variant name after `.`");
-			StringIdx enumNameId = stringPool->intern(tokens[saved].lexeme);
-			StringIdx variantNameId = stringPool->intern(previous().lexeme);
+			StringIdx enumNameId =
+			    stringPool->intern(tokens[saved].text(source_));
+			StringIdx variantNameId =
+			    stringPool->intern(previous().text(source_));
 
 			// Optional payload binding: `(name1, name2, ...)`. Empty
 			// list `()` is permitted and equivalent to no parens.
@@ -608,7 +766,7 @@ NodeIdx Parser::parsePatternAtom() {
 						consume(TOK_IDENTIFIER,
 						        "Expected binding name in variant payload");
 						bindings.push_back(
-						    stringPool->intern(previous().lexeme));
+						    stringPool->intern(previous().text(source_)));
 					} while (match(TOK_COMMA));
 				}
 				consume(TOK_CLOSE_PAREN,
@@ -636,7 +794,8 @@ NodeIdx Parser::parsePatternAtom() {
 	if (match(TOK_NUMBER)) {
 		bool isNegative = false;
 		bool isFloat = false;
-		uint64_t lo = parseNumLexeme(previous().lexeme, isNegative, isFloat);
+		uint64_t lo =
+		    parseNumLexeme(previous().text(source_), isNegative, isFloat);
 		if (isFloat) {
 			parseError("Float literals are not allowed in `match` patterns "
 			           "(use an integer literal or a `..=` range)");
@@ -646,7 +805,8 @@ NodeIdx Parser::parsePatternAtom() {
 			consume(TOK_NUMBER, "Expected upper bound after `..=`");
 			bool hiNeg = false;
 			bool hiFloat = false;
-			uint64_t hi = parseNumLexeme(previous().lexeme, hiNeg, hiFloat);
+			uint64_t hi =
+			    parseNumLexeme(previous().text(source_), hiNeg, hiFloat);
 			if (hiFloat) {
 				parseError(
 				    "Float literals are not allowed in `match` patterns");
@@ -668,7 +828,7 @@ NodeIdx Parser::parsePatternAtom() {
 		parseError("Char literals in patterns are not yet supported");
 	}
 	// Wildcard `_` is lexed as TOK_IDENTIFIER; recognize it here.
-	if (check(TOK_IDENTIFIER) && peek().lexeme == "_") {
+	if (check(TOK_IDENTIFIER) && peek().text(source_) == "_") {
 		advance();
 		return emit(AstNode{AstTag::PatWildcard, 0, 0, 0, 0, 0});
 	}
@@ -746,7 +906,7 @@ NodeIdx Parser::parseExpression() {
 	if (match(TOK_CONST) || match(TOK_VAR)) {
 		bool isConst = previous().type == TOK_CONST;
 		consume(TOK_IDENTIFIER, "Expected variable name");
-		StringIdx name = stringPool->intern(previous().lexeme);
+		StringIdx name = stringPool->intern(previous().text(source_));
 
 		// kNoType signals "infer from init"; astgenVarDecl lowers the
 		// init first in that case and takes its type. Previously this
@@ -855,12 +1015,18 @@ NodeIdx Parser::parseExpression() {
 	}
 	if (match(TOK_FOR)) {
 		consume(TOK_IDENTIFIER, "Expected variable name after 'for'");
-		StringIdx varName = stringPool->intern(previous().lexeme);
+		StringIdx varName = stringPool->intern(previous().text(source_));
 
 		consume(TOK_IN, "Expected 'in' after for variable");
+		// Disable typed struct literals while parsing the range so a
+		// `for i in 0:n { body }` doesn't greedily swallow `n { body }`
+		// as a literal. Restored before the body opener.
+		bool prevAllow = allowStructLit_;
+		allowStructLit_ = false;
 		NodeIdx start = parseComparison();
 		consume(TOK_COLON, "Expected ':' in for range");
 		NodeIdx end = parseComparison();
+		allowStructLit_ = prevAllow;
 
 		consume(TOK_OPEN_BRACE, "Expected '{' after for range");
 		std::vector<NodeIdx> body;
@@ -1128,7 +1294,7 @@ std::unique_ptr<FunctionAST> Parser::parseFunction() {
 
 	if (!isTest) { consume(TOK_FN, "Expected 'fn' keyword"); }
 	consume(TOK_IDENTIFIER, "Expected function name");
-	std::string name = previous().lexeme;
+	std::string name(previous().text(source_));
 
 	consume(TOK_OPEN_PAREN, "Expected '(' after function name");
 
@@ -1145,7 +1311,7 @@ std::unique_ptr<FunctionAST> Parser::parseFunction() {
 				break;
 			}
 			consume(TOK_IDENTIFIER, "Expected parameter name");
-			std::string paramName = previous().lexeme;
+			std::string paramName(previous().text(source_));
 
 			consume(TOK_COLON, "Expected ':' after parameter name");
 
@@ -1210,7 +1376,7 @@ void Parser::parseStructBody(
 		}
 		// Field: `name: Type`. Comma separates from the next member.
 		consume(TOK_IDENTIFIER, "Expected field name or 'fn'");
-		std::string fieldName = previous().lexeme;
+		std::string fieldName(previous().text(source_));
 		consume(TOK_COLON, "Expected ':' after field name");
 		TypeIdx fieldType = parseType();
 		fields.emplace_back(std::move(fieldName), fieldType);
@@ -1224,7 +1390,7 @@ void Parser::parseStructBody(
 std::unique_ptr<StructDeclAST> Parser::parseStructDecl() {
 	consume(TOK_CONST, "Expected 'const' for struct declaration");
 	consume(TOK_IDENTIFIER, "Expected struct name");
-	std::string name = previous().lexeme;
+	std::string name(previous().text(source_));
 	consume(TOK_EQUAL, "Expected '=' after struct name");
 	consume(TOK_STRUCT, "Expected 'struct' keyword");
 	consume(TOK_OPEN_BRACE, "Expected '{' after 'struct'");
@@ -1256,7 +1422,7 @@ NodeIdx Parser::parseEnumExpression() {
 	while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
 		consume(TOK_IDENTIFIER, "Expected enum variant name");
 		EnumVariantAST v;
-		v.Name = previous().lexeme;
+		v.Name = previous().text(source_);
 		// Optional positional payload list.
 		if (match(TOK_OPEN_PAREN)) {
 			if (!check(TOK_CLOSE_PAREN)) {
@@ -1304,7 +1470,7 @@ NodeIdx Parser::parseStructExpression() {
 std::unique_ptr<EnumDeclAST> Parser::parseEnumDecl() {
 	consume(TOK_CONST, "Expected 'const' for enum declaration");
 	consume(TOK_IDENTIFIER, "Expected enum name");
-	std::string name = previous().lexeme;
+	std::string name(previous().text(source_));
 	consume(TOK_EQUAL, "Expected '=' after enum name");
 	consume(TOK_ENUM, "Expected 'enum' keyword");
 	consume(TOK_OPEN_BRACE, "Expected '{' after 'enum'");
@@ -1314,7 +1480,7 @@ std::unique_ptr<EnumDeclAST> Parser::parseEnumDecl() {
 	while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
 		consume(TOK_IDENTIFIER, "Expected enum variant name");
 		EnumVariantAST v;
-		v.Name = previous().lexeme;
+		v.Name = previous().text(source_);
 		// Optional payload: `Variant(T1, T2, ...)`. Unit variants omit
 		// the parenthesized list.
 		if (match(TOK_OPEN_PAREN)) {
@@ -1332,7 +1498,7 @@ std::unique_ptr<EnumDeclAST> Parser::parseEnumDecl() {
 			bool neg = false;
 			uint64_t mag = 0;
 			try {
-				NumberResult r = parseNumberLiteral(previous().lexeme);
+				NumberResult r = parseNumberLiteral(previous().text(source_));
 				if (r.kind != NumberResultKind::Int) {
 					parseError(
 					    "Enum discriminant must be a non-negative integer");
@@ -1371,7 +1537,7 @@ std::unique_ptr<EnumDeclAST> Parser::parseEnumDecl() {
 std::unique_ptr<UnionDeclAST> Parser::parseUnionDecl() {
 	consume(TOK_CONST, "Expected 'const' for union declaration");
 	consume(TOK_IDENTIFIER, "Expected union name");
-	std::string name = previous().lexeme;
+	std::string name(previous().text(source_));
 	consume(TOK_EQUAL, "Expected '=' after union name");
 	consume(TOK_UNION, "Expected 'union' keyword");
 	consume(TOK_OPEN_BRACE, "Expected '{' after 'union'");
@@ -1379,7 +1545,7 @@ std::unique_ptr<UnionDeclAST> Parser::parseUnionDecl() {
 	std::vector<std::pair<std::string, TypeIdx>> fields;
 	while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
 		consume(TOK_IDENTIFIER, "Expected union field name");
-		std::string fieldName = previous().lexeme;
+		std::string fieldName(previous().text(source_));
 		consume(TOK_COLON, "Expected ':' after field name");
 		TypeIdx fieldType = parseType();
 		fields.emplace_back(std::move(fieldName), fieldType);
@@ -1394,12 +1560,15 @@ std::unique_ptr<UnionDeclAST> Parser::parseUnionDecl() {
 std::unique_ptr<ImportDeclAST> Parser::parseImportDecl() {
 	consume(TOK_CONST, "Expected 'const' for import declaration");
 	consume(TOK_IDENTIFIER, "Expected identifier for import name");
-	std::string name = previous().lexeme;
+	std::string name(previous().text(source_));
 
 	consume(TOK_EQUAL, "Expected '=' after import name");
 	consume(TOK_IMPORT, "Expected 'import' keyword");
 	consume(TOK_OPEN_PAREN, "Expected '(' after 'import'");
 	consume(TOK_STRING_LITERAL, "Expected string literal for import path");
+	// Decoded value (escapes resolved); raw `text(source_)` would
+	// include the surrounding `"..."` quotes which the resolver
+	// doesn't expect.
 	std::string path = previous().lexeme;
 	consume(TOK_CLOSE_PAREN, "Expected ')' after import path");
 	consume(TOK_SEMI, "Expected ';' after import declaration");
@@ -1415,7 +1584,7 @@ std::unique_ptr<DestructuringImportDeclAST> Parser::parseDestructuringImport() {
 	std::vector<std::string> names;
 	do {
 		consume(TOK_IDENTIFIER, "Expected identifier in destructuring import");
-		names.push_back(previous().lexeme);
+		names.emplace_back(previous().text(source_));
 	} while (match(TOK_COMMA));
 
 	consume(TOK_CLOSE_BRACE, "Expected '}' after destructuring names");
@@ -1433,7 +1602,7 @@ std::unique_ptr<DestructuringImportDeclAST> Parser::parseDestructuringImport() {
 std::unique_ptr<ConstDeclAST> Parser::parseConstDecl() {
 	consume(TOK_CONST, "Expected 'const' for module-scope constant");
 	consume(TOK_IDENTIFIER, "Expected identifier for constant name");
-	std::string name = previous().lexeme;
+	std::string name(previous().text(source_));
 
 	TypeIdx declared = kNoType;
 	if (match(TOK_COLON)) { declared = parseType(); }

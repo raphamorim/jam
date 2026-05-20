@@ -9,6 +9,7 @@
 #define CODEGEN_H
 
 #include "ast_flat.h"
+#include "decl.h"
 #include "diagnostics.h"
 #include "drop_registry.h"
 #include "jam_llvm.h"
@@ -24,6 +25,10 @@
 class FunctionAST;
 class StructDeclAST;
 class EnumDeclAST;
+
+namespace jam {
+class Analyzer;
+}
 
 class JamCodegenContext {
   public:
@@ -198,6 +203,15 @@ class JamCodegenContext {
 	//     note: in instantiation of `Pair(Vec(NoDefault), i32)`
 	// when an error surfaces deep inside a monomorphisation.
 	std::vector<jam::Diagnostic::Trace> &refTrace() const { return refTrace_; }
+
+	// Demand-driven decl analysis. The DeclTable is populated by
+	// the driver (main.cpp) right after parse + module resolution;
+	// the Analyzer is the chokepoint every getLLVMType / generic-
+	// instantiation path consults so cycles are caught structurally
+	// and module-ordering doesn't matter.
+	jam::DeclTable &declTable() const { return declTable_; }
+	jam::Analyzer &analyzer() const;
+
 	// look up a drop method for an instantiated struct
 	// (e.g. Box__i32). Falls back to the pre-built drop registry.
 	// Returns nullptr if the struct has no drop method.
@@ -240,6 +254,12 @@ class JamCodegenContext {
 	mutable jam::Diagnostics diagnostics_;
 	std::string currentFile_;
 	mutable std::vector<jam::Diagnostic::Trace> refTrace_;
+
+	// Decl table + lazy analyzer. The table is populated by the
+	// driver post-parse; the analyzer is materialised on first
+	// `analyzer()` call so the JamCodegenContext ctor stays trivial.
+	mutable jam::DeclTable declTable_;
+	mutable std::unique_ptr<jam::Analyzer> analyzer_;
 
 	// callsite ABI: when codegen for a call expression needs to know
 	// the callee's parameter modes (e.g. to decide whether to auto-take

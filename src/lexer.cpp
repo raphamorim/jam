@@ -71,9 +71,16 @@ void Lexer::addToken(TokenType type) { addToken(type, ""); }
 
 void Lexer::addToken(TokenType type, const std::string &lexeme) {
 	// `tokenStart` is captured at the top of each scan-loop iteration
-	// (before the first `advance()`), so we can stamp it onto every
-	// emitted Token without per-call site bookkeeping.
-	tokens.emplace_back(type, lexeme, line, tokenStart);
+	// (before the first `advance()`); `length` is the span between
+	// then and `current`. Together they let callers slice the source
+	// for the token's raw bytes via `Token::text(source)` — no per-
+	// token string copy. The `lexeme` argument is only passed by the
+	// string-literal path, which needs to carry the escape-decoded
+	// value (a `\n` in the raw source becomes a single LF byte that
+	// the source slice can't reproduce).
+	uint32_t length =
+	    static_cast<uint32_t>(static_cast<uint32_t>(current) - tokenStart);
+	tokens.emplace_back(type, lexeme, line, tokenStart, length);
 }
 
 void Lexer::identifier() {
@@ -81,61 +88,66 @@ void Lexer::identifier() {
 	            1;  // Start position (we already consumed the first character)
 	while (isAlphaNumeric(peek())) advance();
 
-	std::string text = source.substr(start, current - start);
+	// `text` is a view into the source — keyword classification only
+	// reads it, so no copy is needed. The emitted Token's `lexeme`
+	// stays empty; downstream callers reconstruct the string via
+	// `token.text(source)`.
+	std::string_view text(source.data() + start,
+	                      static_cast<std::size_t>(current - start));
 
 	// Check for keywords
 	if (text == "fn") {
-		addToken(TOK_FN, text);
+		addToken(TOK_FN);
 	} else if (text == "return") {
-		addToken(TOK_RETURN, text);
+		addToken(TOK_RETURN);
 	} else if (text == "const") {
-		addToken(TOK_CONST, text);
+		addToken(TOK_CONST);
 	} else if (text == "var") {
-		addToken(TOK_VAR, text);
+		addToken(TOK_VAR);
 	} else if (text == "mut") {
-		addToken(TOK_MUT, text);
+		addToken(TOK_MUT);
 	} else if (text == "if") {
-		addToken(TOK_IF, text);
+		addToken(TOK_IF);
 	} else if (text == "else") {
-		addToken(TOK_ELSE, text);
+		addToken(TOK_ELSE);
 	} else if (text == "match") {
-		addToken(TOK_MATCH, text);
+		addToken(TOK_MATCH);
 	} else if (text == "while") {
-		addToken(TOK_WHILE, text);
+		addToken(TOK_WHILE);
 	} else if (text == "loop") {
-		addToken(TOK_LOOP, text);
+		addToken(TOK_LOOP);
 	} else if (text == "for") {
-		addToken(TOK_FOR, text);
+		addToken(TOK_FOR);
 	} else if (text == "break") {
-		addToken(TOK_BREAK, text);
+		addToken(TOK_BREAK);
 	} else if (text == "continue") {
-		addToken(TOK_CONTINUE, text);
+		addToken(TOK_CONTINUE);
 	} else if (text == "in") {
-		addToken(TOK_IN, text);
+		addToken(TOK_IN);
 	} else if (text == "true") {
-		addToken(TOK_TRUE, text);
+		addToken(TOK_TRUE);
 	} else if (text == "false") {
-		addToken(TOK_FALSE, text);
+		addToken(TOK_FALSE);
 	} else if (text == "extern") {
-		addToken(TOK_EXTERN, text);
+		addToken(TOK_EXTERN);
 	} else if (text == "export") {
-		addToken(TOK_EXPORT, text);
+		addToken(TOK_EXPORT);
 	} else if (text == "pub") {
-		addToken(TOK_PUB, text);
+		addToken(TOK_PUB);
 	} else if (text == "import") {
-		addToken(TOK_IMPORT, text);
+		addToken(TOK_IMPORT);
 	} else if (text == "tfn") {
-		addToken(TOK_TFN, text);
+		addToken(TOK_TFN);
 	} else if (text == "struct") {
-		addToken(TOK_STRUCT, text);
+		addToken(TOK_STRUCT);
 	} else if (text == "union") {
-		addToken(TOK_UNION, text);
+		addToken(TOK_UNION);
 	} else if (text == "enum") {
-		addToken(TOK_ENUM, text);
+		addToken(TOK_ENUM);
 	} else if (text == "as") {
-		addToken(TOK_AS, text);
+		addToken(TOK_AS);
 	} else if (text == "move") {
-		addToken(TOK_MOVE, text);
+		addToken(TOK_MOVE);
 	} else if (text == "u1" || text == "u8" || text == "u16" || text == "u32" ||
 	           text == "u64" || text == "i8" || text == "i16" ||
 	           text == "i32" || text == "i64" || text == "f32" ||
@@ -145,9 +157,9 @@ void Lexer::identifier() {
 		// themselves types, used at compile time only. Lexed as TOK_TYPE
 		// alongside the scalar built-ins so the parser sees it in a type
 		// position uniformly.
-		addToken(TOK_TYPE, text);
+		addToken(TOK_TYPE);
 	} else {
-		addToken(TOK_IDENTIFIER, text);
+		addToken(TOK_IDENTIFIER);
 	}
 }
 
@@ -175,15 +187,14 @@ static bool isAlphaDigit(char c) {
 	       (c >= 'A' && c <= 'Z');
 }
 
-void Lexer::number() { scanNumberBody(current - 1); }
+void Lexer::number() { scanNumberBody(); }
 
 void Lexer::negativeNumber() {
-	int start = current - 1;  // points at the leading `-`
-	advance();                // consume the first digit
-	scanNumberBody(start);
+	advance();  // consume the first digit after the leading `-`
+	scanNumberBody();
 }
 
-void Lexer::scanNumberBody(int start) {
+void Lexer::scanNumberBody() {
 	// State machine: int → int_period → float → float_exp. We track
 	// only enough state to know whether `+`/`-` is valid (it is only
 	// after a p/P/e/E exponent letter).
@@ -261,8 +272,7 @@ void Lexer::scanNumberBody(int start) {
 		if (stop) break;
 	}
 
-	std::string num = source.substr(start, current - start);
-	addToken(TOK_NUMBER, num);
+	addToken(TOK_NUMBER);
 }
 
 char Lexer::parseHexByte() {

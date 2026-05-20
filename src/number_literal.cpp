@@ -47,7 +47,7 @@ NumberResult okFloat(NumberBase base, double value) {
 
 }  // namespace
 
-NumberResult parseNumberLiteral(const std::string &bytes) {
+NumberResult parseNumberLiteral(std::string_view bytes) {
 	std::size_t i = 0;
 	uint8_t baseValue = 10;
 	NumberBase base = NumberBase::Decimal;

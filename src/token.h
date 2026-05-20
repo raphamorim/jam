@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 // Token types
 enum TokenType {
@@ -83,15 +84,36 @@ enum TokenType {
 };
 
 // Token structure.
+//
+// Storage model: `byteOffset` + `length` mark the token's raw span in
+// the original source buffer; `text(source)` returns a string_view over
+// that span and is the right call for every token kind EXCEPT
+// `TOK_STRING_LITERAL`.
+//
+// `lexeme` is populated only for `TOK_STRING_LITERAL` and carries the
+// *decoded* value — escape sequences like `\n` / `\u{2603}` are
+// resolved to the bytes the runtime expects, which the raw source
+// doesn't contain. Use `lexeme` for string literals, `text(source)`
+// for everything else.
 struct Token {
 	TokenType type;
 	std::string lexeme;
 	int line;
 	uint32_t byteOffset = 0;
+	uint32_t length = 0;
 
-	Token(TokenType type, std::string lexeme, int line, uint32_t byteOffset = 0)
+	Token(TokenType type, std::string lexeme, int line, uint32_t byteOffset = 0,
+	      uint32_t length = 0)
 	    : type(type), lexeme(std::move(lexeme)), line(line),
-	      byteOffset(byteOffset) {}
+	      byteOffset(byteOffset), length(length) {}
+
+	// Raw source span. Caller passes the same `source` the lexer ran
+	// over. The returned view is valid as long as `source` is. For
+	// `TOK_STRING_LITERAL` this returns the raw `"..."`-bracketed bytes
+	// from the source — use `lexeme` for the decoded value.
+	std::string_view text(const std::string &source) const {
+		return std::string_view(source).substr(byteOffset, length);
+	}
 };
 
 #endif  // TOKEN_H

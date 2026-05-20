@@ -23,7 +23,7 @@ fn drop(self: mut Counter) {
 
 fn singleScope() u32 {
     var hits: u32 = 0;
-    var c: Counter = { value: 7, sink: &hits };
+    var c: Counter = Counter { value: 7, sink: &hits };
     // c drops here at function end → hits becomes 1
     return c.value + 100;
 }
@@ -36,8 +36,8 @@ fn callerObservingDrop() u32 {
 }
 
 fn wrapsCounter(sink: *mut u32) u32 {
-    var c: Counter = { value: 5, sink: sink };
-    var d: Counter = { value: 11, sink: sink };
+    var c: Counter = Counter { value: 5, sink: sink };
+    var d: Counter = Counter { value: 11, sink: sink };
     // Both c and d drop at function exit (reverse-decl: d first, then c).
     // Each drop bumps `*sink` by 1 → sink becomes 2.
     return c.value + d.value;
@@ -50,7 +50,7 @@ fn earlyReturnDropsToo(b: bool) u32 {
 }
 
 fn early(b: bool, sink: *mut u32) u32 {
-    var c: Counter = { value: 13, sink: sink };
+    var c: Counter = Counter { value: 13, sink: sink };
     if (b) {
         return c.value;
     }

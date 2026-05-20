@@ -17,7 +17,7 @@ fn drop(self: mut Bumper) {
 fn ifBodyDropsAtEnd(b: bool) u32 {
     var hits: u32 = 0;
     if (b) {
-        var x: Bumper = { sink: &hits };
+        var x: Bumper = Bumper { sink: &hits };
         // x goes out of scope at end of this block → drop runs → hits=1
     }
     // We can read hits here; if drop ran at end of if, hits == 1.
@@ -33,7 +33,7 @@ fn elseBodyDropsAtEnd() u32 {
     if (false) {
         var ignored: u32 = 0;
     } else {
-        var x: Bumper = { sink: &hits };
+        var x: Bumper = Bumper { sink: &hits };
         // drop at end of else → hits=1
     }
     return hits;
@@ -43,7 +43,7 @@ fn elseBodyDropsAtEnd() u32 {
 fn loopIterationDrops() u32 {
     var hits: u32 = 0;
     for i in 0:5 {
-        var x: Bumper = { sink: &hits };
+        var x: Bumper = Bumper { sink: &hits };
         // drop at end of iteration body → hits++ each pass
     }
     return hits;
@@ -52,9 +52,9 @@ fn loopIterationDrops() u32 {
 // --- Outer drop fires at function end; inner drop fires at end of if ---
 fn nested(b: bool) u32 {
     var hits: u32 = 0;
-    var outer: Bumper = { sink: &hits };
+    var outer: Bumper = Bumper { sink: &hits };
     if (b) {
-        var inner: Bumper = { sink: &hits };
+        var inner: Bumper = Bumper { sink: &hits };
         // inner drops at end of if → hits=1
     }
     var afterIf: u32 = hits;
@@ -65,9 +65,9 @@ fn nested(b: bool) u32 {
 // --- Return inside an if body: ALL active scopes drop before ret ---
 fn earlyReturnDropsAll() u32 {
     var hits: u32 = 0;
-    var outer: Bumper = { sink: &hits };
+    var outer: Bumper = Bumper { sink: &hits };
     if (true) {
-        var inner: Bumper = { sink: &hits };
+        var inner: Bumper = Bumper { sink: &hits };
         return hits;
         // never reached
     }

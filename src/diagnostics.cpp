@@ -110,7 +110,10 @@ void emitOne(std::ostream &out, const Diagnostic &d, int indent = 0) {
 		emitOne(out, nd, indent + 4);
 	}
 	for (const auto &frame : d.referenceTrace) {
-		out << pad << "    note: in instantiation of `" << frame.decl << "`";
+		const char *verb = frame.kind == Diagnostic::Trace::Kind::Reference
+		                       ? "referenced by"
+		                       : "in instantiation of";
+		out << pad << "    note: " << verb << " `" << frame.decl << "`";
 		if (!frame.loc.file.empty() && frame.loc.line > 0) {
 			out << " at " << frame.loc.file << ":" << frame.loc.line;
 		}

@@ -45,7 +45,7 @@ tfn doubleByValueOK() {
 }
 
 tfn pickFieldAOK() {
-    var p: Pair = { a: 9, b: 0 };
+    var p: Pair = Pair { a: 9, b: 0 };
     assert(pickFieldA(&p), 10);
 }
 

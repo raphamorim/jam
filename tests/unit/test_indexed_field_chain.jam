@@ -20,7 +20,7 @@ const Board = struct {
 };
 
 tfn writeArrayElemField() {
-    var arr: [2]Cpu = [{ pc: 0, sp: 0 }; 2];
+    var arr: [2]Cpu = [Cpu { pc: 0, sp: 0 }; 2];
     arr[0].pc = 42;
     arr[1].pc = 99;
     arr[1].sp = 7;
@@ -30,7 +30,7 @@ tfn writeArrayElemField() {
 }
 
 tfn writeArrayElemNestedField() {
-    var arr: [2]Outer = [{ inner: { a: 0, b: 0 }, tag: 0 }; 2];
+    var arr: [2]Outer = [Outer { inner: Inner { a: 0, b: 0 }, tag: 0 }; 2];
     arr[0].inner.a = 10;
     arr[0].inner.b = 20;
     arr[0].tag = 1;
@@ -44,7 +44,7 @@ tfn writeArrayElemNestedField() {
 }
 
 tfn writeIndexedFieldThroughStruct() {
-    var b: Board = { cells: [{ pc: 0, sp: 0 }; 4] };
+    var b: Board = Board { cells: [Cpu { pc: 0, sp: 0 }; 4] };
     b.cells[0].pc = 100;
     b.cells[2].sp = 200;
     b.cells[3].pc = 300;
@@ -54,14 +54,14 @@ tfn writeIndexedFieldThroughStruct() {
 }
 
 tfn readArrayElemFieldDirectly() {
-    var arr: [3]Cpu = [{ pc: 0, sp: 0 }; 3];
+    var arr: [3]Cpu = [Cpu { pc: 0, sp: 0 }; 3];
     arr[1].pc = 77;
     var x: u32 = arr[1].pc;
     assert(x, 77);
 }
 
 tfn computeWithIndexedField() {
-    var arr: [2]Cpu = [{ pc: 5, sp: 0 }; 2];
+    var arr: [2]Cpu = [Cpu { pc: 5, sp: 0 }; 2];
     arr[0].pc = 5;
     arr[1].pc = 10;
     var sum: u32 = arr[0].pc + arr[1].pc;
@@ -69,7 +69,7 @@ tfn computeWithIndexedField() {
 }
 
 tfn indexExpressionWithSideEffectArith() {
-    var arr: [4]Cpu = [{ pc: 0, sp: 0 }; 4];
+    var arr: [4]Cpu = [Cpu { pc: 0, sp: 0 }; 4];
     var i: u64 = 0;
     arr[i + 2].pc = 88;
     assert(arr[2].pc, 88);
@@ -92,7 +92,7 @@ fn CounterFactory(T: type) type {
 const CounterU32 = CounterFactory(u32);
 
 tfn methodCallOnIndexedReceiverMut() {
-    var arr: [3]CounterU32 = [{ v: 0 }; 3];
+    var arr: [3]CounterU32 = [CounterU32 { v: 0 }; 3];
     arr[0].bump(10);
     arr[1].bump(20);
     arr[2].bump(30);
@@ -102,7 +102,7 @@ tfn methodCallOnIndexedReceiverMut() {
 }
 
 tfn methodCallOnIndexedReceiverLet() {
-    var arr: [2]CounterU32 = [{ v: 5 }; 2];
+    var arr: [2]CounterU32 = [CounterU32 { v: 5 }; 2];
     arr[0].bump(3);
     arr[1].bump(7);
     assert(arr[0].read(), 8);
@@ -110,7 +110,7 @@ tfn methodCallOnIndexedReceiverLet() {
 }
 
 tfn methodCallOnIndexedReceiverChained() {
-    var arr: [2]CounterU32 = [{ v: 1 }; 2];
+    var arr: [2]CounterU32 = [CounterU32 { v: 1 }; 2];
     arr[0].bump(arr[1].read() + 9);
     assert(arr[0].read(), 11);
 }

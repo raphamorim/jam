@@ -55,7 +55,7 @@ const Vec = struct {
 
 // --- Field reassignment after struct-literal init ---
 fn fieldReassign() u32 {
-    var v: Vec = { x: 0, y: 0 };
+    var v: Vec = Vec { x: 0, y: 0 };
     v.x = 7;
     v.y = 11;
     return v.x + v.y;

@@ -29,7 +29,7 @@ fn dropOneA() u32 {
 }
 
 fn onlyA(sink: *mut u32) u32 {
-    var a: A = { sink: sink };
+    var a: A = A { sink: sink };
     return 1;
 }
 
@@ -40,7 +40,7 @@ fn dropOneB() u32 {
 }
 
 fn onlyB(sink: *mut u32) u32 {
-    var b: B = { sink: sink };
+    var b: B = B { sink: sink };
     return 2;
 }
 
@@ -51,8 +51,8 @@ fn dropBoth() u32 {
 }
 
 fn bothInOne(sink: *mut u32) u32 {
-    var a: A = { sink: sink };
-    var b: B = { sink: sink };
+    var a: A = A { sink: sink };
+    var b: B = B { sink: sink };
     return 3;
 }
 

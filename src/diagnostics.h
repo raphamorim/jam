@@ -40,8 +40,20 @@ struct Diagnostic {
 	enum class Severity : uint8_t { Error, Warning, Note };
 
 	struct Trace {
+		// Distinguishes the verb used when the formatter prints a
+		// frame. Generic-instantiation frames pushed by codegen
+		// during monomorphisation use `Instantiation` ("in
+		// instantiation of `Vec(i32).default`"); analyzer frames
+		// pushed while walking decl dependencies use `Reference`
+		// ("referenced by `MyStruct`"). The two convey different
+		// causal shapes — one is "you asked me to compile X(T)", the
+		// other is "X showed up while resolving Y" — and conflating
+		// them under one verb loses information at error time.
+		enum class Kind : uint8_t { Instantiation, Reference };
+
 		SrcLoc loc;
 		std::string decl;  // e.g. "Vec(NoDefault).default"
+		Kind kind = Kind::Instantiation;
 		// `hidden` counts trace frames that were elided when the
 		// chain exceeded a (future) `--reference-trace=N` limit.
 		// Kept at 0 today: the full live stack is always

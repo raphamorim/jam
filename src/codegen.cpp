@@ -7,6 +7,7 @@
 
 #include "codegen.h"
 
+#include "analyzer.h"
 #include "ast.h"
 #include "astgen.h"
 #include "jir_codegen.h"
@@ -25,6 +26,17 @@ JamCodegenContext::~JamCodegenContext() {
 	JamLLVMDisposeBuilder(builder);
 	JamLLVMDisposeModule(mod);
 	JamLLVMDisposeContext(ctx);
+}
+
+jam::Analyzer &JamCodegenContext::analyzer() const {
+	if (!analyzer_) {
+		// Lazy ctor — needs a fully-constructed JamCodegenContext to
+		// reference for diagnostics / file / type pool. The DeclTable
+		// is a sibling member, so its address is stable.
+		analyzer_ = std::make_unique<jam::Analyzer>(
+		    const_cast<JamCodegenContext &>(*this), declTable_);
+	}
+	return *analyzer_;
 }
 
 // Parse a type-syntax string into the canonical TypeIdx (recursive). The
@@ -724,12 +736,51 @@ TypeIdx substituteType(TypeIdx ty,
 }  // namespace
 
 TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
-	auto cached = genericResolutions_.find(callTy);
+	// Apply the active substitution context to the GenericCall's args
+	// before resolving. The same `Inner(T)` TypeIdx appears in every
+	// instantiation of an outer generic that mentions it — Wrap(i32)
+	// must see `[i32]`, Wrap(f32) must see `[f32]`. Without this
+	// substitution the args stay as the placeholder Named("T") and
+	// the inner instantiation either resolves to a meaningless
+	// Inner__T or loops because the placeholder never collapses.
+	//
+	// The cache key is the *substituted* GenericCall TypeIdx so two
+	// outer substitutions don't conflate.
+	const TypeKey &k0 = typePool.get(callTy);
+	const auto &rawArgs = typePool.genericArgsAt(k0.b);
+	TypeIdx effectiveTy = callTy;
+	if (!currentSubst_.empty()) {
+		std::vector<TypeIdx> substArgs;
+		substArgs.reserve(rawArgs.size());
+		bool anyChanged = false;
+		for (TypeIdx a : rawArgs) {
+			TypeIdx s = substituteType(a, currentSubst_, typePool, stringPool);
+			if (s != a) anyChanged = true;
+			substArgs.push_back(s);
+		}
+		if (anyChanged) {
+			effectiveTy = typePool.internGenericCall(
+			    static_cast<StringIdx>(k0.a), std::move(substArgs));
+		}
+	}
+
+	auto cached = genericResolutions_.find(effectiveTy);
 	if (cached != genericResolutions_.end()) return cached->second;
 
-	const TypeKey &k = typePool.get(callTy);
+	const TypeKey &k = typePool.get(effectiveTy);
 	const std::string &calleeName = stringPool.get(static_cast<StringIdx>(k.a));
 	const auto &args = typePool.genericArgsAt(k.b);
+
+	// Demand-driven: consult the Analyzer first so cycle detection
+	// kicks in and any cross-decl dependency the user introduced is
+	// recorded. The analyzer's stub for Function decls just confirms
+	// the FunctionAST is reachable — the heavy lifting (resolving
+	// args, instantiating the struct) stays here. Step 4 will hoist
+	// the instantiation logic into the analyzer itself.
+	jam::DeclIndex calleeDecl = declTable_.findByName(calleeName);
+	if (calleeDecl != jam::kNoDecl) {
+		analyzer().ensureDeclAnalyzed(calleeDecl);
+	}
 
 	// Identity-based lookup: namespace-qualified and bare callees both
 	// resolve to the same FunctionAST (main.cpp registers both forms).
@@ -752,7 +803,7 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 	GenericInstanceKey idKey{generic, std::vector<TypeIdx>(args)};
 	auto idCached = genericInstances_.find(idKey);
 	if (idCached != genericInstances_.end()) {
-		genericResolutions_[callTy] = idCached->second;
+		genericResolutions_[effectiveTy] = idCached->second;
 		return idCached->second;
 	}
 	if (args.size() != generic->Args.size()) {
@@ -825,7 +876,7 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 	}
 
 	genericInstances_[idKey] = result;
-	genericResolutions_[callTy] = result;
+	genericResolutions_[effectiveTy] = result;
 	return result;
 }
 

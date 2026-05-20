@@ -43,7 +43,8 @@ AnalyzeResult analyzeSource(const std::string &src) {
 	Lexer lexer(src);
 	auto tokens = lexer.scanTokens();
 
-	Parser parser(tokens, *result.types, *result.strings, *result.nodes);
+	Parser parser(tokens, lexer.sourceBuffer(), *result.types, *result.strings,
+	              *result.nodes);
 	result.module = parser.parse();
 
 	jam::init_analysis::FunctionRegistry registry;
@@ -162,7 +163,7 @@ const Pair = struct { a: u32, b: u32 };
 fn modifyAndRead(whole: mut Pair, part: u32) u32 { return part; }
 
 fn caller() u32 {
-    var p: Pair = { a: 1, b: 2 };
+    var p: Pair = Pair { a: 1, b: 2 };
     return modifyAndRead(p, p.a);
 }
 )");
@@ -177,7 +178,7 @@ const Pair = struct { a: u32, b: u32 };
 fn add(a: u32, b: u32) u32 { return a + b; }
 
 fn caller() u32 {
-    var p: Pair = { a: 10, b: 20 };
+    var p: Pair = Pair { a: 10, b: 20 };
     return add(p.a, p.b);
 }
 )");
@@ -244,7 +245,7 @@ fn consume(f: move File) i32 {
 }
 
 fn caller() i32 {
-    var f: File = { fd: 7 };
+    var f: File = File { fd: 7 };
     return consume(f);
 }
 )");
@@ -269,7 +270,7 @@ fn read(f: File) i32 {
 }
 
 fn caller() i32 {
-    var f: File = { fd: 7 };
+    var f: File = File { fd: 7 };
     return read(f);
 }
 )");
@@ -291,7 +292,7 @@ fn close(f: mut File) {
 }
 
 fn caller() i32 {
-    var f: File = { fd: 7 };
+    var f: File = File { fd: 7 };
     close(&f);
     return f.fd;
 }
@@ -313,7 +314,7 @@ fn consume(p: move Plain) u32 {
 }
 
 fn caller() u32 {
-    var p: Plain = { a: 1, b: 2 };
+    var p: Plain = Plain { a: 1, b: 2 };
     return consume(p);
 }
 )");

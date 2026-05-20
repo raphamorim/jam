@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "analyzer.h"
 #include "ast.h"
 #include "astgen.h"
 #include "cabi.h"
@@ -97,9 +98,9 @@ static int compileAndRun(const std::string &filename,
 	std::vector<std::unique_ptr<StructDeclAST>> sharedAnonStructs;
 	std::vector<std::unique_ptr<EnumDeclAST>> sharedAnonEnums;
 
-	Parser parser(tokens, codegenCtx.getTypePool(), codegenCtx.getStringPool(),
-	              codegenCtx.getNodeStore(), &codegenCtx.diagnostics(),
-	              filename);
+	Parser parser(tokens, lexer.sourceBuffer(), codegenCtx.getTypePool(),
+	              codegenCtx.getStringPool(), codegenCtx.getNodeStore(),
+	              &codegenCtx.diagnostics(), filename);
 	parser.sharedAnonStructs = &sharedAnonStructs;
 	parser.sharedAnonEnums = &sharedAnonEnums;
 	std::unique_ptr<ModuleAST> module;
@@ -158,6 +159,70 @@ static int compileAndRun(const std::string &filename,
 
 	codegenCtx.setAnonStructs(&sharedAnonStructs);
 	codegenCtx.setAnonEnums(&sharedAnonEnums);
+
+	// Populate the demand-driven DeclTable: one Decl per top-level
+	// binding across the main module + every imported module. The
+	// analyzer consults this table for cycle detection when codegen
+	// resolves a generic call, a Named type, or any other cross-decl
+	// reference. Step 4 will make this the *only* source of truth and
+	// delete the parallel functionAsts / struct registry tables; for
+	// now we populate it in parallel so the existing eager pipeline
+	// stays unchanged.
+	auto registerTopLevelDecls = [&](ModuleAST *m, bool publicOnly) {
+		auto setSrc = [&](jam::Decl &d, const std::string &name) {
+			(void)name;
+			d.file = codegenCtx.currentFile();
+			// Line populated when AST nodes carry per-node line; for
+			// the top-level decl we use 0 (no specific line) for
+			// now.
+		};
+		for (auto &fn : m->Functions) {
+			if (publicOnly && !fn->isPub) continue;
+			jam::DeclIndex idx = codegenCtx.declTable().create(
+			    jam::DeclKind::Function, fn->Name);
+			auto &d = codegenCtx.declTable().get(idx);
+			d.fnAst = fn.get();
+			setSrc(d, fn->Name);
+		}
+		for (auto &s : m->Structs) {
+			if (publicOnly && !s->isPub) continue;
+			jam::DeclIndex idx =
+			    codegenCtx.declTable().create(jam::DeclKind::Struct, s->Name);
+			auto &d = codegenCtx.declTable().get(idx);
+			d.structAst = s.get();
+			setSrc(d, s->Name);
+		}
+		for (auto &e : m->Enums) {
+			if (publicOnly && !e->isPub) continue;
+			jam::DeclIndex idx =
+			    codegenCtx.declTable().create(jam::DeclKind::Enum, e->Name);
+			auto &d = codegenCtx.declTable().get(idx);
+			d.enumAst = e.get();
+			setSrc(d, e->Name);
+		}
+		for (auto &u : m->Unions) {
+			if (publicOnly && !u->isPub) continue;
+			jam::DeclIndex idx =
+			    codegenCtx.declTable().create(jam::DeclKind::Union, u->Name);
+			auto &d = codegenCtx.declTable().get(idx);
+			d.unionAst = u.get();
+			setSrc(d, u->Name);
+		}
+		for (auto &c : m->Consts) {
+			if (publicOnly && !c->isPub) continue;
+			jam::DeclIndex idx =
+			    codegenCtx.declTable().create(jam::DeclKind::Const, c->Name);
+			auto &d = codegenCtx.declTable().get(idx);
+			d.constAst = c.get();
+			setSrc(d, c->Name);
+		}
+	};
+	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
+		if (path == "std") continue;
+		registerTopLevelDecls(importedModule.get(), /*publicOnly=*/true);
+	}
+	registerTopLevelDecls(module.get(), /*publicOnly=*/false);
+
 	// `publicOnly` is set when iterating an imported module: only `pub`
 	// items get registered, so non-pub items can't leak into the
 	// importing module via bare-name lookup. Main-module decls always
@@ -178,66 +243,6 @@ static int compileAndRun(const std::string &filename,
 			codegenCtx.registerUnion(u->Name, unionType, u->Fields);
 		}
 	};
-	auto fillStructBodies = [&](ModuleAST *m, bool publicOnly) {
-		for (auto &s : m->Structs) {
-			if (publicOnly && !s->isPub) continue;
-			std::vector<JamTypeRef> fieldTypes;
-			fieldTypes.reserve(s->Fields.size());
-			for (auto &f : s->Fields) {
-				fieldTypes.push_back(codegenCtx.getLLVMType(f.second));
-			}
-			const auto *info = codegenCtx.getStruct(s->Name);
-			JamLLVMStructSetBody(info->type, fieldTypes.data(),
-			                     static_cast<unsigned>(fieldTypes.size()),
-			                     false);
-		}
-	};
-	// Lay out a union as `{ alignedField, [paddingBytes x i8] }`. The
-	// alignedField is the field with the largest alignment requirement;
-	// padding makes up the difference between that field's size and the
-	// largest field's size, so the union ends up with the right size and
-	// alignment for any field's stored value.
-	auto fillUnionBodies = [&](ModuleAST *m, bool publicOnly) {
-		for (auto &u : m->Unions) {
-			if (publicOnly && !u->isPub) continue;
-			if (u->Fields.empty()) {
-				throw std::runtime_error("Union `" + u->Name +
-				                         "` must have at least one field");
-			}
-			uint64_t maxSize = 0, maxAlign = 1;
-			size_t alignFieldIdx = 0;
-			for (size_t i = 0; i < u->Fields.size(); i++) {
-				uint64_t sz = codegenCtx.typeSize(u->Fields[i].second);
-				uint64_t al = codegenCtx.typeAlign(u->Fields[i].second);
-				if (sz > maxSize) maxSize = sz;
-				if (al > maxAlign) {
-					maxAlign = al;
-					alignFieldIdx = i;
-				}
-			}
-			// Round size up to a multiple of alignment so writes through
-			// the most-aligned field don't run off the end.
-			uint64_t allocSize = (maxSize + maxAlign - 1) / maxAlign * maxAlign;
-			JamTypeRef alignedTy =
-			    codegenCtx.getLLVMType(u->Fields[alignFieldIdx].second);
-			uint64_t alignedSz =
-			    codegenCtx.typeSize(u->Fields[alignFieldIdx].second);
-			uint64_t paddingBytes =
-			    allocSize > alignedSz ? allocSize - alignedSz : 0;
-
-			std::vector<JamTypeRef> bodyTypes;
-			bodyTypes.push_back(alignedTy);
-			if (paddingBytes > 0) {
-				bodyTypes.push_back(
-				    JamLLVMArrayType(codegenCtx.getInt8Type(),
-				                     static_cast<unsigned>(paddingBytes)));
-			}
-			const auto *info = codegenCtx.getUnion(u->Name);
-			JamLLVMStructSetBody(info->type, bodyTypes.data(),
-			                     static_cast<unsigned>(bodyTypes.size()),
-			                     false);
-		}
-	};
 	auto declareEnums = [&](ModuleAST *m, bool publicOnly) {
 		for (auto &e : m->Enums) {
 			if (publicOnly && !e->isPub) continue;
@@ -251,93 +256,6 @@ static int compileAndRun(const std::string &filename,
 				variants.push_back(std::move(info));
 			}
 			codegenCtx.registerEnum(e->Name, std::move(variants));
-		}
-	};
-	// For payloaded enums, lay out as `{i8 tag, alignDriver,
-	// [extraBytes x i8]}` where `alignDriver` is the smallest scalar
-	// type whose alignment matches the strictest variant's alignment
-	// (i8 / i16 / i32 / i64 for align 1 / 2 / 4 / 8 respectively).
-	// LLVM gives the resulting struct the alignment of `alignDriver`,
-	// which propagates to allocas and stores — without that we get
-	// align-1 enum slots even for u64-payload variants, which forces
-	// LLVM to emit unaligned memory ops.
-	//
-	// `extraBytes` makes up the difference between the largest variant's
-	// payload size and the alignDriver scalar's size, rounded up to
-	// maxAlign so the trailing slot in an array of enums is correctly
-	// aligned.
-	auto fillEnumBodies = [&](ModuleAST *m, bool publicOnly) {
-		for (auto &e : m->Enums) {
-			if (publicOnly && !e->isPub) continue;
-			const auto *info = codegenCtx.getEnum(e->Name);
-			if (!info || !info->hasPayloadVariant) continue;
-
-			uint64_t maxSize = 0, maxAlign = 1;
-			for (const auto &v : info->variants) {
-				uint64_t off = 0, varAlign = 1;
-				for (TypeIdx t : v.payloadTypes) {
-					uint64_t s = codegenCtx.typeSize(t);
-					uint64_t a = codegenCtx.typeAlign(t);
-					off = (off + a - 1) / a * a;  // align this field
-					off += s;
-					if (a > varAlign) varAlign = a;
-				}
-				if (varAlign > 1) {
-					off = (off + varAlign - 1) / varAlign * varAlign;
-				}
-				if (off > maxSize) maxSize = off;
-				if (varAlign > maxAlign) maxAlign = varAlign;
-			}
-
-			// Pick a scalar to drive struct alignment.
-			JamTypeRef alignDriver;
-			uint64_t alignDriverSize;
-			switch (maxAlign) {
-			case 1:
-				alignDriver = codegenCtx.getInt8Type();
-				alignDriverSize = 1;
-				break;
-			case 2:
-				alignDriver = codegenCtx.getInt16Type();
-				alignDriverSize = 2;
-				break;
-			case 4:
-				alignDriver = codegenCtx.getInt32Type();
-				alignDriverSize = 4;
-				break;
-			case 8:
-				alignDriver = codegenCtx.getInt64Type();
-				alignDriverSize = 8;
-				break;
-			default:
-				throw std::runtime_error(
-				    "Enum `" + e->Name +
-				    "` requires alignment > 8, which is not yet "
-				    "supported");
-			}
-
-			// Round payload size up to maxAlign so a contiguous array
-			// of enums tiles correctly.
-			uint64_t paddedSize =
-			    (maxSize + maxAlign - 1) / maxAlign * maxAlign;
-			uint64_t extraBytes = (paddedSize > alignDriverSize)
-			                          ? paddedSize - alignDriverSize
-			                          : 0;
-
-			std::vector<JamTypeRef> bodyTypes;
-			bodyTypes.push_back(codegenCtx.getInt8Type());  // tag
-			bodyTypes.push_back(alignDriver);
-			if (extraBytes > 0) {
-				bodyTypes.push_back(
-				    JamLLVMArrayType(codegenCtx.getInt8Type(),
-				                     static_cast<unsigned>(extraBytes)));
-			}
-
-			JamLLVMStructSetBody(info->type, bodyTypes.data(),
-			                     static_cast<unsigned>(bodyTypes.size()),
-			                     false);
-			codegenCtx.setEnumLLVMType(e->Name, info->type, maxSize, maxAlign,
-			                           true);
 		}
 	};
 	// Enums that need a named struct type (i.e. those with payload
@@ -363,15 +281,80 @@ static int compileAndRun(const std::string &filename,
 	declareUnions(module.get(), /*publicOnly=*/false);
 	declareEnums(module.get(), /*publicOnly=*/false);
 	declareEnumLLVMTypes(module.get());
+
+	// Register imported pub functions + handle-import metadata + emit
+	// their LLVM prototypes BEFORE filling struct/union/enum bodies.
+	// A struct field typed as a generic instantiation
+	// (`inner: Vec(i32)`) drives `getLLVMType` to resolve the
+	// GenericCall, which instantiates Vec for i32 and codegens its
+	// methods. Those methods call externs from the same imported
+	// module (e.g. `malloc`), so the externs need prototypes
+	// declared by the time the instantiation runs.
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
 		if (path == "std") continue;
-		fillStructBodies(importedModule.get(), /*publicOnly=*/true);
-		fillUnionBodies(importedModule.get(), /*publicOnly=*/true);
-		fillEnumBodies(importedModule.get(), /*publicOnly=*/true);
+		for (auto &func : importedModule->Functions) {
+			if (func->isPub && !func->isGeneric()) {
+				JirFunction jfn = astgenMetadata(*func, codegenCtx);
+				jfn.name = mangledFunctionName(*func, codegenCtx.getTypePool(),
+				                               codegenCtx.getStringPool());
+				jirDeclarePrototype(jfn, codegenCtx);
+			}
+			if (func->isPub) {
+				codegenCtx.registerFunctionAST(func->Name, func.get());
+			}
+		}
 	}
-	fillStructBodies(module.get(), /*publicOnly=*/false);
-	fillUnionBodies(module.get(), /*publicOnly=*/false);
-	fillEnumBodies(module.get(), /*publicOnly=*/false);
+	for (auto &import : module->Imports) {
+		if (import->Path == "std" || import->Path == "test") continue;
+		const std::string &handle = import->Name;
+		ModuleAST *importedModule = resolver.getOrLoadModule(import->Path);
+		if (!importedModule) continue;
+		codegenCtx.registerImportHandle(handle, import->Path);
+		auto aliasNamed = [&](const std::string &bare) {
+			TypeIdx target = codegenCtx.getTypePool().internNamed(
+			    codegenCtx.getStringPool().intern(bare));
+			codegenCtx.registerTypeAlias(handle + "." + bare, target);
+		};
+		for (auto &func : importedModule->Functions) {
+			if (func->isPub) {
+				codegenCtx.registerFunctionAST(handle + "." + func->Name,
+				                               func.get());
+			} else {
+				codegenCtx.registerPrivateName(handle, func->Name);
+			}
+		}
+		for (auto &s : importedModule->Structs) {
+			if (s->isPub) aliasNamed(s->Name);
+			else codegenCtx.registerPrivateName(handle, s->Name);
+		}
+		for (auto &e : importedModule->Enums) {
+			if (e->isPub) aliasNamed(e->Name);
+			else codegenCtx.registerPrivateName(handle, e->Name);
+		}
+		for (auto &u : importedModule->Unions) {
+			if (u->isPub) aliasNamed(u->Name);
+			else codegenCtx.registerPrivateName(handle, u->Name);
+		}
+	}
+
+	// Single demand-driven body-fill pass: walk every Struct/Enum/
+	// Union decl in the DeclTable and ask the analyzer to materialise
+	// it. The per-kind `resolveTypeFields*` functions are re-entrant
+	// — when a struct's field references another struct/enum/union,
+	// the field walk's ensure*Body call fills that dependency
+	// transitively. The publicOnly filtering that the per-module
+	// fill*Bodies lambdas used to do isn't needed any more because
+	// `registerTopLevelDecls` already applied that filter when
+	// populating the DeclTable.
+	auto &dt = codegenCtx.declTable();
+	for (std::size_t i = 1; i < dt.all().size(); ++i) {
+		jam::DeclIndex idx = static_cast<jam::DeclIndex>(i);
+		const jam::Decl &dr = dt.get(idx);
+		if (dr.kind == jam::DeclKind::Struct ||
+		    dr.kind == jam::DeclKind::Enum || dr.kind == jam::DeclKind::Union) {
+			codegenCtx.analyzer().ensureDeclAnalyzed(idx);
+		}
+	}
 
 	// Register module-scope `const NAME[: T]? = expr;` bindings. These
 	// are inlined at use sites (see AstTag::Variable in ast.cpp), so we
@@ -497,61 +480,10 @@ static int compileAndRun(const std::string &filename,
 	// file (or another module) would fail with "Unknown function". The
 	// two-pass shape lets source read naturally top-down (main on top,
 	// helpers below) without a manual "forward declarations" section.
-
-	// Pass 1a: prototypes for pub functions in imported modules.
-	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
-		if (path == "std") continue;
-		for (auto &func : importedModule->Functions) {
-			if (func->isPub && !func->isGeneric()) {
-				JirFunction jfn = astgenMetadata(*func, codegenCtx);
-				jfn.name = mangledFunctionName(*func, codegenCtx.getTypePool(),
-				                               codegenCtx.getStringPool());
-				jirDeclarePrototype(jfn, codegenCtx);
-			}
-			// Generic functions are still registered so call sites can
-			// look them up for instantiation, but no LLVM is emitted
-			// until each instantiation is processed.
-			if (func->isPub) {
-				codegenCtx.registerFunctionAST(func->Name, func.get());
-			}
-		}
-	}
-
-	for (auto &import : module->Imports) {
-		if (import->Path == "std" || import->Path == "test") continue;
-		const std::string &handle = import->Name;
-		ModuleAST *importedModule = resolver.getOrLoadModule(import->Path);
-		if (!importedModule) continue;
-		codegenCtx.registerImportHandle(handle, import->Path);
-		auto aliasNamed = [&](const std::string &bare) {
-			TypeIdx target = codegenCtx.getTypePool().internNamed(
-			    codegenCtx.getStringPool().intern(bare));
-			codegenCtx.registerTypeAlias(handle + "." + bare, target);
-		};
-		// Track pub vs non-pub items per handle. Pub items get the
-		// qualified registration; non-pub get recorded so a later
-		// lookup miss produces the precise "not exported" diagnostic.
-		for (auto &func : importedModule->Functions) {
-			if (func->isPub) {
-				codegenCtx.registerFunctionAST(handle + "." + func->Name,
-				                               func.get());
-			} else {
-				codegenCtx.registerPrivateName(handle, func->Name);
-			}
-		}
-		for (auto &s : importedModule->Structs) {
-			if (s->isPub) aliasNamed(s->Name);
-			else codegenCtx.registerPrivateName(handle, s->Name);
-		}
-		for (auto &e : importedModule->Enums) {
-			if (e->isPub) aliasNamed(e->Name);
-			else codegenCtx.registerPrivateName(handle, e->Name);
-		}
-		for (auto &u : importedModule->Unions) {
-			if (u->isPub) aliasNamed(u->Name);
-			else codegenCtx.registerPrivateName(handle, u->Name);
-		}
-	}
+	//
+	// Pass 1a (imported pub fn prototypes) and the handle-import
+	// metadata loop ran earlier — see above declareStructs — because
+	// struct-field generic instantiation needs them to be in place.
 
 	// Pass 1b: prototypes for the main module's functions (we still skip
 	// test funcs in non-test mode and user `main` in test mode).

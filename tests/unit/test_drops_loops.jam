@@ -22,7 +22,7 @@ fn breakDropsBody() u32 {
 
 fn breakInner(sink: *mut u32) {
     for i in 0:10 {
-        var x: Bumper = { sink: sink };
+        var x: Bumper = Bumper { sink: sink };
         if (i == 3) {
             // x must drop before the break exits the loop → bumps once
             break;
@@ -40,7 +40,7 @@ fn continueDropsBody() u32 {
 
 fn continueInner(sink: *mut u32) {
     for i in 0:5 {
-        var x: Bumper = { sink: sink };
+        var x: Bumper = Bumper { sink: sink };
         if (i == 2) {
             // x must drop before the continue jumps to next iter
             continue;
@@ -59,9 +59,9 @@ fn breakNestedScopes() u32 {
 
 fn breakNestedInner(sink: *mut u32) {
     for i in 0:10 {
-        var outer: Bumper = { sink: sink };
+        var outer: Bumper = Bumper { sink: sink };
         if (i == 1) {
-            var inner: Bumper = { sink: sink };
+            var inner: Bumper = Bumper { sink: sink };
             // break should drop: inner first, then outer, then exit
             // → bumps twice on this path
             break;

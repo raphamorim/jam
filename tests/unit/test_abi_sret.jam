@@ -14,7 +14,7 @@ const Big = struct {
 };
 
 fn makeBig(seed: u64) Big {
-    var b: Big = { a: seed, b: seed * 2, c: seed * 3 };
+    var b: Big = Big { a: seed, b: seed * 2, c: seed * 3 };
     return b;
 }
 
@@ -27,7 +27,7 @@ fn sumOfMakeBig(seed: u64) u64 {
 
 // sret callee that takes a large parameter (P9.5 + P9.6 together).
 fn passThroughBig(b: Big) Big {
-    var copy: Big = { a: b.a + 1, b: b.b + 1, c: b.c + 1 };
+    var copy: Big = Big { a: b.a + 1, b: b.b + 1, c: b.c + 1 };
     return copy;
 }
 
@@ -44,7 +44,7 @@ tfn sumOfMakeBigOK() {
 }
 
 tfn passThroughBigOK() {
-    var src: Big = { a: 100, b: 200, c: 300 };
+    var src: Big = Big { a: 100, b: 200, c: 300 };
     var got: Big = passThroughBig(src);
     assert(got.a, 101);
     assert(got.b, 201);

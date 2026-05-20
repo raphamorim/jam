@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 enum class NumberBase : uint8_t {
 	Decimal = 10,
@@ -63,7 +64,7 @@ struct NumberResult {
 	NumberError failure{};
 };
 
-NumberResult parseNumberLiteral(const std::string &bytes);
+NumberResult parseNumberLiteral(std::string_view bytes);
 const char *numberErrorMessage(NumberErrorKind kind);
 
 #endif  // NUMBER_LITERAL_H

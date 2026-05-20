@@ -12,7 +12,7 @@ const Box = struct {
 
 tfn writeThroughField() {
     var raw: *mut[] u8 = malloc(64);
-    var b: Box = { ptr: raw as *mut[] i32 };
+    var b: Box = Box { ptr: raw as *mut[] i32 };
     b.ptr[0] = 42;
     b.ptr[1] = 99;
     b.ptr[2] = 7;
@@ -27,7 +27,7 @@ tfn readThroughField() {
     var p: *mut[] i32 = raw as *mut[] i32;
     p[0] = 11;
     p[1] = 22;
-    var b: Box = { ptr: p };
+    var b: Box = Box { ptr: p };
     assert(b.ptr[0], 11);
     assert(b.ptr[1], 22);
     free(b.ptr as *mut[] u8);
@@ -50,7 +50,7 @@ fn Cell(T: type) type {
 
 tfn writeThroughSelfField() {
     var raw: *mut[] u8 = malloc(64);
-    var c: Cell(i32) = { ptr: raw as *mut[] i32 };
+    var c: Cell(i32) = Cell(i32) { ptr: raw as *mut[] i32 };
     c.set(0, 5);
     c.set(1, 17);
     assert(c.get(0), 5);

@@ -8,7 +8,7 @@ fn Box(T: type) type {
     return struct {
         value: T,
         fn make(v: T) Self {
-            return { value: v };
+            return Self { value: v };
         }
     };
 }

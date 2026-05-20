@@ -9,19 +9,19 @@ const FloatBits = union {
 };
 
 fn writeIntReadInt() u32 {
-    var b: FloatBits = { i: 0xCAFEBABE };
+    var b: FloatBits = FloatBits { i: 0xCAFEBABE };
     return b.i;
 }
 
 fn writeIntReadIntZero() u32 {
-    var b: FloatBits = { i: 0 };
+    var b: FloatBits = FloatBits { i: 0 };
     return b.i;
 }
 
 fn aliasMostRecentWrite() u32 {
     // Writing one field then another then reading the second:
     // returns the second-written value's bit pattern.
-    var b: FloatBits = { i: 0xAAAAAAAA };
+    var b: FloatBits = FloatBits { i: 0xAAAAAAAA };
     b.i = 0x55555555;
     return b.i;
 }
@@ -30,8 +30,8 @@ fn floatRoundTrip(seed: u32) u32 {
     // Write the bit pattern via u32, read it via f32, then write that
     // f32 back via the float field, then read via u32 again. The
     // pattern survives unchanged for any non-NaN, non-signaling value.
-    var b: FloatBits = { i: seed };
-    var b2: FloatBits = { f: b.f };
+    var b: FloatBits = FloatBits { i: seed };
+    var b2: FloatBits = FloatBits { f: b.f };
     return b2.i;
 }
 
@@ -51,7 +51,7 @@ const SmallVsBig = union {
 fn writeBigReadSmall() u8 {
     // u64 written, u8 read — returns the low byte (little-endian on
     // every target Jam currently supports).
-    var u: SmallVsBig = { b: 0xDEADBEEFCAFEBABE };
+    var u: SmallVsBig = SmallVsBig { b: 0xDEADBEEFCAFEBABE };
     return u.s;
 }
 
@@ -60,7 +60,7 @@ fn writeSmallReadBig() u64 {
     // alloca held. We first zero via the wide field, then write the
     // small field, then read the wide field — only the low byte is
     // defined.
-    var u: SmallVsBig = { b: 0 };
+    var u: SmallVsBig = SmallVsBig { b: 0 };
     u.s = 42;
     return u.b;
 }
@@ -69,7 +69,7 @@ tfn writeBigReadSmallByte()  { assert(writeBigReadSmall(), 0xBE); }
 tfn writeSmallReadBigVal()   { assert(writeSmallReadBig(), 42); }
 
 fn returnUnion(seed: u32) FloatBits {
-    var b: FloatBits = { i: seed };
+    var b: FloatBits = FloatBits { i: seed };
     return b;
 }
 
@@ -89,7 +89,7 @@ const ThreeWayU32 = union {
 };
 
 fn signedUnsignedReinterpret() u32 {
-    var u: ThreeWayU32 = { b: -1 };  // 0xFFFFFFFF as i32
+    var u: ThreeWayU32 = ThreeWayU32 { b: -1 };  // 0xFFFFFFFF as i32
     return u.a;                       // read as u32 → 0xFFFFFFFF
 }
 
@@ -104,12 +104,12 @@ const Bigger = union {
 };
 
 fn writeBiggestReadSmallest() u8 {
-    var u: Bigger = { big: 0x0102030405060708 };
+    var u: Bigger = Bigger { big: 0x0102030405060708 };
     return u.small;        // 0x08 on little-endian
 }
 
 fn writeBiggestReadMedium() u32 {
-    var u: Bigger = { big: 0x0102030405060708 };
+    var u: Bigger = Bigger { big: 0x0102030405060708 };
     return u.medium;       // 0x05060708 on little-endian
 }
 

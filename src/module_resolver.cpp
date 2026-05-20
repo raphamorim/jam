@@ -156,7 +156,8 @@ std::unique_ptr<ModuleAST>
 ModuleResolver::parseSource(const std::string &source) const {
 	Lexer lexer(source);
 	std::vector<Token> tokens = lexer.scanTokens();
-	Parser parser(tokens, *typePool, *stringPool, *nodeStore);
+	Parser parser(tokens, lexer.sourceBuffer(), *typePool, *stringPool,
+	              *nodeStore);
 	parser.sharedAnonStructs = sharedAnonStructs_;
 	parser.sharedAnonEnums = sharedAnonEnums_;
 	return parser.parse();

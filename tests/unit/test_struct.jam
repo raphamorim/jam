@@ -6,7 +6,7 @@ const Inner = struct { a: u8, b: u8 };
 const Outer = struct { inner: Inner, c: u8 };
 
 tfn vec3_with_float_fields_compiles_and_runs() {
-    const v: Vec3 = {
+    const v: Vec3 = Vec3 {
         x: 0,
         y: 100,
         z: 50,
@@ -14,21 +14,21 @@ tfn vec3_with_float_fields_compiles_and_runs() {
 }
 
 tfn pixel_field_access_returns_correct_values() {
-    const px: Pixel = { r: 10, g: 20, b: 30 };
+    const px: Pixel = Pixel { r: 10, g: 20, b: 30 };
     assert(px.r, 10);
     assert(px.g, 20);
     assert(px.b, 30);
 }
 
 tfn pixel_fields_compose_in_arithmetic() {
-    const px: Pixel = { r: 5, g: 10, b: 15 };
+    const px: Pixel = Pixel { r: 5, g: 10, b: 15 };
     assert(px.r + px.g, 15);
     assert(px.r + px.b, 20);
 }
 
 tfn multiple_pixel_instances_are_independent() {
-    const a: Pixel = { r: 1, g: 2, b: 3 };
-    const b: Pixel = { r: 100, g: 200, b: 250 };
+    const a: Pixel = Pixel { r: 1, g: 2, b: 3 };
+    const b: Pixel = Pixel { r: 100, g: 200, b: 250 };
     assert(a.r, 1);
     assert(b.r, 100);
     assert(a.g, 2);
@@ -36,14 +36,14 @@ tfn multiple_pixel_instances_are_independent() {
 }
 
 tfn player_holds_mixed_field_types() {
-    const p: Player = { hp: 1000000, level: 42, alive: true };
+    const p: Player = Player { hp: 1000000, level: 42, alive: true };
     assert(p.hp, 1000000);
     assert(p.level, 42);
 }
 
 tfn nested_struct_literal_works() {
-    const x: Outer = {
-        inner: { a: 1, b: 2 },
+    const x: Outer = Outer {
+        inner: Inner { a: 1, b: 2 },
         c: 3,
     };
     assert(x.inner.a, 1);
@@ -52,7 +52,7 @@ tfn nested_struct_literal_works() {
 }
 
 tfn field_assignment_modifies_struct() {
-    var px: Pixel = { r: 0, g: 0, b: 0 };
+    var px: Pixel = Pixel { r: 0, g: 0, b: 0 };
     px.r = 100;
     px.g = 200;
     px.b = 50;
@@ -62,7 +62,7 @@ tfn field_assignment_modifies_struct() {
 }
 
 tfn nested_field_assignment_modifies_struct() {
-    var x: Outer = { inner: { a: 0, b: 0 }, c: 0 };
+    var x: Outer = Outer { inner: Inner { a: 0, b: 0 }, c: 0 };
     x.inner.a = 7;
     x.inner.b = 8;
     x.c = 9;
@@ -78,7 +78,7 @@ tfn variable_assignment_modifies_value() {
 }
 
 fn make_pixel(r_val: u8, g_val: u8, b_val: u8) Pixel {
-    const p: Pixel = { r: r_val, g: g_val, b: b_val };
+    const p: Pixel = Pixel { r: r_val, g: g_val, b: b_val };
     return p;
 }
 
@@ -94,6 +94,6 @@ fn pixel_red_channel(p: Pixel) u8 {
 }
 
 tfn struct_param_field_access_works() {
-    const px: Pixel = { r: 77, g: 0, b: 0 };
+    const px: Pixel = Pixel { r: 77, g: 0, b: 0 };
     assert(pixel_red_channel(px), 77);
 }

@@ -42,7 +42,7 @@ const Stats = struct {
 
 fn statsOf(s: *const[] u8) Stats {
     var len: u64 = strlen(s);
-    var out: Stats = { a: len, b: len * 2, c: len * 3 };
+    var out: Stats = Stats { a: len, b: len * 2, c: len * 3 };
     return out;
 }
 
@@ -70,7 +70,7 @@ fn fillField(b: mut Bag) i32 {
 }
 
 tfn fillFieldOK() {
-    var b: Bag = { one: 0, two: 0, three: 0, four: 0 };
+    var b: Bag = Bag { one: 0, two: 0, three: 0, four: 0 };
     var n: i32 = fillField(&b);
     assert(n, 2);
     assert(b.one, 104);  // 'h'

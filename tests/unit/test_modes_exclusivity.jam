@@ -31,7 +31,7 @@ fn addPair(a: u32, b: u32) u32 {
 }
 
 fn disjointFields() u32 {
-    var p: Pair = { a: 10, b: 20 };
+    var p: Pair = Pair { a: 10, b: 20 };
     return addPair(p.a, p.b);
 }
 

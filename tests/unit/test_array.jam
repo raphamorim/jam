@@ -61,13 +61,13 @@ fn loopFillThenReadLast() u8 {
 }
 
 fn structFieldArrayWrite() u8 {
-    var g: Game = { score: 0, board: [0; 10] };
+    var g: Game = Game { score: 0, board: [0; 10] };
     g.board[3] = 42;
     return g.board[3];
 }
 
 fn structFieldArrayLoopFill() u8 {
-    var g: Game = { score: 0, board: [0; 10] };
+    var g: Game = Game { score: 0, board: [0; 10] };
     for i in 0:10 {
         g.board[i] = i;
     }
@@ -75,7 +75,7 @@ fn structFieldArrayLoopFill() u8 {
 }
 
 fn structFieldArrayMixed() u8 {
-    var g: Game = { score: 99, board: [0; 10] };
+    var g: Game = Game { score: 99, board: [0; 10] };
     g.board[0] = g.score;
     g.board[1] = 50;
     return g.board[0];

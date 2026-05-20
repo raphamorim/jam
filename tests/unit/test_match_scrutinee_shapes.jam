@@ -21,7 +21,7 @@ fn scoreOfFieldMatch(g: Game) u32 {
 }
 
 tfn matchOnStructField() {
-    var g: Game = { color: Color.Red, score: 0 };
+    var g: Game = Game { color: Color.Red, score: 0 };
     assert(scoreOfFieldMatch(g), 1);
 
     g.color = Color.Green;

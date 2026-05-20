@@ -38,7 +38,7 @@ class Lexer {
 	void identifier();
 	void number();
 	void negativeNumber();
-	void scanNumberBody(int start);
+	void scanNumberBody();
 	void stringLiteral();
 	char parseHexByte();
 	std::string parseUnicodeEscape();
@@ -46,6 +46,13 @@ class Lexer {
   public:
 	explicit Lexer(std::string source);
 	std::vector<Token> scanTokens();
+
+	// Const view of the source buffer the lexer holds. Used by the
+	// parser to resolve `Token::text(source)` calls — every emitted
+	// Token's `byteOffset`/`length` index into THIS buffer, so the
+	// parser must reference the lexer's owned copy (or another
+	// identical copy, but reusing the lexer's avoids a duplicate).
+	const std::string &sourceBuffer() const { return source; }
 };
 
 #endif  // LEXER_H

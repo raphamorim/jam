@@ -14,7 +14,7 @@ fn Holder(T: type) type {
 const HolderI32 = Holder(i32);
 
 tfn instanceMethod() {
-    var h: HolderI32 = { value: 7 };
+    var h: HolderI32 = HolderI32 { value: 7 };
     assert(h.get(), 7);
 }
 
@@ -36,7 +36,7 @@ fn Holder2(T: type) type {
 const Holder2I32 = Holder2(i32);
 
 tfn selfMethodCallFromBody() {
-    var h: Holder2I32 = { value: 11 };
+    var h: Holder2I32 = Holder2I32 { value: 11 };
     assert(h.getTwice(), 11);
 }
 
@@ -66,14 +66,14 @@ fn Accumulator(T: type) type {
 const AccumI32 = Accumulator(i32);
 
 tfn mutInstanceMethod() {
-    var a: AccumI32 = { sum: 0 };
+    var a: AccumI32 = AccumI32 { sum: 0 };
     a.add(3);
     a.add(5);
     assert(a.total(), 8);
 }
 
 tfn selfMutMethodFromMutBody() {
-    var a: AccumI32 = { sum: 0 };
+    var a: AccumI32 = AccumI32 { sum: 0 };
     a.addTwice(7);
     assert(a.total(), 14);
 }

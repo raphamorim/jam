@@ -151,7 +151,7 @@ fn Maybe(T: type) type {
         storage: T,
         valid: bool,
         fn default() Self {
-            return { storage: T.default(), valid: false };
+            return Self { storage: T.default(), valid: false };
         }
     };
 }
@@ -175,7 +175,7 @@ fn main() i32 {
 const Bad = struct {
     n: i32,
     fn default(self: mut Self) Self {
-        return { n: 0 };
+        return Self { n: 0 };
     }
 };
 
@@ -291,10 +291,15 @@ fn main() {}
 	// `mod.Private` where Private isn't pub: emits the precise
 	// "is not exported" diagnostic instead of a generic "Unknown".
 	static void testNamespaceNonPubType() {
+		// The type access itself is what we're testing; using
+		// `lib.Private` as a fn-param type is enough to fire the
+		// "is not exported" diagnostic without needing a struct
+		// literal of that type.
 		auto r = compileWithLib("must_fail_ns_nonpub_type",
 		                        R"(
 const lib = import("lib");
-fn main() { var v: lib.Private = { n: 1 }; }
+fn takes(p: lib.Private) {}
+fn main() {}
 )",
 		                        "const Private = struct { n: i32, };\n");
 		ASSERT_TRUE(r.exitCode != 0);
@@ -308,7 +313,8 @@ fn main() { var v: lib.Private = { n: 1 }; }
 		auto r = compileWithLib("must_fail_ns_missing",
 		                        R"(
 const lib = import("lib");
-fn main() { var v: lib.Nope = { n: 1 }; }
+fn takes(p: lib.Nope) {}
+fn main() {}
 )",
 		                        "pub const Val = struct { n: i32, };\n");
 		ASSERT_TRUE(r.exitCode != 0);
@@ -319,7 +325,8 @@ fn main() { var v: lib.Nope = { n: 1 }; }
 	// `unknown.X` where `unknown` was never bound to an import.
 	static void testNamespaceUnknownHandle() {
 		auto r = compileSource("must_fail_ns_unknown_handle", R"(
-fn main() { var v: unknown.X = { n: 1 }; }
+fn takes(p: unknown.X) {}
+fn main() {}
 )");
 		ASSERT_TRUE(r.exitCode != 0);
 		ASSERT_TRUE(stderrContains(r, "unknown module handle"));
@@ -395,7 +402,8 @@ fn main() i32 { return maybe(true); }
 		auto r = compileWithLib("must_fail_bare_name_private",
 		                        R"(
 const lib = import("lib");
-fn main() { var v: Private = { n: 1 }; }
+fn takes(p: Private) {}
+fn main() {}
 )",
 		                        "const Private = struct { n: i32, };\n");
 		ASSERT_TRUE(r.exitCode != 0);

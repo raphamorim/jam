@@ -24,13 +24,13 @@ fn Box(T: type) type {
 }
 
 tfn boxOfI32() {
-    var b: Box(i32) = { value: 17 };
+    var b: Box(i32) = Box(i32) { value: 17 };
     assert(b.value, 17);
 }
 
 tfn boxOfU8DistinctFromBoxOfI32() {
-    var bi: Box(i32) = { value: 1 };
-    var bu: Box(u8) = { value: 2 };
+    var bi: Box(i32) = Box(i32) { value: 1 };
+    var bu: Box(u8) = Box(u8) { value: 2 };
     // Both bindings hold their own struct types with their own field
     // sizes (4 bytes vs 1 byte). Same field name; different storage.
     assert(bi.value, 1);
@@ -45,13 +45,13 @@ fn Pair(A: type, B: type) type {
 }
 
 tfn twoParamGeneric() {
-    var p: Pair(i32, u8) = { first: 7, second: 35 };
+    var p: Pair(i32, u8) = Pair(i32, u8) { first: 7, second: 35 };
     assert(p.first + (p.second as i32), 42);
 }
 
 tfn sameInstantiationReusesType() {
-    var p1: Pair(i32, u8) = { first: 1, second: 2 };
-    var p2: Pair(i32, u8) = { first: 3, second: 4 };
+    var p1: Pair(i32, u8) = Pair(i32, u8) { first: 1, second: 2 };
+    var p2: Pair(i32, u8) = Pair(i32, u8) { first: 3, second: 4 };
     // Both bindings should share the same instantiated struct type
     // (verified by the compiler accepting a homogeneous-type comparison
     // through the field accesses below).
@@ -65,7 +65,7 @@ tfn sameInstantiationReusesType() {
 const BoxI32 = Box(i32);
 
 tfn typeAliasResolvesToInstantiation() {
-    var b: BoxI32 = { value: 17 };
+    var b: BoxI32 = BoxI32 { value: 17 };
     assert(b.value, 17);
 }
 
@@ -87,7 +87,7 @@ fn Holder(T: type) type {
 const HolderI32 = Holder(i32);
 
 tfn methodOnInstantiatedTypeRunsAtCallSite() {
-    var h: HolderI32 = { value: 7 };
+    var h: HolderI32 = HolderI32 { value: 7 };
     assert(HolderI32.unwrap(h), 7);
 }
 
@@ -112,7 +112,7 @@ fn Counter(T: type) type {
 const CounterI32 = Counter(i32);
 
 fn dropFires(sink: *mut u32) {
-    var c: CounterI32 = { sink: sink };
+    var c: CounterI32 = CounterI32 { sink: sink };
     // c drops at function exit, bumping *sink to 1.
 }
 
@@ -135,7 +135,7 @@ fn Node(T: type) type {
 const NodeI32 = Node(i32);
 
 tfn selfInFieldTypeSubstitutes() {
-    var head: NodeI32 = { value: 7, next: &head };
+    var head: NodeI32 = NodeI32 { value: 7, next: &head };
     assert(head.value, 7);
 }
 
@@ -151,7 +151,7 @@ const PtrToI32 = PtrTo(i32);
 
 tfn pointerFieldSubstitutes() {
     var v: i32 = 42;
-    var p: PtrToI32 = { ptr: &v };
+    var p: PtrToI32 = PtrToI32 { ptr: &v };
     var x: *mut i32 = p.ptr;
     assert(x.*, 42);
 }
@@ -166,7 +166,7 @@ fn ThreeOf(T: type) type {
 const ThreeI32 = ThreeOf(i32);
 
 tfn arrayFieldSubstitutes() {
-    var t: ThreeI32 = { items: [7, 35, 0] };
+    var t: ThreeI32 = ThreeI32 { items: [7, 35, 0] };
     assert(t.items[0] + t.items[1], 42);
 }
 
@@ -180,8 +180,8 @@ fn BoxOuter(T: type) type {
 const NestedBox = BoxOuter(BoxOuter(i32));
 
 tfn nestedGenericInstantiates() {
-    var inner: BoxOuter(i32) = { value: 7 };
-    var outer: NestedBox = { value: inner };
+    var inner: BoxOuter(i32) = BoxOuter(i32) { value: 7 };
+    var outer: NestedBox = NestedBox { value: inner };
     assert(outer.value.value, 7);
 }
 
@@ -192,7 +192,7 @@ fn Builder(T: type) type {
     return struct {
         value: T,
         fn make(v: T) Self {
-            var s: Self = { value: v };
+            var s: Self = Self { value: v };
             return s;
         }
         fn doubled(v: T) Self {
@@ -217,7 +217,7 @@ fn Cloner(T: type) type {
         value: T,
         fn cloned(self: Self) Self {
             var v: T = self.value;
-            var s: Self = { value: v };
+            var s: Self = Self { value: v };
             return s;
         }
     };
@@ -226,7 +226,7 @@ fn Cloner(T: type) type {
 const ClonerI32 = Cloner(i32);
 
 tfn typeParamInMethodBody() {
-    var orig: ClonerI32 = { value: 42 };
+    var orig: ClonerI32 = ClonerI32 { value: 42 };
     var c: ClonerI32 = ClonerI32.cloned(orig);
     assert(c.value, 42);
 }
@@ -238,7 +238,7 @@ fn Wrap(T: type) type {
     return struct {
         value: T,
         fn make(v: T) Self {
-            var s: Self = { value: v };
+            var s: Self = Self { value: v };
             return s;
         }
         fn unwrap(self: move Self) T {
@@ -275,8 +275,8 @@ const BumperI32 = Bumper(i32);
 const NestedBumper = Bumper(BumperI32);
 
 fn doubleDropper(sink: *mut u32) {
-    var inner: BumperI32 = { sink: sink, value: 7 };
-    var outer: NestedBumper = { sink: sink, value: inner };
+    var inner: BumperI32 = BumperI32 { sink: sink, value: 7 };
+    var outer: NestedBumper = NestedBumper { sink: sink, value: inner };
 }
 
 tfn nestedDropFiresOnEachLayer() {
@@ -293,7 +293,7 @@ tfn nestedDropFiresOnEachLayer() {
 const Counter = struct {
     n: i32,
     fn default() Self {
-        return { n: 0 };
+        return Self { n: 0 };
     }
 };
 
@@ -311,7 +311,7 @@ fn Pair2(T: type) type {
         a: T,
         b: T,
         fn default() Self {
-            return { a: T.default(), b: T.default() };
+            return Self { a: T.default(), b: T.default() };
         }
     };
 }

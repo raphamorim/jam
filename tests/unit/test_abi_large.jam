@@ -42,23 +42,23 @@ fn pickField(prefix: u32, b: Big) u64 {
 }
 
 tfn sumBigOK() {
-    var x: Big = { a: 10, b: 20, c: 30 };
+    var x: Big = Big { a: 10, b: 20, c: 30 };
     assert(sumBig(x), 60);
 }
 
 tfn sumWideOK() {
-    var w: Wide = { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 };
+    var w: Wide = Wide { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 };
     assert(sumWide(w), 21);
 }
 
 tfn consumeBigOK() {
-    var x: Big = { a: 100, b: 200, c: 300 };
+    var x: Big = Big { a: 100, b: 200, c: 300 };
     assert(consumeBig(x), 600);
     // After consumeBig, x is moved-out — the analyzer would reject any
     // subsequent read of x. We just don't read it.
 }
 
 tfn pickFieldOK() {
-    var x: Big = { a: 0, b: 42, c: 0 };
+    var x: Big = Big { a: 0, b: 42, c: 0 };
     assert(pickField(8, x), 50);
 }

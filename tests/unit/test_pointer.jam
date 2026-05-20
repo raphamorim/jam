@@ -41,7 +41,7 @@ const Point = struct {
 };
 
 fn addressOfStructField() u8 {
-    var pt: Point = { x: 10, y: 20 };
+    var pt: Point = Point { x: 10, y: 20 };
     var px: *mut u8 = &pt.x;
     px.* = 200;
     return pt.x;
