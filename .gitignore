@@ -1,5 +1,24 @@
+*.o.tmp
+*.out
+*.d
+*.slo
+*.lo
+*.o
+*.obj
+*.gch
+*.pch
+*.so
+*.dylib
+*.dll
+*.lai
+*.la
+*.a
+*.lib
+
+# Jam folders
 output/
 build/
+misc/
 
 # Docs (jekyll)
 docs/_site/
@@ -8,7 +27,3 @@ docs/.jekyll-cache/
 docs/.jekyll-metadata
 docs/Gemfile.lock
 docs/vendor/
-
-/misc
-
-*.o.tmp
