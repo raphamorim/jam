@@ -1393,10 +1393,13 @@ void Parser::parseStructBody(
     std::vector<std::unique_ptr<FunctionAST>> &methods) {
 	while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
 		// Method: `fn name(self: ..., ...) ReturnType { body }` (or
-		// `cfn name(...)` for compiler-synthesized-call methods).
-		// Methods can appear in any order relative to fields.
-		// parseFunction consumes the keyword itself.
-		if (check(TOK_FN) || check(TOK_CFN)) {
+		// `cfn name(...)` for compiler-synthesized-call methods, or
+		// any of the `pub` / `extern` / `export` / `tfn` modifiers
+		// that `parseFunction` knows how to consume). Methods can
+		// appear in any order relative to fields. parseFunction
+		// consumes the leading keyword(s) itself.
+		if (check(TOK_FN) || check(TOK_CFN) || check(TOK_PUB) ||
+		    check(TOK_EXTERN) || check(TOK_EXPORT) || check(TOK_TFN)) {
 			methods.push_back(parseFunction());
 			match(TOK_COMMA);  // optional trailing comma after a method
 			continue;

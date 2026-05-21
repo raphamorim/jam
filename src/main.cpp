@@ -534,53 +534,76 @@ static int compileAndRun(const std::string &filename,
 		}
 		return codegenCtx.getStringPool().get(static_cast<StringIdx>(key.a));
 	};
-	for (auto &s : module->Structs) {
-		for (auto &m : s->Methods) {
-			// `cfn`-marked methods (drop / default / at / …) opt in
-			// to compiler-synthesized calls and must match the
-			// expected signature for their name. Plain `fn` methods
-			// are ordinary instance methods — no signature
-			// constraints, no rejection by name.
-			if (m->isCfn && m->Name == "default") {
-				if (!m->Args.empty()) {
-					std::cerr << filename
-					          << ": error: cfn `default` on struct `" << s->Name
-					          << "` must take no parameters\n";
-					return 1;
+	// Validate + register every top-level struct's methods. Imported
+	// modules' structs need the same treatment because struct methods
+	// aren't otherwise re-discovered when only their decl is aliased
+	// across module boundaries. Without this, calls like
+	// `someImportedStruct.method(...)` would fail with "unknown method".
+	// For imported modules we honor pub: a non-pub method on a struct
+	// in module B is invisible to module A's call sites.
+	auto registerStructMethods = [&](ModuleAST *m, bool publicOnly) -> int {
+		for (auto &s : m->Structs) {
+			for (auto &meth : s->Methods) {
+				if (publicOnly && !meth->isPub) continue;
+				// `cfn`-marked methods (drop / default / at / …) opt
+				// in to compiler-synthesized calls and must match the
+				// expected signature for their name. Plain `fn`
+				// methods are ordinary instance methods — no
+				// signature constraints, no rejection by name.
+				if (meth->isCfn && meth->Name == "default") {
+					if (!meth->Args.empty()) {
+						std::cerr << filename
+						          << ": error: cfn `default` on struct `"
+						          << s->Name << "` must take no parameters\n";
+						return 1;
+					}
+					std::string retStruct = resolveStructName(meth->ReturnType);
+					if (retStruct != s->Name) {
+						std::cerr << filename
+						          << ": error: cfn `default` on struct `"
+						          << s->Name << "` must return `Self` (got `"
+						          << retStruct << "`)\n";
+						return 1;
+					}
+				} else if (meth->isCfn && meth->Name == "drop") {
+					if (meth->Args.empty() || meth->Args[0].Name != "self") {
+						std::cerr
+						    << filename << ": error: cfn `" << meth->Name
+						    << "` on struct `" << s->Name
+						    << "` must take `self` as its first parameter\n";
+						return 1;
+					}
+					std::string selfStruct =
+					    resolveStructName(meth->Args[0].Type);
+					if (selfStruct != s->Name) {
+						std::cerr << filename << ": error: cfn `" << meth->Name
+						          << "` on struct `" << s->Name
+						          << "` has self type `" << selfStruct
+						          << "`; expected `" << s->Name << "`\n";
+						return 1;
+					}
 				}
-				std::string retStruct = resolveStructName(m->ReturnType);
-				if (retStruct != s->Name) {
-					std::cerr << filename
-					          << ": error: cfn `default` on struct `" << s->Name
-					          << "` must return `Self` (got `" << retStruct
-					          << "`)\n";
-					return 1;
+				{
+					JirFunction jfn = astgenMetadata(*meth, codegenCtx);
+					jfn.name =
+					    mangledFunctionName(*meth, codegenCtx.getTypePool(),
+					                        codegenCtx.getStringPool());
+					jirDeclarePrototype(jfn, codegenCtx);
 				}
-			} else if (m->isCfn && m->Name == "drop") {
-				if (m->Args.empty() || m->Args[0].Name != "self") {
-					std::cerr << filename << ": error: cfn `" << m->Name
-					          << "` on struct `" << s->Name
-					          << "` must take `self` as its first parameter\n";
-					return 1;
-				}
-				std::string selfStruct = resolveStructName(m->Args[0].Type);
-				if (selfStruct != s->Name) {
-					std::cerr << filename << ": error: cfn `" << m->Name
-					          << "` on struct `" << s->Name
-					          << "` has self type `" << selfStruct
-					          << "`; expected `" << s->Name << "`\n";
-					return 1;
-				}
+				codegenCtx.registerFunctionAST(s->Name + "." + meth->Name,
+				                               meth.get());
 			}
-			{
-				JirFunction jfn = astgenMetadata(*m, codegenCtx);
-				jfn.name = mangledFunctionName(*m, codegenCtx.getTypePool(),
-				                               codegenCtx.getStringPool());
-				jirDeclarePrototype(jfn, codegenCtx);
-			}
-			codegenCtx.registerFunctionAST(s->Name + "." + m->Name, m.get());
 		}
+		return 0;
+	};
+	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
+		if (path == "std") continue;
+		int rc = registerStructMethods(importedModule.get(),
+		                               /*publicOnly=*/true);
+		if (rc != 0) return rc;
 	}
+	int rc = registerStructMethods(module.get(), /*publicOnly=*/false);
+	if (rc != 0) return rc;
 
 	// Build the drop registry up front so AstGen can read it via
 	// `JamCodegenContext::getDropRegistry()` to track which `var`
