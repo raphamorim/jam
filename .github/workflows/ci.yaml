@@ -40,8 +40,13 @@ jobs:
           cmake .. -DCMAKE_PREFIX_PATH=/usr/lib/llvm-20
           cmake --build . -j $(nproc)
 
-      - name: Run unit tests
+      - name: Run unit tests (debug, -C opt-level=0)
         run: ./build/jam test tests/unit
+
+      # catches bugs that only surface once LLVM's optimizer engages
+      # (dead-load explosions, mem2reg interactions, GEP coalescing, etc.)
+      - name: Run unit tests (release, -C opt-level=3)
+        run: ./build/jam -C opt-level=3 test tests/unit
 
       - name: Run codegen-error tests
         run: |
@@ -81,8 +86,13 @@ jobs:
           cmake .. -DCMAKE_PREFIX_PATH=/usr/lib/llvm-20
           cmake --build . -j $(nproc)
 
-      - name: Run unit tests
+      - name: Run unit tests (debug, -C opt-level=0)
         run: ./build/jam test tests/unit
+
+      # catches bugs that only surface once LLVM's optimizer engages
+      # (dead-load explosions, mem2reg interactions, GEP coalescing, etc.)
+      - name: Run unit tests (release, -C opt-level=3)
+        run: ./build/jam -C opt-level=3 test tests/unit
 
       - name: Run codegen-error tests
         run: |
@@ -119,8 +129,13 @@ jobs:
           cmake .. -DCMAKE_PREFIX_PATH="${LLVM_PREFIX}"
           cmake --build . -j $(sysctl -n hw.ncpu)
 
-      - name: Run unit tests
+      - name: Run unit tests (debug, -C opt-level=0)
         run: ./build/jam test tests/unit
+
+      # catches bugs that only surface once LLVM's optimizer engages
+      # (dead-load explosions, mem2reg interactions, GEP coalescing, etc.)
+      - name: Run unit tests (release, -C opt-level=3)
+        run: ./build/jam -C opt-level=3 test tests/unit
 
       - name: Run codegen-error tests
         run: |

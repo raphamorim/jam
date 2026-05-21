@@ -1,4 +1,4 @@
-.PHONY: build install uninstall clean cmake-build cmake-install cmake-uninstall test test-unit docs format check-format
+.PHONY: build install uninstall clean cmake-build cmake-install cmake-uninstall test test-release test-unit test-unit-release docs format check-format
 .DEFAULT_GOAL := build
 
 LLVM_CONFIG=$(shell which llvm-config 2>/dev/null || echo "llvm-config")
@@ -100,19 +100,29 @@ info:
 	@echo ""
 	@echo "Available targets:"
 	@echo "  make build          - Build the compiler"
-	@echo "  make test-unit      - Run Jam unit tests"
-	@echo "  make test           - Run all tests (Jam + C++)"
+	@echo "  make test-unit      - Run Jam unit tests (debug, -O0)"
+	@echo "  make test-unit-release - Run Jam unit tests (release, -O3)"
+	@echo "  make test           - Run all tests at default (debug)"
+	@echo "  make test-release   - Run all tests + release (-O3)"
 	@echo "  make docs           - Serve documentation site"
 	@echo "  make install        - Install using manual method"
 	@echo "  make uninstall      - Uninstall manual installation"
-	@echo "  make cmake-install  - Install using CMake (recommended)"
+	@echo "  make cmake-install  - Install using CMake"
 	@echo "  make cmake-uninstall- Uninstall CMake installation"
 	@echo "  make clean          - Clean build artifacts"
 	@echo "  make info           - Show this information"
 
 test-unit: build
-	@echo "Running Jam unit tests..."
+	@echo "Running Jam unit tests (debug, -C opt-level=0)..."
 	./jam.out test tests/unit
+
+# -O3 (release) pass over the same unit suite.
+# runs the optimizer to catch bugs that only surface when LLVM's
+# passes are active (dead-load explosions, GEP/Load coalescing,
+# mem2reg interactions, etc.).
+test-unit-release: build
+	@echo "Running Jam unit tests (release, -C opt-level=3)..."
+	./jam.out -C opt-level=3 test tests/unit
 
 test-init: build
 	@echo ""
@@ -164,6 +174,7 @@ test-analyzer: build
 	./analyzer_tests
 
 test: test-unit test-init test-abi test-codegen-errors test-jir test-diagnostics test-decl test-analyzer
+test-release: test test-unit-release
 
 fmt: format
 
