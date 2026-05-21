@@ -1,6 +1,6 @@
 const { assert } = import("test");
 
-// Two `fn drop(self: mut T)` for different types coexist
+// Two `cfn drop(self: mut T)` for different types coexist
 // because the codegen mangles each to `__drop_<TypeName>` at the LLVM
 // level. Each fires for its own type at scope exit.
 

@@ -1,7 +1,7 @@
 const { assert } = import("test");
 
 // Drop functions can be declared inside the struct body. The form is a
-// pure synonym of the free-function `fn drop(self: mut T)`: the drop
+// pure synonym of the free-function `cfn drop(self: mut T)`: the drop
 // registry picks it up the same way, codegen synthesizes the same
 // `__drop_T` call at scope exit, the side-effect order is identical.
 

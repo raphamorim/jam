@@ -47,7 +47,7 @@ struct DropTrack {
 	std::string varName;
 	JirRef slot;             // alloca for the variable
 	TypeIdx type;            // source-level type
-	std::string llvmFnName;  // canonical drop fn (legacy mangles to `__drop_T`)
+	std::string llvmFnName;  // canonical drop fn — FQN like `T.drop` / `m.T.drop`
 };
 
 struct AstGenCtx {
@@ -483,13 +483,12 @@ static void astgenReturn(AstGenCtx &gctx, const AstNode &n) {
 }
 
 // Resolve the canonical drop function name for a Jam type. Returns
-// empty when the type has no drop fn registered. For struct/named
-// types, legacy `mangledFunctionName` produces `__drop_<TypeName>`
-// at the LLVM level; we mirror that here so the call resolves at
-// codegen time even though the FunctionAST::Name is bare "drop".
-// Falls back to the codegen context's instantiated-drops table so
-// generic struct/enum instantiations (Vec(i32), Holder(i32), ...)
-// fire drops too.
+// empty when the type has no drop fn registered. Routes through
+// `mangledFunctionName` so the LLVM symbol picked here is the same
+// one the drop fn's definition gets at codegen time (FQN like
+// `T.drop` or `m.T.drop`). Falls back to the codegen context's
+// instantiated-drops table so generic struct/enum instantiations
+// (Vec(i32), Holder(i32), ...) fire drops too.
 static std::string lookupDropFnLLVMName(AstGenCtx &gctx, TypeIdx ty) {
 	const TypeKey &k = gctx.ctx.getTypePool().get(ty);
 	std::string typeName;
@@ -3407,6 +3406,29 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 	// Builtin: `assert(actual, expected)` — handled via JIR inline,
 	// not as a regular function call.
 	if (callee == "assert") { return astgenAssertCall(gctx, n); }
+
+	// Multi-dot qualified call: `handle.Struct.method(args)`. Mirrors
+	// Zig's `container_ty.getNamespace().lookupInNamespace(name)`
+	// (Sema.zig:5295) — methods on imported structs live under the
+	// importer's namespace handle, not in a flat global table. The
+	// registration site in main.cpp puts these under the key
+	// `handle.Struct.method`; we look them up directly here.
+	if (callee.find('.') != callee.rfind('.')) {
+		if (const FunctionAST *method = gctx.ctx.getFunctionAST(callee)) {
+			std::vector<JirRef> argRefs;
+			argRefs.reserve(argCount);
+			for (uint32_t i = 0; i < argCount; i++) {
+				NodeIdx argIdx =
+				    static_cast<NodeIdx>(ns.getExtra(argsExtra + 1 + i));
+				if (i < method->Args.size()) {
+					argRefs.push_back(lowerArg(gctx, argIdx, method->Args[i]));
+				} else {
+					argRefs.push_back(astgenExpr(gctx, argIdx, kNoType));
+				}
+			}
+			return emitCall(gctx, method, argRefs);
+		}
+	}
 
 	// Single-dot qualified call: try in order
 	//   1. `inst.method(args)` — instance dispatch on a local variable

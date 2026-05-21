@@ -1,0 +1,99 @@
+const { assert } = import("test");
+
+// Struct methods can carry the same visibility modifiers as free
+// functions: `pub fn` exports the method across module boundaries,
+// plain `fn` keeps it private to the defining module.
+//
+// In a single-file unit test we can't directly exercise the
+// cross-module visibility check (no imports), but we *can* verify:
+//   - `pub fn` parses inside a struct body
+//   - `pub fn` methods are callable as instance methods and as
+//     qualified static calls
+//   - `pub fn init()` works as a constructor convention
+//   - a struct may freely mix `pub fn`, plain `fn`, and `cfn` in any
+//     order without confusing the parser
+
+const Counter = struct {
+    value: u32,
+
+    pub fn init() Self {
+        return Self { value: 0 };
+    }
+
+    pub fn bump(self: mut Self) {
+        self.value = self.value + 1;
+    }
+
+    pub fn get(self: mut Self) u32 {
+        return self.value;
+    }
+
+    // Non-pub method — should still be callable from within this
+    // module. (Visibility only gates cross-module callers.)
+    fn secret(self: mut Self) u32 {
+        return self.value * 2;
+    }
+};
+
+tfn pubFnInitReturnsFreshInstance() {
+    var c: Counter = Counter.init();
+    assert(c.value, 0);
+}
+
+tfn pubFnBumpMutatesReceiver() {
+    var c: Counter = Counter.init();
+    c.bump();
+    c.bump();
+    c.bump();
+    assert(c.value, 3);
+}
+
+tfn pubFnGetReturnsField() {
+    var c: Counter = Counter { value: 42 };
+    assert(c.get(), 42);
+}
+
+tfn nonPubFnStillCallableInModule() {
+    var c: Counter = Counter { value: 7 };
+    assert(c.secret(), 14);
+}
+
+// Mix of `pub fn`, plain `fn`, and `cfn` in one struct — proves the
+// parser accepts the modifiers in any order and codegen wires up the
+// right symbol for each.
+const Mixed = struct {
+    n: u32,
+    sink: *mut u32,
+
+    pub fn init(sink: *mut u32) Self {
+        return Self { n: 100, sink: sink };
+    }
+
+    pub fn add(self: mut Self, x: u32) {
+        self.n = self.n + x;
+    }
+
+    fn quiet(self: mut Self) u32 {
+        return self.n + 1;
+    }
+
+    cfn drop(self: mut Self) {
+        var p: *mut u32 = self.sink;
+        p.* = p.* + 1;
+    }
+};
+
+fn dropsOnce(sink: *mut u32) u32 {
+    var m: Mixed = Mixed.init(sink);
+    m.add(5);
+    return m.quiet();
+}
+
+tfn mixedModifiersCoexist() {
+    var hits: u32 = 0;
+    var n: u32 = dropsOnce(&hits);
+    // 100 + 5 = 105; quiet returns n+1 = 106.
+    assert(n, 106);
+    // Drop fired once at scope exit.
+    assert(hits, 1);
+}

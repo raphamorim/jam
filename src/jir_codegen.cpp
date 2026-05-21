@@ -597,8 +597,8 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 	case JirTag::Call: {
 		// `inst.a` is the StringIdx of the LLVM symbol name —
 		// astgen has already done the mangling (test functions get
-		// `__test_`; `fn drop(self: mut T)` becomes `__drop_T`;
-		// instantiated cloned methods keep their qualified
+		// `__test_`; methods get dotted FQNs like `T.drop` or
+		// `m.T.drop`; instantiated cloned methods keep their
 		// `Vec__i32.push` form). Codegen does a single lookup.
 		StringIdx calleeId = static_cast<StringIdx>(inst.a);
 		const std::string &symbol = lctx.ctx.getStringPool().get(calleeId);

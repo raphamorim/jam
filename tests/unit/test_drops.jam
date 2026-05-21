@@ -10,7 +10,7 @@ const Counter = struct {
     sink: *mut u32,
 };
 
-// `fn drop(self: mut Counter)` is the user-defined destructor. When a
+// `cfn drop(self: mut Counter)` is the user-defined destructor. When a
 // `var c: Counter = ...;` goes out of scope, the codegen synthesizes a
 // call to drop(&c). We bump the sink-pointed value so we can observe it
 // from the test harness.

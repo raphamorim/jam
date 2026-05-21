@@ -1,0 +1,22 @@
+// Sibling of mod_cross_a.jam — same surface API, different bodies.
+// The point is that the LLVM symbol for `Counter.init` from a and b
+// must NOT collide; module-prefixed mangling makes them
+// `mod_cross_a.Counter.init` vs `mod_cross_b.Counter.init`.
+
+pub const Counter = struct {
+    value: u32,
+
+    pub fn init() Self {
+        return Self { value: 200 };
+    }
+
+    pub fn get(self: mut Self) u32 {
+        return self.value;
+    }
+};
+
+pub fn helper() u32 {
+    return 2;
+}
+
+fn main() u8 { return 0; }

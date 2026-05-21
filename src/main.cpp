@@ -324,8 +324,25 @@ static int compileAndRun(const std::string &filename,
 			}
 		}
 		for (auto &s : importedModule->Structs) {
-			if (s->isPub) aliasNamed(s->Name);
-			else codegenCtx.registerPrivateName(handle, s->Name);
+			if (s->isPub) {
+				aliasNamed(s->Name);
+				// Also register each pub method under the namespace-
+				// qualified key `handle.Struct.method` so astgen's
+				// multi-dot callee lookup can find it. Mirrors the
+				// free-fn dual registration above (bare + handle.X).
+				// Inspired by Zig's namespace-scoped Decl lookup
+				// (Sema.zig:5295) where every type carries a back-
+				// pointer to its namespace and method resolution walks
+				// `container_ty.getNamespace().lookupInNamespace(name)`.
+				for (auto &m : s->Methods) {
+					if (m->isPub) {
+						codegenCtx.registerFunctionAST(
+						    handle + "." + s->Name + "." + m->Name, m.get());
+					}
+				}
+			} else {
+				codegenCtx.registerPrivateName(handle, s->Name);
+			}
 		}
 		for (auto &e : importedModule->Enums) {
 			if (e->isPub) aliasNamed(e->Name);
@@ -666,6 +683,19 @@ static int compileAndRun(const std::string &filename,
 					jfn.name =
 					    mangledFunctionName(*func, codegenCtx.getTypePool(),
 					                        codegenCtx.getStringPool());
+					jirFunctions.push_back(std::move(jfn));
+				} catch (const AstGenAnalysisFail &) {
+					// diagnostic already pushed
+				}
+			}
+		}
+		for (auto &s : importedModule->Structs) {
+			for (auto &m : s->Methods) {
+				if (!m->isPub) continue;
+				try {
+					JirFunction jfn = astgenFunction(*m, codegenCtx);
+					jfn.name = mangledFunctionName(*m, codegenCtx.getTypePool(),
+					                               codegenCtx.getStringPool());
 					jirFunctions.push_back(std::move(jfn));
 				} catch (const AstGenAnalysisFail &) {
 					// diagnostic already pushed

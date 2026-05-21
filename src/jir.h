@@ -222,8 +222,8 @@ enum class JirTag : uint8_t {
 	// Explicit destructor call for a tracked binding. Emitted by
 	// AstGen at scope-exit points (return / break / continue /
 	// fall-through). `a` = the binding's alloca JirRef; `b` =
-	// StringIdx of the LLVM symbol to call (e.g. `__drop_T` for
-	// top-level drop fns, `T.drop` for instantiated methods).
+	// StringIdx of the LLVM symbol to call (e.g. `T.drop` for a
+	// top-level drop fn, `Vec__i32.drop` for instantiated methods).
 	// Codegen unconditionally lowers to `call void <symbol>(ptr)`
 	// — no metadata-driven emission, no scope-tracking outside
 	// AstGen. ty is kNoType (void).

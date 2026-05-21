@@ -225,6 +225,27 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 		loadNested(destImport->Path);
 	}
 
+	// Stamp the import path on every function/method so the mangler
+	// can build Zig-style FQNs (`timer.Timer.read32`). Without this,
+	// two modules that both define `pub fn helper()` or `pub const
+	// Counter = struct { pub fn init() }` would emit the same LLVM
+	// symbol and the linker would silently merge them.
+	//
+	// Extern fns are skipped — they reference libc / external C
+	// symbols by bare name (`malloc`, `free`, `printf`) and the
+	// linker has to find those exactly. Same for export — the user
+	// asked for that exact symbol to be visible to C callers.
+	for (auto &fn : module->Functions) {
+		if (fn->isExtern || fn->isExport) continue;
+		fn->modulePath = importPath;
+	}
+	for (auto &s : module->Structs) {
+		for (auto &m : s->Methods) {
+			if (m->isExtern || m->isExport) continue;
+			m->modulePath = importPath;
+		}
+	}
+
 	currentlyLoading.erase(importPath);
 	loadedModules[importPath] = std::move(module);
 	return loadedModules[importPath].get();

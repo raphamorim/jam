@@ -63,6 +63,28 @@ class FunctionAST {
 	// regular `fn` shaped like one of those names is just a method;
 	// `cfn` is what wires it to the compiler's hooks.
 	bool isCfn;
+	// Name of the enclosing struct, if this is a method declared inside
+	// a `const T = struct { fn name(...) ... }` body. Empty for free
+	// functions and for clones of generic-instantiated methods (those
+	// already carry a qualified Name like `Vec__i32.push`, so the
+	// mangler keeps that as the LLVM symbol).
+	//
+	// The mangler reads this to emit unique LLVM symbols for methods
+	// across structs — without it, two structs that both define
+	// `fn init()` would collapse to the same `_init` symbol and the
+	// linker would silently pick one definition for both call sites.
+	std::string parentStruct;
+
+	// Path of the module this function was declared in (e.g. "timer"
+	// for code in timer.jam). Empty for the entry module (matching
+	// Zig's behavior where the root file scope is the unqualified
+	// namespace) and for generic clones that already carry qualified
+	// names. ModuleResolver stamps this when a module is loaded.
+	//
+	// Combined with parentStruct, the mangler can emit Zig-style
+	// dotted LLVM symbols (`timer.Timer.read32`) so same-named
+	// methods or free fns in different modules don't collide.
+	std::string modulePath;
 
 	FunctionAST(std::string Name, std::vector<Param> Args, TypeIdx ReturnType,
 	            std::vector<NodeIdx> Body, bool isExtern = false,

@@ -1,0 +1,32 @@
+// Cross-module symbol uniqueness — imports two sibling modules
+// (mod_cross_a, mod_cross_b) that each define `pub fn helper()` and
+// `pub const Counter = struct { pub fn init() / pub fn get() }`. The
+// LLVM symbols must differ across modules; before the modulePath
+// stamping landed, both `helper`s and both `Counter.init`s collapsed
+// to the same symbol and the linker silently merged them.
+//
+// Lookup mirrors Zig's namespace-scoped resolution (Sema.zig:5295):
+// methods on imported structs live under the importing handle's
+// namespace, not in a flat global table — registered as
+// `handle.Struct.method` and resolved via the multi-dot path in
+// astgenCall.
+
+const { assert } = import("test");
+const a = import("mod_cross_a");
+const b = import("mod_cross_b");
+
+tfn freeFnsFromDifferentModulesNoClobber() {
+    assert(a.helper(), 1);
+    assert(b.helper(), 2);
+}
+
+tfn methodsOnSameNamedImportedStructsNoClobber() {
+    // Both modules export a `Counter` with `init()` returning a
+    // module-specific value. Resolution goes via the
+    // `handle.Struct.method` registry; mangling produces
+    // `mod_cross_a.Counter.init` vs `mod_cross_b.Counter.init`.
+    var ca: a.Counter = a.Counter.init();
+    var cb: b.Counter = b.Counter.init();
+    assert(ca.get(), 100);
+    assert(cb.get(), 200);
+}

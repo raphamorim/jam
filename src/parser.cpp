@@ -1400,7 +1400,16 @@ void Parser::parseStructBody(
 		// consumes the leading keyword(s) itself.
 		if (check(TOK_FN) || check(TOK_CFN) || check(TOK_PUB) ||
 		    check(TOK_EXTERN) || check(TOK_EXPORT) || check(TOK_TFN)) {
-			methods.push_back(parseFunction());
+			auto methodFn = parseFunction();
+			// Stamp the enclosing struct so the mangler can give the
+			// method a unique LLVM symbol (e.g. `Counter__init`),
+			// avoiding collisions with same-named methods on other
+			// structs. `structContextStack.back()` is the struct
+			// currently being parsed.
+			if (!structContextStack.empty()) {
+				methodFn->parentStruct = structContextStack.back();
+			}
+			methods.push_back(std::move(methodFn));
 			match(TOK_COMMA);  // optional trailing comma after a method
 			continue;
 		}

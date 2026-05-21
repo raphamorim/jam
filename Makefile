@@ -13,7 +13,7 @@ OUT := output
 SRC_NAMES := jam_llvm main lexer parser codegen target cabi \
              module_resolver symbol_table number_literal \
              init_analysis drop_registry abi diagnostics decl \
-             analyzer astgen jir_codegen jir_verify
+             analyzer comptime astgen jir_codegen jir_verify
 OBJS := $(addprefix $(OUT)/, $(addsuffix .o, $(SRC_NAMES)))
 
 # Check if we're on macOS or Linux
@@ -164,7 +164,14 @@ test-decl: build
 test-analyzer: build
 	$(call CXX_TEST_TARGET,analyzer,$(OBJS))
 
-test: test-unit test-init test-abi test-codegen-errors test-jir test-diagnostics test-decl test-analyzer
+test-comptime: build
+	@echo ""
+	@echo "Building and running Comptime C++ tests..."
+	@clang++ -c ./tests/cpp/test_comptime.cpp -o $(OUT)/test_comptime.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	@clang++ -o $(OUT)/comptime_tests $(OUT)/test_comptime.o $(OUT)/comptime.o $(OUT)/diagnostics.o
+	@$(OUT)/comptime_tests
+
+test: test-unit test-init test-abi test-codegen-errors test-jir test-diagnostics test-decl test-analyzer test-comptime
 test-release: test test-unit-release
 
 fmt: format

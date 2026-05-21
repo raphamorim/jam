@@ -1,0 +1,24 @@
+// Helper module for test_cross_module_mangling.jam — defines a
+// `Counter` struct with `init` and `get` and a free `helper` fn,
+// intentionally same-named with mod_cross_b.jam to exercise the
+// module-prefixed mangling (`mod_cross_a.Counter.init` vs
+// `mod_cross_b.Counter.init`). Standalone compile uses the no-op
+// `main` below so the test runner can pick this file up too.
+
+pub const Counter = struct {
+    value: u32,
+
+    pub fn init() Self {
+        return Self { value: 100 };
+    }
+
+    pub fn get(self: mut Self) u32 {
+        return self.value;
+    }
+};
+
+pub fn helper() u32 {
+    return 1;
+}
+
+fn main() u8 { return 0; }

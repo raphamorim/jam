@@ -170,7 +170,7 @@ pub fn Vec(T: type) type {
         }
 
         // `cfn drop` is what hooks Vec into MVS auto-cleanup. A
-        // plain `fn drop` would not auto-fire at scope exit; only
+        // plain `cfn drop` would not auto-fire at scope exit; only
         // the cfn variant is registered with the drop registry.
         cfn drop(self: mut Self) {
             free(self.ptr as *mut[] u8);

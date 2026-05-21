@@ -20,7 +20,10 @@ namespace drops {
 // `cfn` (not plain `fn`) is required: only methods opted into the
 // compiler-synthesized-call set get auto-fired at scope exit. A
 // plain `fn drop(self)` is treated as an ordinary method the user
-// invokes explicitly — no implicit destructor call.
+// invokes explicitly — no implicit destructor call. This matters
+// because a user-callable `fn drop` plus an auto-fire would
+// double-drop; the `cfn` opt-in is the signal that the user is
+// handing control of the call to the compiler.
 static void considerDropCandidate(const FunctionAST *fn, const TypePool &types,
                                   const StringPool &strings,
                                   DropRegistry &registry) {
