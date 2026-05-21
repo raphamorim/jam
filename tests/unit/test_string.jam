@@ -45,7 +45,7 @@ fn test_string_hex() str {
     return hex;
 }
 
-// Test unicode escapes (like Zig)
+// Test unicode escapes
 fn test_string_unicode_escape() str {
     const earth: str = "\u{1F30D}";
     return earth;

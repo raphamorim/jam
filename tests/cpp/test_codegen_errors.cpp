@@ -351,7 +351,7 @@ fn main() { var r: i32 = lib.priv(7); }
 	// Non-void function whose body may complete without returning a
 	// value. Previously emitted `unreachable` silently — calling the
 	// fn was undefined behavior at runtime. Now rejected at compile
-	// time, mirroring Zig's `endsWithNoReturn()` check.
+	// time via the analyzer's noreturn-tail check.
 	static void testForgottenReturnRejected() {
 		auto r = compileSource("must_fail_forgotten_return", R"(
 fn forgotReturn() i32 { var x: i32 = 42; }

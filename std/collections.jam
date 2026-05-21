@@ -4,8 +4,7 @@
 // realloc as the backing allocator. MVS auto-drops the backing
 // buffer at scope exit. A user-pluggable Allocator interface is
 // deferred until function-pointer support lands in the compiler;
-// once it does, `std.mem.Allocator` will be a runtime vtable type
-// matching Zig's `std.mem.Allocator`.
+// once it does, `std.mem.Allocator` will be a runtime vtable type.
 //
 // `Option(T)` lives in `std/option` and is imported here for
 // fallible getters / poppers.

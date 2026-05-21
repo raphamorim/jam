@@ -53,9 +53,8 @@ enum class DeclKind : uint8_t {
 };
 
 // Where this Decl sits in the analysis lifecycle. The chokepoint state
-// is InProgress: re-entering it triggers cycle detection. Mirrors
-// Module.zig:451-484's `analysis` enum, trimmed to the states a
-// non-incremental compiler needs.
+// is InProgress: re-entering it triggers cycle detection. Trimmed to
+// the states a non-incremental compiler needs.
 enum class DeclAnalysis : uint8_t {
 	Unreferenced,       // not yet touched
 	InProgress,         // analyzer running, cycle-detector key
@@ -68,7 +67,7 @@ enum class DeclAnalysis : uint8_t {
 // Decl can be Complete (the Struct's typed value is `(type, NamedTy)`)
 // long before the Struct's fields are materialised. Field materialisation
 // only happens when something — `getLLVMType`, `@sizeOf`, a field
-// access — actually demands it. Mirrors Module.zig:923-933.
+// access — actually demands it.
 enum class StructStatus : uint8_t {
 	None,            // declared, fields not yet computed
 	FieldTypesWIP,   // computing fields; cycle-detector key
@@ -176,7 +175,7 @@ class DeclTable {
 
 	// Wire a symmetric `from -> to` dependency edge so trace output
 	// can walk either direction. Idempotent: a duplicate edge is a
-	// no-op. Mirrors Module.zig:4839-4859 declareDeclDependency.
+	// no-op.
 	void declareDependency(DeclIndex from, DeclIndex to);
 
 	// Number of registered decls excluding the sentinel.

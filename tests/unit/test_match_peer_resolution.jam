@@ -1,13 +1,11 @@
 // Match expression — peer type resolution, signedness, expected-type
-// propagation. Covers the codegen paths reworked to match Zig's
-// resolvePeerTypes (src/Sema.zig:28538) and Rust's check_expr_match
-// (rustc_hir_typeck/src/_match.rs:67-97). Each `tfn` pins down a
-// distinct corner case the codegen used to mishandle.
+// propagation. Covers the codegen paths reworked to handle mixed-width
+// integer arms, signedness widening, and expected-type hinting. Each
+// `tfn` pins down a distinct corner case the codegen used to
+// mishandle.
 const { assert } = import("test");
 
-// ─────────────────────────────────────────────────────────────────
 // Section A. Mixed widths, all positive
-// ─────────────────────────────────────────────────────────────────
 
 fn pickPositive(sel: i32) i32 {
     return match (sel) {
@@ -37,9 +35,7 @@ tfn wideArmDoesNotClobberNarrowArms() {
     assert(pickWide(0), 100000);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section B. Signed values & mixed signedness
-// ─────────────────────────────────────────────────────────────────
 
 fn pickSigned(sel: i32) i32 {
     return match (sel) {
@@ -82,9 +78,7 @@ tfn signednessWithoutOuterExpectedType() {
     assert(arithmeticConsumer(99), 301);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section C. Or-patterns
-// ─────────────────────────────────────────────────────────────────
 
 fn classify(sel: i32) i32 {
     return match (sel) {
@@ -103,9 +97,7 @@ tfn orPatternBranchesShareArm() {
     assert(classify(99), 999);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section D. Range patterns
-// ─────────────────────────────────────────────────────────────────
 
 fn rangeBucket(n: i32) i32 {
     return match (n) {
@@ -147,9 +139,7 @@ tfn rangeAndLiteralCoexistInArms() {
     assert(rangeAndLiteralMix(43), 400);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section E. Wildcard placement
-// ─────────────────────────────────────────────────────────────────
 
 fn wildcardOnly(sel: i32) i32 {
     return match (sel) {
@@ -177,9 +167,7 @@ tfn wildcardAtTail() {
     assert(wildcardCovers(99), 20);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section F. Diverging arms
-// ─────────────────────────────────────────────────────────────────
 
 fn earlyReturn(sel: i32) i32 {
     match (sel) {
@@ -226,9 +214,7 @@ tfn noreturnCallArmCompilesAndRoutes() {
     assert(divergeViaNoreturn(2), 20);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section G. Match in various positions
-// ─────────────────────────────────────────────────────────────────
 
 fn matchInVarDecl(sel: i32) i32 {
     var r: i32 = match (sel) {
@@ -276,9 +262,7 @@ tfn matchInsideIfBranch() {
     assert(matchInsideIf(0, false), 0);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section H. Side-effect-only arms (no value, no phi)
-// ─────────────────────────────────────────────────────────────────
 
 fn sideEffectArms(sel: i32) i32 {
     var count: i32 = 0;
@@ -296,9 +280,7 @@ tfn statementFormMatchAssignsCorrectArm() {
     assert(sideEffectArms(99), 30);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section I. Enum variants
-// ─────────────────────────────────────────────────────────────────
 
 const Direction = enum { North, East, South, West };
 
@@ -343,9 +325,7 @@ tfn enumOrPatternArms() {
     assert(isPrimary(Tag.Other), false);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section J. Scrutinee shapes
-// ─────────────────────────────────────────────────────────────────
 
 fn parseDigit(c: i32) i32 {
     return match (c - 48) {     // arithmetic scrutinee
@@ -377,9 +357,7 @@ tfn functionCallScrutinee() {
     assert(mkAndDispatch(10), 999);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section K. Nested matches
-// ─────────────────────────────────────────────────────────────────
 
 fn matchNested(a: i32, b: i32) i32 {
     return match (a) {
@@ -407,9 +385,7 @@ tfn nestedMatchInArm() {
     assert(matchNested(5, 5), 99);
 }
 
-// ─────────────────────────────────────────────────────────────────
 // Section L. Unsigned high-bit values
-// ─────────────────────────────────────────────────────────────────
 
 fn highBitU32(sel: i32) u32 {
     return match (sel) {

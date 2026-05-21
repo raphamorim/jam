@@ -290,9 +290,10 @@ static std::size_t predecessorCount(const JirFunction &jfn,
 // MemberAccess, Index, Deref) emit only the address-producing JIR
 // (alloca slot / FieldAddr / IndexAddr) — never a Load of the whole
 // value. Pointer requests on non-lvalue nodes spill the value to a
-// fresh alloca and return that pointer. Modeled on Zig's
-// `ResultInfo.ResultLoc` (AstGen.zig): the producer's job is to
-// honor the consumer's request.
+// fresh alloca and return that pointer. The producer's job is to
+// honor the consumer's request: each lvalue-shaped case branches
+// on `loc` in the main switch so one entry point covers both
+// value and address forms uniformly.
 enum class ResultLoc { Value, Pointer };
 
 // Forward decl: AstGen for an arbitrary AST node in expression
@@ -1259,19 +1260,19 @@ static JirRef emitStructCfnDispatch(AstGenCtx &gctx,
 // rvalue-Load-then-spill pattern that JirTag::Index uses for SSA
 // aggregates — which for arrays loads the entire backing storage
 // (up to several KB) into an SSA value per access and stalls LLVM
-// at -O1+ when many such accesses share a function. Mirrors Zig's
-// lvalExpr-then-elem_ptr shape.
+// at -O1+ when many such accesses share a function. The fast path
+// takes the base by pointer and lowers `arr[i]` as a single
+// IndexAddr + per-element Load.
 static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 	NodeIdx baseIdx = static_cast<NodeIdx>(n.lhs);
 	NodeIdx idxIdx = static_cast<NodeIdx>(n.rhs);
 
-	// Array Variable fast path. Mirrors Zig's elem_val_node lowering
-	// for arrays: take the base as a pointer (zero-cost for a
-	// Variable — just the alloca's own JirRef), emit IndexAddr to
-	// the element, then Load just that element. Avoids the rvalue-
-	// Load-then-spill pattern JirTag::Index uses on Array SSA
-	// values, which loads the full backing storage (up to several
-	// KB) per access and stalls LLVM at -O1+.
+	// Array Variable fast path. Take the base as a pointer (zero-
+	// cost for a Variable — just the alloca's own JirRef), emit
+	// IndexAddr to the element, then Load just that element. Avoids
+	// the rvalue-Load-then-spill pattern JirTag::Index uses on
+	// Array SSA values, which loads the full backing storage (up to
+	// several KB) per access and stalls LLVM at -O1+.
 	//
 	// Limited to Variable bases on purpose — astgenExpr(.., Pointer)
 	// on a non-struct MemberAccess (e.g. `slice.ptr`) routes
@@ -3244,10 +3245,9 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 		// astgenExpr — for array receivers, an rvalue Load would
 		// pull the entire backing storage (up to several KB) into an
 		// SSA value as a dead instruction, which stalls LLVM at
-		// -O1+. Mirrors Zig's lvalExpr pattern (AstGen.zig:assign)
-		// where the LHS is always taken as a pointer first. The
-		// rvalue Load only fires on the fall-through struct/enum
-		// dispatch path below.
+		// -O1+. Taking the receiver as a pointer first keeps the
+		// hot path on a GEP and lets the rvalue Load only fire on
+		// the fall-through struct/enum dispatch path below.
 		const AstNode &recvNode = ns.get(recvExprIdx);
 		bool recvIsLvalueable = recvNode.tag == AstTag::Variable ||
 		                        recvNode.tag == AstTag::MemberAccess ||
@@ -3673,11 +3673,11 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
 	// emits the address-producing JIR directly (alloca slot for
 	// Variable; FieldAddr / BitCast for MemberAccess; IndexAddr for
 	// Index; the operand itself for Deref) and writes the leaf
-	// type into `*outLeafTy` for callers that need it. Mirrors
-	// Zig's expr() with `rl == .ref`: the producer honors the
-	// consumer's request without ever materializing the underlying
-	// value. Non-lvalue tags fall through to the value-producing
-	// switch below and the final alloca-spill catches them.
+	// type into `*outLeafTy` for callers that need it. The
+	// producer's job is to honor the caller's request without
+	// materializing the underlying value. Non-lvalue tags fall
+	// through to the value-producing switch below and the final
+	// alloca-spill catches them.
 	if (loc == ResultLoc::Pointer) {
 		TypeIdx leafTy = kNoType;
 		JirRef ptrResult = kNoJirRef;

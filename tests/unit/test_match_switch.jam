@@ -13,7 +13,7 @@
 
 const { assert } = import("test");
 
-// ── Path 1: dense integer arms → real LLVM switch ──────────
+// Path 1: dense integer arms → real LLVM switch
 
 fn classifyDigit(x: u8) u8 {
     var r: u8 = 0;
@@ -32,7 +32,7 @@ tfn denseMiddleArm() { assert(classifyDigit(2), 102); }
 tfn denseLastArm()   { assert(classifyDigit(3), 103); }
 tfn denseDefault()   { assert(classifyDigit(99), 200); }
 
-// ── Path 2: sparse integer arms ─────────────────────────────
+// Path 2: sparse integer arms
 
 fn classifySparse(x: i32) i32 {
     var r: i32 = 0;
@@ -50,7 +50,7 @@ tfn sparseMid()      { assert(classifySparse(500),  2); }
 tfn sparseHigh()     { assert(classifySparse(9999), 3); }
 tfn sparseDefault()  { assert(classifySparse(42),   0); }
 
-// ── Path 3: signed negatives ─────────────────────────────────
+// Path 3: signed negatives
 
 fn classifySigned(x: i32) i32 {
     var r: i32 = 0;
@@ -68,7 +68,7 @@ tfn signedZero()     { assert(classifySigned(0),  20); }
 tfn signedPositive() { assert(classifySigned(1),  30); }
 tfn signedDefault()  { assert(classifySigned(7),  99); }
 
-// ── Path 4: single arm → cond_br specialization ──────────────
+// Path 4: single arm → cond_br specialization
 
 fn singleArm(x: u32) u32 {
     var r: u32 = 0;
@@ -83,7 +83,7 @@ tfn singleArmMatch()    { assert(singleArm(42) as i32, 1); }
 tfn singleArmDefault()  { assert(singleArm(0)  as i32, 0); }
 tfn singleArmMisses()   { assert(singleArm(99) as i32, 0); }
 
-// ── Path 5: unit-enum variants → switch on i8 discriminant ──
+// Path 5: unit-enum variants → switch on i8 discriminant
 
 const Light = enum { Red, Yellow, Green };
 
@@ -101,7 +101,7 @@ tfn lightRed()    { assert(lightTime(Light.Red)    as i32, 30); }
 tfn lightYellow() { assert(lightTime(Light.Yellow) as i32, 5);  }
 tfn lightGreen()  { assert(lightTime(Light.Green)  as i32, 25); }
 
-// ── Path 6: or-pattern flattens to multiple switch cases ────
+// Path 6: or-pattern flattens to multiple switch cases
 
 fn isWeekend(d: u8) u8 {
     var r: u8 = 0;
@@ -117,7 +117,7 @@ tfn orSaturday() { assert(isWeekend(6), 1); }
 tfn orMonday()   { assert(isWeekend(1), 0); }
 tfn orFriday()   { assert(isWeekend(5), 0); }
 
-// ── Path 7: shared target across or-pattern + per-literal arm ─
+// Path 7: shared target across or-pattern + per-literal arm
 
 fn quadrant(x: i8) i8 {
     var r: i8 = 0;
@@ -135,7 +135,7 @@ tfn quad3() { assert(quadrant(3) as i32, 20); }
 tfn quad4() { assert(quadrant(4) as i32, 20); }
 tfn quad9() { assert(quadrant(9) as i32, 0);  }
 
-// ── Path 8: fallback — range patterns stay on the CondBr chain ─
+// Path 8: fallback — range patterns stay on the CondBr chain
 
 fn rangeClassify(x: u32) u32 {
     var r: u32 = 0;
@@ -153,7 +153,7 @@ tfn rangeHigh()   { assert(rangeClassify(500) as i32, 3); }
 tfn rangeEdgeIn() { assert(rangeClassify(9)   as i32, 1); }
 tfn rangeEdgeOut(){ assert(rangeClassify(10)  as i32, 2); }
 
-// ── Path 9: fallback — payloaded enum variants with bindings ──
+// Path 9: fallback — payloaded enum variants with bindings
 
 const Shape = enum {
     Point,
@@ -175,7 +175,7 @@ tfn payloadPoint()  { assert(area(Shape.Point)         as i32, 0); }
 tfn payloadCircle() { assert(area(Shape.Circle(5))     as i32, 75); }
 tfn payloadRect()   { assert(area(Shape.Rect(4, 6))    as i32, 24); }
 
-// ── Path 10: non-exhaustive integer match (no wildcard) ─────
+// Path 10: non-exhaustive integer match (no wildcard)
 
 fn maybeMatch(x: u8) u8 {
     var r: u8 = 99;

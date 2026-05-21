@@ -1,10 +1,10 @@
 // Diagnostic-pipeline tests.
 //
-// Covers the structured-diagnostic system introduced to mirror Zig's
-// AstGen errors (`file:line: error: message` format with secondary
-// notes and reference traces). Tests run jam.out as a subprocess and
-// assert on its stderr; this keeps the suite stable across pure-IR
-// refactors and matches the existing test_codegen_errors.cpp shape.
+// Covers the structured-diagnostic system: `file:line: error: message`
+// format with secondary notes and reference traces. Tests run jam.out
+// as a subprocess and assert on its stderr; this keeps the suite
+// stable across pure-IR refactors and matches the existing
+// test_codegen_errors.cpp shape.
 
 #include "test_framework.h"
 #include <cstdio>
@@ -58,7 +58,7 @@ std::size_t countOccurrences(const std::string &hay,
 	return n;
 }
 
-// ── Line-number tests ──────────────────────────────────────────
+// Line-number tests
 
 void testUnknownFunctionHasLine() {
 	auto r = compileSource("diag_unknown_fn", "fn main() i32 {\n"
@@ -110,7 +110,7 @@ void testUnknownFieldHasLine() {
 	ASSERT_TRUE(stderrContains(r, ":4: error:"));
 }
 
-// ── Init-analysis flows through the same channel ───────────────
+// Init-analysis flows through the same channel
 
 void testUseAfterMoveHasLine() {
 	auto r = compileSource("diag_use_after_move",
@@ -126,7 +126,7 @@ void testUseAfterMoveHasLine() {
 	ASSERT_TRUE(stderrContains(r, "uninitialized binding"));
 }
 
-// ── Multi-error reporting ───────────────────────────────────────
+// Multi-error reporting
 
 void testMultipleErrorsAllReported() {
 	auto r = compileSource("diag_multi", "fn first() i32 { return foo(); }\n"
@@ -157,7 +157,7 @@ void testMultiErrorsSortedByLine() {
 	ASSERT_TRUE(p1 < p2);
 }
 
-// ── Reference trace for generic instantiation ──────────────────
+// Reference trace for generic instantiation
 
 void testGenericInstantiationCarriesRefTrace() {
 	auto r = compileSource("diag_ref_trace",
@@ -181,7 +181,7 @@ void testGenericInstantiationCarriesRefTrace() {
 	ASSERT_TRUE(stderrContains(r, "in instantiation of `Box__i32.pickBad`"));
 }
 
-// ── Per-decl recovery (one broken decl doesn't suppress others) ──
+// Per-decl recovery (one broken decl doesn't suppress others)
 
 void testBrokenDeclDoesNotMaskNextDecl() {
 	auto r = compileSource(
@@ -195,12 +195,12 @@ void testBrokenDeclDoesNotMaskNextDecl() {
 	ASSERT_TRUE(stderrContains(r, "anotherMissingFn"));
 }
 
-// ── Within-decl multi-error (Poison-based recovery) ──────────────
+// Within-decl multi-error (Poison-based recovery)
 
 // Three unknown-function calls in the same function should each
 // produce a distinct diagnostic. Without Poison-based recovery the
 // first failNode would bail the whole decl and we'd see only one
-// error — Zig's recoverable-error model lets us report them all.
+// error — the recoverable-error model lets us report them all.
 void testRecoveryWithinSingleDecl() {
 	auto r = compileSource("diag_recover_within", "fn main() i32 {\n"
 	                                              "    var a: i32 = foo();\n"
@@ -247,7 +247,7 @@ void testUnknownMethodIsRecoverable() {
 	ASSERT_TRUE(stderrContains(r, "alsoBogus"));
 }
 
-// ── Parser errors now carry :line: too ─────────────────────────
+// Parser errors now carry :line: too
 
 void testParserErrorHasLine() {
 	auto r = compileSource("diag_parser_line", "fn main() i32 {\n"
@@ -492,7 +492,7 @@ void testIntegerOverflowLiteralHasLine() {
 	ASSERT_TRUE(stderrContains(r, "exceeds u64 range"));
 }
 
-// ── Output format is stable ────────────────────────────────────
+// Output format is stable
 
 void testDiagnosticFormatIsFileLineError() {
 	auto r = compileSource("diag_format", "fn main() i32 {\n"

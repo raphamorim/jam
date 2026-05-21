@@ -114,7 +114,7 @@ tfn mixedVoidAndValueArmsCompile() {
 // and lowers as i16. Without peer-type widening at phi-build time,
 // the wildcard arm's value would be substituted with typed zero
 // because phi-type would be picked from arm 1 (i8) and arm 3's i16
-// value wouldn't match. Mirrors Zig's resolvePeerTypes() behaviour.
+// value wouldn't match — peer-type widening fixes that.
 fn pickByWidth(sel: i32, gate: bool) i32 {
     var r: i32 = 0;
     if (gate) {
