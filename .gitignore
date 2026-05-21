@@ -34,3 +34,4 @@ output
 diagnostic_tests
 analyzer_tests
 decl_tests
+jir_tests

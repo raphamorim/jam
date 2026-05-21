@@ -24,56 +24,6 @@ brew tap raphamorim/jam https://github.com/raphamorim/jam
 brew install --HEAD jam
 ```
 
-Quick overview:
-
-```jam
-const std = import("std");
-const {Vec} = import("collections");
-
-const Histogram = struct {
-    bins: Vec(u32),
-
-    // `cfn` opts a method into the compiler's synthesized-call set.
-    //
-    //   cfn default()       opt-in constructor
-    //   cfn drop(...)       auto-fires at every scope exit
-    //   cfn at(self, i)     desugars `obj[i]`     (read)
-    //   cfn setAt(...)      desugars `obj[i] = x` (write)
-    cfn default() Self {
-        var bins: Vec(u32) = Vec(u32).withCapacity(256);
-        var i: u32 = 0;
-        while (i < 256) {
-            bins.push(0);
-            i = i + 1;
-        }
-        return Self { bins: bins };
-    }
-    cfn drop(self: mut Self) {
-        std.fmt.println("drop has happened");
-    }
-    cfn at(self: Self, i: u32) u32 {
-        return self.bins[i];
-    }
-    cfn setAt(self: mut Self, i: u32, value: u32) {
-        self.bins[i] = value;
-    }
-
-    fn record(self: mut Self, byte: u8) {
-        const i: u32 = byte as u32;
-        self[i] = self[i] + 1;
-    }
-};
-
-fn main() {
-    var h: Histogram = Histogram.default();
-    h.record(7);
-    h.record(7);
-    h.record(42);
-    std.fmt.println(h[7]);    // 2, via h.at(7)
-    std.fmt.println(h[42]);   // 1
-}
-```
-
 ## Contributing
 
 1. [Donate monthly](https://github.com/sponsors/raphamorim).
