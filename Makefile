@@ -8,6 +8,14 @@ CLANG_FORMAT ?= clang-format
 CLANG_FORMAT_STYLE := file:clang-format
 FORMAT_SOURCES := $(wildcard src/*.cpp src/*.h) $(wildcard tests/cpp/*.cpp tests/cpp/*.h)
 
+OUT := output
+
+SRC_NAMES := jam_llvm main lexer parser codegen target cabi \
+             module_resolver symbol_table number_literal \
+             init_analysis drop_registry abi diagnostics decl \
+             analyzer astgen jir_codegen jir_verify
+OBJS := $(addprefix $(OUT)/, $(addsuffix .o, $(SRC_NAMES)))
+
 # Check if we're on macOS or Linux
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
@@ -30,26 +38,13 @@ build:
 		echo "error: llvm-config not found."; \
 		exit 1; \
 	fi
-	clang++ -c ./src/jam_llvm.cpp -o ./jam_llvm.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/main.cpp -o ./main.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/lexer.cpp -o ./lexer.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/parser.cpp -o ./parser.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/codegen.cpp -o ./codegen.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/target.cpp -o ./target.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/cabi.cpp -o ./cabi.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/module_resolver.cpp -o ./module_resolver.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/symbol_table.cpp -o ./symbol_table.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/number_literal.cpp -o ./number_literal.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/init_analysis.cpp -o ./init_analysis.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/drop_registry.cpp -o ./drop_registry.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/abi.cpp -o ./abi.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/diagnostics.cpp -o ./diagnostics.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/decl.cpp -o ./decl.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/analyzer.cpp -o ./analyzer.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/astgen.cpp -o ./astgen.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/jir_codegen.cpp -o ./jir_codegen.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -c ./src/jir_verify.cpp -o ./jir_verify.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./jam.out ./jam_llvm.o ./main.o ./lexer.o ./parser.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o ./diagnostics.o ./decl.o ./analyzer.o ./astgen.o ./jir_codegen.o ./jir_verify.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
+	@mkdir -p $(OUT)
+	@for name in $(SRC_NAMES); do \
+		echo "  CC:  src/$$name.cpp -> $(OUT)/$$name.o"; \
+		clang++ -c ./src/$$name.cpp -o $(OUT)/$$name.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS) || exit $$?; \
+	done
+	@echo "  LD: $(OUT)/jam.out"
+	@clang++ -o $(OUT)/jam.out $(OBJS) `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
 
 cmake-build:
 	@echo "Building with CMake..."
@@ -76,7 +71,7 @@ install: build
 	@echo "Installing Jam compiler to $(PREFIX)..."
 	@echo "Platform: $(PLATFORM)"
 	install -d $(BINDIR)
-	cp ./jam.out $(BINDIR)/jam
+	cp $(OUT)/jam.out $(BINDIR)/jam
 	chmod 755 $(BINDIR)/jam
 	@echo "Installing Jam standard library to $(STDDIR)..."
 	install -d $(STDDIR)
@@ -89,14 +84,14 @@ uninstall:
 	rm -rf $(LIBDIR)/jam
 
 clean:
-	rm -f ./jam_llvm.o ./main.o ./lexer.o ./parser.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o ./diagnostics.o ./decl.o ./analyzer.o ./astgen.o ./jir_codegen.o ./jir_verify.o ./jam.out
-	rm -rf build/
+	rm -rf $(OUT) build/
 
 info:
 	@echo "Platform: $(PLATFORM)"
 	@echo "LLVM Config: $(LLVM_CONFIG)"
 	@echo "Install Prefix: $(PREFIX)"
 	@echo "Binary Directory: $(BINDIR)"
+	@echo "Build Output: $(OUT)/"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  make build          - Build the compiler"
@@ -114,7 +109,7 @@ info:
 
 test-unit: build
 	@echo "Running Jam unit tests (debug, -C opt-level=0)..."
-	./jam.out test tests/unit
+	$(OUT)/jam.out test tests/unit
 
 # -O3 (release) pass over the same unit suite.
 # runs the optimizer to catch bugs that only surface when LLVM's
@@ -122,56 +117,52 @@ test-unit: build
 # mem2reg interactions, etc.).
 test-unit-release: build
 	@echo "Running Jam unit tests (release, -C opt-level=3)..."
-	./jam.out -C opt-level=3 test tests/unit
+	$(OUT)/jam.out -C opt-level=3 test tests/unit
+
+define CXX_TEST_TARGET
+	@echo ""
+	@echo "Building and running $(1) C++ tests..."
+	@clang++ -c ./tests/cpp/test_$(1).cpp -o $(OUT)/test_$(1).o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	@clang++ -o $(OUT)/$(1)_tests $(OUT)/test_$(1).o $(2) `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
+	@$(OUT)/$(1)_tests
+endef
 
 test-init: build
-	@echo ""
-	@echo "Building and running init-analyzer C++ tests..."
-	clang++ -c ./tests/cpp/test_init_analysis.cpp -o ./test_init_analysis.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./init_tests ./test_init_analysis.o ./jam_llvm.o ./lexer.o ./parser.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o ./diagnostics.o ./decl.o ./analyzer.o ./astgen.o ./jir_codegen.o ./jir_verify.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
-	./init_tests
+	$(call CXX_TEST_TARGET,init_analysis,$(OBJS))
 
 test-abi: build
-	@echo ""
-	@echo "Building and running ABI classifier C++ tests..."
-	clang++ -c ./tests/cpp/test_abi.cpp -o ./test_abi.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./abi_tests ./test_abi.o ./jam_llvm.o ./lexer.o ./parser.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o ./diagnostics.o ./decl.o ./analyzer.o ./astgen.o ./jir_codegen.o ./jir_verify.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
-	./abi_tests
+	$(call CXX_TEST_TARGET,abi,$(OBJS))
 
 test-codegen-errors: build
 	@echo ""
 	@echo "Building and running codegen-error C++ tests..."
-	clang++ -c ./tests/cpp/test_codegen_errors.cpp -o ./test_codegen_errors.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./codegen_error_tests ./test_codegen_errors.o
-	./codegen_error_tests
+	@clang++ -c ./tests/cpp/test_codegen_errors.cpp -o $(OUT)/test_codegen_errors.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	@clang++ -o $(OUT)/codegen_error_tests $(OUT)/test_codegen_errors.o
+	@$(OUT)/codegen_error_tests
 
 test-jir: build
 	@echo ""
 	@echo "Building and running JIR C++ tests..."
-	clang++ -c ./tests/cpp/test_jir_skeleton.cpp -o ./test_jir_skeleton.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./jir_tests ./test_jir_skeleton.o
-	./jir_tests
+	@clang++ -c ./tests/cpp/test_jir_skeleton.cpp -o $(OUT)/test_jir_skeleton.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	@clang++ -o $(OUT)/jir_tests $(OUT)/test_jir_skeleton.o
+	@$(OUT)/jir_tests
 
 test-diagnostics: build
 	@echo ""
 	@echo "Building and running diagnostic-pipeline tests..."
-	clang++ -c ./tests/cpp/test_diagnostics.cpp -o ./test_diagnostics.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./diagnostic_tests ./test_diagnostics.o
-	./diagnostic_tests
+	@clang++ -c ./tests/cpp/test_diagnostics.cpp -o $(OUT)/test_diagnostics.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	@clang++ -o $(OUT)/diagnostic_tests $(OUT)/test_diagnostics.o
+	@$(OUT)/diagnostic_tests
 
 test-decl: build
 	@echo ""
 	@echo "Building and running DeclTable C++ tests..."
-	clang++ -c ./tests/cpp/test_decl_table.cpp -o ./test_decl_table.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./decl_tests ./test_decl_table.o ./decl.o
-	./decl_tests
+	@clang++ -c ./tests/cpp/test_decl_table.cpp -o $(OUT)/test_decl_table.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	@clang++ -o $(OUT)/decl_tests $(OUT)/test_decl_table.o $(OUT)/decl.o
+	@$(OUT)/decl_tests
 
 test-analyzer: build
-	@echo ""
-	@echo "Building and running Analyzer C++ tests..."
-	clang++ -c ./tests/cpp/test_analyzer.cpp -o ./test_analyzer.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	clang++ -o ./analyzer_tests ./test_analyzer.o ./jam_llvm.o ./lexer.o ./parser.o ./codegen.o ./target.o ./cabi.o ./module_resolver.o ./symbol_table.o ./number_literal.o ./init_analysis.o ./drop_registry.o ./abi.o ./diagnostics.o ./decl.o ./analyzer.o ./astgen.o ./jir_codegen.o ./jir_verify.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
-	./analyzer_tests
+	$(call CXX_TEST_TARGET,analyzer,$(OBJS))
 
 test: test-unit test-init test-abi test-codegen-errors test-jir test-diagnostics test-decl test-analyzer
 test-release: test test-unit-release

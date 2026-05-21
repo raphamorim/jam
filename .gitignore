@@ -1,20 +1,5 @@
-build
-*.o.tmp
-*.out
-*.d
-*.slo
-*.lo
-*.o
-*.obj
-*.gch
-*.pch
-*.so
-*.dylib
-*.dll
-*.lai
-*.la
-*.a
-*.lib
+output/
+build/
 
 # Docs (jekyll)
 docs/_site/
@@ -26,12 +11,4 @@ docs/vendor/
 
 /misc
 
-# fwiw i need to update this flow
-abi_tests
-codegen_error_tests
-init_tests
-output
-diagnostic_tests
-analyzer_tests
-decl_tests
-jir_tests
+*.o.tmp
