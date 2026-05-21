@@ -151,6 +151,8 @@ const char *tagName(JirTag t) {
 		return "Unreachable";
 	case JirTag::Call:
 		return "Call";
+	case JirTag::CallIndirect:
+		return "CallIndirect";
 	case JirTag::Param:
 		return "Param";
 	case JirTag::StructLit:
@@ -484,6 +486,22 @@ struct Verifier {
 			// extra-allocation lands at offset zero.
 			if (inst.b >= jfn.extra.size()) {
 				err(r, "Call extra index out of bounds");
+				return;
+			}
+			uint32_t argCount = jfn.extra[inst.b];
+			checkExtraSlice(inst.b, 1 + argCount, r, "call-args");
+			for (uint32_t i = 0; i < argCount; i++) {
+				JirRef ar = static_cast<JirRef>(jfn.extra[inst.b + 1 + i]);
+				checkRef(ar, false, r, "call-arg");
+			}
+			return;
+		}
+		case JirTag::CallIndirect: {
+			// `a` is a JirRef of a Fn-typed value; `b` mirrors Call's
+			// extra-pool layout [argCount, arg0_ref, ...].
+			checkRef(inst.a, false, r, "callee");
+			if (inst.b >= jfn.extra.size()) {
+				err(r, "CallIndirect extra index out of bounds");
 				return;
 			}
 			uint32_t argCount = jfn.extra[inst.b];

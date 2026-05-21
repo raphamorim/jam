@@ -321,6 +321,16 @@ JAM_EXTERN_C JamValueRef JamLLVMBuildCall(JamBuilderRef builder,
                                           JamFunctionRef func,
                                           JamValueRef *args, unsigned numArgs,
                                           const char *name);
+// Indirect call through a function-typed value. `funcType` is the LLVM
+// FunctionType built from the Jam-level Fn TypeIdx (return + params);
+// `callee` is the ptr-typed Value holding the code address. Used by
+// JirTag::CallIndirect lowering.
+JAM_EXTERN_C JamValueRef JamLLVMBuildIndirectCall(JamBuilderRef builder,
+                                                    JamTypeRef funcType,
+                                                    JamValueRef callee,
+                                                    JamValueRef *args,
+                                                    unsigned numArgs,
+                                                    const char *name);
 JAM_EXTERN_C JamValueRef JamLLVMBuildPhi(JamBuilderRef builder, JamTypeRef type,
                                          const char *name);
 JAM_EXTERN_C void JamLLVMAddIncoming(JamValueRef phi, JamValueRef *values,

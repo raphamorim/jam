@@ -350,6 +350,14 @@ enum class TypeKind : uint8_t {
 	// via the substitution engine when an LLVM type is requested or
 	// when a binding's static TypeIdx is needed.
 	GenericCall,
+	// Function-typed value: a pointer to a function with a known
+	// signature. Parsed from `fn(T1, T2) Ret` in type position. The
+	// TypeKey carries the return TypeIdx in `a` and an index into
+	// TypePool::fnParams in `b`. Lowered to LLVM `ptr` — the value
+	// itself is a code address; the signature is metadata the
+	// compiler consults at call sites to type-check arguments and
+	// pick the right LLVM function type for the indirect call.
+	Fn,
 };
 
 struct TypeKey {
@@ -395,6 +403,11 @@ inline bool operator==(const TypeKey &x, const TypeKey &y) {
 	case TypeKind::Type:
 		// Singleton meta-type: every TypeKey of kind Type is equal.
 		return true;
+	case TypeKind::Fn:
+		// equal iff return type AND param-list index match. Params
+		// are interned in TypePool::fnParams_ so the index is
+		// canonical (two `fn(i32) i32` keys share the same b).
+		return x.a == y.a && x.b == y.b;
 	case TypeKind::GenericCall:
 		// equal iff callee name AND args-list index match. The
 		// args index is canonical because the side table interns
@@ -445,6 +458,13 @@ class TypePool {
 	// once.
 	std::vector<std::vector<TypeIdx>> genericArgs_;
 	std::map<std::vector<TypeIdx>, uint32_t> genericArgsIdx_;
+	// Side table for function-type parameter lists. A `TypeKind::Fn`
+	// TypeKey stores the index into this vector in `b`. Two
+	// `fn(i32, str) i64` types interned at distinct sites resolve to
+	// the same TypeIdx because the param list `[i32, str]` is interned
+	// here once.
+	std::vector<std::vector<TypeIdx>> fnParams_;
+	std::map<std::vector<TypeIdx>, uint32_t> fnParamsIdx_;
 
 	TypeIdx pushKey(TypeKey k) {
 		TypeIdx id = static_cast<TypeIdx>(keys_.size());
@@ -526,6 +546,26 @@ class TypePool {
 
 	const std::vector<TypeIdx> &genericArgsAt(uint32_t idx) const {
 		return genericArgs_[idx];
+	}
+
+	// intern a `fn(T1, T2) Ret` type. The param list is interned in
+	// fnParams_ so two identical signatures share an index and hence
+	// the same TypeIdx. Return type is stored directly in `a`.
+	TypeIdx internFn(TypeIdx returnTy, std::vector<TypeIdx> paramTys) {
+		uint32_t paramsIdx;
+		auto it = fnParamsIdx_.find(paramTys);
+		if (it != fnParamsIdx_.end()) {
+			paramsIdx = it->second;
+		} else {
+			paramsIdx = static_cast<uint32_t>(fnParams_.size());
+			fnParams_.push_back(paramTys);
+			fnParamsIdx_.emplace(std::move(paramTys), paramsIdx);
+		}
+		return intern(TypeKey{TypeKind::Fn, 0, 0, returnTy, paramsIdx});
+	}
+
+	const std::vector<TypeIdx> &fnParamsAt(uint32_t idx) const {
+		return fnParams_[idx];
 	}
 	TypeIdx internEnum(StringIdx nameId) {
 		return intern(TypeKey{TypeKind::Enum, 0, 0, nameId, 0});

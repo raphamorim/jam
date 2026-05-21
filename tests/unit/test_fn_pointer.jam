@@ -1,0 +1,57 @@
+const { assert } = import("test");
+
+// Phase 0: fn-pointer types. Three shapes exercise the indirect-
+// call path:
+//   1. Fn-typed local            → `var f: fn(...) = name; f(args);`
+//   2. Fn-typed struct field      → `s.field(args)` on a top-level struct
+//   3. Fn-typed field via Self    → `self.field(args)` inside a method
+//      on a generic struct (where Self resolves to the instantiation)
+
+fn add(a: i32, b: i32) i32 { return a + b; }
+fn mul(a: i32, b: i32) i32 { return a * b; }
+
+fn callViaLocal() i32 {
+    var f: fn(i32, i32) i32 = add;
+    return f(3, 4);
+}
+
+fn callViaLocalSwapped() i32 {
+    var f: fn(i32, i32) i32 = mul;
+    return f(3, 4);
+}
+
+const Adder = struct {
+    ctx: i32,
+    op: fn(i32, i32) i32,
+};
+
+fn callViaStructField() i32 {
+    var a: Adder = Adder { ctx: 10, op: add };
+    return a.op(a.ctx, 5);
+}
+
+fn callViaStructFieldDifferentFn() i32 {
+    var a: Adder = Adder { ctx: 10, op: mul };
+    return a.op(a.ctx, 5);
+}
+
+fn Combiner(T: type) type {
+    return struct {
+        ctx: T,
+        op: fn(T, T) T,
+        fn run(self: Self, x: T) T {
+            return self.op(self.ctx, x);
+        }
+    };
+}
+
+fn callViaSelfFieldInGenericMethod() i32 {
+    var c: Combiner(i32) = Combiner(i32) { ctx: 100, op: add };
+    return c.run(7);
+}
+
+tfn fnPointerInLocal() { assert(callViaLocal(), 7); }
+tfn fnPointerInLocalSwapped() { assert(callViaLocalSwapped(), 12); }
+tfn fnPointerInStructField() { assert(callViaStructField(), 15); }
+tfn fnPointerInStructFieldSwapped() { assert(callViaStructFieldDifferentFn(), 50); }
+tfn fnPointerSelfFieldGenericMethod() { assert(callViaSelfFieldInGenericMethod(), 107); }

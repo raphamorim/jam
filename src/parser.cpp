@@ -562,6 +562,23 @@ NodeIdx Parser::parsePrimary() {
 //   [N]T         — fixed-size array (mutability follows the binding;
 //                  `N` is part of the type)
 TypeIdx Parser::parseType() {
+	// `fn(T1, T2, ...) Ret` — function-typed value. Used for fields
+	// that hold a callback (Writer's writeFn, vtable-ish dispatch).
+	// The grammar is anchored on the `fn` keyword in type position to
+	// keep it unambiguous against bare identifiers. Return type is
+	// required (use `void` for callbacks that don't return a value).
+	if (match(TOK_FN)) {
+		consume(TOK_OPEN_PAREN, "Expected `(` after `fn` in type");
+		std::vector<TypeIdx> paramTys;
+		if (!check(TOK_CLOSE_PAREN)) {
+			do {
+				paramTys.push_back(parseType());
+			} while (match(TOK_COMMA));
+		}
+		consume(TOK_CLOSE_PAREN, "Expected `)` after fn-type parameters");
+		TypeIdx retTy = parseType();
+		return typePool->internFn(retTy, std::move(paramTys));
+	}
 	if (match(TOK_STAR)) {
 		bool ptrConst = false;
 		if (match(TOK_CONST)) {

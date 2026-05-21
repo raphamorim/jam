@@ -163,6 +163,15 @@ enum class JirTag : uint8_t {
 	//       `b` = ExtraIdx → [argCount, arg0, arg1, ...]
 	//       `ty` = return type (kNoType for void).
 	Call,
+	// CallIndirect: `a` = JirRef of a fn-typed value (the function
+	//               pointer); `b` = ExtraIdx → [argCount, arg0, ...];
+	//               `ty` = return type. The signature (return + params)
+	//               is read from the JIR-level Fn TypeIdx on `a` and
+	//               used by codegen to build the LLVM function type
+	//               for the indirect call. Emitted whenever the callee
+	//               isn't a known function name — fn-typed local, fn-
+	//               typed struct field, fn-typed param, etc.
+	CallIndirect,
 
 	// Function reference (Rust-style item-as-value). Resolves a fn
 	// name to its address. `a` = StringIdx (function's LLVM symbol

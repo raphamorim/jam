@@ -726,7 +726,8 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 // initExpr;` at the module level and lower by re-evaluating the init
 // expression at each read site. Constant folding makes this cheap;
 // non-constant inits would require a runtime global slot (deferred).
-static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n) {
+static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n,
+                              TypeIdx expected = kNoType) {
 	const std::string &name =
 	    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
 	auto it = gctx.locals.find(name);
@@ -741,11 +742,13 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n) {
 		return astgenExpr(gctx, mc->initExpr, mc->declaredType);
 	}
 	// Fn-name-as-value (Rust-style item coercion). The identifier
-	// resolves to a function symbol — surface its address as a u64
-	// so it can be assigned to a u64 slot, written to a buffer, or
-	// (with `as *mut[] u8`) round-tripped to a typed pointer. Generic
-	// fns are rejected because no monomorphized body exists at this
-	// point in lowering.
+	// resolves to a function symbol — surface its address as either
+	// (a) a typed function pointer when the context expects a Fn
+	// type, so `var f: fn(i32) i32 = add;` and struct fields of fn
+	// type get a properly-typed value, or (b) the legacy u64 when
+	// the context is untyped (writes to buffers, manual casts).
+	// Generic fns are rejected because no monomorphized body exists
+	// at this point in lowering.
 	if (const FunctionAST *fn = gctx.ctx.getFunctionAST(name)) {
 		if (fn->isGeneric()) {
 			return recoverHere(gctx,
@@ -757,7 +760,16 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n) {
 		fnref.tag = JirTag::FnRef;
 		fnref.a = static_cast<JirRef>(
 		    gctx.ctx.getStringPool().intern(fn->Name));
-		fnref.ty = BuiltinType::U64;
+		// If the consumer asked for a Fn type, give them one; otherwise
+		// fall back to u64 (legacy raw-address shape). Future cleanup:
+		// always emit the typed Fn and let consumers cast to u64
+		// explicitly via `as`.
+		bool expectFn = false;
+		if (expected != kNoType) {
+			const TypeKey &ek = gctx.ctx.getTypePool().get(expected);
+			expectFn = ek.kind == TypeKind::Fn;
+		}
+		fnref.ty = expectFn ? expected : BuiltinType::U64;
 		return emit(gctx, fnref);
 	}
 	// Recoverable: emit a Poison so the rest of the function still
@@ -3661,6 +3673,94 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 
 	const FunctionAST *fn = gctx.ctx.getFunctionAST(callee);
 	if (fn == nullptr) {
+		// Before erroring, try the fn-pointer-in-local-or-field paths.
+		// Two cases, both producing a Fn-typed JirRef we can call
+		// indirect through:
+		//   (1) zero-dot callee `f` is a local whose type is Fn.
+		//       `var f: fn(...) = ...; f(args);`
+		//   (2) single-dot callee `recv.field` where `field` is a Fn-
+		//       typed field on recv's struct. `w.writeFn(args);`
+		// Multi-dot callees (`x.y.z(args)`) take the indirect-call path
+		// in the parser already; this branch is only for the cases the
+		// parser emitted as direct Call (qualified-name based).
+		auto buildIndirectCall = [&](JirRef calleeVal) -> JirRef {
+			TypeIdx calleeTy = gctx.jfn.getInst(calleeVal).ty;
+			const TypeKey &k = gctx.ctx.getTypePool().get(calleeTy);
+			TypeIdx retTy = static_cast<TypeIdx>(k.a);
+			const auto &paramTys = gctx.ctx.getTypePool().fnParamsAt(k.b);
+			std::vector<JirRef> argRefs;
+			argRefs.reserve(argCount);
+			for (uint32_t i = 0; i < argCount; i++) {
+				NodeIdx argIdx =
+				    static_cast<NodeIdx>(ns.getExtra(argsExtra + 1 + i));
+				TypeIdx expectArg = i < paramTys.size() ? paramTys[i] : kNoType;
+				argRefs.push_back(astgenExpr(gctx, argIdx, expectArg));
+			}
+			std::vector<uint32_t> packed;
+			packed.reserve(1 + argRefs.size());
+			packed.push_back(static_cast<uint32_t>(argRefs.size()));
+			for (JirRef r : argRefs) packed.push_back(static_cast<uint32_t>(r));
+			JirExtraIdx extraIdx =
+			    gctx.jfn.pushExtra(packed.data(), packed.size());
+			JirInst ic{};
+			ic.tag = JirTag::CallIndirect;
+			ic.a = calleeVal;
+			ic.b = extraIdx;
+			ic.ty = retTy;
+			return emit(gctx, ic);
+		};
+
+		size_t dotPos = callee.find('.');
+		if (dotPos == std::string::npos) {
+			// (1) bare name — is it a Fn-typed local?
+			auto it = gctx.locals.find(callee);
+			if (it != gctx.locals.end()) {
+				TypeIdx localTy = gctx.localTypes[callee];
+				const TypeKey &k = gctx.ctx.getTypePool().get(localTy);
+				if (k.kind == TypeKind::Fn) {
+					JirInst load{};
+					load.tag = JirTag::Load;
+					load.a = it->second;
+					load.ty = localTy;
+					JirRef fnVal = emit(gctx, load);
+					return buildIndirectCall(fnVal);
+				}
+			}
+		} else if (callee.find('.', dotPos + 1) == std::string::npos) {
+			// (2) single-dot `recv.field` — fall through only when
+			// `recv` is a local AND `field` is a Fn-typed field on
+			// its struct type.
+			std::string recvName = callee.substr(0, dotPos);
+			std::string fieldName = callee.substr(dotPos + 1);
+			auto it = gctx.locals.find(recvName);
+			if (it != gctx.locals.end()) {
+				TypeIdx recvTy = gctx.localTypes[recvName];
+				const auto *sinfo = gctx.ctx.lookupStruct(recvTy);
+				if (sinfo != nullptr) {
+					for (size_t i = 0; i < sinfo->fields.size(); ++i) {
+						if (sinfo->fields[i].first != fieldName) continue;
+						TypeIdx fieldTy = sinfo->fields[i].second;
+						const TypeKey &fk =
+						    gctx.ctx.getTypePool().get(fieldTy);
+						if (fk.kind != TypeKind::Fn) break;
+						// Load recv as a value, ExtractValue the field.
+						JirInst loadRecv{};
+						loadRecv.tag = JirTag::Load;
+						loadRecv.a = it->second;
+						loadRecv.ty = recvTy;
+						JirRef recvVal = emit(gctx, loadRecv);
+						JirInst ev{};
+						ev.tag = JirTag::ExtractValue;
+						ev.a = recvVal;
+						ev.b = static_cast<uint32_t>(i);
+						ev.ty = fieldTy;
+						JirRef fnVal = emit(gctx, ev);
+						return buildIndirectCall(fnVal);
+					}
+				}
+			}
+		}
+
 		// Qualified callees (`lib.priv`) get the precise pub-access
 		// diagnostic via formatNamespaceLookupError.
 		std::string msg =
@@ -3870,7 +3970,7 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
 		astgenVarDecl(gctx, n);
 		return kNoJirRef;
 	case AstTag::Variable:
-		result = astgenVariable(gctx, n);
+		result = astgenVariable(gctx, n, expected);
 		break;
 	case AstTag::Assign:
 		astgenAssign(gctx, n);

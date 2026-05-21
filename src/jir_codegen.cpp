@@ -373,10 +373,15 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		return JamLLVMBuildIntToPtr(lctx.ctx.getBuilder(), v, ty, "i2p");
 	}
 	case JirTag::FnRef: {
-		// `inst.a` carries the StringIdx of the LLVM symbol name. We
-		// resolve to the LLVM Function (already a ptr-typed Value),
-		// then lower to ptrtoint to match the JIR's u64 result type.
-		// This mirrors Rust's `my_fn as u64` lowering.
+		// `inst.a` carries the StringIdx of the LLVM symbol name. The
+		// LLVM Function is already a ptr-typed Value. Two result-type
+		// shapes:
+		//   * `inst.ty` is `TypeKind::Fn` (typed function pointer) —
+		//     return the function value directly (it's already a ptr;
+		//     under LLVM 15+ opaque pointers this is the right shape
+		//     for any callee-pointer use).
+		//   * Otherwise (u64 raw-address shape) — ptrtoint to settle
+		//     into an integer slot. Mirrors Rust's `my_fn as u64`.
 		StringIdx nameId = static_cast<StringIdx>(inst.a);
 		const std::string &name = lctx.ctx.getStringPool().get(nameId);
 		JamFunctionRef f =
@@ -386,6 +391,13 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 			                         "`");
 		}
 		JamValueRef fnVal = JamLLVMFunctionAsValue(f);
+		const TypeKey &dstKey = lctx.ctx.getTypePool().get(inst.ty);
+		if (dstKey.kind == TypeKind::Fn) {
+			// Already-ptr value; the JIR-level Fn type is the metadata
+			// the call-site uses to build the LLVM function type for
+			// the indirect call.
+			return fnVal;
+		}
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
 		return JamLLVMBuildPtrToInt(lctx.ctx.getBuilder(), fnVal, ty,
 		                            "fnref.u64");
@@ -630,6 +642,53 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		const char *resultName = (inst.ty == kNoType) ? "" : "call";
 		return JamLLVMBuildCall(lctx.ctx.getBuilder(), f, args.data(),
 		                        static_cast<unsigned>(args.size()), resultName);
+	}
+	case JirTag::CallIndirect: {
+		// Indirect call through a Fn-typed value. `inst.a` is the
+		// callee JirRef (its JIR type must be TypeKind::Fn); `inst.b`
+		// is the args extra slice. We build the LLVM FunctionType
+		// from the Fn signature on-demand — no sret/ABI tricks for
+		// now (those land when fn-pointer signatures need to match
+		// the same calling-convention machinery as direct calls).
+		JirRef calleeRef = static_cast<JirRef>(inst.a);
+		JamValueRef calleeVal = emitInst(lctx, calleeRef);
+		TypeIdx calleeTy = lctx.jfn.getInst(calleeRef).ty;
+		const TypeKey &k = lctx.ctx.getTypePool().get(calleeTy);
+		if (k.kind != TypeKind::Fn) {
+			throw std::runtime_error(
+			    "jirCodegen: CallIndirect callee is not of Fn type");
+		}
+		TypeIdx retTy = static_cast<TypeIdx>(k.a);
+		const auto &paramTys = lctx.ctx.getTypePool().fnParamsAt(k.b);
+
+		// Build LLVM function type for the call instruction.
+		std::vector<JamTypeRef> llvmParamTys;
+		llvmParamTys.reserve(paramTys.size());
+		for (TypeIdx pt : paramTys) {
+			llvmParamTys.push_back(lctx.ctx.getLLVMType(pt));
+		}
+		JamTypeRef llvmRetTy = (retTy == kNoType)
+		                            ? lctx.ctx.getVoidType()
+		                            : lctx.ctx.getLLVMType(retTy);
+		JamTypeRef llvmFnTy = JamLLVMFunctionType(
+		    llvmRetTy, llvmParamTys.data(),
+		    static_cast<unsigned>(llvmParamTys.size()), /*isVarArgs=*/false);
+
+		// Materialise argument values.
+		JirExtraIdx extra = static_cast<JirExtraIdx>(inst.b);
+		uint32_t argCount = lctx.jfn.getExtra(extra);
+		std::vector<JamValueRef> args;
+		args.reserve(argCount);
+		for (uint32_t i = 0; i < argCount; i++) {
+			JirRef ar = static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
+			args.push_back(emitInst(lctx, ar));
+		}
+
+		const char *resultName = (inst.ty == kNoType) ? "" : "call.indirect";
+		return JamLLVMBuildIndirectCall(lctx.ctx.getBuilder(), llvmFnTy,
+		                                 calleeVal, args.data(),
+		                                 static_cast<unsigned>(args.size()),
+		                                 resultName);
 	}
 	// === Control ===
 	case JirTag::Br: {

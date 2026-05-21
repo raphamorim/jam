@@ -786,6 +786,26 @@ JamValueRef JamLLVMBuildCall(JamBuilderRef builder, JamFunctionRef func,
 	                                                      argValues, name));
 }
 
+// Indirect call through a function pointer. The signature (return +
+// param types) lives in `funcType` — built by the caller from the
+// JIR-level Fn TypeIdx — and `callee` is the Value holding the code
+// address (an opaque ptr under LLVM 15+). Used to lower JirTag::
+// CallIndirect, where the JIR's Fn type is the source of truth for
+// the LLVM function-type the call instruction needs.
+JamValueRef JamLLVMBuildIndirectCall(JamBuilderRef builder,
+                                      JamTypeRef funcType, JamValueRef callee,
+                                      JamValueRef *args, unsigned numArgs,
+                                      const char *name) {
+	std::vector<llvm::Value *> argValues;
+	for (unsigned i = 0; i < numArgs; i++) {
+		argValues.push_back(UNWRAP_VALUE(args[i]));
+	}
+	llvm::FunctionType *ft =
+	    llvm::cast<llvm::FunctionType>(UNWRAP_TYPE(funcType));
+	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateCall(ft, UNWRAP_VALUE(callee),
+	                                                      argValues, name));
+}
+
 JamValueRef JamLLVMBuildPhi(JamBuilderRef builder, JamTypeRef type,
                             const char *name) {
 	return WRAP_VALUE(

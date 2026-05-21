@@ -215,6 +215,17 @@ JamTypeRef JamCodegenContext::getLLVMType(TypeIdx ty) const {
 		result = getLLVMType(resolved);
 		break;
 	}
+	case TypeKind::Fn: {
+		// Function-typed values lower to LLVM opaque pointers. The
+		// signature isn't part of the LLVM value type (LLVM 15+ uses
+		// opaque pointers everywhere); the Jam type system tracks the
+		// signature for call-site type-checking. The actual LLVM
+		// function type (return + params) is built per indirect call
+		// site by jir_codegen, reading the signature out of the
+		// TypeKey + fnParamsAt(k.b).
+		result = JamLLVMPointerType(getInt8Type(), 0);
+		break;
+	}
 	}
 	llvmTypeCache[ty] = result;
 	return result;
@@ -594,6 +605,9 @@ uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
 	case TypeKind::GenericCall:
 		// resolve and recurse.
 		return typeSize(resolveGenericCall(ty));
+	case TypeKind::Fn:
+		// Function value = code pointer = pointer width.
+		return 8;
 	}
 	throw std::runtime_error("typeSize: unhandled type kind");
 }
@@ -681,6 +695,9 @@ uint64_t JamCodegenContext::typeAlign(TypeIdx ty) const {
 		return 1;
 	case TypeKind::GenericCall:
 		return typeAlign(resolveGenericCall(ty));
+	case TypeKind::Fn:
+		// Function pointer alignment.
+		return 8;
 	}
 	throw std::runtime_error("typeAlign: unhandled type kind");
 }
@@ -727,6 +744,21 @@ TypeIdx substituteType(TypeIdx ty,
 		}
 		return types.internGenericCall(static_cast<StringIdx>(k.a),
 		                               std::move(newArgs));
+	}
+	case TypeKind::Fn: {
+		// Function-typed value: substitute the return type AND every
+		// param type. A `fn(T) T` field inside a generic struct sees
+		// T → concrete on instantiation, so the field's TypeIdx must
+		// rebuild with substituted children.
+		TypeIdx retSub =
+		    substituteType(static_cast<TypeIdx>(k.a), subst, types, strings);
+		const auto &params = types.fnParamsAt(k.b);
+		std::vector<TypeIdx> newParams;
+		newParams.reserve(params.size());
+		for (TypeIdx p : params) {
+			newParams.push_back(substituteType(p, subst, types, strings));
+		}
+		return types.internFn(retSub, std::move(newParams));
 	}
 	default:
 		return ty;
