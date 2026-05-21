@@ -1,0 +1,70 @@
+// Built-in `asPtr` / `asMutPtr` methods on `[N]T` arrays.
+// Modeled on Rust's `[T; N]::as_ptr` / `as_mut_ptr`: the method
+// name picks the mutability of the returned pointer; the body
+// is a single bitcast of the array's storage address to a
+// `PtrMany(elem)`. No `&arr[0]` and no `as`-cast at call sites.
+//
+// Jam doesn't track const-vs-mut at the pointer-type level today
+// (both `*const[] T` and `*mut[] T` intern as the same TypeIdx),
+// so the two methods produce structurally identical values; the
+// name encodes intent only. Once pointer-mutability is enforced,
+// `asPtr` will narrow to `*const[] T` and `asMutPtr` stays mut.
+
+const { assert } = import("test");
+
+extern fn write(fd: i32, buf: *const[] u8, count: u64) i64;
+
+fn loadFirstByteConst(p: *const[] u8) u8 {
+    return p[0];
+}
+
+fn writeThirdByteMut(p: *mut[] u8, v: u8) {
+    p[2] = v;
+}
+
+tfn asPtrPassesArrayAddressToFFI() {
+    // `asPtr` is the FFI-facing read-only variant. The result is
+    // assignable to a *const[] u8 param without any further cast.
+    var arr: [3]u8 = [10, 20, 30];
+    assert(loadFirstByteConst(arr.asPtr()) as i32, 10);
+}
+
+tfn asMutPtrAllowsWriteThroughThePointer() {
+    // `asMutPtr` is the FFI-facing read-write variant. Writes
+    // through the returned pointer are visible on the original
+    // array — confirms the call returns the storage address, not
+    // a copy.
+    var arr: [4]u8 = [0; 4];
+    writeThirdByteMut(arr.asMutPtr(), 99);
+    assert(arr[2] as i32, 99);
+}
+
+tfn asPtrZeroOverhead() {
+    // Several `asPtr` calls in a row should each yield the same
+    // base address (no spilling, no allocation). We confirm
+    // indirectly: a read via the second call sees the write
+    // through the first.
+    var arr: [2]u8 = [0; 2];
+    var p: *mut[] u8 = arr.asMutPtr();
+    p[0] = 42;
+    var q: *const[] u8 = arr.asPtr();
+    assert(q[0] as i32, 42);
+}
+
+tfn asPtrOnLargerType() {
+    // Different element type — verifies the bitcast targets the
+    // right `PtrMany(elem)` based on the array's element TypeIdx.
+    var arr: [4]i32 = [100, 200, 300, 400];
+    var p: *const[] i32 = arr.asPtr();
+    assert(p[0], 100);
+    assert(p[3], 400);
+}
+
+tfn asPtrAfterMutationVisible() {
+    // Mutation through `[i] = …` and read through `asPtr()` see
+    // the same memory.
+    var arr: [3]u8 = [1, 2, 3];
+    arr[1] = 9;
+    var p: *const[] u8 = arr.asPtr();
+    assert(p[1] as i32, 9);
+}

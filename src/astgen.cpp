@@ -284,10 +284,31 @@ static std::size_t predecessorCount(const JirFunction &jfn,
 	return count;
 }
 
+// Result-location protocol. Callers tell `astgenExpr` whether they
+// want the expression's *value* (default) or a *pointer* to its
+// storage. Pointer requests on lvalue-shaped nodes (Variable,
+// MemberAccess, Index, Deref) emit only the address-producing JIR
+// (alloca slot / FieldAddr / IndexAddr) — never a Load of the whole
+// value. Pointer requests on non-lvalue nodes spill the value to a
+// fresh alloca and return that pointer. Modeled on Zig's
+// `ResultInfo.ResultLoc` (AstGen.zig): the producer's job is to
+// honor the consumer's request.
+enum class ResultLoc { Value, Pointer };
+
 // Forward decl: AstGen for an arbitrary AST node in expression
-// position. Returns the JirRef of the produced value, or kNoJirRef
-// for statement-form / void expressions.
-static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected);
+// position. Returns the JirRef of the produced value (or pointer-
+// to-value when `loc == ResultLoc::Pointer`), or kNoJirRef for
+// statement-form / void expressions.
+//
+// When `loc == ResultLoc::Pointer` and `outLeafTy` is non-null, the
+// callee writes the pointee type into `*outLeafTy`. The JIR ty of
+// the returned JirRef is inconsistent for pointer results (alloca
+// refs carry `ty=leaf`; FieldAddr / IndexAddr / BitCast carry
+// `ty=PtrSingle(leaf)`), so callers that need the leaf without
+// casework should pass `outLeafTy`.
+static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
+                         ResultLoc loc = ResultLoc::Value,
+                         TypeIdx *outLeafTy = nullptr);
 // Forward decls: branch emitters, defined below alongside the
 // control-flow helpers.
 static void emitBr(AstGenCtx &gctx, JirBlockRef target);
@@ -723,150 +744,31 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n) {
 	return recoverHere(gctx, "unknown variable `" + name + "`", kNoType);
 }
 
-// Resolve `node` as an *lvalue* — return a JirRef whose value is a
-// pointer to the underlying storage, along with the pointee type via
-// `outLeafTy`. Used by Assign to lower `target = value` for non-
-// trivial targets (struct fields, array elements, deref).
-//
-// Variable     → alloca ref (already a pointer)
-// MemberAccess → FieldAddr against base's pointer
-// Index        → IndexAddr against base's pointer
-// Deref        → the pointer itself
-static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
+// Resolve `node` as an *lvalue* — thin wrapper for legacy callers
+// over `astgenExpr(..., Pointer, &outLeafTy)`. Real Pointer-loc
+// logic lives inline in `astgenExpr`'s entry switch (Variable,
+// Deref, MemberAccess, Index). Non-lvalue tags here error via the
+// validation switch below before reaching `astgenExpr`'s value-
+// then-spill fallback, so misuse is reported as "not assignable"
+// rather than silently spilling into a temporary that dies at
+// expression-end.
+static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node,
+                           TypeIdx &outLeafTy) {
 	const NodeStore &ns = gctx.ctx.getNodeStore();
 	const AstNode &n = ns.get(node);
 	switch (n.tag) {
-	case AstTag::Variable: {
-		const std::string &name =
-		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
-		auto it = gctx.locals.find(name);
-		if (it == gctx.locals.end()) {
-			failHere(gctx, "astgen: unknown lvalue variable `" + name + "`");
-		}
-		outLeafTy = gctx.localTypes[name];
-		return it->second;
-	}
-	case AstTag::Deref: {
-		// `p.* = ...` — the operand evaluates to the pointer itself.
-		JirRef ptrRef = astgenExpr(gctx, static_cast<NodeIdx>(n.lhs), kNoType);
-		TypeIdx pty = gctx.jfn.getInst(ptrRef).ty;
-		const TypeKey &k = gctx.ctx.getTypePool().get(pty);
-		if (k.kind != TypeKind::PtrSingle && k.kind != TypeKind::PtrMany) {
-			failHere(gctx, "astgen: cannot deref non-pointer");
-		}
-		outLeafTy = static_cast<TypeIdx>(k.a);
-		return ptrRef;
-	}
-	case AstTag::MemberAccess: {
-		TypeIdx baseTy = kNoType;
-		JirRef basePtr =
-		    astgenLvalue(gctx, static_cast<NodeIdx>(n.lhs), baseTy);
-		StringIdx memberId = static_cast<StringIdx>(n.rhs);
-		const std::string &memberName = gctx.ctx.getStringPool().get(memberId);
-		// Union field lvalue: every field shares the union's address,
-		// so the field pointer IS the union pointer — just retype it.
-		if (const auto *uinfo = gctx.ctx.lookupUnion(baseTy)) {
-			TypeIdx fieldTy =
-			    gctx.ctx.getUnionFieldType(uinfo->name, memberName);
-			if (fieldTy == kNoType) {
-				failHere(gctx, "astgen: union `" + uinfo->name +
-				                   "` has no field `" + memberName + "`");
-			}
-			outLeafTy = fieldTy;
-			TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
-			    TypeKey{TypeKind::PtrSingle, 0, 0, fieldTy, 0});
-			JirInst bc{};
-			bc.tag = JirTag::BitCast;
-			bc.a = basePtr;
-			bc.ty = ptrTy;
-			return emit(gctx, bc);
-		}
-		const auto *info = gctx.ctx.lookupStruct(baseTy);
-		if (info == nullptr) {
-			failHere(gctx, "astgen: lvalue field access on non-struct");
-		}
-		int idx = gctx.ctx.getFieldIndex(info->name, memberName);
-		if (idx < 0) {
-			failHere(gctx, "astgen: unknown field `" + memberName + "` on `" +
-			                   info->name + "`");
-		}
-		outLeafTy = info->fields[idx].second;
-		TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
-		    TypeKey{TypeKind::PtrSingle, 0, 0, outLeafTy, 0});
-		JirInst fa{};
-		fa.tag = JirTag::FieldAddr;
-		fa.a = basePtr;
-		fa.b = static_cast<uint32_t>(idx);
-		fa.ty = ptrTy;
-		// The codegen needs to know the base struct type to compute
-		// the GEP — we encode it in flags via the type pool? For
-		// simplicity, jir_codegen rederives it from the base
-		// instruction's ty (which for a FieldAddr is the pointer
-		// type whose pointee is `outLeafTy` — not the base struct).
-		// To keep base info, we set instruction flags to a marker
-		// and recover via the JirRef of the base when needed.
-		return emit(gctx, fa);
-	}
-	case AstTag::Index: {
-		TypeIdx baseTy = kNoType;
-		JirRef basePtr =
-		    astgenLvalue(gctx, static_cast<NodeIdx>(n.lhs), baseTy);
-		NodeIdx idxIdx = static_cast<NodeIdx>(n.rhs);
-		JirRef idxRef = astgenExpr(gctx, idxIdx, BuiltinType::U64);
-		const TypeKey &k = gctx.ctx.getTypePool().get(baseTy);
-
-		// Struct indexing in lvalue position is handled exclusively
-		// via the assignment path (astgenAssign dispatches to
-		// `cfn setAt`). Nothing to do here — fall through to the
-		// built-in array / slice / ptr-many index-address logic.
-		TypeIdx elemTy = kNoType;
-		if (k.kind == TypeKind::Array || k.kind == TypeKind::Slice ||
-		    k.kind == TypeKind::PtrMany) {
-			elemTy = static_cast<TypeIdx>(k.a);
-		} else {
-			failHere(gctx, "astgen: lvalue index on non-array/slice/ptr-many");
-		}
-		// For pointer-typed base variables, the alloca holds the
-		// *pointer* itself — we need to load it first so the GEP
-		// strides through the pointee's storage, not through the
-		// alloca slot. Arrays inline their storage into the alloca
-		// so they GEP directly.
-		if (k.kind == TypeKind::PtrMany) {
-			JirInst load{};
-			load.tag = JirTag::Load;
-			load.a = basePtr;
-			load.ty = baseTy;
-			basePtr = emit(gctx, load);
-		} else if (k.kind == TypeKind::Slice) {
-			// For slice variables: load the whole slice value, then
-			// extract the .ptr field to GEP through.
-			JirInst load{};
-			load.tag = JirTag::Load;
-			load.a = basePtr;
-			load.ty = baseTy;
-			JirRef sliceVal = emit(gctx, load);
-			TypeIdx ptrManyTy = gctx.ctx.getTypePool().intern(
-			    TypeKey{TypeKind::PtrMany, 0, 0, elemTy, 0});
-			JirInst ev{};
-			ev.tag = JirTag::ExtractValue;
-			ev.a = sliceVal;
-			ev.b = 0;
-			ev.ty = ptrManyTy;
-			basePtr = emit(gctx, ev);
-		}
-		outLeafTy = elemTy;
-		TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
-		    TypeKey{TypeKind::PtrSingle, 0, 0, elemTy, 0});
-		JirInst ia{};
-		ia.tag = JirTag::IndexAddr;
-		ia.a = basePtr;
-		ia.b = idxRef;
-		ia.ty = ptrTy;
-		return emit(gctx, ia);
-	}
+	case AstTag::Variable:
+	case AstTag::Deref:
+	case AstTag::MemberAccess:
+	case AstTag::Index:
+		break;
 	default:
 		failNode(gctx, node, "this expression is not assignable");
 	}
+	TypeIdx leaf = kNoType;
+	JirRef ptr = astgenExpr(gctx, node, kNoType, ResultLoc::Pointer, &leaf);
+	outLeafTy = leaf;
+	return ptr;
 }
 
 // AstGen for `Assign`. Two paths:
@@ -889,58 +791,47 @@ static void astgenAssign(AstGenCtx &gctx, const AstNode &n) {
 	if (target.tag == AstTag::Index) {
 		NodeIdx baseIdx = static_cast<NodeIdx>(target.lhs);
 		NodeIdx idxIdx = static_cast<NodeIdx>(target.rhs);
-		// Peek the base's type by lowering it as an rvalue. For a
-		// struct with a `cfn setAt`, the receiver-prep below will
-		// re-lower as lvalue (mut/move self) or spill (non-
-		// addressable rvalue) — same shape as the indirect-call
-		// path. For non-struct bases (arrays / slices / ptr-many),
-		// we fall back to the existing lvalue-pointer-store path
-		// without having done extra work the next call can't
-		// observe (the rvalue lowering is side-effect-free for
-		// Variable / Index / MemberAccess / Deref bases).
-		JirRef baseRef = astgenExpr(gctx, baseIdx, kNoType);
-		TypeIdx baseTy = gctx.jfn.getInst(baseRef).ty;
-		const auto *sinfo = gctx.ctx.lookupStruct(baseTy);
+		// Take the base as a pointer via ResultLoc::Pointer (zero-
+		// cost for Variable bases — just the alloca's JirRef). The
+		// dropped alternative was `astgenExpr(baseIdx)` which for
+		// array bases Loads the entire backing storage as a dead
+		// SSA register and stalls LLVM at -O1+.
+		//
+		// Limited to Variable bases for the same reason as
+		// astgenIndex's fast path: astgenLvalue throws on non-
+		// struct MemberAccess (e.g. `slice.ptr`). Non-Variable LHS
+		// of an indexed-assign is rare; those fall through to the
+		// general lvalue-store path below.
+		TypeIdx baseTy = kNoType;
+		const AstNode &baseNode = gctx.ctx.getNodeStore().get(baseIdx);
+		if (baseNode.tag == AstTag::Variable) {
+			JirRef basePtr =
+			    astgenExpr(gctx, baseIdx, kNoType, ResultLoc::Pointer);
+			baseTy = gctx.jfn.getInst(basePtr).ty;
+		}
+		const auto *sinfo = baseTy != kNoType
+		                        ? gctx.ctx.lookupStruct(baseTy)
+		                        : nullptr;
 		if (sinfo != nullptr) {
 			const std::string qualified = sinfo->name + ".setAt";
 			const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
 			if (method != nullptr && method->isCfn &&
 			    method->Args.size() >= 3) {
+				// setAt's self must be mut/move (it mutates), so we
+				// always hand the method a *Self pointer from
+				// astgenLvalue. The peek above already restricted
+				// the base shape to Variable, so this lvalue lookup
+				// is just an alloca table read.
+				ParamMode mode = method->Args[0].Mode;
+				if (mode != ParamMode::Mut && mode != ParamMode::Move) {
+					failHere(gctx, "astgen: cfn setAt on `" + sinfo->name +
+					                   "` must take `self: mut Self`");
+				}
+				TypeIdx leafTyR = kNoType;
+				JirRef recv = astgenLvalue(gctx, baseIdx, leafTyR);
 				JirRef idxRef = astgenExpr(gctx, idxIdx, BuiltinType::U64);
-				// setAt's value parameter type tells us what to
-				// lower the RHS as.
 				TypeIdx valParamTy = method->Args[2].Type;
 				JirRef valRef = astgenExpr(gctx, valueIdx, valParamTy);
-				// Receiver-prep: setAt's self is mut/move, so we
-				// hand it a *Self pointer.
-				ParamMode mode = method->Args[0].Mode;
-				JirRef recv = baseRef;
-				if (mode == ParamMode::Mut || mode == ParamMode::Move) {
-					const AstNode &baseNode =
-					    gctx.ctx.getNodeStore().get(baseIdx);
-					TypeIdx leafTyR = kNoType;
-					switch (baseNode.tag) {
-					case AstTag::Variable:
-					case AstTag::MemberAccess:
-					case AstTag::Index:
-					case AstTag::Deref:
-						recv = astgenLvalue(gctx, baseIdx, leafTyR);
-						break;
-					default: {
-						JirInst alloca{};
-						alloca.tag = JirTag::Alloca;
-						alloca.ty = baseTy;
-						JirRef slot = emitAllocaHoisted(gctx, alloca);
-						JirInst store{};
-						store.tag = JirTag::Store;
-						store.a = slot;
-						store.b = baseRef;
-						emit(gctx, store);
-						recv = slot;
-						break;
-					}
-					}
-				}
 				emitStructCfnDispatch(gctx, sinfo, "setAt", recv, idxRef,
 				                      {valRef});
 				return;
@@ -1361,9 +1252,62 @@ static JirRef emitStructCfnDispatch(AstGenCtx &gctx,
 // SSA aggregates) shape. Element type comes from the base's TypeKey.
 // Struct receivers route through `at(self, i)` — see
 // `emitStructIndexAtCall`.
+//
+// Array Variables (and other lvalueable Array bases) take a
+// dedicated fast path: peek the type via astgenLvalue, then emit
+// IndexAddr + Load against the storage pointer. This avoids the
+// rvalue-Load-then-spill pattern that JirTag::Index uses for SSA
+// aggregates — which for arrays loads the entire backing storage
+// (up to several KB) into an SSA value per access and stalls LLVM
+// at -O1+ when many such accesses share a function. Mirrors Zig's
+// lvalExpr-then-elem_ptr shape.
 static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 	NodeIdx baseIdx = static_cast<NodeIdx>(n.lhs);
 	NodeIdx idxIdx = static_cast<NodeIdx>(n.rhs);
+
+	// Array Variable fast path. Mirrors Zig's elem_val_node lowering
+	// for arrays: take the base as a pointer (zero-cost for a
+	// Variable — just the alloca's own JirRef), emit IndexAddr to
+	// the element, then Load just that element. Avoids the rvalue-
+	// Load-then-spill pattern JirTag::Index uses on Array SSA
+	// values, which loads the full backing storage (up to several
+	// KB) per access and stalls LLVM at -O1+.
+	//
+	// Limited to Variable bases on purpose — astgenExpr(.., Pointer)
+	// on a non-struct MemberAccess (e.g. `slice.ptr`) routes
+	// through astgenLvalue's MemberAccess branch, which errors on
+	// non-struct parents. The rvalue path handles slices / ptr-many
+	// correctly anyway (small Load + GEP).
+	{
+		const AstNode &baseNode = gctx.ctx.getNodeStore().get(baseIdx);
+		if (baseNode.tag == AstTag::Variable) {
+			JirRef basePtr =
+			    astgenExpr(gctx, baseIdx, kNoType, ResultLoc::Pointer);
+			TypeIdx leafTy = gctx.jfn.getInst(basePtr).ty;
+			const TypeKey &lk = gctx.ctx.getTypePool().get(leafTy);
+			if (lk.kind == TypeKind::Array) {
+				TypeIdx elemTy = static_cast<TypeIdx>(lk.a);
+				JirRef idxRef =
+				    astgenExpr(gctx, idxIdx, BuiltinType::U64);
+				TypeIdx elemPtrTy = gctx.ctx.getTypePool().intern(
+				    TypeKey{TypeKind::PtrSingle, 0, 0, elemTy, 0});
+				JirInst ia{};
+				ia.tag = JirTag::IndexAddr;
+				ia.a = basePtr;
+				ia.b = idxRef;
+				ia.ty = elemPtrTy;
+				JirRef elemPtr = emit(gctx, ia);
+				JirInst ld{};
+				ld.tag = JirTag::Load;
+				ld.a = elemPtr;
+				ld.ty = elemTy;
+				return emit(gctx, ld);
+			}
+			// Non-Array Variable: fall through. basePtr is the
+			// existing alloca's JirRef, no fresh JIR emitted.
+		}
+	}
+
 	JirRef baseRef = astgenExpr(gctx, baseIdx, kNoType);
 	JirRef idxRef = astgenExpr(gctx, idxIdx, BuiltinType::U64);
 	TypeIdx baseTy = gctx.jfn.getInst(baseRef).ty;
@@ -3289,12 +3233,72 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 		const std::string &methodName =
 		    gctx.ctx.getStringPool().get(methodNameId);
 
-		// Resolve the receiver as a value so we can pick the right
-		// method off its type. For mut/move dispatch we'll redo this
-		// as an lvalue below — passing the original storage pointer
-		// instead of a spilled copy.
+		// Built-in array methods. `[N]T` exposes two zero-cost
+		// pointer-handover methods, modeled on Rust's
+		// `[T; N]::as_ptr` / `as_mut_ptr`:
+		//
+		//   arr.asPtr()    -> *const[] T  (FFI / read-only callees)
+		//   arr.asMutPtr() -> *mut[] T    (FFI / write-needing callees)
+		//
+		// We peek the receiver type via astgenLvalue rather than
+		// astgenExpr — for array receivers, an rvalue Load would
+		// pull the entire backing storage (up to several KB) into an
+		// SSA value as a dead instruction, which stalls LLVM at
+		// -O1+. Mirrors Zig's lvalExpr pattern (AstGen.zig:assign)
+		// where the LHS is always taken as a pointer first. The
+		// rvalue Load only fires on the fall-through struct/enum
+		// dispatch path below.
+		const AstNode &recvNode = ns.get(recvExprIdx);
+		bool recvIsLvalueable = recvNode.tag == AstTag::Variable ||
+		                        recvNode.tag == AstTag::MemberAccess ||
+		                        recvNode.tag == AstTag::Index ||
+		                        recvNode.tag == AstTag::Deref;
+		if (recvIsLvalueable && (methodName == "asPtr" ||
+		                         methodName == "asMutPtr")) {
+			JirRef basePtr = astgenExpr(gctx, recvExprIdx, kNoType,
+			                             ResultLoc::Pointer);
+			TypeIdx leafTy = gctx.jfn.getInst(basePtr).ty;
+			const TypeKey &lk = gctx.ctx.getTypePool().get(leafTy);
+			if (lk.kind == TypeKind::Array) {
+				TypeIdx elemTy = static_cast<TypeIdx>(lk.a);
+				TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
+				    TypeKey{TypeKind::PtrMany, 0, 0, elemTy, 0});
+				// IndexAddr at 0 produces a `PtrMany(elem)` for the
+				// array's base — same GEP shape `arr[i]` uses.
+				JirInst zeroI{};
+				zeroI.tag = JirTag::Int;
+				zeroI.a = 0;
+				zeroI.ty = BuiltinType::U64;
+				JirRef zeroRef = emit(gctx, zeroI);
+				JirInst ia{};
+				ia.tag = JirTag::IndexAddr;
+				ia.a = basePtr;
+				ia.b = zeroRef;
+				ia.ty = ptrTy;
+				return emit(gctx, ia);
+			}
+			// Not an array — fall through to the rvalue dispatch
+			// below. (basePtr is unused; cheap, no Load was emitted.)
+		}
+
+		// Resolve the receiver as a value for struct / enum dispatch.
+		// For mut/move dispatch we'll redo this as an lvalue below —
+		// passing the original storage pointer instead of a spilled
+		// copy.
 		JirRef recvVal = astgenExpr(gctx, recvExprIdx, kNoType);
 		TypeIdx recvTy = gctx.jfn.getInst(recvVal).ty;
+		{
+			const TypeKey &recvKey = gctx.ctx.getTypePool().get(recvTy);
+			if (recvKey.kind == TypeKind::Array) {
+				// Non-lvalueable array receiver (e.g. a call result):
+				// the rvalue-Load path got us here. Without a stable
+				// storage location, we can't safely hand a pointer
+				// to FFI — reject.
+				failHere(gctx, "astgen: `" + methodName +
+				                   "()` requires an addressable array "
+				                   "(variable, field, or indexed slot)");
+			}
+		}
 
 		// Resolve to a struct name (generic instantiation happens here
 		// as a side effect of lookupStruct).
@@ -3545,6 +3549,41 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 			if (it != gctx.locals.end()) {
 				std::string instName = prefix;
 				TypeIdx instTy = gctx.localTypes[instName];
+				// Built-in array methods: `arr.asPtr()` / `arr.asMutPtr()`
+				// return the array's storage base as a `PtrMany(elem)`.
+				// Mirrors Rust's `[T; N]::as_ptr` / `as_mut_ptr`. See the
+				// matching block in the indirect-call path for the
+				// rationale.
+				//
+				// Implementation: emit an `IndexAddr` at index 0 against
+				// the alloca, typing the result as `PtrMany(elem)`. This
+				// reuses the same JIR shape that `arr[i]` already produces
+				// (a GEP that LLVM fully understands and can optimize
+				// through), instead of a direct alloca-to-pointer bitcast
+				// which sent LLVM's opt passes into a loop in early
+				// experiments.
+				const TypeKey &instKey = gctx.ctx.getTypePool().get(instTy);
+				if (instKey.kind == TypeKind::Array) {
+					if (methodName == "asPtr" || methodName == "asMutPtr") {
+						TypeIdx elemTy =
+						    static_cast<TypeIdx>(instKey.a);
+						TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
+						    TypeKey{TypeKind::PtrMany, 0, 0, elemTy, 0});
+						JirInst zeroI{};
+						zeroI.tag = JirTag::Int;
+						zeroI.a = 0;
+						zeroI.ty = BuiltinType::U64;
+						JirRef zeroRef = emit(gctx, zeroI);
+						JirInst ia{};
+						ia.tag = JirTag::IndexAddr;
+						ia.a = it->second;  // alloca slot
+						ia.b = zeroRef;
+						ia.ty = ptrTy;
+						return emit(gctx, ia);
+					}
+					failHere(gctx, "astgen: array type has no method `" +
+					                   methodName + "`");
+				}
 				const auto *sinfo = gctx.ctx.lookupStruct(instTy);
 				if (sinfo != nullptr) {
 					std::string qualified = sinfo->name + "." + methodName;
@@ -3616,9 +3655,11 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 	return emitCall(gctx, fn, argRefs);
 }
 
-static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected) {
-	const AstNode &n = gctx.ctx.getNodeStore().get(node);
-	int line = gctx.ctx.getNodeStore().getLine(node);
+static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
+                         ResultLoc loc, TypeIdx *outLeafTy) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	const AstNode &n = ns.get(node);
+	int line = ns.getLine(node);
 	// Stamp the current node so error helpers without an explicit
 	// NodeIdx in scope can still produce a SrcLoc anchored at the
 	// expression we're working on. We never need to restore on exit:
@@ -3627,6 +3668,160 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected) {
 	// either get overwritten by the next sibling's astgenExpr call
 	// or fall out of scope entirely.
 	gctx.currentNode = node;
+
+	// Pointer-loc dispatch for lvalue-shaped nodes. Each branch
+	// emits the address-producing JIR directly (alloca slot for
+	// Variable; FieldAddr / BitCast for MemberAccess; IndexAddr for
+	// Index; the operand itself for Deref) and writes the leaf
+	// type into `*outLeafTy` for callers that need it. Mirrors
+	// Zig's expr() with `rl == .ref`: the producer honors the
+	// consumer's request without ever materializing the underlying
+	// value. Non-lvalue tags fall through to the value-producing
+	// switch below and the final alloca-spill catches them.
+	if (loc == ResultLoc::Pointer) {
+		TypeIdx leafTy = kNoType;
+		JirRef ptrResult = kNoJirRef;
+		bool handled = true;
+		switch (n.tag) {
+		case AstTag::Variable: {
+			const std::string &name =
+			    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
+			auto it = gctx.locals.find(name);
+			if (it == gctx.locals.end()) {
+				failHere(gctx,
+				         "astgen: unknown lvalue variable `" + name + "`");
+			}
+			leafTy = gctx.localTypes[name];
+			ptrResult = it->second;
+			break;
+		}
+		case AstTag::Deref: {
+			// `p.* = ...` — operand IS the pointer value.
+			JirRef innerPtr = astgenExpr(
+			    gctx, static_cast<NodeIdx>(n.lhs), kNoType);
+			TypeIdx pty = gctx.jfn.getInst(innerPtr).ty;
+			const TypeKey &pk = gctx.ctx.getTypePool().get(pty);
+			if (pk.kind != TypeKind::PtrSingle &&
+			    pk.kind != TypeKind::PtrMany) {
+				failHere(gctx, "astgen: cannot deref non-pointer");
+			}
+			leafTy = static_cast<TypeIdx>(pk.a);
+			ptrResult = innerPtr;
+			break;
+		}
+		case AstTag::MemberAccess: {
+			TypeIdx baseTy = kNoType;
+			JirRef basePtr =
+			    astgenExpr(gctx, static_cast<NodeIdx>(n.lhs), kNoType,
+			               ResultLoc::Pointer, &baseTy);
+			StringIdx memberId = static_cast<StringIdx>(n.rhs);
+			const std::string &memberName =
+			    gctx.ctx.getStringPool().get(memberId);
+			// Union field lvalue: every field shares the union's
+			// address — the field pointer IS the union pointer
+			// (just retyped).
+			if (const auto *uinfo = gctx.ctx.lookupUnion(baseTy)) {
+				TypeIdx fieldTy =
+				    gctx.ctx.getUnionFieldType(uinfo->name, memberName);
+				if (fieldTy == kNoType) {
+					failHere(gctx, "astgen: union `" + uinfo->name +
+					                   "` has no field `" + memberName + "`");
+				}
+				leafTy = fieldTy;
+				TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
+				    TypeKey{TypeKind::PtrSingle, 0, 0, fieldTy, 0});
+				JirInst bc{};
+				bc.tag = JirTag::BitCast;
+				bc.a = basePtr;
+				bc.ty = ptrTy;
+				ptrResult = emit(gctx, bc);
+				break;
+			}
+			const auto *info = gctx.ctx.lookupStruct(baseTy);
+			if (info == nullptr) {
+				failHere(gctx, "astgen: lvalue field access on non-struct");
+			}
+			int idx = gctx.ctx.getFieldIndex(info->name, memberName);
+			if (idx < 0) {
+				failHere(gctx, "astgen: unknown field `" + memberName +
+				                   "` on `" + info->name + "`");
+			}
+			leafTy = info->fields[idx].second;
+			TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
+			    TypeKey{TypeKind::PtrSingle, 0, 0, leafTy, 0});
+			JirInst fa{};
+			fa.tag = JirTag::FieldAddr;
+			fa.a = basePtr;
+			fa.b = static_cast<uint32_t>(idx);
+			fa.ty = ptrTy;
+			ptrResult = emit(gctx, fa);
+			break;
+		}
+		case AstTag::Index: {
+			TypeIdx baseTy = kNoType;
+			JirRef basePtr =
+			    astgenExpr(gctx, static_cast<NodeIdx>(n.lhs), kNoType,
+			               ResultLoc::Pointer, &baseTy);
+			NodeIdx idxIdxN = static_cast<NodeIdx>(n.rhs);
+			JirRef idxRef = astgenExpr(gctx, idxIdxN, BuiltinType::U64);
+			const TypeKey &lk = gctx.ctx.getTypePool().get(baseTy);
+			TypeIdx elemTy = kNoType;
+			if (lk.kind == TypeKind::Array ||
+			    lk.kind == TypeKind::Slice ||
+			    lk.kind == TypeKind::PtrMany) {
+				elemTy = static_cast<TypeIdx>(lk.a);
+			} else {
+				failHere(
+				    gctx,
+				    "astgen: lvalue index on non-array/slice/ptr-many");
+			}
+			// PtrMany base: the alloca holds the pointer value
+			// itself; Load to follow it. Array base: alloca holds
+			// inline storage; GEP directly. Slice base: load the
+			// {ptr,len} value, ExtractValue .ptr, GEP that.
+			if (lk.kind == TypeKind::PtrMany) {
+				JirInst load{};
+				load.tag = JirTag::Load;
+				load.a = basePtr;
+				load.ty = baseTy;
+				basePtr = emit(gctx, load);
+			} else if (lk.kind == TypeKind::Slice) {
+				JirInst load{};
+				load.tag = JirTag::Load;
+				load.a = basePtr;
+				load.ty = baseTy;
+				JirRef sliceVal = emit(gctx, load);
+				TypeIdx ptrManyTy = gctx.ctx.getTypePool().intern(
+				    TypeKey{TypeKind::PtrMany, 0, 0, elemTy, 0});
+				JirInst ev{};
+				ev.tag = JirTag::ExtractValue;
+				ev.a = sliceVal;
+				ev.b = 0;
+				ev.ty = ptrManyTy;
+				basePtr = emit(gctx, ev);
+			}
+			leafTy = elemTy;
+			TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
+			    TypeKey{TypeKind::PtrSingle, 0, 0, elemTy, 0});
+			JirInst ia{};
+			ia.tag = JirTag::IndexAddr;
+			ia.a = basePtr;
+			ia.b = idxRef;
+			ia.ty = ptrTy;
+			ptrResult = emit(gctx, ia);
+			break;
+		}
+		default:
+			handled = false;
+			break;
+		}
+		if (handled) {
+			if (outLeafTy) *outLeafTy = leafTy;
+			return ptrResult;
+		}
+		// Fall through to value-then-spill below for non-lvalue tags.
+	}
+
 	JirRef result = kNoJirRef;
 	switch (n.tag) {
 	case AstTag::NumberLit:
@@ -3721,6 +3916,26 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected) {
 	}
 	if (result != kNoJirRef && line > 0) {
 		gctx.jfn.getInstMut(result).srcLine = static_cast<uint32_t>(line);
+	}
+	// Pointer-loc spill: non-lvalue nodes (Call results, BinaryOp,
+	// literals, etc.) fell through to the value-producing switch
+	// above. To honor `loc == Pointer`, materialize a temporary
+	// alloca, store the value into it, and return its address. The
+	// pointer lives for the surrounding expression — same shape
+	// `astgenAddressOf` uses for its non-lvalue branch.
+	if (loc == ResultLoc::Pointer && result != kNoJirRef) {
+		TypeIdx leafTy = gctx.jfn.getInst(result).ty;
+		JirInst alloca{};
+		alloca.tag = JirTag::Alloca;
+		alloca.ty = leafTy;
+		JirRef slot = emitAllocaHoisted(gctx, alloca);
+		JirInst store{};
+		store.tag = JirTag::Store;
+		store.a = slot;
+		store.b = result;
+		emit(gctx, store);
+		if (outLeafTy) *outLeafTy = leafTy;
+		return slot;
 	}
 	return result;
 }
