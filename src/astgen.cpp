@@ -740,6 +740,26 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n) {
 	if (const auto *mc = gctx.ctx.getModuleConst(name)) {
 		return astgenExpr(gctx, mc->initExpr, mc->declaredType);
 	}
+	// Fn-name-as-value (Rust-style item coercion). The identifier
+	// resolves to a function symbol — surface its address as a u64
+	// so it can be assigned to a u64 slot, written to a buffer, or
+	// (with `as *mut[] u8`) round-tripped to a typed pointer. Generic
+	// fns are rejected because no monomorphized body exists at this
+	// point in lowering.
+	if (const FunctionAST *fn = gctx.ctx.getFunctionAST(name)) {
+		if (fn->isGeneric()) {
+			return recoverHere(gctx,
+			                   "cannot take address of generic fn `" + name +
+			                       "`",
+			                   kNoType);
+		}
+		JirInst fnref{};
+		fnref.tag = JirTag::FnRef;
+		fnref.a = static_cast<JirRef>(
+		    gctx.ctx.getStringPool().intern(fn->Name));
+		fnref.ty = BuiltinType::U64;
+		return emit(gctx, fnref);
+	}
 	// Recoverable: emit a Poison so the rest of the function still
 	// gets analyzed (and additional errors reported in the same pass).
 	return recoverHere(gctx, "unknown variable `" + name + "`", kNoType);
@@ -1585,6 +1605,16 @@ static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 		inst.a = val;
 		inst.ty = dstTy;
 		return emit(gctx, inst);
+	}
+	// Pointer ↔ integer cast — only u64 is wide enough to round-trip
+	// a pointer on every supported target, so restrict to that width.
+	// `myPtr as u64` or `addr as *mut[] u8`. Stays out of the int↔int
+	// path below because that one issues SExt/Trunc instead.
+	if (isPtr(src) && dst.kind == TypeKind::Int && dst.a == 64) {
+		return emitCast(JirTag::PtrToInt);
+	}
+	if (src.kind == TypeKind::Int && src.a == 64 && isPtr(dst)) {
+		return emitCast(JirTag::IntToPtr);
 	}
 	if (src.kind == TypeKind::Int && dst.kind == TypeKind::Int) {
 		uint32_t sw = src.a;

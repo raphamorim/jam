@@ -133,6 +133,12 @@ const char *tagName(JirTag t) {
 		return "FPTrunc";
 	case JirTag::BitCast:
 		return "BitCast";
+	case JirTag::PtrToInt:
+		return "PtrToInt";
+	case JirTag::IntToPtr:
+		return "IntToPtr";
+	case JirTag::FnRef:
+		return "FnRef";
 	case JirTag::Br:
 		return "Br";
 	case JirTag::CondBr:
@@ -343,11 +349,18 @@ struct Verifier {
 		case JirTag::FPExt:
 		case JirTag::FPTrunc:
 		case JirTag::BitCast:
+		case JirTag::PtrToInt:
+		case JirTag::IntToPtr:
 		case JirTag::FieldAccess:
 		case JirTag::ExtractValue:
 		case JirTag::FieldAddr:
 		case JirTag::EnumPayload:
 			checkRef(inst.a, false, r, "a");
+			return;
+		case JirTag::FnRef:
+			// `a` is a StringIdx, not a JirRef — nothing to check
+			// against `insts.size()`. Codegen will fail loudly if the
+			// referenced function symbol isn't in the module.
 			return;
 		case JirTag::DropBinding: {
 			checkRef(inst.a, false, r, "a");

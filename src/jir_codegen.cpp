@@ -362,6 +362,34 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
 		return JamLLVMBuildBitCast(lctx.ctx.getBuilder(), v, ty, "bitcast");
 	}
+	case JirTag::PtrToInt: {
+		JamValueRef v = emitInst(lctx, inst.a);
+		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
+		return JamLLVMBuildPtrToInt(lctx.ctx.getBuilder(), v, ty, "p2i");
+	}
+	case JirTag::IntToPtr: {
+		JamValueRef v = emitInst(lctx, inst.a);
+		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
+		return JamLLVMBuildIntToPtr(lctx.ctx.getBuilder(), v, ty, "i2p");
+	}
+	case JirTag::FnRef: {
+		// `inst.a` carries the StringIdx of the LLVM symbol name. We
+		// resolve to the LLVM Function (already a ptr-typed Value),
+		// then lower to ptrtoint to match the JIR's u64 result type.
+		// This mirrors Rust's `my_fn as u64` lowering.
+		StringIdx nameId = static_cast<StringIdx>(inst.a);
+		const std::string &name = lctx.ctx.getStringPool().get(nameId);
+		JamFunctionRef f =
+		    JamLLVMGetFunction(lctx.ctx.getModule(), name.c_str());
+		if (!f) {
+			throw std::runtime_error("jirCodegen: unknown fn-ref `" + name +
+			                         "`");
+		}
+		JamValueRef fnVal = JamLLVMFunctionAsValue(f);
+		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
+		return JamLLVMBuildPtrToInt(lctx.ctx.getBuilder(), fnVal, ty,
+		                            "fnref.u64");
+	}
 	// === Aggregates ===
 	case JirTag::StructLit: {
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);

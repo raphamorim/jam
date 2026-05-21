@@ -813,6 +813,22 @@ JamValueRef JamLLVMBuildIntCast(JamBuilderRef builder, JamValueRef val,
 	    UNWRAP_VALUE(val), UNWRAP_TYPE(destType), isSigned, name));
 }
 
+JamValueRef JamLLVMBuildPtrToInt(JamBuilderRef builder, JamValueRef val,
+                                  JamTypeRef destType, const char *name) {
+	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreatePtrToInt(
+	    UNWRAP_VALUE(val), UNWRAP_TYPE(destType), name));
+}
+
+JamValueRef JamLLVMBuildIntToPtr(JamBuilderRef builder, JamValueRef val,
+                                  JamTypeRef destType, const char *name) {
+	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateIntToPtr(
+	    UNWRAP_VALUE(val), UNWRAP_TYPE(destType), name));
+}
+
+JamValueRef JamLLVMFunctionAsValue(JamFunctionRef func) {
+	return WRAP_VALUE(static_cast<llvm::Value *>(UNWRAP_FUNCTION(func)));
+}
+
 JamValueRef JamLLVMBuildSIToFP(JamBuilderRef builder, JamValueRef val,
                                JamTypeRef destType, const char *name) {
 	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateSIToFP(

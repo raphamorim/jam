@@ -57,6 +57,30 @@ bool stderrContains(const CompileResult &r, const std::string &substr) {
 	return r.stderr_.find(substr) != std::string::npos;
 }
 
+// `--emit-ir` variant. Skips the link step (so it doesn't try to drop
+// the binary into `./output`, which is the build directory) and pipes
+// LLVM IR back through the same stdout/stderr channel. Positive tests
+// match on IR substrings; negative tests match on the diagnostic.
+CompileResult compileSourceIR(const std::string &name,
+                              const std::string &source) {
+	std::string path = "/tmp/" + name + ".jam";
+	{
+		std::ofstream out(path);
+		out << source;
+	}
+	std::string cmd = "./jam.out --emit-ir " + path + " 2>&1";
+
+	std::string output;
+	FILE *pipe = popen(cmd.c_str(), "r");
+	if (!pipe) { throw std::runtime_error("popen failed: " + cmd); }
+	char buf[256];
+	while (fgets(buf, sizeof(buf), pipe) != nullptr) output += buf;
+	int status = pclose(pipe);
+
+	int exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+	return {exitCode, std::move(output)};
+}
+
 // Multi-file variant: writes `main.jam` and `lib.jam` into a fresh
 // /tmp directory, then runs jam.out on main.jam. The module resolver
 // uses main.jam's directory as `baseDir`, so `import("lib")` from
@@ -133,6 +157,27 @@ class CodegenErrorTests {
 		framework.addTest(
 		    "Codegen - noreturn fn whose body may fall through is rejected",
 		    testNoreturnFallsThroughRejected);
+		// Fn-as-value (Rust-style item coercion) + ptr↔int casts.
+		framework.addTest("FnRef - bare fn name lowers to ptrtoint @fn",
+		                  testFnRefBareName);
+		framework.addTest("FnRef - explicit `fn as u64` lowers to ptrtoint",
+		                  testFnRefAsU64);
+		framework.addTest("FnRef - ptr ↔ u64 round-trips via ptrtoint/inttoptr",
+		                  testPtrU64RoundTrip);
+		framework.addTest("FnRef - extern fn name resolves to its address",
+		                  testFnRefExternFn);
+		framework.addTest(
+		    "FnRef - generic fn rejected with `cannot take address` diagnostic",
+		    testFnRefGenericRejected);
+		framework.addTest(
+		    "FnRef - ptr as u32 (narrower than u64) is rejected",
+		    testPtrAsNarrowIntRejected);
+		framework.addTest(
+		    "FnRef - u32 as *mut[] u8 (narrower than u64) is rejected",
+		    testNarrowIntAsPtrRejected);
+		framework.addTest(
+		    "FnRef - truly unknown variable still errors (no fn fallback)",
+		    testUnknownVariableStillErrors);
 	}
 
   private:
@@ -408,6 +453,137 @@ fn main() {}
 		                        "const Private = struct { n: i32, };\n");
 		ASSERT_TRUE(r.exitCode != 0);
 		ASSERT_TRUE(stderrContains(r, "Private"));
+	}
+
+	// === Fn-as-value (Rust-style item coercion) + ptr↔int casts ====
+	//
+	// These exercise the `export fn` callback workflow needed for
+	// SDL_AudioSpec-style C-ABI callbacks. The bare-name form mirrors
+	// Rust's implicit fn-item coercion; the `as u64` form is the
+	// explicit cast. Both must lower to LLVM `ptrtoint`.
+
+	// Bare fn name in expression position binds as a u64 — the
+	// "coercion" branch of the AsCast early-exits when src == dst so
+	// we should see a direct ptrtoint store with no extra cast IR.
+	static void testFnRefBareName() {
+		auto r = compileSourceIR("fnref_bare", R"(
+export fn cb(ud: u64, s: *mut[] u8, len: i32) { s[0] = 1; }
+fn main() {
+    var addr: u64 = cb;
+}
+)");
+		ASSERT_TRUE(r.exitCode == 0);
+		// Function should be externally linked, C-ABI (no `internal`).
+		ASSERT_TRUE(stderrContains(r, "define void @cb"));
+		// The fn-ref must lower to ptrtoint of the named symbol.
+		ASSERT_TRUE(stderrContains(r, "ptrtoint (ptr @cb to i64)"));
+	}
+
+	// Explicit `fn as u64` cast. With FnRef typed as u64 the cast is
+	// a no-op at the JIR level — same ptrtoint instruction.
+	static void testFnRefAsU64() {
+		auto r = compileSourceIR("fnref_as_u64", R"(
+export fn cb(ud: u64, s: *mut[] u8, len: i32) { s[0] = 1; }
+fn main() {
+    var addr: u64 = cb as u64;
+}
+)");
+		ASSERT_TRUE(r.exitCode == 0);
+		ASSERT_TRUE(stderrContains(r, "ptrtoint (ptr @cb to i64)"));
+	}
+
+	// Pointer ↔ u64 round-trip. Confirms both ptrtoint and inttoptr
+	// branches in astgenAsCast / jirCodegen exist and produce the
+	// matching LLVM instructions.
+	static void testPtrU64RoundTrip() {
+		auto r = compileSourceIR("ptr_u64_round_trip", R"(
+extern fn malloc(size: u64) *mut[] u8;
+fn main() {
+    var p: *mut[] u8 = malloc(16);
+    var a: u64 = p as u64;
+    var p2: *mut[] u8 = a as *mut[] u8;
+    p2[0] = 99;
+}
+)");
+		ASSERT_TRUE(r.exitCode == 0);
+		ASSERT_TRUE(stderrContains(r, "ptrtoint ptr"));
+		ASSERT_TRUE(stderrContains(r, "inttoptr i64"));
+	}
+
+	// Pure `extern fn` (no body) should still be referenceable by
+	// name — the symbol resolves to the LLVM `declare` placeholder
+	// and ptrtoint folds it just like a defined function.
+	static void testFnRefExternFn() {
+		auto r = compileSourceIR("fnref_extern", R"(
+extern fn malloc(size: u64) *mut[] u8;
+fn main() {
+    var addr: u64 = malloc;
+}
+)");
+		ASSERT_TRUE(r.exitCode == 0);
+		ASSERT_TRUE(stderrContains(r, "ptrtoint (ptr @malloc to i64)"));
+	}
+
+	// Taking the address of a generic fn is meaningless before
+	// monomorphization — no concrete LLVM symbol exists yet. AstGen
+	// surfaces a precise diagnostic naming both the action and the
+	// fn.
+	static void testFnRefGenericRejected() {
+		auto r = compileSource("fnref_generic", R"(
+fn identity(T: type, x: T) T { return x; }
+fn main() {
+    var a: u64 = identity as u64;
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "cannot take address of generic fn"));
+		ASSERT_TRUE(stderrContains(r, "identity"));
+	}
+
+	// Pointers are 64-bit on every target Jam supports. Casting to a
+	// narrower int width would silently truncate the upper bits and
+	// is rejected up front rather than letting LLVM emit a lossy
+	// truncate. The user can always do `(p as u64) as u32` if they
+	// really want the lower 32 bits.
+	static void testPtrAsNarrowIntRejected() {
+		auto r = compileSource("ptr_as_narrow_int", R"(
+extern fn malloc(size: u64) *mut[] u8;
+fn main() {
+    var p: *mut[] u8 = malloc(8);
+    var a: u32 = p as u32;
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "unsupported `as` cast"));
+	}
+
+	// Mirror of the above for the other direction: only u64 → ptr
+	// is accepted (a u32 can't carry a full target pointer).
+	static void testNarrowIntAsPtrRejected() {
+		auto r = compileSource("narrow_int_as_ptr", R"(
+fn main() {
+    var n: u32 = 0xFF;
+    var p: *mut[] u8 = n as *mut[] u8;
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "unsupported `as` cast"));
+	}
+
+	// Regression guard: the fn-name fallback in astgenVariable must
+	// NOT swallow the existing "unknown variable" diagnostic. If a
+	// name is neither a local, a module const, nor a function, the
+	// error must still fire — otherwise downstream codegen will
+	// crash trying to resolve a non-existent symbol.
+	static void testUnknownVariableStillErrors() {
+		auto r = compileSource("fnref_unknown_var", R"(
+fn main() {
+    var a: u64 = nonexistent_thing;
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "unknown variable"));
+		ASSERT_TRUE(stderrContains(r, "nonexistent_thing"));
 	}
 };
 

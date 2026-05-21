@@ -130,6 +130,13 @@ enum class JirTag : uint8_t {
 	FPExt,
 	FPTrunc,
 	BitCast,
+	// Pointer ↔ integer conversions. PtrToInt: `a` = ptr-typed value
+	// ref, `ty` = destination int type. IntToPtr: `a` = int-typed
+	// value ref, `ty` = destination ptr type. Used for raw-address
+	// round-trips (Rust-style `ptr as u64` / `u64 as *mut T`) and to
+	// surface function addresses as integers (paired with `FnRef`).
+	PtrToInt,
+	IntToPtr,
 
 	// Control flow
 	// Br:          `a` = JirBlockRef target. No result.
@@ -156,6 +163,14 @@ enum class JirTag : uint8_t {
 	//       `b` = ExtraIdx → [argCount, arg0, arg1, ...]
 	//       `ty` = return type (kNoType for void).
 	Call,
+
+	// Function reference (Rust-style item-as-value). Resolves a fn
+	// name to its address. `a` = StringIdx (function's LLVM symbol
+	// name); `ty` = u64. Generic functions are rejected at AstGen
+	// (no monomorphized body exists yet). Codegen lowers to
+	// `ptrtoint ptr @<name> to i64` so the result drops straight into
+	// a u64 slot — pair with IntToPtr if a typed pointer is needed.
+	FnRef,
 
 	// Function parameter access
 	// Param: `a` = parameter index; `ty` = param type.

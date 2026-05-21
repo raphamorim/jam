@@ -330,6 +330,22 @@ JAM_EXTERN_C JamValueRef JamLLVMBuildBitCast(JamBuilderRef builder,
                                              JamValueRef val,
                                              JamTypeRef destType,
                                              const char *name);
+// Raw-address conversions used to lower Jam's `ptr as int` and
+// `int as ptr` casts (plus the FnRef path which surfaces a function's
+// address as a u64). Both lower to a single LLVM instruction.
+JAM_EXTERN_C JamValueRef JamLLVMBuildPtrToInt(JamBuilderRef builder,
+                                              JamValueRef val,
+                                              JamTypeRef destType,
+                                              const char *name);
+JAM_EXTERN_C JamValueRef JamLLVMBuildIntToPtr(JamBuilderRef builder,
+                                              JamValueRef val,
+                                              JamTypeRef destType,
+                                              const char *name);
+// View a function as a generic Value pointer — needed because
+// llvm::Function inherits from llvm::Value, and the rest of the
+// codegen plumbing speaks in JamValueRef. Used by the FnRef lowering
+// to feed the function into JamLLVMBuildPtrToInt.
+JAM_EXTERN_C JamValueRef JamLLVMFunctionAsValue(JamFunctionRef func);
 JAM_EXTERN_C JamValueRef JamLLVMBuildIntCast(JamBuilderRef builder,
                                              JamValueRef val,
                                              JamTypeRef destType, bool isSigned,
