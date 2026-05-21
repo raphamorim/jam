@@ -1282,6 +1282,76 @@ static JirRef emitStructCfnDispatch(AstGenCtx &gctx,
 // Struct receivers route through `at(self, i)` — see
 // `emitStructIndexAtCall`.
 //
+// Statically determine, without emitting any JIR, whether `node` is
+// an addressable expression chain whose leaf type is Array — and if
+// so, return that Array TypeIdx (else kNoType). Walks the AST
+// structurally: Variable → localTypes; MemberAccess → recurse on the
+// parent, then look up the field type via the parent's StructInfo;
+// Index → recurse on base, then unwrap one Array dimension; Deref →
+// recurse on the pointee. Anything else (slice projections, calls,
+// arithmetic, literals) returns kNoType.
+//
+// Used by astgenIndex's fast path to gate `astgenLvalue` — calling
+// astgenLvalue speculatively on shapes like `slice.ptr` throws.
+// Peeking the type structurally lets us only commit to the lvalue
+// path when we know it will succeed.
+static TypeIdx peekAddressableArrayLeafType(AstGenCtx &gctx, NodeIdx node) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	const AstNode &n = ns.get(node);
+	TypeIdx ty = kNoType;
+	switch (n.tag) {
+	case AstTag::Variable: {
+		const std::string &name =
+		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
+		auto it = gctx.localTypes.find(name);
+		if (it == gctx.localTypes.end()) return kNoType;
+		ty = it->second;
+		break;
+	}
+	case AstTag::MemberAccess: {
+		// Resolve the parent's type, then look up the named field.
+		// Recurse with a helper that handles the broader non-Array
+		// leaves too — we need parent's actual type, not just "is
+		// addressable-array".
+		NodeIdx parentIdx = static_cast<NodeIdx>(n.lhs);
+		const AstNode &parent = ns.get(parentIdx);
+		TypeIdx parentTy = kNoType;
+		if (parent.tag == AstTag::Variable) {
+			const std::string &pname = gctx.ctx.getStringPool().get(
+			    static_cast<StringIdx>(parent.lhs));
+			auto it = gctx.localTypes.find(pname);
+			if (it == gctx.localTypes.end()) return kNoType;
+			parentTy = it->second;
+		} else {
+			// Recurse: parent is itself a MemberAccess / Index /
+			// Deref chain. Peek its leaf type; if the leaf is an
+			// addressable expression, we'd still need to know its
+			// type (not just Array-ness). For simplicity, only
+			// support Variable parents for now — that covers the
+			// `self.field[i]` case which is what timer.jam needs.
+			return kNoType;
+		}
+		const auto *sinfo = gctx.ctx.lookupStruct(parentTy);
+		if (sinfo == nullptr) return kNoType;
+		const std::string &fieldName =
+		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.rhs));
+		for (const auto &f : sinfo->fields) {
+			if (f.first == fieldName) {
+				ty = f.second;
+				break;
+			}
+		}
+		if (ty == kNoType) return kNoType;
+		break;
+	}
+	default:
+		return kNoType;
+	}
+	const TypeKey &k = gctx.ctx.getTypePool().get(ty);
+	if (k.kind == TypeKind::Array) return ty;
+	return kNoType;
+}
+
 // Array Variables (and other lvalueable Array bases) take a
 // dedicated fast path: peek the type via astgenLvalue, then emit
 // IndexAddr + Load against the storage pointer. This avoids the
@@ -1295,25 +1365,38 @@ static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 	NodeIdx baseIdx = static_cast<NodeIdx>(n.lhs);
 	NodeIdx idxIdx = static_cast<NodeIdx>(n.rhs);
 
-	// Array Variable fast path. Take the base as a pointer (zero-
-	// cost for a Variable — just the alloca's own JirRef), emit
-	// IndexAddr to the element, then Load just that element. Avoids
-	// the rvalue-Load-then-spill pattern JirTag::Index uses on
-	// Array SSA values, which loads the full backing storage (up to
-	// several KB) per access and stalls LLVM at -O1+.
+	// Array addressable-base fast path. For Array bases reached via
+	// an addressable expression chain, take the base as a pointer via
+	// ResultLoc::Pointer and emit IndexAddr + Load for just the
+	// element. Avoids the rvalue-Load-then-spill pattern
+	// JirTag::Index uses on Array SSA values, which loads the full
+	// backing storage (up to several KB) per access and stalls LLVM
+	// at -O1+.
 	//
-	// Limited to Variable bases on purpose — astgenExpr(.., Pointer)
-	// on a non-struct MemberAccess (e.g. `slice.ptr`) routes
-	// through astgenLvalue's MemberAccess branch, which errors on
-	// non-struct parents. The rvalue path handles slices / ptr-many
-	// correctly anyway (small Load + GEP).
+	// Discovered while investigating the Timer struct perf
+	// regression: `self.channels[idx].counter` was lowering to
+	// `load %Timer (208B); extractvalue channels (192B); alloca; store;
+	// gep; load` per *field access* — every read of a field on an
+	// indexed array element of a struct field cost hundreds of bytes
+	// of register traffic. The previous Variable-only fast path
+	// missed this case.
+	//
+	// We must STATICALLY prove the base resolves to an Array before
+	// calling astgenLvalue — calling it speculatively on shapes like
+	// `slice.ptr` throws ("lvalue field access on non-struct").
+	// `peekAddressableArrayElem` walks the AST without emitting JIR
+	// and returns the array's element type when the chain is a known
+	// Variable / MemberAccess-on-struct / Index / Deref leading to
+	// Array, or kNoType otherwise.
 	{
-		const AstNode &baseNode = gctx.ctx.getNodeStore().get(baseIdx);
-		if (baseNode.tag == AstTag::Variable) {
-			JirRef basePtr =
-			    astgenExpr(gctx, baseIdx, kNoType, ResultLoc::Pointer);
-			TypeIdx leafTy = gctx.jfn.getInst(basePtr).ty;
+		TypeIdx peekedArrayTy = peekAddressableArrayLeafType(gctx, baseIdx);
+		if (peekedArrayTy != kNoType) {
+			TypeIdx leafTy = kNoType;
+			JirRef basePtr = astgenLvalue(gctx, baseIdx, leafTy);
 			const TypeKey &lk = gctx.ctx.getTypePool().get(leafTy);
+			// Sanity: the peek already promised Array, but check
+			// in case the lvalue path saw something different (e.g.
+			// type-alias edges peek didn't unfold).
 			if (lk.kind == TypeKind::Array) {
 				TypeIdx elemTy = static_cast<TypeIdx>(lk.a);
 				JirRef idxRef = astgenExpr(gctx, idxIdx, BuiltinType::U64);
@@ -1331,8 +1414,6 @@ static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 				ld.ty = elemTy;
 				return emit(gctx, ld);
 			}
-			// Non-Array Variable: fall through. basePtr is the
-			// existing alloca's JirRef, no fresh JIR emitted.
 		}
 	}
 
