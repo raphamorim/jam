@@ -727,7 +727,7 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 // expression at each read site. Constant folding makes this cheap;
 // non-constant inits would require a runtime global slot (deferred).
 static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n,
-                              TypeIdx expected = kNoType) {
+                             TypeIdx expected = kNoType) {
 	const std::string &name =
 	    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
 	auto it = gctx.locals.find(name);
@@ -751,15 +751,14 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n,
 	// at this point in lowering.
 	if (const FunctionAST *fn = gctx.ctx.getFunctionAST(name)) {
 		if (fn->isGeneric()) {
-			return recoverHere(gctx,
-			                   "cannot take address of generic fn `" + name +
-			                       "`",
-			                   kNoType);
+			return recoverHere(
+			    gctx, "cannot take address of generic fn `" + name + "`",
+			    kNoType);
 		}
 		JirInst fnref{};
 		fnref.tag = JirTag::FnRef;
-		fnref.a = static_cast<JirRef>(
-		    gctx.ctx.getStringPool().intern(fn->Name));
+		fnref.a =
+		    static_cast<JirRef>(gctx.ctx.getStringPool().intern(fn->Name));
 		// If the consumer asked for a Fn type, give them one; otherwise
 		// fall back to u64 (legacy raw-address shape). Future cleanup:
 		// always emit the typed Fn and let consumers cast to u64
@@ -785,8 +784,7 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n,
 // then-spill fallback, so misuse is reported as "not assignable"
 // rather than silently spilling into a temporary that dies at
 // expression-end.
-static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node,
-                           TypeIdx &outLeafTy) {
+static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 	const NodeStore &ns = gctx.ctx.getNodeStore();
 	const AstNode &n = ns.get(node);
 	switch (n.tag) {
@@ -842,9 +840,8 @@ static void astgenAssign(AstGenCtx &gctx, const AstNode &n) {
 			    astgenExpr(gctx, baseIdx, kNoType, ResultLoc::Pointer);
 			baseTy = gctx.jfn.getInst(basePtr).ty;
 		}
-		const auto *sinfo = baseTy != kNoType
-		                        ? gctx.ctx.lookupStruct(baseTy)
-		                        : nullptr;
+		const auto *sinfo =
+		    baseTy != kNoType ? gctx.ctx.lookupStruct(baseTy) : nullptr;
 		if (sinfo != nullptr) {
 			const std::string qualified = sinfo->name + ".setAt";
 			const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
@@ -1320,8 +1317,7 @@ static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 			const TypeKey &lk = gctx.ctx.getTypePool().get(leafTy);
 			if (lk.kind == TypeKind::Array) {
 				TypeIdx elemTy = static_cast<TypeIdx>(lk.a);
-				JirRef idxRef =
-				    astgenExpr(gctx, idxIdx, BuiltinType::U64);
+				JirRef idxRef = astgenExpr(gctx, idxIdx, BuiltinType::U64);
 				TypeIdx elemPtrTy = gctx.ctx.getTypePool().intern(
 				    TypeKey{TypeKind::PtrSingle, 0, 0, elemTy, 0});
 				JirInst ia{};
@@ -3295,10 +3291,10 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 		                        recvNode.tag == AstTag::MemberAccess ||
 		                        recvNode.tag == AstTag::Index ||
 		                        recvNode.tag == AstTag::Deref;
-		if (recvIsLvalueable && (methodName == "asPtr" ||
-		                         methodName == "asMutPtr")) {
-			JirRef basePtr = astgenExpr(gctx, recvExprIdx, kNoType,
-			                             ResultLoc::Pointer);
+		if (recvIsLvalueable &&
+		    (methodName == "asPtr" || methodName == "asMutPtr")) {
+			JirRef basePtr =
+			    astgenExpr(gctx, recvExprIdx, kNoType, ResultLoc::Pointer);
 			TypeIdx leafTy = gctx.jfn.getInst(basePtr).ty;
 			const TypeKey &lk = gctx.ctx.getTypePool().get(leafTy);
 			if (lk.kind == TypeKind::Array) {
@@ -3607,8 +3603,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 				const TypeKey &instKey = gctx.ctx.getTypePool().get(instTy);
 				if (instKey.kind == TypeKind::Array) {
 					if (methodName == "asPtr" || methodName == "asMutPtr") {
-						TypeIdx elemTy =
-						    static_cast<TypeIdx>(instKey.a);
+						TypeIdx elemTy = static_cast<TypeIdx>(instKey.a);
 						TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
 						    TypeKey{TypeKind::PtrMany, 0, 0, elemTy, 0});
 						JirInst zeroI{};
@@ -3740,8 +3735,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 					for (size_t i = 0; i < sinfo->fields.size(); ++i) {
 						if (sinfo->fields[i].first != fieldName) continue;
 						TypeIdx fieldTy = sinfo->fields[i].second;
-						const TypeKey &fk =
-						    gctx.ctx.getTypePool().get(fieldTy);
+						const TypeKey &fk = gctx.ctx.getTypePool().get(fieldTy);
 						if (fk.kind != TypeKind::Fn) break;
 						// Load recv as a value, ExtractValue the field.
 						JirInst loadRecv{};
@@ -3827,8 +3821,8 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
 		}
 		case AstTag::Deref: {
 			// `p.* = ...` — operand IS the pointer value.
-			JirRef innerPtr = astgenExpr(
-			    gctx, static_cast<NodeIdx>(n.lhs), kNoType);
+			JirRef innerPtr =
+			    astgenExpr(gctx, static_cast<NodeIdx>(n.lhs), kNoType);
 			TypeIdx pty = gctx.jfn.getInst(innerPtr).ty;
 			const TypeKey &pk = gctx.ctx.getTypePool().get(pty);
 			if (pk.kind != TypeKind::PtrSingle &&
@@ -3841,9 +3835,8 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
 		}
 		case AstTag::MemberAccess: {
 			TypeIdx baseTy = kNoType;
-			JirRef basePtr =
-			    astgenExpr(gctx, static_cast<NodeIdx>(n.lhs), kNoType,
-			               ResultLoc::Pointer, &baseTy);
+			JirRef basePtr = astgenExpr(gctx, static_cast<NodeIdx>(n.lhs),
+			                            kNoType, ResultLoc::Pointer, &baseTy);
 			StringIdx memberId = static_cast<StringIdx>(n.rhs);
 			const std::string &memberName =
 			    gctx.ctx.getStringPool().get(memberId);
@@ -3889,21 +3882,18 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
 		}
 		case AstTag::Index: {
 			TypeIdx baseTy = kNoType;
-			JirRef basePtr =
-			    astgenExpr(gctx, static_cast<NodeIdx>(n.lhs), kNoType,
-			               ResultLoc::Pointer, &baseTy);
+			JirRef basePtr = astgenExpr(gctx, static_cast<NodeIdx>(n.lhs),
+			                            kNoType, ResultLoc::Pointer, &baseTy);
 			NodeIdx idxIdxN = static_cast<NodeIdx>(n.rhs);
 			JirRef idxRef = astgenExpr(gctx, idxIdxN, BuiltinType::U64);
 			const TypeKey &lk = gctx.ctx.getTypePool().get(baseTy);
 			TypeIdx elemTy = kNoType;
-			if (lk.kind == TypeKind::Array ||
-			    lk.kind == TypeKind::Slice ||
+			if (lk.kind == TypeKind::Array || lk.kind == TypeKind::Slice ||
 			    lk.kind == TypeKind::PtrMany) {
 				elemTy = static_cast<TypeIdx>(lk.a);
 			} else {
-				failHere(
-				    gctx,
-				    "astgen: lvalue index on non-array/slice/ptr-many");
+				failHere(gctx,
+				         "astgen: lvalue index on non-array/slice/ptr-many");
 			}
 			// PtrMany base: the alloca holds the pointer value
 			// itself; Load to follow it. Array base: alloca holds

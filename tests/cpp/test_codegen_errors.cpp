@@ -169,9 +169,8 @@ class CodegenErrorTests {
 		framework.addTest(
 		    "FnRef - generic fn rejected with `cannot take address` diagnostic",
 		    testFnRefGenericRejected);
-		framework.addTest(
-		    "FnRef - ptr as u32 (narrower than u64) is rejected",
-		    testPtrAsNarrowIntRejected);
+		framework.addTest("FnRef - ptr as u32 (narrower than u64) is rejected",
+		                  testPtrAsNarrowIntRejected);
 		framework.addTest(
 		    "FnRef - u32 as *mut[] u8 (narrower than u64) is rejected",
 		    testNarrowIntAsPtrRejected);

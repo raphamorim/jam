@@ -792,18 +792,17 @@ JamValueRef JamLLVMBuildCall(JamBuilderRef builder, JamFunctionRef func,
 // address (an opaque ptr under LLVM 15+). Used to lower JirTag::
 // CallIndirect, where the JIR's Fn type is the source of truth for
 // the LLVM function-type the call instruction needs.
-JamValueRef JamLLVMBuildIndirectCall(JamBuilderRef builder,
-                                      JamTypeRef funcType, JamValueRef callee,
-                                      JamValueRef *args, unsigned numArgs,
-                                      const char *name) {
+JamValueRef JamLLVMBuildIndirectCall(JamBuilderRef builder, JamTypeRef funcType,
+                                     JamValueRef callee, JamValueRef *args,
+                                     unsigned numArgs, const char *name) {
 	std::vector<llvm::Value *> argValues;
 	for (unsigned i = 0; i < numArgs; i++) {
 		argValues.push_back(UNWRAP_VALUE(args[i]));
 	}
 	llvm::FunctionType *ft =
 	    llvm::cast<llvm::FunctionType>(UNWRAP_TYPE(funcType));
-	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateCall(ft, UNWRAP_VALUE(callee),
-	                                                      argValues, name));
+	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateCall(
+	    ft, UNWRAP_VALUE(callee), argValues, name));
 }
 
 JamValueRef JamLLVMBuildPhi(JamBuilderRef builder, JamTypeRef type,
@@ -834,13 +833,13 @@ JamValueRef JamLLVMBuildIntCast(JamBuilderRef builder, JamValueRef val,
 }
 
 JamValueRef JamLLVMBuildPtrToInt(JamBuilderRef builder, JamValueRef val,
-                                  JamTypeRef destType, const char *name) {
+                                 JamTypeRef destType, const char *name) {
 	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreatePtrToInt(
 	    UNWRAP_VALUE(val), UNWRAP_TYPE(destType), name));
 }
 
 JamValueRef JamLLVMBuildIntToPtr(JamBuilderRef builder, JamValueRef val,
-                                  JamTypeRef destType, const char *name) {
+                                 JamTypeRef destType, const char *name) {
 	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateIntToPtr(
 	    UNWRAP_VALUE(val), UNWRAP_TYPE(destType), name));
 }

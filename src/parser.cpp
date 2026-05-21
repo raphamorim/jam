@@ -571,9 +571,7 @@ TypeIdx Parser::parseType() {
 		consume(TOK_OPEN_PAREN, "Expected `(` after `fn` in type");
 		std::vector<TypeIdx> paramTys;
 		if (!check(TOK_CLOSE_PAREN)) {
-			do {
-				paramTys.push_back(parseType());
-			} while (match(TOK_COMMA));
+			do { paramTys.push_back(parseType()); } while (match(TOK_COMMA));
 		}
 		consume(TOK_CLOSE_PAREN, "Expected `)` after fn-type parameters");
 		TypeIdx retTy = parseType();

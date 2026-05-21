@@ -667,9 +667,8 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		for (TypeIdx pt : paramTys) {
 			llvmParamTys.push_back(lctx.ctx.getLLVMType(pt));
 		}
-		JamTypeRef llvmRetTy = (retTy == kNoType)
-		                            ? lctx.ctx.getVoidType()
-		                            : lctx.ctx.getLLVMType(retTy);
+		JamTypeRef llvmRetTy = (retTy == kNoType) ? lctx.ctx.getVoidType()
+		                                          : lctx.ctx.getLLVMType(retTy);
 		JamTypeRef llvmFnTy = JamLLVMFunctionType(
 		    llvmRetTy, llvmParamTys.data(),
 		    static_cast<unsigned>(llvmParamTys.size()), /*isVarArgs=*/false);
@@ -685,10 +684,9 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		}
 
 		const char *resultName = (inst.ty == kNoType) ? "" : "call.indirect";
-		return JamLLVMBuildIndirectCall(lctx.ctx.getBuilder(), llvmFnTy,
-		                                 calleeVal, args.data(),
-		                                 static_cast<unsigned>(args.size()),
-		                                 resultName);
+		return JamLLVMBuildIndirectCall(
+		    lctx.ctx.getBuilder(), llvmFnTy, calleeVal, args.data(),
+		    static_cast<unsigned>(args.size()), resultName);
 	}
 	// === Control ===
 	case JirTag::Br: {
