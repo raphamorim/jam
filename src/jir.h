@@ -24,7 +24,7 @@ class FunctionAST;
 // needed.
 //
 // Pipeline (target):
-//   Source → Tokens → AST → AstGen → JIR → Codegen → LLVM IR
+//   Source -> Tokens -> AST -> AstGen -> JIR -> Codegen -> LLVM IR
 //
 // Each `JirInst` carries a typed result (or `kNoType` for control-flow
 // instructions) plus a source line for diagnostics. Variable-width
@@ -140,8 +140,8 @@ enum class JirTag : uint8_t {
 
 	// Control flow
 	// Br:          `a` = JirBlockRef target. No result.
-	// CondBr:      `a` = cond ref; `b` = ExtraIdx → [thenBlock, elseBlock].
-	// Switch:      `a` = scrut ref; `b` = ExtraIdx →
+	// CondBr:      `a` = cond ref; `b` = ExtraIdx -> [thenBlock, elseBlock].
+	// Switch:      `a` = scrut ref; `b` = ExtraIdx ->
 	//                  [defaultBlock, caseCount,
 	//                   case0_lo, case0_hi, case0_signed, case0_block,
 	//                   case1_..., ...]
@@ -160,11 +160,11 @@ enum class JirTag : uint8_t {
 
 	// Function call
 	// Call: `a` = StringIdx (callee qualified name);
-	//       `b` = ExtraIdx → [argCount, arg0, arg1, ...]
+	//       `b` = ExtraIdx -> [argCount, arg0, arg1, ...]
 	//       `ty` = return type (kNoType for void).
 	Call,
 	// CallIndirect: `a` = JirRef of a fn-typed value (the function
-	//               pointer); `b` = ExtraIdx → [argCount, arg0, ...];
+	//               pointer); `b` = ExtraIdx -> [argCount, arg0, ...];
 	//               `ty` = return type. The signature (return + params)
 	//               is read from the JIR-level Fn TypeIdx on `a` and
 	//               used by codegen to build the LLVM function type
@@ -186,11 +186,12 @@ enum class JirTag : uint8_t {
 	Param,
 
 	// Aggregates
-	// StructLit:    `b` = ExtraIdx → [fieldCount, field0_val, field1_val, ...];
+	// StructLit:    `b` = ExtraIdx -> [fieldCount, field0_val, field1_val,
+	// ...];
 	//               `ty` = struct type.
 	// FieldAccess:  `a` = base ref, `b` = field index; `ty` = field type.
 	// ExtractValue: `a` = aggregate ref, `b` = field index; `ty` = field type.
-	// ArrayLit:     `b` = ExtraIdx → [count, elem0, elem1, ...];
+	// ArrayLit:     `b` = ExtraIdx -> [count, elem0, elem1, ...];
 	//               `ty` = array type.
 	// Index:        `a` = base ref, `b` = index ref; `ty` = element type.
 	StructLit,

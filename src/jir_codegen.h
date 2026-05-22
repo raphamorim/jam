@@ -15,7 +15,7 @@ class JamCodegenContext;
 // JIR codegen — walks a fully-typed JirFunction and emits LLVM IR
 // instructions. By design this stage is mechanical: there is no type
 // inference, no peer resolution, no divergence analysis. Each JirInst
-// maps to a small handful of LLVM IR instructions and the JirRef →
+// maps to a small handful of LLVM IR instructions and the JirRef ->
 // LLVM Value mapping carries the dataflow.
 //
 // Two-step API: prototype emission runs first so forward references

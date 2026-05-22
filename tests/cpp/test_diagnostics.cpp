@@ -365,7 +365,7 @@ void testSelfReferentialUnionIsCaught() {
 }
 
 void testStructViaUnionCycleIsCaught() {
-	// Mixed struct→union→struct chain. The cycle key here is on the
+	// Mixed struct->union->struct chain. The cycle key here is on the
 	// inner struct's FieldTypesWIP — the union's body fill triggers
 	// ensureStructBody, which re-enters S while it's still WIP.
 	auto r = compileSource("diag_struct_via_union",

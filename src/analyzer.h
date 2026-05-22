@@ -105,7 +105,7 @@ class Analyzer {
 	DeclValue analyzeFunction(DeclIndex idx);
 	DeclValue analyzeConst(DeclIndex idx);
 
-	// Push a "dependency loop detected: A → B → A" diagnostic, using
+	// Push a "dependency loop detected: A -> B -> A" diagnostic, using
 	// the current analysis stack as the chain.
 	void pushCycleError(DeclIndex repeated);
 

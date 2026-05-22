@@ -243,7 +243,7 @@ class JamCodegenContext {
 	// Lazy LLVM type per TypeIdx (built once, reused). Indexed by TypeIdx.
 	mutable std::vector<JamTypeRef> llvmTypeCache;
 
-	// Pre-built map of struct → drop fn (built before any function is
+	// Pre-built map of struct -> drop fn (built before any function is
 	// lowered). AstGen consults this to wire drop calls at scope exit;
 	// drop tracking itself lives in the per-function `AstGenCtx`.
 	const jam::drops::DropRegistry *dropRegistry = nullptr;
@@ -302,7 +302,7 @@ class JamCodegenContext {
 		// `pub struct`, `pub enum`, `pub union`, `pub const Foo = T`
 		// by source-level name. TypeIdx points into the global TypePool.
 		std::unordered_map<std::string, TypeIdx> types;
-		// `pub const X = import(...)`-style re-exports: name → the
+		// `pub const X = import(...)`-style re-exports: name -> the
 		// Module TypeIdx for the re-exported module.
 		std::unordered_map<std::string, TypeIdx> moduleAliases;
 	};
@@ -313,7 +313,7 @@ class JamCodegenContext {
 	// graph. Used as a fallback when the flat
 	// `getFunctionAST("handle.X")` lookup misses on a 3+ segment path
 	// like `std.fmt.print`. Returns nullptr if any segment fails to
-	// resolve to a Module → Module → ... → Function chain.
+	// resolve to a Module -> Module -> ... -> Function chain.
 	const FunctionAST *resolveChainedFunction(const std::string &dotted) const;
 
 	// Sibling of `resolveChainedFunction` for types. A type annotation
@@ -329,7 +329,7 @@ class JamCodegenContext {
   private:
 	std::unordered_map<std::string, const FunctionAST *> functionAsts;
 	std::unordered_map<std::string, ImportHandleInfo> importHandles_;
-	// Resolved canonical path → namespace decl table. See ModuleNamespace.
+	// Resolved canonical path -> namespace decl table. See ModuleNamespace.
 	std::unordered_map<std::string, ModuleNamespace> moduleNamespaces_;
 
 	// `genericResolutions_` memoizes per-callsite: every unique
@@ -375,7 +375,7 @@ class JamCodegenContext {
 	const std::vector<std::unique_ptr<EnumDeclAST>> *anonEnums_ = nullptr;
 
 	// type alias table. `const BoxI32 = Box(i32);` registers
-	// `BoxI32 → resolved-TypeIdx-of-Box(i32)`. Consulted by lookupStruct
+	// `BoxI32 -> resolved-TypeIdx-of-Box(i32)`. Consulted by lookupStruct
 	// (and by getLLVMType via the recursive lookup path) so a binding
 	// declared `var b: BoxI32` finds the same struct that `Box(i32)`
 	// would produce.

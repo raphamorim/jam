@@ -407,7 +407,7 @@ JamCodegenContext::lookupEnum(TypeIdx ty) const {
 	const TypeKey &k = typePool.get(ty);
 	// a GenericCall TypeIdx resolves to a concrete type;
 	// recurse on the resolved TypeIdx so generic enum instantiations
-	// (e.g. `Option(i32)` → `Option__i32`) resolve uniformly.
+	// (e.g. `Option(i32)` -> `Option__i32`) resolve uniformly.
 	if (k.kind == TypeKind::GenericCall) {
 		return lookupEnum(resolveGenericCall(ty));
 	}
@@ -621,7 +621,7 @@ uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
 	case TypeKind::Struct:
 	case TypeKind::Named: {
 		// a Named type may be a substitution-context
-		// reference to a parameter (T → i32) or to Self. Resolve
+		// reference to a parameter (T -> i32) or to Self. Resolve
 		// through the substitution map first; if found and the
 		// target is a primitive (Int/Float/etc.), the recursive
 		// typeSize handles it. Same shape as getLLVMType.
@@ -742,7 +742,7 @@ uint64_t JamCodegenContext::typeAlign(TypeIdx ty) const {
 	case TypeKind::Struct:
 	case TypeKind::Named: {
 		// substitution context wins. A Named type may
-		// be a parameter reference (T → i32) or Self that resolves
+		// be a parameter reference (T -> i32) or Self that resolves
 		// to a non-aggregate; the recursive call handles primitives.
 		const std::string &substName =
 		    stringPool.get(static_cast<StringIdx>(k.a));
@@ -856,7 +856,7 @@ TypeIdx substituteType(TypeIdx ty,
 	case TypeKind::Fn: {
 		// Function-typed value: substitute the return type AND every
 		// param type. A `fn(T) T` field inside a generic struct sees
-		// T → concrete on instantiation, so the field's TypeIdx must
+		// T -> concrete on instantiation, so the field's TypeIdx must
 		// rebuild with substituted children.
 		TypeIdx retSub =
 		    substituteType(static_cast<TypeIdx>(k.a), subst, types, strings);
@@ -1043,7 +1043,7 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 	const StructDeclAST *anon = (*anonStructs_)[anonIdx].get();
 
 	// Build the instantiated struct's name from the callee + arg names.
-	// `Maybe(File)` → `Maybe__File`. Pointer/array types lower through
+	// `Maybe(File)` -> `Maybe__File`. Pointer/array types lower through
 	// substituteType; we only need a stable spelling for the canonical
 	// non-compound cases here. v1's stdlib won't pass non-named types
 	// as generic args, so this is enough to get the demo running.
@@ -1078,9 +1078,9 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 		return typePool.internNamed(stringPool.intern(instName));
 	}
 
-	// Build the full substitution map: parameter names → concrete args,
+	// Build the full substitution map: parameter names -> concrete args,
 	// plus the anon-struct's synthetic name (which is what `Self`
-	// resolved to in *type* positions at parse time) → the new
+	// resolved to in *type* positions at parse time) -> the new
 	// instantiated struct's Named TypeIdx. We also alias the literal
 	// string "Self" to the same target so codegen sites that see
 	// the parser's stringified `Self.method(...)` (an expression-
@@ -1170,7 +1170,7 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 			// nested type expressions in the signature.
 			setCurrentSubst(bodySubst);
 			// Pass 1 builds a signature-only JirFunction and emits
-			// the prototype with JIR's ABI (mut/move → ptr). The
+			// the prototype with JIR's ABI (mut/move -> ptr). The
 			// metadata is cached on the InstMethod entry so Pass 2
 			// can continue from here instead of rebuilding it.
 			JirFunction passOneJir = astgenMetadata(*clonePtr, mutCtx);
@@ -1286,7 +1286,7 @@ TypeIdx JamCodegenContext::instantiateEnumExpr(
 	}
 
 	// Memoize. Return as a Named TypeIdx so the rest of codegen resolves
-	// through the existing Named → EnumInfo path (handles size/align,
+	// through the existing Named -> EnumInfo path (handles size/align,
 	// match dispatch, etc., uniformly with non-generic enum references).
 	if (const EnumInfo *existing = getEnum(instName)) {
 		(void)existing;

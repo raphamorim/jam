@@ -300,7 +300,7 @@ class ModuleAST {
 	// (`__anon_enum_<N>`); the EnumExpr AST node carries the index in
 	// its d.lhs slot. Variant payload types may reference generic
 	// parameters (e.g. `Some(T)`); the substitution engine resolves
-	// them at each instantiation site (`Option(i32)` → `Some(i32)`).
+	// them at each instantiation site (`Option(i32)` -> `Some(i32)`).
 	std::vector<std::unique_ptr<EnumDeclAST>> AnonEnums;
 
 	ModuleAST() = default;

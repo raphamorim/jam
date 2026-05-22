@@ -1190,7 +1190,7 @@ bool JamLLVMEmitObjectFile(JamModuleRef mod, JamTargetMachineRef tm,
 	mpm.run(*M, mam);
 
 	// LTO modes emit bitcode; the linker will run the rest of the pipeline.
-	// Otherwise lower IR → MIR → object via the legacy codegen-PM (LLVM has
+	// Otherwise lower IR -> MIR -> object via the legacy codegen-PM (LLVM has
 	// not migrated codegen to the new PM yet).
 	if (lto != JAM_LTO_OFF) {
 		llvm::WriteBitcodeToFile(*M, dest);

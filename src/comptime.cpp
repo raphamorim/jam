@@ -162,7 +162,7 @@ ComptimeValue ComptimeEvaluator::evalAtCall(const AstNode &n,
 	// return None (caller can do its own dispatch if it wants).
 	if ((n.flags & 1) == 0) { return ComptimeValue::makeNone(); }
 
-	// Expr-arg multi-form: rhs = ExtraIdx → [argCount, arg0, ...].
+	// Expr-arg multi-form: rhs = ExtraIdx -> [argCount, arg0, ...].
 	ExtraIdx extra = static_cast<ExtraIdx>(n.rhs);
 	uint32_t argCount = nodes_.getExtra(extra);
 	std::vector<ComptimeValue> argVals;

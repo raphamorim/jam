@@ -64,7 +64,7 @@ void testDependencyEdgesAreSymmetric() {
 	jam::DeclIndex b = t.create(jam::DeclKind::Function, "b");
 	jam::DeclIndex c = t.create(jam::DeclKind::Function, "c");
 
-	// a → b, a → c, b → c
+	// a -> b, a -> c, b -> c
 	t.declareDependency(a, b);
 	t.declareDependency(a, c);
 	t.declareDependency(b, c);

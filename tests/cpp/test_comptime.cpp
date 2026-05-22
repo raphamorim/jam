@@ -610,7 +610,7 @@ void testExecWhileIterationCapTrips() {
 	    e.execStmt(whileNode, scope, iter, /*iterCap=*/100, ret, diags, loc);
 	ASSERT_TRUE(r == jam::ExecResult::IterationCap);
 	ASSERT_TRUE(diags.hasErrors());
-	// 100 iterations ran (i went 0→1→…→100); the 101st loop attempt
+	// 100 iterations ran (i went 0->1->…->100); the 101st loop attempt
 	// trips the cap before the body runs.
 	ASSERT_EQ(static_cast<uint64_t>(100), scope.lookup("i")->asU64());
 }

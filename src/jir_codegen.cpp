@@ -19,9 +19,9 @@
 
 namespace {
 
-// Per-function lowering state: maps JirRef → LLVM Value so dataflow
+// Per-function lowering state: maps JirRef -> LLVM Value so dataflow
 // references resolve as instructions are emitted in block order.
-// Also maps JirBlockRef → LLVM BasicBlock for terminators.
+// Also maps JirBlockRef -> LLVM BasicBlock for terminators.
 struct JirCodegenCtx {
 	const JirFunction &jfn;
 	JamCodegenContext &ctx;
@@ -631,7 +631,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		}
 		if (calleeUsesSret) {
 			// The LLVM call itself returns void; the value lives in
-			// the sret slot. Load it so the JirRef → LLVM value map
+			// the sret slot. Load it so the JirRef -> LLVM value map
 			// holds the materialized return value.
 			JamLLVMBuildCall(lctx.ctx.getBuilder(), f, args.data(),
 			                 static_cast<unsigned>(args.size()), "");
@@ -714,7 +714,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// Specialization, mirroring rustc_codegen_ssa/mir/block.rs::
 		// codegen_switchint_terminator: collapse Switch back to a
 		// cond_br when the shape is trivial.
-		//   * 1 case + default → ICmpEq + CondBr (always valid: the
+		//   * 1 case + default -> ICmpEq + CondBr (always valid: the
 		//     default is the cond_br's `else` whether it's a live
 		//     fall-through block or an unreachable one).
 		// Rust also collapses 2-case bool shapes — that requires

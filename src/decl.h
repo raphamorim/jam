@@ -78,7 +78,7 @@ enum class StructStatus : uint8_t {
 
 // Enum / Union body lifecycles. Same shape as StructStatus but kept
 // in their own enums so a tagged-union variant's status can't be
-// silently treated as a struct's. Both follow None → BodyWIP →
+// silently treated as a struct's. Both follow None -> BodyWIP ->
 // HaveBody; the WIP state is the cycle-detector key for
 // `resolveTypeFieldsEnum` / `resolveTypeFieldsUnion`.
 enum class EnumStatus : uint8_t {

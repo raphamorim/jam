@@ -323,7 +323,7 @@ static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
                        const std::vector<JirRef> &argRefs);
 // `v[i]` desugar dispatch — see `emitStructCfnDispatch` for the body.
 // Forward-declared so astgenAssign (in this file, above the
-// definition) can call it for `v[i] = x` → setAt routing.
+// definition) can call it for `v[i] = x` -> setAt routing.
 static JirRef emitStructCfnDispatch(AstGenCtx &gctx,
                                     const JamCodegenContext::StructInfo *sinfo,
                                     const char *methodName, JirRef recv,
@@ -407,7 +407,7 @@ static JirRef astgenNumberLit(AstGenCtx &gctx, const AstNode &n,
 	// directly so literals lower at the consumer's width (this is the
 	// peer-type-propagation contract). When the expected type is a
 	// generic call or alias that resolves to an integer (e.g.
-	// `Identity(i32)` → i32), resolve it first so the contract holds
+	// `Identity(i32)` -> i32), resolve it first so the contract holds
 	// transitively. Otherwise fall back to the smallest-fit width.
 	if (expected != kNoType) {
 		TypeIdx resolved = expected;
@@ -561,7 +561,7 @@ static void emitDrops(AstGenCtx &gctx, const std::vector<DropTrack> &bindings) {
 }
 
 // AstGen for `VarDecl`. Lowers to Alloca + Store(init). The variable's
-// name → alloca ref binding is recorded so subsequent reads emit
+// name -> alloca ref binding is recorded so subsequent reads emit
 // Load(alloca).
 static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 	const NodeStore &ns = gctx.ctx.getNodeStore();
@@ -887,7 +887,7 @@ static void astgenAssign(AstGenCtx &gctx, const AstNode &n) {
 	NodeIdx targetIdx = static_cast<NodeIdx>(n.lhs);
 	NodeIdx valueIdx = static_cast<NodeIdx>(n.rhs);
 
-	// `v[i] = x` on a struct → `v.setAt(i, x)`.
+	// `v[i] = x` on a struct -> `v.setAt(i, x)`.
 	const AstNode &target = gctx.ctx.getNodeStore().get(targetIdx);
 	if (target.tag == AstTag::Index) {
 		NodeIdx baseIdx = static_cast<NodeIdx>(target.lhs);
@@ -1040,7 +1040,7 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 		}
 		TypeIdx expectedField = info->fields[idx].second;
 		JirRef fieldVal = astgenExpr(gctx, exprIdx, expectedField);
-		// Silent int→float widening matches the legacy struct codegen:
+		// Silent int->float widening matches the legacy struct codegen:
 		// `Vec3 { x: 0 }` with `x: f32` lands an integer literal here;
 		// emit SIToFP / UIToFP to settle the IR type instead of letting
 		// jir_codegen pipe an integer value into a float slot of the
@@ -1131,6 +1131,66 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 			sl.ty = enumTy;
 			return emit(gctx, sl);
 		}
+	}
+
+	// Addressable base -> FieldAddr + Load fieldTy. The value path
+	// below would emit Load wholeStruct + ExtractValue, which for a
+	// struct embedding large arrays scales as O(structSize) per field
+	// read — a method reading N fields from a 1KB self struct emitted
+	// N copies of a 1KB load.
+	bool baseIsLvalueable = baseNode.tag == AstTag::Variable ||
+	                        baseNode.tag == AstTag::MemberAccess ||
+	                        baseNode.tag == AstTag::Index ||
+	                        baseNode.tag == AstTag::Deref;
+	if (baseIsLvalueable) {
+		TypeIdx baseLeafTy = kNoType;
+		JirRef basePtr = astgenLvalue(gctx, baseIdx, baseLeafTy);
+		if (const auto *uinfo = gctx.ctx.lookupUnion(baseLeafTy)) {
+			TypeIdx fieldTy = gctx.ctx.getUnionFieldType(uinfo->name, member);
+			if (fieldTy == kNoType) {
+				failHere(gctx, "astgen: union `" + uinfo->name +
+				                   "` has no field `" + member + "`");
+			}
+			TypeIdx fieldPtrTy = gctx.ctx.getTypePool().intern(
+			    TypeKey{TypeKind::PtrSingle, 0, 0, fieldTy, 0});
+			JirInst bc{};
+			bc.tag = JirTag::BitCast;
+			bc.a = basePtr;
+			bc.ty = fieldPtrTy;
+			JirRef fp = emit(gctx, bc);
+			JirInst ld{};
+			ld.tag = JirTag::Load;
+			ld.a = fp;
+			ld.ty = fieldTy;
+			return emit(gctx, ld);
+		}
+		if (const auto *info = gctx.ctx.lookupStruct(baseLeafTy)) {
+			int idx = gctx.ctx.getFieldIndex(info->name, member);
+			if (idx < 0) {
+				return recoverHere(gctx,
+				                   "unknown field `" + member + "` on `" +
+				                       info->name + "`",
+				                   kNoType);
+			}
+			TypeIdx fieldTy = info->fields[idx].second;
+			TypeIdx fieldPtrTy = gctx.ctx.getTypePool().intern(
+			    TypeKey{TypeKind::PtrSingle, 0, 0, fieldTy, 0});
+			JirInst fa{};
+			fa.tag = JirTag::FieldAddr;
+			fa.a = basePtr;
+			fa.b = static_cast<uint32_t>(idx);
+			fa.ty = fieldPtrTy;
+			JirRef fp = emit(gctx, fa);
+			JirInst ld{};
+			ld.tag = JirTag::Load;
+			ld.a = fp;
+			ld.ty = fieldTy;
+			return emit(gctx, ld);
+		}
+		// Slice base (.ptr / .len), or some other shape — fall
+		// through to the value path. The astgenLvalue call above
+		// emitted an alloca/GEP lookup that may go unused; small
+		// cost relative to the win for struct/union bases.
 	}
 
 	// Regular struct field projection.
@@ -1356,9 +1416,9 @@ static JirRef emitStructCfnDispatch(AstGenCtx &gctx,
 // Statically determine, without emitting any JIR, whether `node` is
 // an addressable expression chain whose leaf type is Array — and if
 // so, return that Array TypeIdx (else kNoType). Walks the AST
-// structurally: Variable → localTypes; MemberAccess → recurse on the
+// structurally: Variable -> localTypes; MemberAccess -> recurse on the
 // parent, then look up the field type via the parent's StructInfo;
-// Index → recurse on base, then unwrap one Array dimension; Deref →
+// Index -> recurse on base, then unwrap one Array dimension; Deref ->
 // recurse on the pointee. Anything else (slice projections, calls,
 // arithmetic, literals) returns kNoType.
 //
@@ -1493,7 +1553,7 @@ static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 	TypeIdx baseTy = gctx.jfn.getInst(baseRef).ty;
 	const TypeKey &k = gctx.ctx.getTypePool().get(baseTy);
 
-	// Struct dispatch: `v[i]` → `v.at(i)`. The `at` method is value-
+	// Struct dispatch: `v[i]` -> `v.at(i)`. The `at` method is value-
 	// shaped — it returns T directly, no pointer wrapper. The call's
 	// result IS the index expression's value; nothing more to do.
 	// `lookupStruct` chases Struct / Named / GenericCall TypeKinds
@@ -1632,7 +1692,7 @@ static JirRef astgenDeref(AstGenCtx &gctx, const AstNode &n) {
 static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 	NodeIdx operandIdx = static_cast<NodeIdx>(n.lhs);
 	TypeIdx dstTyOrig = static_cast<TypeIdx>(n.rhs);
-	// Resolve GenericCall destinations (e.g. `Identity(u8)` → u8) so
+	// Resolve GenericCall destinations (e.g. `Identity(u8)` -> u8) so
 	// the downstream Int/Float branches see the concrete type.
 	TypeIdx dstTy = dstTyOrig;
 	{
@@ -1666,7 +1726,7 @@ static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 		return emit(gctx, inst);
 	};
 
-	// Bool-to-integer: i1 → integer of any width.
+	// Bool-to-integer: i1 -> integer of any width.
 	if (src.kind == TypeKind::Bool && dst.kind == TypeKind::Int) {
 		JirInst inst{};
 		inst.tag = JirTag::ZExt;
@@ -1803,9 +1863,9 @@ static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 }
 
 // AstGen for `UnaryOp`. Three forms:
-//   `-x`  (Neg)     → 0 - x  for ints, FNeg for floats
-//   `!x`  (LogNot)  → x == false (xor 1)
-//   `~x`  (BitNot)  → x XOR all-ones
+//   `-x`  (Neg)     -> 0 - x  for ints, FNeg for floats
+//   `!x`  (LogNot)  -> x == false (xor 1)
+//   `~x`  (BitNot)  -> x XOR all-ones
 static JirRef astgenUnaryOp(AstGenCtx &gctx, const AstNode &n,
                             TypeIdx expected) {
 	NodeIdx opIdx = static_cast<NodeIdx>(n.lhs);
@@ -2414,8 +2474,8 @@ struct SwitchCase {
 // caller — it doesn't contribute cases, it becomes the default block.
 //
 // `scrutIsEnum` selects how PatLit / PatEnumVariant are validated:
-//   * integer scrutinee → only PatLit accepted; value = literal bits.
-//   * enum scrutinee   → only PatEnumVariant accepted; value = the
+//   * integer scrutinee -> only PatLit accepted; value = literal bits.
+//   * enum scrutinee   -> only PatEnumVariant accepted; value = the
 //                         variant's discriminant byte. The enum's
 //                         `EnumInfo` is supplied so we can resolve the
 //                         variant name without re-doing the lookup
@@ -2553,7 +2613,7 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx, JirRef scrut,
 	case AstTag::PatEnumVariant: {
 		// Decode the PatEnumVariant via the four-way encoding documented
 		// in the legacy `decodePatEnumVariant`:
-		//   flags & 1: bindings present, lhs = ExtraIdx → [recv, variant,
+		//   flags & 1: bindings present, lhs = ExtraIdx -> [recv, variant,
 		//              count, name0, name1, ...]; else lhs is the receiver
 		//   flags & 2: receiver is a TypeIdx (GenericCall, resolved via
 		//              lookupEnum); else it's a StringIdx
@@ -2968,7 +3028,7 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 // Resolves the receiver TypeIdx to its struct/enum name (triggering
 // lazy generic instantiation as a side effect), synthesizes a regular
 // Call AST node with qualified name `ReceiverName.method`, and recurses
-// into astgenCall. Instantiation runs the full astgen → jirDefineBody
+// into astgenCall. Instantiation runs the full astgen -> jirDefineBody
 // pipeline in `JamCodegenContext::instantiateStructExpr`, so the JIR
 // Call here resolves cleanly by LLVM name at codegen time.
 static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n) {
@@ -3334,30 +3394,28 @@ static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 	if (pabi.kind != jam::abi::ParamABI::Kind::ByPointer) {
 		return astgenExpr(gctx, argIdx, p.Type);
 	}
-	// ByPointer: feed an address. Mut / Move want the caller's
-	// storage when the arg is an lvalue (so writes are observed by the
-	// caller). Let / Const reach here only for large aggregates — the
-	// callee can't mutate them through the pointer (no `mut`), but the
-	// LLVM signature wants a pointer because the value is too big to
-	// pass in registers. In both cases, when the arg isn't already an
-	// lvalue we spill it to a fresh alloca.
+	// ByPointer: feed an address. Lvalueable arg -> hand the existing
+	// storage ptr; non-lvalue rvalue -> spill to a fresh alloca. All
+	// four param modes share this shape — mut/move want the caller's
+	// storage so writes are observed, let on large aggregates wants
+	// it because the value is too big to pass in registers. Routing
+	// let/move-by-ptr through the lvalue path saves the otherwise-
+	// dead value-load + spill at every call site.
 	const AstNode &argNode = gctx.ctx.getNodeStore().get(argIdx);
-	if (p.Mode == ParamMode::Mut || p.Mode == ParamMode::Move) {
-		TypeIdx leafTy = kNoType;
-		switch (argNode.tag) {
-		case AstTag::Variable:
-		case AstTag::MemberAccess:
-		case AstTag::Index:
-		case AstTag::Deref:
-			return astgenLvalue(gctx, argIdx, leafTy);
-		case AstTag::AddressOf:
-			return astgenExpr(gctx, argIdx, kNoType);
-		default:
-			break;
-		}
+	TypeIdx leafTy = kNoType;
+	switch (argNode.tag) {
+	case AstTag::Variable:
+	case AstTag::MemberAccess:
+	case AstTag::Index:
+	case AstTag::Deref:
+		return astgenLvalue(gctx, argIdx, leafTy);
+	case AstTag::AddressOf:
+		return astgenExpr(gctx, argIdx, kNoType);
+	default:
+		break;
 	}
 	JirRef val = astgenExpr(gctx, argIdx, p.Type);
-	TypeIdx leafTy = gctx.jfn.getInst(val).ty;
+	leafTy = gctx.jfn.getInst(val).ty;
 	JirInst alloca{};
 	alloca.tag = JirTag::Alloca;
 	alloca.ty = leafTy;
@@ -4036,8 +4094,21 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 			JirRef basePtr =
 			    astgenExpr(gctx, recvExprIdx, kNoType, ResultLoc::Pointer);
 			TypeIdx leafTy = gctx.jfn.getInst(basePtr).ty;
-			const TypeKey &lk = gctx.ctx.getTypePool().get(leafTy);
-			if (lk.kind == TypeKind::Array) {
+			const TypeKey &lk0 = gctx.ctx.getTypePool().get(leafTy);
+			// MemberAccess on a struct field returns a FieldAddr whose
+			// type is `PtrSingle(arrayTy)` (the field's storage
+			// address), not the array itself. Unwrap one pointer level
+			// so the Array check fires for `self.field.asMutPtr()` the
+			// same way it does for `arr.asMutPtr()` on a local. Same
+			// goes for `PtrMany` from an Index lvalue.
+			TypeKind lkKind = lk0.kind;
+			TypeIdx unwrappedTy = leafTy;
+			if (lkKind == TypeKind::PtrSingle || lkKind == TypeKind::PtrMany) {
+				unwrappedTy = static_cast<TypeIdx>(lk0.a);
+				lkKind = gctx.ctx.getTypePool().get(unwrappedTy).kind;
+			}
+			const TypeKey &lk = gctx.ctx.getTypePool().get(unwrappedTy);
+			if (lkKind == TypeKind::Array) {
 				TypeIdx elemTy = static_cast<TypeIdx>(lk.a);
 				TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
 				    TypeKey{TypeKind::PtrMany, 0, 0, elemTy, 0});
@@ -4059,19 +4130,36 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 			// below. (basePtr is unused; cheap, no Load was emitted.)
 		}
 
-		// Resolve the receiver as a value for struct / enum dispatch.
-		// For mut/move dispatch we'll redo this as an lvalue below —
-		// passing the original storage pointer instead of a spilled
-		// copy.
-		JirRef recvVal = astgenExpr(gctx, recvExprIdx, kNoType);
-		TypeIdx recvTy = gctx.jfn.getInst(recvVal).ty;
-		{
+		// Receiver lowering. The goal is to never emit a full-
+		// aggregate value-load just to peek the receiver's type when
+		// `outer.field.method()` embeds a large struct.
+		//   * lvalueable recv (Variable / MemberAccess / Index /
+		//     Deref): astgenLvalue gives the pointer and the receiver
+		//     type with no value-load. mut/move methods take the ptr
+		//     straight; by-value methods Load through it.
+		//   * non-lvalueable recv (Call result, etc.): value path.
+		//     by-value methods consume the value directly; mut/move
+		//     methods spill to a fresh alloca.
+		JirRef recvVal = kNoJirRef;
+		JirRef recvLvaluePtr = kNoJirRef;
+		TypeIdx recvTy = kNoType;
+		const AstNode &recvNodeForLvalue = ns.get(recvExprIdx);
+		bool recvLvalueable = recvNodeForLvalue.tag == AstTag::Variable ||
+		                      recvNodeForLvalue.tag == AstTag::MemberAccess ||
+		                      recvNodeForLvalue.tag == AstTag::Index ||
+		                      recvNodeForLvalue.tag == AstTag::Deref;
+		if (recvLvalueable) {
+			TypeIdx leafTy = kNoType;
+			recvLvaluePtr = astgenLvalue(gctx, recvExprIdx, leafTy);
+			recvTy = leafTy;
+		} else {
+			recvVal = astgenExpr(gctx, recvExprIdx, kNoType);
+			recvTy = gctx.jfn.getInst(recvVal).ty;
 			const TypeKey &recvKey = gctx.ctx.getTypePool().get(recvTy);
 			if (recvKey.kind == TypeKind::Array) {
 				// Non-lvalueable array receiver (e.g. a call result):
-				// the rvalue-Load path got us here. Without a stable
-				// storage location, we can't safely hand a pointer
-				// to FFI — reject.
+				// without a stable storage location we can't safely
+				// hand a pointer to FFI — reject.
 				failHere(gctx, "astgen: `" + methodName +
 				                   "()` requires an addressable array "
 				                   "(variable, field, or indexed slot)");
@@ -4097,35 +4185,39 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 		}
 		ParamMode mode =
 		    method->Args.empty() ? ParamMode::Let : method->Args[0].Mode;
-		JirRef recvArg = recvVal;
+		JirRef recvArg;
 		if (mode == ParamMode::Mut || mode == ParamMode::Move) {
-			// Re-lower the receiver as an lvalue so the method sees
-			// the original storage. For non-lvalue rvalues we spill
-			// the already-computed value to a fresh alloca.
-			const AstNode &recvNode = ns.get(recvExprIdx);
-			TypeIdx leafTy = kNoType;
-			JirRef ptr;
-			switch (recvNode.tag) {
-			case AstTag::Variable:
-			case AstTag::MemberAccess:
-			case AstTag::Index:
-			case AstTag::Deref:
-				ptr = astgenLvalue(gctx, recvExprIdx, leafTy);
-				break;
-			default: {
+			if (recvLvaluePtr != kNoJirRef) {
+				recvArg = recvLvaluePtr;
+			} else {
+				// Non-lvalue receiver with a mut/move method: spill the
+				// already-computed value to a fresh alloca so the
+				// callee gets a stable storage address.
 				JirInst alloca{};
 				alloca.tag = JirTag::Alloca;
 				alloca.ty = recvTy;
-				ptr = emitAllocaHoisted(gctx, alloca);
+				JirRef ptr = emitAllocaHoisted(gctx, alloca);
 				JirInst store{};
 				store.tag = JirTag::Store;
 				store.a = ptr;
 				store.b = recvVal;
 				emit(gctx, store);
-				break;
+				recvArg = ptr;
 			}
+		} else {
+			if (recvVal != kNoJirRef) {
+				recvArg = recvVal;
+			} else {
+				// Lvalue receiver + by-value method: Load through the
+				// ptr now. This is the only spot where a full-aggregate
+				// load is unavoidable; the previous design emitted it
+				// unconditionally even when the method took a pointer.
+				JirInst load{};
+				load.tag = JirTag::Load;
+				load.a = recvLvaluePtr;
+				load.ty = recvTy;
+				recvArg = emit(gctx, load);
 			}
-			recvArg = ptr;
 		}
 		std::vector<JirRef> argRefs;
 		argRefs.reserve(1 + argCount);
@@ -4297,7 +4389,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 							offC.ty = BuiltinType::U64;
 							JirRef offRef = emit(gctx, offC);
 							gepInst.b = offRef;
-							gepInst.ty = payAreaPtrTy;  // *u8 → byte stride
+							gepInst.ty = payAreaPtrTy;  // *u8 -> byte stride
 							JirRef fieldPtr = emit(gctx, gepInst);
 							JirInst payStore{};
 							payStore.tag = JirTag::Store;

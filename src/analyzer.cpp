@@ -31,15 +31,15 @@ void Analyzer::pushCycleError(DeclIndex repeated) {
 	std::ostringstream chain;
 	// The cycle is the suffix of analysisStack_ that begins with the
 	// first occurrence of `repeated`. Walk from there to the end so
-	// the user reads the loop in source order: A → B → A.
+	// the user reads the loop in source order: A -> B -> A.
 	auto first =
 	    std::find(analysisStack_.begin(), analysisStack_.end(), repeated);
 	chain << "dependency loop detected: ";
 	for (auto it = first; it != analysisStack_.end(); ++it) {
-		if (it != first) chain << " → ";
+		if (it != first) chain << " -> ";
 		chain << "`" << decls_.get(*it).name << "`";
 	}
-	chain << " → `" << repeatedDecl.name << "`";
+	chain << " -> `" << repeatedDecl.name << "`";
 	// The chain itself is in the message, so the reference trace
 	// would just duplicate it. Skip the trace here; other diagnostics
 	// that don't print the chain get it via emitErrorWithRefTrace.
@@ -198,7 +198,7 @@ bool Analyzer::resolveTypeFieldsStruct(DeclIndex idx) {
 		// the matching ensure*Body when the field is a *direct* named
 		// type (TypeKind::Named/Struct/Enum/Union, not PtrSingle/
 		// PtrMany/Slice/Array), so linked-list idioms keep working
-		// while `S { x: S }` (or struct→union→struct chains) correctly
+		// while `S { x: S }` (or struct->union->struct chains) correctly
 		// trips the WIP cycle check.
 		const TypeKey &fk = ctx_.getTypePool().get(f.second);
 		if (fk.kind == TypeKind::Named || fk.kind == TypeKind::Struct ||
@@ -618,7 +618,7 @@ DeclValue Analyzer::analyzeConst(DeclIndex idx) {
 	Decl &d = decls_.get(idx);
 	// `AliasedType` is set by `registerConsts` in main.cpp when it
 	// detects that the const's RHS is a type-resolving expression
-	// (e.g. `const Box = Vec(i32)` → AliasedType = GenericCall ty).
+	// (e.g. `const Box = Vec(i32)` -> AliasedType = GenericCall ty).
 	// Reading that field here lets the analyzer surface the alias
 	// as a Type-kind DeclValue, so future call sites that ask the
 	// analyzer "what is X?" get a TypeIdx back instead of None.

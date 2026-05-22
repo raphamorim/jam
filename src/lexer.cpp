@@ -176,11 +176,11 @@ void Lexer::identifier() {
 // number_literal.cpp.
 //
 // Greedy character set:
-//   .          → entering a float (or `..=` separator — see below)
-//   _          → digit separator
-//   0-9, a-z, A-Z → digits or future suffix letters
-//   e, E, p, P → exponent markers
-//   + / -      → exponent sign immediately after p/P/e/E
+//   .          -> entering a float (or `..=` separator — see below)
+//   _          -> digit separator
+//   0-9, a-z, A-Z -> digits or future suffix letters
+//   e, E, p, P -> exponent markers
+//   + / -      -> exponent sign immediately after p/P/e/E
 //
 // Escape hatch:
 //   `..` (followed by a non-digit) ends the number — required so that
@@ -201,7 +201,7 @@ void Lexer::negativeNumber() {
 }
 
 void Lexer::scanNumberBody() {
-	// State machine: int → int_period → float → float_exp. We track
+	// State machine: int -> int_period -> float -> float_exp. We track
 	// only enough state to know whether `+`/`-` is valid (it is only
 	// after a p/P/e/E exponent letter).
 	enum NumState { S_INT, S_INT_PERIOD, S_FLOAT, S_FLOAT_EXP };

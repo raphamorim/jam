@@ -59,19 +59,19 @@ struct ReturnABI {
 // Classify a parameter (mode, type) pair. Pure function of its inputs;
 // safe to call any number of times. See docs/ABI.md §4.
 //
-//   mut                    → always ByPointer
-//   let / move, scalar T   → ByValue
+//   mut                    -> always ByPointer
+//   let / move, scalar T   -> ByValue
 //   let / move, aggregate
-//     size <= kByValueMaxBytes → ByValue (LLVM handles register packing)
-//     size  > kByValueMaxBytes → ByPointer
+//     size <= kByValueMaxBytes -> ByValue (LLVM handles register packing)
+//     size  > kByValueMaxBytes -> ByPointer
 ParamABI classifyParam(ParamMode mode, TypeIdx ty,
                        const JamCodegenContext &ctx);
 
 // Classify a return type. See docs/ABI.md §4.
 //
-//   scalar T                       → Direct
-//   aggregate with size <= 16 B    → Direct (LLVM packs into return regs)
-//   aggregate with size  > 16 B    → Indirect (sret)
+//   scalar T                       -> Direct
+//   aggregate with size <= 16 B    -> Direct (LLVM packs into return regs)
+//   aggregate with size  > 16 B    -> Indirect (sret)
 ReturnABI classifyReturn(TypeIdx ty, const JamCodegenContext &ctx);
 
 // Threshold above which an owned aggregate is passed/returned by pointer

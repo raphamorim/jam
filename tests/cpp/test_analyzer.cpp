@@ -1,5 +1,5 @@
 // Unit tests for src/analyzer.h — the demand-driven Decl chokepoint.
-// Covers the state-machine transitions (Unreferenced → InProgress →
+// Covers the state-machine transitions (Unreferenced -> InProgress ->
 // Complete), the cycle detector (Decl.analysis re-entry produces a
 // "dependency loop" diagnostic with the chain), and the struct-status
 // chokepoint (Struct.status FieldTypesWIP re-entry produces a
@@ -95,7 +95,7 @@ void testInProgressTriggersCycleError() {
 
 void testCycleChainListsAnalysisStackInOrder() {
 	// When the analyzer hits a cycle, the message should list the
-	// chain in source order: A → B → A. We populate the analysis
+	// chain in source order: A -> B -> A. We populate the analysis
 	// stack ourselves and ask the analyzer to "re-enter" A from the
 	// middle of B's analysis.
 	JamCodegenContext ctx("test_module");
@@ -207,7 +207,7 @@ void testEnsureDeclAnalyzedFunctionPopulatesSignatureCache() {
 	decls.get(fn2).fnAst = &realFn;
 	az.ensureDeclAnalyzed(fn2);
 	ASSERT_TRUE(decls.get(fn2).signature.computed);
-	// Empty Args → empty params vector; kNoType return → Direct ABI
+	// Empty Args -> empty params vector; kNoType return -> Direct ABI
 	// classification's default (matches what classifyReturn returns
 	// for the void-like case).
 	ASSERT_EQ(static_cast<std::size_t>(0),
@@ -276,7 +276,7 @@ void testAnalysisStackEmptyAfterTopLevelCall() {
 
 int main() {
 	TestFramework framework;
-	framework.addTest("Analyzer - Unreferenced → InProgress → Complete",
+	framework.addTest("Analyzer - Unreferenced -> InProgress -> Complete",
 	                  testUnreferencedTransitionsThroughInProgressToComplete);
 	framework.addTest("Analyzer - Complete returns cached value",
 	                  testCompleteDeclReturnsCachedValueNoReanalysis);
@@ -287,7 +287,7 @@ int main() {
 	framework.addTest("Analyzer - cycle chain lists stack in source order",
 	                  testCycleChainListsAnalysisStackInOrder);
 	framework.addTest(
-	    "Analyzer - resolveTypeFieldsStruct: None → HaveFieldTypes",
+	    "Analyzer - resolveTypeFieldsStruct: None -> HaveFieldTypes",
 	    testResolveTypeFieldsStructNoneToHaveFieldTypes);
 	framework.addTest(
 	    "Analyzer - resolveTypeFieldsStruct: WIP is self-cycle error",

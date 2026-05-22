@@ -163,7 +163,7 @@ static std::string chainRootName(const NodeStore &ns, const StringPool &pool,
 }
 
 // Count the number of dots (== MemberAccess hops) in a qualified-name
-// chain. `foo` → 0, `foo.bar` → 1, `foo.bar.baz` → 2, etc.
+// chain. `foo` -> 0, `foo.bar` -> 1, `foo.bar.baz` -> 2, etc.
 static int chainDotCount(const NodeStore &ns, NodeIdx chainRoot) {
 	const AstNode &n = ns.get(chainRoot);
 	if (n.tag != AstTag::MemberAccess) return 0;
@@ -181,7 +181,7 @@ NodeIdx Parser::parsePrimary() {
 	//   * Type-arg form (`@sizeOf(T)`, `@alignOf(T)`): single TypeIdx
 	//     stored in rhs. flags=0.
 	//   * Expr-arg multi-form (`@emit*(...)` intrinsics callable from
-	//     cfn bodies): rhs is an ExtraIdx → [argCount, arg0, ...].
+	//     cfn bodies): rhs is an ExtraIdx -> [argCount, arg0, ...].
 	//     flags bit 0 = 1.
 	// The intrinsic name decides which encoding the parser uses.
 	if (match(TOK_AT)) {

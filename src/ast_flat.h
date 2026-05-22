@@ -63,21 +63,22 @@ enum class AstTag : uint8_t {
 
 	// Calls
 	// d.lhs = StringIdx (callee fully qualified, e.g. "std.fmt.println")
-	// d.rhs = ExtraIdx → [argCount, arg0, arg1, ...]
+	// d.rhs = ExtraIdx -> [argCount, arg0, arg1, ...]
 	Call,
 
 	// Statements
 	Return,  // d.lhs = NodeIdx (operand) or kNoNode for bare `return;`
 	Assign,  // d.lhs = NodeIdx (target), d.rhs = NodeIdx (value)
-	// d.lhs = ExtraIdx → [StringIdx name, TypeIdx type, NodeIdx init]
+	// d.lhs = ExtraIdx -> [StringIdx name, TypeIdx type, NodeIdx init]
 	// d.rhs = flags (bit 0 = isConst)
 	VarDecl,
-	// d.lhs = NodeIdx (cond), d.rhs = ExtraIdx →
+	// d.lhs = NodeIdx (cond), d.rhs = ExtraIdx ->
 	//   [thenCount, elseCount, then0, then1, ..., else0, else1, ...]
 	IfNode,
-	// d.lhs = NodeIdx (cond), d.rhs = ExtraIdx → [bodyCount, body0, body1, ...]
+	// d.lhs = NodeIdx (cond), d.rhs = ExtraIdx -> [bodyCount, body0, body1,
+	// ...]
 	WhileNode,
-	// d.lhs = ExtraIdx → [StringIdx var, NodeIdx start, NodeIdx end,
+	// d.lhs = ExtraIdx -> [StringIdx var, NodeIdx start, NodeIdx end,
 	//                     bodyCount, body0, body1, ...]
 	ForNode,
 	Break,
@@ -86,17 +87,17 @@ enum class AstTag : uint8_t {
 	// Module-level
 	ImportLit,  // d.lhs = StringIdx (module path)
 	// d.lhs = TypeIdx (struct type, kNoType if inferred from var-decl context)
-	// d.rhs = ExtraIdx → [fieldCount, fieldName0, fieldExpr0, fieldName1, ...]
+	// d.rhs = ExtraIdx -> [fieldCount, fieldName0, fieldExpr0, fieldName1, ...]
 	StructLit,
 	// `[a, b, c, ...]` array literal in expression position. Element type
 	// inferred from var-decl target type (kNoType if unknown — codegen
 	// rejects).
 	// d.lhs = TypeIdx (target element type, kNoType if unbound)
-	// d.rhs = ExtraIdx → [count, elem0, elem1, ...]
+	// d.rhs = ExtraIdx -> [count, elem0, elem1, ...]
 	ArrayLit,
 	// `[expr; N]` array repeat literal. N is a constant integer expression.
 	// d.lhs = TypeIdx (target array type, kNoType if unbound)
-	// d.rhs = ExtraIdx → [valueNode, countNode]
+	// d.rhs = ExtraIdx -> [valueNode, countNode]
 	ArrayRepeat,
 	// a `struct { fields, methods }` expression, evaluated at
 	// compile time to a value of type `type`. The expression's body lives
@@ -119,7 +120,7 @@ enum class AstTag : uint8_t {
 	// Pattern match (integer literals, ranges, or-patterns, wildcard).
 	// The catch-all is the wildcard pattern `_`; there is no `else` arm.
 	// d.lhs = NodeIdx (scrutinee expression)
-	// d.rhs = ExtraIdx → [armCount,
+	// d.rhs = ExtraIdx -> [armCount,
 	//                     arm0_patIdx, arm0_bodyCount, arm0_body...,
 	//                     arm1_patIdx, arm1_bodyCount, arm1_body..., ...]
 	MatchNode,
@@ -136,7 +137,7 @@ enum class AstTag : uint8_t {
 	// Two arg-encoding shapes, discriminated by d.flags bit 0:
 	//   * flags bit 0 = 0 — type-arg single-form. d.rhs = TypeIdx.
 	//     Used by `@sizeOf(T)`, `@alignOf(T)`.
-	//   * flags bit 0 = 1 — expr-arg multi-form. d.rhs = ExtraIdx →
+	//   * flags bit 0 = 1 — expr-arg multi-form. d.rhs = ExtraIdx ->
 	//     [argCount, arg0_NodeIdx, arg1_NodeIdx, ...]. Used by
 	//     `@emit*` intrinsics callable from cfn bodies.
 	//
@@ -144,16 +145,16 @@ enum class AstTag : uint8_t {
 	AtCall,
 
 	// Static method call on a generic-call type receiver:
-	//   Vec(i32).empty()          → struct static method
-	//   Option(i32).Some(42)      → enum variant constructor
-	//   Option(i32).None()        → unit-variant constructor
+	//   Vec(i32).empty()          -> struct static method
+	//   Option(i32).Some(42)      -> enum variant constructor
+	//   Option(i32).None()        -> unit-variant constructor
 	// The parser detects the `IDENT(args).IDENT(args)` shape via
 	// paren-balanced peek-ahead, parses the inner args as TYPES, and
 	// builds a GenericCall TypeIdx for the receiver. Codegen resolves
 	// the receiver type (instantiating if necessary) and dispatches
 	// to the appropriate static-method or variant-constructor path.
 	// d.lhs = TypeIdx (receiver type — typically GenericCall)
-	// d.rhs = ExtraIdx → [methodNameId, argCount, arg0, arg1, ...]
+	// d.rhs = ExtraIdx -> [methodNameId, argCount, arg0, arg1, ...]
 	TypeMethodCall,
 
 	// Pattern atoms — internal nodes used inside MatchNode arms. Never
@@ -166,7 +167,7 @@ enum class AstTag : uint8_t {
 	PatRange,
 	// No payload.
 	PatWildcard,
-	// d.lhs = ExtraIdx → [count, sub0, sub1, ...]; each subN is a NodeIdx
+	// d.lhs = ExtraIdx -> [count, sub0, sub1, ...]; each subN is a NodeIdx
 	// of a PatLit / PatRange / PatWildcard / PatEnumVariant.
 	PatOr,
 	// Enum-variant pattern (`EnumName.VariantName` in a match arm).

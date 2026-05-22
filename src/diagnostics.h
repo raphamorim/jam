@@ -74,7 +74,7 @@ struct Diagnostic {
 // reaches the diagnostic emitter with the chain attached.
 //
 // Scope: this is a stack of *currently-active* instantiation frames.
-// It captures nested instantiation (A→B→C while all three are still
+// It captures nested instantiation (A->B->C while all three are still
 // in flight) but does NOT capture references from already-completed
 // decls. The stack covers the practical case where instantiation
 // errors fire mid-stack; cross-decl historical reference chains are

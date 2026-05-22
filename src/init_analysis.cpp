@@ -106,7 +106,7 @@ class Analyzer {
 	struct BorrowPath {
 		StringIdx base = kNoString;   // base binding name, or kNoString if
 		                              // the arg isn't a simple lvalue chain
-		std::vector<PathStep> steps;  // root → leaf order after extraction
+		std::vector<PathStep> steps;  // root -> leaf order after extraction
 	};
 
 	BorrowPath extractPath(NodeIdx argIdx) const;
@@ -146,7 +146,7 @@ std::vector<Diagnostic> Analyzer::run(const FunctionAST &fn) {
 
 	NameMap state;
 	// parameter entry state depends on the declared mode.
-	//   Let / Mut / Move → Init (caller's binding is valid)
+	//   Let / Mut / Move -> Init (caller's binding is valid)
 	// `move` does not change anything for the callee's view of its own
 	// parameter — the moved-from-ness applies to the *caller's* binding
 	// after the call.
@@ -320,7 +320,7 @@ Result Analyzer::analyze(NodeIdx idx, NameMap state) {
 // Statement / declaration cases.
 
 Result Analyzer::analyzeVarDecl(NodeIdx idx, NameMap state) {
-	// VarDecl: d.lhs = ExtraIdx → [StringIdx name, TypeIdx type, NodeIdx init]
+	// VarDecl: d.lhs = ExtraIdx -> [StringIdx name, TypeIdx type, NodeIdx init]
 	const AstNode &n = nodes_.get(idx);
 	ExtraIdx extra = n.lhs;
 	StringIdx nameIdx = nodes_.getExtra(extra + 0);
@@ -391,7 +391,8 @@ Result Analyzer::analyzeAssignTarget(NodeIdx idx, NameMap state) {
 
 Result Analyzer::analyzeIf(NodeIdx idx, NameMap state) {
 	// IfNode: d.lhs = NodeIdx (cond)
-	//         d.rhs = ExtraIdx → [thenCount, elseCount, then0, ..., else0, ...]
+	//         d.rhs = ExtraIdx -> [thenCount, elseCount, then0, ..., else0,
+	//         ...]
 	const AstNode &n = nodes_.get(idx);
 	auto r = analyze(n.lhs, std::move(state));
 	if (r.terminated) return r;
@@ -426,7 +427,7 @@ Result Analyzer::analyzeIf(NodeIdx idx, NameMap state) {
 }
 
 Result Analyzer::analyzeWhile(NodeIdx idx, NameMap state) {
-	// WhileNode: d.lhs = NodeIdx (cond), d.rhs = ExtraIdx →
+	// WhileNode: d.lhs = NodeIdx (cond), d.rhs = ExtraIdx ->
 	//            [bodyCount, body0, body1, ...]
 	const AstNode &n = nodes_.get(idx);
 	auto r = analyze(n.lhs, std::move(state));
@@ -452,7 +453,7 @@ Result Analyzer::analyzeWhile(NodeIdx idx, NameMap state) {
 }
 
 Result Analyzer::analyzeFor(NodeIdx idx, NameMap state) {
-	// ForNode: d.lhs = ExtraIdx → [StringIdx var, NodeIdx start, NodeIdx end,
+	// ForNode: d.lhs = ExtraIdx -> [StringIdx var, NodeIdx start, NodeIdx end,
 	//                              bodyCount, body0, body1, ...]
 	const AstNode &n = nodes_.get(idx);
 	ExtraIdx extra = n.lhs;
@@ -492,7 +493,7 @@ Result Analyzer::analyzeFor(NodeIdx idx, NameMap state) {
 }
 
 Result Analyzer::analyzeMatch(NodeIdx idx, NameMap state) {
-	// MatchNode: d.lhs = NodeIdx (scrutinee), d.rhs = ExtraIdx →
+	// MatchNode: d.lhs = NodeIdx (scrutinee), d.rhs = ExtraIdx ->
 	//   [armCount,
 	//    arm0_patIdx, arm0_bodyCount, arm0_body...,
 	//    arm1_patIdx, arm1_bodyCount, arm1_body..., ...]
@@ -558,7 +559,7 @@ Result Analyzer::analyzeReturn(NodeIdx idx, NameMap state) {
 }
 
 Result Analyzer::analyzeCall(NodeIdx idx, NameMap state) {
-	// Call: d.lhs = StringIdx (callee), d.rhs = ExtraIdx → [argCount, args...]
+	// Call: d.lhs = StringIdx (callee), d.rhs = ExtraIdx -> [argCount, args...]
 	const AstNode &n = nodes_.get(idx);
 	const FunctionAST *callee = nullptr;
 	if ((n.flags & 1) == 0) {
@@ -748,7 +749,7 @@ Analyzer::BorrowPath Analyzer::extractPath(NodeIdx argIdx) const {
 
 // Two paths overlap when one is a prefix of the other (or they are
 // equal). Per MVS.md §4.1:
-//   - Same base required; different bases → disjoint.
+//   - Same base required; different bases -> disjoint.
 //   - Step-by-step compare on common prefix:
 //       Field vs Field: same name? continue : disjoint
 //       Index vs Index: both const & equal? continue : differ-const? disjoint
@@ -784,7 +785,7 @@ bool Analyzer::pathsOverlap(const BorrowPath &a, const BorrowPath &b) {
 }
 
 Result Analyzer::analyzeStructLit(NodeIdx idx, NameMap state) {
-	// StructLit: d.rhs = ExtraIdx →
+	// StructLit: d.rhs = ExtraIdx ->
 	//   [fieldCount, fieldName0, fieldExpr0, fieldName1, fieldExpr1, ...]
 	const AstNode &n = nodes_.get(idx);
 	ExtraIdx extra = n.rhs;

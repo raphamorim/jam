@@ -89,7 +89,7 @@ struct ComptimeValue {
 	uint64_t asU64() const;
 };
 
-// A lexically-scoped map of name → ComptimeValue. The evaluator reads
+// A lexically-scoped map of name -> ComptimeValue. The evaluator reads
 // from it when it encounters a Variable node, and the executor mutates
 // it on var-decl / assignment statements.
 //

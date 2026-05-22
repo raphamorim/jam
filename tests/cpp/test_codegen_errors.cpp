@@ -38,7 +38,7 @@ CompileResult compileSource(const std::string &name,
 		out << source;
 	}
 
-	// Redirect stderr→stdout so popen captures both. jam.out usually
+	// Redirect stderr->stdout so popen captures both. jam.out usually
 	// only writes to stderr on error, but this is robust either way.
 	std::string cmd = "./jam.out " + path + " 2>&1";
 
@@ -249,7 +249,7 @@ fn main() i32 { return 0; }
 	}
 
 	// Float-typed destinations need a float literal (`3.0`) or an
-	// explicit `as` cast. Implicit int→float coercion is rejected so
+	// explicit `as` cast. Implicit int->float coercion is rejected so
 	// the source spells out every bit-pattern change.
 	static void testIntToFloatRejected() {
 		auto r = compileSource("must_fail_int_to_float", R"(
@@ -558,7 +558,7 @@ fn main() {
 		ASSERT_TRUE(stderrContains(r, "unsupported `as` cast"));
 	}
 
-	// Mirror of the above for the other direction: only u64 → ptr
+	// Mirror of the above for the other direction: only u64 -> ptr
 	// is accepted (a u32 can't carry a full target pointer).
 	static void testNarrowIntAsPtrRejected() {
 		auto r = compileSource("narrow_int_as_ptr", R"(

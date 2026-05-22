@@ -56,8 +56,8 @@ typedef enum {
 	JAM_ICMP_SLE = 41,  // signed less or equal
 } JamIntPredicate;
 
-// Float comparison predicates. `O` = ordered (NaN inputs → false);
-// `U` = unordered (NaN inputs → true). Jam emits the ordered
+// Float comparison predicates. `O` = ordered (NaN inputs -> false);
+// `U` = unordered (NaN inputs -> true). Jam emits the ordered
 // variants by default so NaN never satisfies a comparison.
 typedef enum {
 	JAM_FCMP_FALSE = 50,  // always false

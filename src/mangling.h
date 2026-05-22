@@ -19,19 +19,19 @@
 // symbol names, so no further escaping is needed.
 //
 // The rules:
-//   - `tfn t()` → `__test_t` (the harness in main.cpp calls these by
+//   - `tfn t()` -> `__test_t` (the harness in main.cpp calls these by
 //     prefixed name).
 //   - Cloned instantiated methods carry their qualified name already
 //     (`Vec__i32.push`) — we keep it.
-//   - Free-function `cfn drop(self: mut T)` → `T.drop`. The receiver
+//   - Free-function `cfn drop(self: mut T)` -> `T.drop`. The receiver
 //     type qualifies it so two top-level drops for different types
 //     don't collide on the bare name `drop`. Matches what an
 //     equivalent in-struct `cfn drop` would mangle to.
 //   - Otherwise: `[modulePath.][parentStruct.]Name`
-//       free fn in entry module       → `name`
-//       free fn in module `m`         → `m.name`
-//       method on `T` in entry module → `T.name`
-//       method on `T` in module `m`   → `m.T.name`
+//       free fn in entry module       -> `name`
+//       free fn in module `m`         -> `m.name`
+//       method on `T` in entry module -> `T.name`
+//       method on `T` in module `m`   -> `m.T.name`
 //
 // Centralised so every site that picks a function's LLVM symbol
 // (`jirDeclarePrototype`, `astgen::emitCall`, generic instantiation in

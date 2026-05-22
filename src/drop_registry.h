@@ -21,7 +21,7 @@ class StringPool;
 namespace jam {
 namespace drops {
 
-// Map of struct name → user-defined drop function for that type.
+// Map of struct name -> user-defined drop function for that type.
 //
 // A type T is "drop-bearing" when the program declares
 //

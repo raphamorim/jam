@@ -7,11 +7,11 @@
 // the resulting ParamABI / ReturnABI shape.
 //
 // Reference behavior (from docs/ABI.md §3):
-//   mut                    → ByPointer (any size)
-//   let / move, scalar T   → ByValue
+//   mut                    -> ByPointer (any size)
+//   let / move, scalar T   -> ByValue
 //   let / move, aggregate
-//     size <= 16 bytes     → ByValue
-//     size  > 16 bytes     → ByPointer
+//     size <= 16 bytes     -> ByValue
+//     size  > 16 bytes     -> ByPointer
 
 #include "../../src/abi.h"
 #include "../../src/ast.h"
