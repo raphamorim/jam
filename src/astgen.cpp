@@ -2285,9 +2285,7 @@ static void astgenContinue(AstGenCtx &gctx) {
 	emitBr(gctx, gctx.loopStack.back().continueBlock);
 }
 
-// =====================================================================
 // Match lowering (Phase 5)
-// =====================================================================
 //
 // Each match desugars to:
 //   - eval scrutinee

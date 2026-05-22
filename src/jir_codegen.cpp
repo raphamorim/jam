@@ -166,7 +166,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamLLVMBuildStore(lctx.ctx.getBuilder(), val, ptr);
 		return nullptr;
 	}
-	// === Integer arithmetic ===
+	// Integer arithmetic
 	case JirTag::Add: {
 		JamValueRef a = emitInst(lctx, inst.a);
 		JamValueRef b = emitInst(lctx, inst.b);
@@ -202,7 +202,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamValueRef b = emitInst(lctx, inst.b);
 		return JamLLVMBuildURem(lctx.ctx.getBuilder(), a, b, "urem");
 	}
-	// === Float arithmetic ===
+	// Float arithmetic
 	case JirTag::FAdd: {
 		JamValueRef a = emitInst(lctx, inst.a);
 		JamValueRef b = emitInst(lctx, inst.b);
@@ -232,7 +232,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamValueRef a = emitInst(lctx, inst.a);
 		return JamLLVMBuildFNeg(lctx.ctx.getBuilder(), a, "fneg");
 	}
-	// === Integer comparison ===
+	// Integer comparison
 	case JirTag::ICmpEq:
 		return buildICmp(lctx, JAM_ICMP_EQ, emitInst(lctx, inst.a),
 		                 emitInst(lctx, inst.b), "eq");
@@ -263,7 +263,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 	case JirTag::ICmpUge:
 		return buildICmp(lctx, JAM_ICMP_UGE, emitInst(lctx, inst.a),
 		                 emitInst(lctx, inst.b), "uge");
-	// === Float comparison ===
+	// Float comparison
 	case JirTag::FCmpOeq:
 		return buildFCmp(lctx, JAM_FCMP_OEQ, emitInst(lctx, inst.a),
 		                 emitInst(lctx, inst.b), "oeq");
@@ -282,7 +282,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 	case JirTag::FCmpOge:
 		return buildFCmp(lctx, JAM_FCMP_OGE, emitInst(lctx, inst.a),
 		                 emitInst(lctx, inst.b), "oge");
-	// === Bitwise / shift ===
+	// Bitwise / shift
 	case JirTag::BitAnd:
 		return JamLLVMBuildAnd(lctx.ctx.getBuilder(), emitInst(lctx, inst.a),
 		                       emitInst(lctx, inst.b), "and");
@@ -314,7 +314,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamValueRef one = JamLLVMConstInt(lctx.ctx.getInt1Type(), 1, false);
 		return JamLLVMBuildXor(lctx.ctx.getBuilder(), v, one, "lnot");
 	}
-	// === Type conversions ===
+	// Type conversions
 	case JirTag::ZExt: {
 		JamValueRef v = emitInst(lctx, inst.a);
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
@@ -402,7 +402,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		return JamLLVMBuildPtrToInt(lctx.ctx.getBuilder(), fnVal, ty,
 		                            "fnref.u64");
 	}
-	// === Aggregates ===
+	// Aggregates
 	case JirTag::StructLit: {
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
 		JirExtraIdx extra = static_cast<JirExtraIdx>(inst.b);
@@ -593,7 +593,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		return JamLLVMBuildLoad(lctx.ctx.getBuilder(), fieldTy, fieldPtr,
 		                        "enum.payload.val");
 	}
-	// === Function call ===
+	// Function call
 	case JirTag::Call: {
 		// `inst.a` is the StringIdx of the LLVM symbol name —
 		// astgen has already done the mangling (test functions get
@@ -688,7 +688,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		    lctx.ctx.getBuilder(), llvmFnTy, calleeVal, args.data(),
 		    static_cast<unsigned>(args.size()), resultName);
 	}
-	// === Control ===
+	// Control
 	case JirTag::Br: {
 		JirBlockRef target = static_cast<JirBlockRef>(inst.a);
 		JamLLVMBuildBr(lctx.ctx.getBuilder(), lctx.blockMap.at(target));

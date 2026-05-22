@@ -456,7 +456,7 @@ fn main() {}
 		ASSERT_TRUE(stderrContains(r, "Private"));
 	}
 
-	// === Fn-as-value (Rust-style item coercion) + ptr↔int casts ====
+	// Fn-as-value (Rust-style item coercion) + ptr↔int casts
 	//
 	// These exercise the `export fn` callback workflow needed for
 	// SDL_AudioSpec-style C-ABI callbacks. The bare-name form mirrors
