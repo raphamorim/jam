@@ -150,6 +150,10 @@ void Lexer::identifier() {
 		addToken(TOK_AS);
 	} else if (text == "move") {
 		addToken(TOK_MOVE);
+	} else if (text == "comp") {
+		addToken(TOK_COMP);
+	} else if (text == "inline") {
+		addToken(TOK_INLINE);
 	} else if (text == "u1" || text == "u8" || text == "u16" || text == "u32" ||
 	           text == "u64" || text == "i8" || text == "i16" ||
 	           text == "i32" || text == "i64" || text == "f32" ||

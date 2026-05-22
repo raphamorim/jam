@@ -372,6 +372,287 @@ void testEvalRequiredSilentOnSuccess() {
 	ASSERT_FALSE(diags.hasErrors());
 }
 
+// ── Mutable scope ────────────────────────────────────────────────
+
+void testScopeSetMutatesExistingBinding() {
+	jam::ComptimeScope scope;
+	scope.bind("x", jam::ComptimeValue::makeInt(5, 32, true));
+	bool ok = scope.set("x", jam::ComptimeValue::makeInt(10, 32, true));
+	ASSERT_TRUE(ok);
+	ASSERT_EQ(static_cast<uint64_t>(10), scope.lookup("x")->asU64());
+}
+
+void testScopeSetFailsForUnknownName() {
+	jam::ComptimeScope scope;
+	bool ok = scope.set("nope", jam::ComptimeValue::makeBool(false));
+	ASSERT_FALSE(ok);
+}
+
+void testScopeSetWalksUpToParent() {
+	jam::ComptimeScope parent;
+	parent.bind("x", jam::ComptimeValue::makeInt(5, 32, true));
+	jam::ComptimeScope child(&parent);
+	// `x` lives in parent; child.set should mutate parent's binding.
+	bool ok = child.set("x", jam::ComptimeValue::makeInt(99, 32, true));
+	ASSERT_TRUE(ok);
+	ASSERT_EQ(static_cast<uint64_t>(99), parent.lookup("x")->asU64());
+}
+
+// ── Helper builders for statement nodes ──────────────────────────
+
+NodeIdx mkVarDecl(NodeStore &ns, StringPool &sp, const std::string &name,
+                   NodeIdx init) {
+	ExtraIdx extra = ns.reserveExtra(3);
+	ns.setExtra(extra, sp.intern(name));
+	ns.setExtra(extra + 1, kNoType);  // type — ignored by comp evaluator
+	ns.setExtra(extra + 2, init);
+	AstNode node{};
+	node.tag = AstTag::VarDecl;
+	node.lhs = extra;
+	node.rhs = 0;  // flags
+	return ns.addNode(node);
+}
+
+NodeIdx mkAssign(NodeStore &ns, NodeIdx target, NodeIdx value) {
+	AstNode node{};
+	node.tag = AstTag::Assign;
+	node.lhs = target;
+	node.rhs = value;
+	return ns.addNode(node);
+}
+
+NodeIdx mkIfNode(NodeStore &ns, NodeIdx cond,
+                  const std::vector<NodeIdx> &thenStmts,
+                  const std::vector<NodeIdx> &elseStmts) {
+	std::size_t total = 2 + thenStmts.size() + elseStmts.size();
+	ExtraIdx extra = ns.reserveExtra(total);
+	ns.setExtra(extra, static_cast<uint32_t>(thenStmts.size()));
+	ns.setExtra(extra + 1, static_cast<uint32_t>(elseStmts.size()));
+	for (std::size_t i = 0; i < thenStmts.size(); i++) {
+		ns.setExtra(extra + 2 + i, thenStmts[i]);
+	}
+	for (std::size_t i = 0; i < elseStmts.size(); i++) {
+		ns.setExtra(extra + 2 + thenStmts.size() + i, elseStmts[i]);
+	}
+	AstNode node{};
+	node.tag = AstTag::IfNode;
+	node.lhs = cond;
+	node.rhs = extra;
+	return ns.addNode(node);
+}
+
+NodeIdx mkWhileNode(NodeStore &ns, NodeIdx cond,
+                     const std::vector<NodeIdx> &body) {
+	ExtraIdx extra = ns.reserveExtra(1 + body.size());
+	ns.setExtra(extra, static_cast<uint32_t>(body.size()));
+	for (std::size_t i = 0; i < body.size(); i++) {
+		ns.setExtra(extra + 1 + i, body[i]);
+	}
+	AstNode node{};
+	node.tag = AstTag::WhileNode;
+	node.lhs = cond;
+	node.rhs = extra;
+	return ns.addNode(node);
+}
+
+NodeIdx mkMemberAccess(NodeStore &ns, StringPool &sp, NodeIdx base,
+                        const std::string &member) {
+	AstNode node{};
+	node.tag = AstTag::MemberAccess;
+	node.lhs = base;
+	node.rhs = sp.intern(member);
+	return ns.addNode(node);
+}
+
+// ── execStmt: VarDecl + Assign ───────────────────────────────────
+
+void testExecVarDeclAddsBinding() {
+	NodeStore ns;
+	StringPool sp;
+	TypePool tp;
+	jam::ComptimeEvaluator e(ns, sp, tp);
+	jam::ComptimeScope scope;
+	jam::Diagnostics diags;
+	jam::SrcLoc loc{"test.jam", 1};
+	uint32_t iter = 0;
+	jam::ComptimeValue ret;
+
+	// var x = 42;
+	NodeIdx decl = mkVarDecl(ns, sp, "x", mkInt(ns, 42));
+	jam::ExecResult r = e.execStmt(decl, scope, iter, 1000, ret, diags, loc);
+	ASSERT_TRUE(r == jam::ExecResult::Continue);
+	ASSERT_TRUE(scope.lookup("x") != nullptr);
+	ASSERT_EQ(static_cast<uint64_t>(42), scope.lookup("x")->asU64());
+}
+
+void testExecAssignMutatesBinding() {
+	NodeStore ns;
+	StringPool sp;
+	TypePool tp;
+	jam::ComptimeEvaluator e(ns, sp, tp);
+	jam::ComptimeScope scope;
+	jam::Diagnostics diags;
+	jam::SrcLoc loc{"test.jam", 1};
+	uint32_t iter = 0;
+	jam::ComptimeValue ret;
+
+	scope.bind("x", jam::ComptimeValue::makeInt(5, 64, false));
+	NodeIdx tgt = mkVar(ns, sp, "x");
+	NodeIdx asn = mkAssign(ns, tgt, mkInt(ns, 99));
+	jam::ExecResult r = e.execStmt(asn, scope, iter, 1000, ret, diags, loc);
+	ASSERT_TRUE(r == jam::ExecResult::Continue);
+	ASSERT_EQ(static_cast<uint64_t>(99), scope.lookup("x")->asU64());
+}
+
+void testExecAssignToUndeclaredErrors() {
+	NodeStore ns;
+	StringPool sp;
+	TypePool tp;
+	jam::ComptimeEvaluator e(ns, sp, tp);
+	jam::ComptimeScope scope;
+	jam::Diagnostics diags;
+	jam::SrcLoc loc{"test.jam", 1};
+	uint32_t iter = 0;
+	jam::ComptimeValue ret;
+
+	NodeIdx tgt = mkVar(ns, sp, "neverDeclared");
+	NodeIdx asn = mkAssign(ns, tgt, mkInt(ns, 1));
+	jam::ExecResult r = e.execStmt(asn, scope, iter, 1000, ret, diags, loc);
+	ASSERT_TRUE(r == jam::ExecResult::Error);
+	ASSERT_TRUE(diags.hasErrors());
+}
+
+// ── execStmt: control flow ───────────────────────────────────────
+
+void testExecIfPicksTrueBranch() {
+	NodeStore ns;
+	StringPool sp;
+	TypePool tp;
+	jam::ComptimeEvaluator e(ns, sp, tp);
+	jam::ComptimeScope scope;
+	jam::Diagnostics diags;
+	jam::SrcLoc loc{"test.jam", 1};
+	uint32_t iter = 0;
+	jam::ComptimeValue ret;
+
+	scope.bind("x", jam::ComptimeValue::makeInt(0, 64, false));
+	// if (true) { x = 1; } else { x = 2; }
+	NodeIdx thenAsn = mkAssign(ns, mkVar(ns, sp, "x"), mkInt(ns, 1));
+	NodeIdx elseAsn = mkAssign(ns, mkVar(ns, sp, "x"), mkInt(ns, 2));
+	NodeIdx ifNode =
+	    mkIfNode(ns, mkBool(ns, true), {thenAsn}, {elseAsn});
+	jam::ExecResult r = e.execStmt(ifNode, scope, iter, 1000, ret, diags, loc);
+	ASSERT_TRUE(r == jam::ExecResult::Continue);
+	ASSERT_EQ(static_cast<uint64_t>(1), scope.lookup("x")->asU64());
+}
+
+void testExecIfPicksFalseBranch() {
+	NodeStore ns;
+	StringPool sp;
+	TypePool tp;
+	jam::ComptimeEvaluator e(ns, sp, tp);
+	jam::ComptimeScope scope;
+	jam::Diagnostics diags;
+	jam::SrcLoc loc{"test.jam", 1};
+	uint32_t iter = 0;
+	jam::ComptimeValue ret;
+
+	scope.bind("x", jam::ComptimeValue::makeInt(0, 64, false));
+	NodeIdx thenAsn = mkAssign(ns, mkVar(ns, sp, "x"), mkInt(ns, 1));
+	NodeIdx elseAsn = mkAssign(ns, mkVar(ns, sp, "x"), mkInt(ns, 2));
+	NodeIdx ifNode =
+	    mkIfNode(ns, mkBool(ns, false), {thenAsn}, {elseAsn});
+	e.execStmt(ifNode, scope, iter, 1000, ret, diags, loc);
+	ASSERT_EQ(static_cast<uint64_t>(2), scope.lookup("x")->asU64());
+}
+
+void testExecWhileLoopCountsUp() {
+	NodeStore ns;
+	StringPool sp;
+	TypePool tp;
+	jam::ComptimeEvaluator e(ns, sp, tp);
+	jam::ComptimeScope scope;
+	jam::Diagnostics diags;
+	jam::SrcLoc loc{"test.jam", 1};
+	uint32_t iter = 0;
+	jam::ComptimeValue ret;
+
+	// var i: u64 = 0;
+	scope.bind("i", jam::ComptimeValue::makeInt(0, 64, false));
+	// while (i < 5) { i = i + 1; }
+	NodeIdx cond = mkBinOp(ns, BinOp::Lt, mkVar(ns, sp, "i"), mkInt(ns, 5));
+	NodeIdx inc = mkBinOp(ns, BinOp::Add, mkVar(ns, sp, "i"), mkInt(ns, 1));
+	NodeIdx asn = mkAssign(ns, mkVar(ns, sp, "i"), inc);
+	NodeIdx whileNode = mkWhileNode(ns, cond, {asn});
+	jam::ExecResult r =
+	    e.execStmt(whileNode, scope, iter, 1000, ret, diags, loc);
+	ASSERT_TRUE(r == jam::ExecResult::Continue);
+	ASSERT_EQ(static_cast<uint64_t>(5), scope.lookup("i")->asU64());
+}
+
+void testExecWhileIterationCapTrips() {
+	NodeStore ns;
+	StringPool sp;
+	TypePool tp;
+	jam::ComptimeEvaluator e(ns, sp, tp);
+	jam::ComptimeScope scope;
+	jam::Diagnostics diags;
+	jam::SrcLoc loc{"test.jam", 1};
+	uint32_t iter = 0;
+	jam::ComptimeValue ret;
+
+	scope.bind("i", jam::ComptimeValue::makeInt(0, 64, false));
+	// while (true) { i = i + 1; } — cap at 100 iterations.
+	NodeIdx inc = mkBinOp(ns, BinOp::Add, mkVar(ns, sp, "i"), mkInt(ns, 1));
+	NodeIdx asn = mkAssign(ns, mkVar(ns, sp, "i"), inc);
+	NodeIdx whileNode = mkWhileNode(ns, mkBool(ns, true), {asn});
+	jam::ExecResult r =
+	    e.execStmt(whileNode, scope, iter, /*iterCap=*/100, ret, diags, loc);
+	ASSERT_TRUE(r == jam::ExecResult::IterationCap);
+	ASSERT_TRUE(diags.hasErrors());
+	// 100 iterations ran (i went 0→1→…→100); the 101st loop attempt
+	// trips the cap before the body runs.
+	ASSERT_EQ(static_cast<uint64_t>(100), scope.lookup("i")->asU64());
+}
+
+void testExecBlockShortCircuitsOnError() {
+	NodeStore ns;
+	StringPool sp;
+	TypePool tp;
+	jam::ComptimeEvaluator e(ns, sp, tp);
+	jam::ComptimeScope scope;
+	jam::Diagnostics diags;
+	jam::SrcLoc loc{"test.jam", 1};
+	uint32_t iter = 0;
+	jam::ComptimeValue ret;
+
+	// Block: var x = 0; <bad-assign-to-y>; x = 99;
+	// The bad assign should stop execution before x = 99 runs.
+	NodeIdx d = mkVarDecl(ns, sp, "x", mkInt(ns, 0));
+	NodeIdx bad = mkAssign(ns, mkVar(ns, sp, "y"), mkInt(ns, 1));
+	NodeIdx good = mkAssign(ns, mkVar(ns, sp, "x"), mkInt(ns, 99));
+	std::vector<NodeIdx> body = {d, bad, good};
+	jam::ExecResult r = e.execBlock(body.data(), body.size(), scope, iter,
+	                                  1000, ret, diags, loc);
+	ASSERT_TRUE(r == jam::ExecResult::Error);
+	// x stays at 0 (the good assign never ran).
+	ASSERT_EQ(static_cast<uint64_t>(0), scope.lookup("x")->asU64());
+}
+
+void testMemberAccessStrLength() {
+	NodeStore ns;
+	StringPool sp;
+	TypePool tp;
+	jam::ComptimeEvaluator e(ns, sp, tp);
+	jam::ComptimeScope scope;
+	scope.bind("s", jam::ComptimeValue::makeStr(sp.intern("hello")));
+
+	NodeIdx access = mkMemberAccess(ns, sp, mkVar(ns, sp, "s"), "length");
+	jam::ComptimeValue v = e.eval(access, scope);
+	ASSERT_TRUE(v.isInt());
+	ASSERT_EQ(static_cast<uint64_t>(5), v.asU64());
+}
+
 }  // namespace
 
 int main() {
@@ -406,6 +687,30 @@ int main() {
 	framework.addTest(
 	    "Comptime - evalRequired pushes diagnostic on fail",
 	    testEvalRequiredPushesDiagnosticOnFail);
+	framework.addTest("Comptime - scope set mutates existing",
+	                  testScopeSetMutatesExistingBinding);
+	framework.addTest("Comptime - scope set returns false for unknown",
+	                  testScopeSetFailsForUnknownName);
+	framework.addTest("Comptime - scope set walks up to parent",
+	                  testScopeSetWalksUpToParent);
+	framework.addTest("Comptime - exec VarDecl adds binding",
+	                  testExecVarDeclAddsBinding);
+	framework.addTest("Comptime - exec Assign mutates",
+	                  testExecAssignMutatesBinding);
+	framework.addTest("Comptime - exec Assign to undeclared errors",
+	                  testExecAssignToUndeclaredErrors);
+	framework.addTest("Comptime - exec If picks true branch",
+	                  testExecIfPicksTrueBranch);
+	framework.addTest("Comptime - exec If picks false branch",
+	                  testExecIfPicksFalseBranch);
+	framework.addTest("Comptime - exec While counts up to bound",
+	                  testExecWhileLoopCountsUp);
+	framework.addTest("Comptime - exec While iteration cap trips",
+	                  testExecWhileIterationCapTrips);
+	framework.addTest("Comptime - exec Block short-circuits on error",
+	                  testExecBlockShortCircuitsOnError);
+	framework.addTest("Comptime - member-access str.length",
+	                  testMemberAccessStrLength);
 	framework.addTest("Comptime - evalRequired silent on success",
 	                  testEvalRequiredSilentOnSuccess);
 	framework.runAll();

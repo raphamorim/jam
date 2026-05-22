@@ -43,6 +43,13 @@ struct Param {
 	std::string Name;
 	TypeIdx Type;
 	ParamMode Mode = ParamMode::Let;
+	// Declared with the source-level `comp` keyword (e.g. `fn f(comp n:
+	// u32) ...`). A comp param's value must be known at the call site
+	// and is bound into the function's substitution map at instantiation
+	// time, *not* lowered as an LLVM parameter. Each unique comp-arg
+	// combination produces a fresh monomorphisation via the same machine-
+	// ry that handles `T: type` generics.
+	bool isComp = false;
 };
 
 // Function declaration. The body is a sequence of flat-AST node indices
@@ -58,11 +65,23 @@ class FunctionAST {
 	bool isPub;
 	bool isTest;
 	bool isVarArgs;
-	// Declared with `cfn` instead of `fn` — opts the method into
-	// the compiler-synthesized-call set (drop / at / default). A
-	// regular `fn` shaped like one of those names is just a method;
-	// `cfn` is what wires it to the compiler's hooks.
+	// Declared with `cfn` instead of `fn`. The keyword has two
+	// meanings depending on declaration position:
+	//   * Inside a struct body — opts the method into the compiler-
+	//     synthesized-call set (drop / at / default). A regular `fn`
+	//     shaped like one of those names is just a method; `cfn` is
+	//     what wires it to the compiler's hooks. `isCfn=true,
+	//     isCompTimeFn=false`.
+	//   * At top level (free function) — declares a compile-time
+	//     function: the body executes at compile time at each call
+	//     site, with @-emit intrinsics generating runtime code into
+	//     the caller. `isCfn=false, isCompTimeFn=true`. Used by
+	//     `std/fmt.jam` to ship `print` / `eprint` as real Jam
+	//     source.
+	// The two meanings are mutually exclusive — set by the
+	// parseFunction-caller based on declaration context.
 	bool isCfn;
+	bool isCompTimeFn = false;
 	// Name of the enclosing struct, if this is a method declared inside
 	// a `const T = struct { fn name(...) ... }` body. Empty for free
 	// functions and for clones of generic-instantiated methods (those
@@ -101,8 +120,17 @@ class FunctionAST {
 	// supplies concrete type arguments.
 	bool isGeneric() const {
 		if (ReturnType == BuiltinType::Type) return true;
+		// Compile-time functions are always per-call-site instantiated
+		// — the body runs at compile time and emits caller-specific
+		// code. Same dispatch shape as type/comp-value generics.
+		if (isCompTimeFn) return true;
 		for (const Param &p : Args) {
+			// Type-parameter generics (`T: type`) and value-parameter
+			// generics (`comp n: u32`) both monomorphize per call
+			// site — the same machinery handles both, so they fall
+			// under the same generic predicate.
 			if (p.Type == BuiltinType::Type) return true;
+			if (p.isComp) return true;
 		}
 		return false;
 	}
@@ -211,20 +239,39 @@ class ConstDeclAST {
 };
 
 // const std = import("std");
+//
+// When written as `pub const X = import(...)` at module scope, the
+// handle becomes a re-export: a downstream importer that names *this*
+// module can then reach `module.X.member` to descend into the re-
+// exported module. Tracked via `isPub`.
+//
+// `chain` captures trailing `.seg.seg` access on the RHS — e.g. `const
+// fmt = import("std").fmt;` parses with `Path="std"` and `chain=["fmt"]`.
+// Each segment walks a `pub const X = import(...)` re-export in the
+// preceding module's namespace; the final path is what `Name` binds to.
 class ImportDeclAST {
   public:
 	std::string Name;
 	std::string Path;
+	std::vector<std::string> chain;
+	bool isPub = false;
 
 	ImportDeclAST(std::string Name, std::string Path)
 	    : Name(std::move(Name)), Path(std::move(Path)) {}
 };
 
 // const { f1, f2 } = import("mod");
+//
+// `chain` captures trailing `.seg.seg` access on the RHS — e.g.
+// `const {print} = import("std").fmt;` parses with `Path="std"` and
+// `chain=["fmt"]`. Resolution walks pub-import re-exports in each
+// intermediate module's namespace, ending at the module each
+// destructured name is pulled from.
 class DestructuringImportDeclAST {
   public:
 	std::vector<std::string> Names;
 	std::string Path;
+	std::vector<std::string> chain;
 
 	DestructuringImportDeclAST(std::vector<std::string> Names, std::string Path)
 	    : Names(std::move(Names)), Path(std::move(Path)) {}

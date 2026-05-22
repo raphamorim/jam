@@ -101,7 +101,10 @@ ModuleResolver::ModuleResolver(const std::string &baseDir, TypePool &typePool_,
       nodeStore(&nodeStore_) {}
 
 std::string ModuleResolver::resolve(const std::string &importPath) const {
-	if (importPath == "std" || importPath == "test") { return importPath; }
+	// `test` stays a compiler-builtin namespace (provides `assert`).
+	// `std` used to short-circuit too, but now resolves to a real
+	// `std/std.jam` file that re-exports the standard-library modules.
+	if (importPath == "test") { return importPath; }
 	std::string path = importPath;
 
 	if (path.substr(0, 2) == "./") { path = path.substr(2); }
@@ -180,7 +183,7 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 		return nullptr;
 	}
 
-	if (resolvedPath == "std" || resolvedPath == "test") {
+	if (resolvedPath == "test") {
 		auto builtinModule = std::make_unique<ModuleAST>();
 		loadedModules[importPath] = std::move(builtinModule);
 		return loadedModules[importPath].get();
@@ -210,13 +213,13 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 	// every resolved module ends up in the shared `loadedModules` map
 	// and gets its `pub` symbols registered by main.cpp.
 	auto loadNested = [&](const std::string &importPath) {
-		if (importPath == "std") return;
+		if (importPath == "test") return;
 		fs::path modulePath(resolvedPath);
 		std::string moduleDir = modulePath.parent_path().string();
 		ModuleResolver nestedResolver(moduleDir, *typePool, *stringPool,
 		                              *nodeStore);
 		std::string nestedResolved = nestedResolver.resolve(importPath);
-		if (!nestedResolved.empty() && nestedResolved != "std") {
+		if (!nestedResolved.empty() && nestedResolved != "test") {
 			getOrLoadModule(importPath);
 		}
 	};

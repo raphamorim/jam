@@ -130,12 +130,17 @@ enum class AstTag : uint8_t {
 	// tag extraction.
 	AsCast,
 
-	// Comptime intrinsic call: `@name(T)`. Resolved to a constant at
-	// codegen time; LLVM never sees a call instruction. Stage 1 only
-	// supports single-TYPE-arg intrinsics (sizeOf, alignOf); generalize
-	// to multi-arg shapes when user-defined cfn + CTFE lands.
-	// d.lhs = StringIdx (intrinsic name, e.g. "sizeOf")
-	// d.rhs = TypeIdx (the type argument)
+	// Compiler intrinsic call: `@name(arg, …)`. Resolved at astgen
+	// time; LLVM never sees an AtCall instruction.
+	//
+	// Two arg-encoding shapes, discriminated by d.flags bit 0:
+	//   * flags bit 0 = 0 — type-arg single-form. d.rhs = TypeIdx.
+	//     Used by `@sizeOf(T)`, `@alignOf(T)`.
+	//   * flags bit 0 = 1 — expr-arg multi-form. d.rhs = ExtraIdx →
+	//     [argCount, arg0_NodeIdx, arg1_NodeIdx, ...]. Used by
+	//     `@emit*` intrinsics callable from cfn bodies.
+	//
+	// d.lhs = StringIdx (intrinsic name).
 	AtCall,
 
 	// Static method call on a generic-call type receiver:
@@ -350,6 +355,17 @@ enum class TypeKind : uint8_t {
 	// via the substitution engine when an LLVM type is requested or
 	// when a binding's static TypeIdx is needed.
 	GenericCall,
+	// Compile-time module value. Produced by `import(...)`; consumed by
+	// `MemberAccess` for `mod.foo` resolution. The TypeKey carries the
+	// module's canonical resolved path in `a` (StringIdx, e.g.
+	// "collections" or "std"). Has no runtime representation — modules
+	// are values of this type only at compile time; codegen rejects any
+	// attempt to lower a Module-typed JIR ref to LLVM.
+	//
+	// Mirrors Zig's "file = zero-field struct with namespace" pattern,
+	// but kept distinct from TypeKind::Struct so module values can't be
+	// confused with user-defined aggregates.
+	Module,
 	// Function-typed value: a pointer to a function with a known
 	// signature. Parsed from `fn(T1, T2) Ret` in type position. The
 	// TypeKey carries the return TypeIdx in `a` and an index into
@@ -413,6 +429,10 @@ inline bool operator==(const TypeKey &x, const TypeKey &y) {
 		// args index is canonical because the side table interns
 		// args lists.
 		return x.a == y.a && x.b == y.b;
+	case TypeKind::Module:
+		// equal iff the resolved module path matches. One TypeIdx
+		// per unique path (`internModule` consults `idx_`).
+		return x.a == y.a;
 	}
 	return false;
 }
@@ -575,6 +595,11 @@ class TypePool {
 	}
 	TypeIdx internNamed(StringIdx nameId) {
 		return intern(TypeKey{TypeKind::Named, 0, 0, nameId, 0});
+	}
+	// Intern a Module TypeIdx keyed on its resolved path. One TypeIdx
+	// per unique resolved path (e.g. "collections", "std/fmt").
+	TypeIdx internModule(StringIdx pathId) {
+		return intern(TypeKey{TypeKind::Module, 0, 0, pathId, 0});
 	}
 };
 

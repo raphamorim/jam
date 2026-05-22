@@ -87,6 +87,15 @@ enum TokenType {
 	TOK_AS,         // as keyword (explicit type cast)
 	TOK_AT,         // @ — prefix for comptime-function invocations:
 	                //   `@sizeOf(T)`, `@alignOf(T)`, user-defined cfns
+	TOK_COMP,       // comp keyword — comp param marker (`fn f(comp n: u32)
+	                //   ...`); also wraps an expression that must fold at
+	                //   compile time (`comp const X = 1 + 1;`). Source-
+	                //   level keyword for the broader "compile-time
+	                //   evaluation" mechanism implemented in src/comptime.h.
+	TOK_INLINE,     // inline keyword — prefix for `inline while` (loop
+	                //   unrolling at compile time, mirrors Zig's
+	                //   `inline while`). Required by std.fmt's format-
+	                //   string parser.
 };
 
 // Token structure.

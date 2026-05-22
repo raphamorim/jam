@@ -42,6 +42,13 @@ void SymbolTable::registerModule(const std::string &modulePath,
 	for (auto &c : module->Consts) {
 		if (c->isPub) registerPub(c->Name, nullptr);
 	}
+	// `pub const X = import(...)` re-exports. Destructuring imports
+	// (`const { X } = import("std");`) check existence through this
+	// table; without surfacing re-exports here, every module-typed
+	// destructure would be rejected as "not exported".
+	for (auto &i : module->Imports) {
+		if (i->isPub) registerPub(i->Name, nullptr);
+	}
 }
 
 void SymbolTable::registerBuiltinSymbol(const std::string &modulePath,

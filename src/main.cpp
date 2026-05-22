@@ -122,27 +122,65 @@ static int compileAndRun(const std::string &filename,
 	resolver.setSharedAnonRegistries(&sharedAnonStructs, &sharedAnonEnums);
 	SymbolTable symbolTable;
 
+	// Walk a `import("base").seg.seg` chain through pub-import re-
+	// exports to the final target module. Each segment names a
+	// `pub const X = import(...)` alias in the preceding module; we
+	// recurse so a re-export that itself walks a chain composes.
+	auto resolveImportChain =
+	    [&](const std::string &basePath,
+	        const std::vector<std::string> &chain,
+	        auto &self) -> std::pair<std::string, ModuleAST *> {
+		std::string curPath = basePath;
+		ModuleAST *curMod = resolver.getOrLoadModule(curPath);
+		if (!curMod) return {curPath, nullptr};
+		for (const auto &seg : chain) {
+			const ImportDeclAST *re = nullptr;
+			for (auto &imp : curMod->Imports) {
+				if (imp->isPub && imp->Name == seg) {
+					re = imp.get();
+					break;
+				}
+			}
+			if (!re) return {curPath + "." + seg, nullptr};
+			auto sub = self(re->Path, re->chain, self);
+			if (!sub.second) return sub;
+			curPath = sub.first;
+			curMod = sub.second;
+		}
+		return {curPath, curMod};
+	};
+
 	symbolTable.registerBuiltinSymbol("test", "assert");
 	for (auto &import : module->Imports) {
-		if (import->Path == "std" || import->Path == "test") { continue; }
+		if (import->Path == "test") { continue; }
 
-		ModuleAST *importedModule = resolver.getOrLoadModule(import->Path);
+		auto resolved =
+		    resolveImportChain(import->Path, import->chain, resolveImportChain);
+		ModuleAST *importedModule = resolved.second;
 		if (!importedModule) {
-			std::cerr << "Error: Failed to load module: " << import->Path
+			std::cerr << "Error: Failed to load module: " << resolved.first
 			          << std::endl;
 			return 1;
 		}
+		// Rewrite Path to the chain-resolved canonical so every later
+		// pass (handle registration, namespace build) sees one path.
+		import->Path = resolved.first;
+		import->chain.clear();
 
 		symbolTable.registerModule(import->Path, importedModule);
 	}
 
 	for (auto &destImport : module->DestructuringImports) {
-		ModuleAST *importedModule = resolver.getOrLoadModule(destImport->Path);
+		auto resolved = resolveImportChain(destImport->Path, destImport->chain,
+		                                   resolveImportChain);
+		ModuleAST *importedModule = resolved.second;
 		if (!importedModule) {
-			std::cerr << "Error: Failed to load module: " << destImport->Path
+			std::cerr << "Error: Failed to load module: " << resolved.first
 			          << std::endl;
 			return 1;
 		}
+		destImport->Path = resolved.first;
+		destImport->chain.clear();
 
 		symbolTable.registerModule(destImport->Path, importedModule);
 		for (const auto &name : destImport->Names) {
@@ -218,7 +256,6 @@ static int compileAndRun(const std::string &filename,
 		}
 	};
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
-		if (path == "std") continue;
 		registerTopLevelDecls(importedModule.get(), /*publicOnly=*/true);
 	}
 	registerTopLevelDecls(module.get(), /*publicOnly=*/false);
@@ -271,7 +308,6 @@ static int compileAndRun(const std::string &filename,
 		}
 	};
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
-		if (path == "std") continue;
 		declareStructs(importedModule.get(), /*publicOnly=*/true);
 		declareUnions(importedModule.get(), /*publicOnly=*/true);
 		declareEnums(importedModule.get(), /*publicOnly=*/true);
@@ -291,7 +327,11 @@ static int compileAndRun(const std::string &filename,
 	// module (e.g. `malloc`), so the externs need prototypes
 	// declared by the time the instantiation runs.
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
-		if (path == "std") continue;
+		// Per-loaded-module namespace, keyed by the canonical import
+		// path (e.g. "fmt", "std/fmt"). This is the table member-access
+		// on a Module value will consult later.
+		JamCodegenContext::ModuleNamespace ns;
+		ns.path = path;
 		for (auto &func : importedModule->Functions) {
 			if (func->isPub && !func->isGeneric()) {
 				JirFunction jfn = astgenMetadata(*func, codegenCtx);
@@ -301,56 +341,109 @@ static int compileAndRun(const std::string &filename,
 			}
 			if (func->isPub) {
 				codegenCtx.registerFunctionAST(func->Name, func.get());
-			}
-		}
-	}
-	for (auto &import : module->Imports) {
-		if (import->Path == "std" || import->Path == "test") continue;
-		const std::string &handle = import->Name;
-		ModuleAST *importedModule = resolver.getOrLoadModule(import->Path);
-		if (!importedModule) continue;
-		codegenCtx.registerImportHandle(handle, import->Path);
-		auto aliasNamed = [&](const std::string &bare) {
-			TypeIdx target = codegenCtx.getTypePool().internNamed(
-			    codegenCtx.getStringPool().intern(bare));
-			codegenCtx.registerTypeAlias(handle + "." + bare, target);
-		};
-		for (auto &func : importedModule->Functions) {
-			if (func->isPub) {
-				codegenCtx.registerFunctionAST(handle + "." + func->Name,
-				                               func.get());
-			} else {
-				codegenCtx.registerPrivateName(handle, func->Name);
+				ns.functions[func->Name] = func.get();
 			}
 		}
 		for (auto &s : importedModule->Structs) {
 			if (s->isPub) {
-				aliasNamed(s->Name);
-				// Also register each pub method under the namespace-
-				// qualified key `handle.Struct.method` so astgen's
-				// multi-dot callee lookup can find it. Mirrors the
-				// free-fn dual registration above (bare + handle.X).
-				// Inspired by Zig's namespace-scoped Decl lookup
-				// (Sema.zig:5295) where every type carries a back-
-				// pointer to its namespace and method resolution walks
-				// `container_ty.getNamespace().lookupInNamespace(name)`.
-				for (auto &m : s->Methods) {
-					if (m->isPub) {
-						codegenCtx.registerFunctionAST(
-						    handle + "." + s->Name + "." + m->Name, m.get());
-					}
-				}
-			} else {
-				codegenCtx.registerPrivateName(handle, s->Name);
+				ns.types[s->Name] = codegenCtx.getTypePool().internNamed(
+				    codegenCtx.getStringPool().intern(s->Name));
 			}
 		}
 		for (auto &e : importedModule->Enums) {
-			if (e->isPub) aliasNamed(e->Name);
-			else codegenCtx.registerPrivateName(handle, e->Name);
+			if (e->isPub) {
+				ns.types[e->Name] = codegenCtx.getTypePool().internNamed(
+				    codegenCtx.getStringPool().intern(e->Name));
+			}
 		}
 		for (auto &u : importedModule->Unions) {
-			if (u->isPub) aliasNamed(u->Name);
-			else codegenCtx.registerPrivateName(handle, u->Name);
+			if (u->isPub) {
+				ns.types[u->Name] = codegenCtx.getTypePool().internNamed(
+				    codegenCtx.getStringPool().intern(u->Name));
+			}
+		}
+		// `pub const X = import(...)` re-exports — surface the inner
+		// module as a Module-typed alias on this module's namespace.
+		for (auto &reexport : importedModule->Imports) {
+			if (!reexport->isPub) continue;
+			if (reexport->Path == "test") continue;
+			TypeIdx modTy = codegenCtx.getTypePool().internModule(
+			    codegenCtx.getStringPool().intern(reexport->Path));
+			ns.moduleAliases[reexport->Name] = modTy;
+		}
+		codegenCtx.registerModuleNamespace(std::move(ns));
+	}
+	// Register every flat `handle.X` mapping for a given (handle name,
+	// resolved module). Shared by direct-import bindings and module-
+	// valued destructuring bindings (`const {fmt} = import("std");`).
+	auto registerHandleFlats =
+	    [&](const std::string &handle, const std::string &modulePath,
+	        ModuleAST *importedModule) {
+		    codegenCtx.registerImportHandle(handle, modulePath);
+		    auto aliasNamed = [&](const std::string &bare) {
+			    TypeIdx target = codegenCtx.getTypePool().internNamed(
+			        codegenCtx.getStringPool().intern(bare));
+			    codegenCtx.registerTypeAlias(handle + "." + bare, target);
+		    };
+		    for (auto &func : importedModule->Functions) {
+			    if (func->isPub) {
+				    codegenCtx.registerFunctionAST(handle + "." + func->Name,
+				                                   func.get());
+			    } else {
+				    codegenCtx.registerPrivateName(handle, func->Name);
+			    }
+		    }
+		    for (auto &s : importedModule->Structs) {
+			    if (s->isPub) {
+				    aliasNamed(s->Name);
+				    for (auto &m : s->Methods) {
+					    if (m->isPub) {
+						    codegenCtx.registerFunctionAST(
+						        handle + "." + s->Name + "." + m->Name,
+						        m.get());
+					    }
+				    }
+			    } else {
+				    codegenCtx.registerPrivateName(handle, s->Name);
+			    }
+		    }
+		    for (auto &e : importedModule->Enums) {
+			    if (e->isPub) aliasNamed(e->Name);
+			    else codegenCtx.registerPrivateName(handle, e->Name);
+		    }
+		    for (auto &u : importedModule->Unions) {
+			    if (u->isPub) aliasNamed(u->Name);
+			    else codegenCtx.registerPrivateName(handle, u->Name);
+		    }
+	    };
+
+	for (auto &import : module->Imports) {
+		if (import->Path == "test") continue;
+		ModuleAST *importedModule = resolver.getOrLoadModule(import->Path);
+		if (!importedModule) continue;
+		registerHandleFlats(import->Name, import->Path, importedModule);
+	}
+
+	// Destructured names that bind a re-exported module value — treat
+	// them as if the user had written `const X = import("...").X;` so
+	// `X.member` resolves through the standard handle-flat tables.
+	for (auto &destImport : module->DestructuringImports) {
+		if (destImport->Path == "test") continue;
+		ModuleAST *src = resolver.getOrLoadModule(destImport->Path);
+		if (!src) continue;
+		for (const auto &name : destImport->Names) {
+			const ImportDeclAST *re = nullptr;
+			for (auto &imp : src->Imports) {
+				if (imp->isPub && imp->Name == name) {
+					re = imp.get();
+					break;
+				}
+			}
+			if (!re) continue;
+			auto resolved =
+			    resolveImportChain(re->Path, re->chain, resolveImportChain);
+			if (!resolved.second) continue;
+			registerHandleFlats(name, resolved.first, resolved.second);
 		}
 	}
 
@@ -395,7 +488,6 @@ static int compileAndRun(const std::string &filename,
 			if (fn->Name == name) return fn.get();
 		}
 		for (const auto &kv : resolver.getLoadedModules()) {
-			if (kv.first == "std") continue;
 			for (auto &fn : kv.second->Functions) {
 				if (fn->isPub && fn->Name == name) return fn.get();
 			}
@@ -487,7 +579,6 @@ static int compileAndRun(const std::string &filename,
 		}
 	};
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
-		if (path == "std") continue;
 		registerConsts(importedModule.get());
 	}
 	registerConsts(module.get());
@@ -614,7 +705,6 @@ static int compileAndRun(const std::string &filename,
 		return 0;
 	};
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
-		if (path == "std") continue;
 		int rc = registerStructMethods(importedModule.get(),
 		                               /*publicOnly=*/true);
 		if (rc != 0) return rc;
@@ -675,7 +765,6 @@ static int compileAndRun(const std::string &filename,
 		}
 	}
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
-		if (path == "std") continue;
 		for (auto &func : importedModule->Functions) {
 			if (func->isPub && !func->isGeneric()) {
 				try {
@@ -761,7 +850,6 @@ static int compileAndRun(const std::string &filename,
 			}
 		}
 		for (const auto &kv : resolver.getLoadedModules()) {
-			if (kv.first == "std") continue;
 			for (auto &fn : kv.second->Functions) {
 				if (fn->isPub) { fnRegistry[fn->Name] = fn.get(); }
 			}

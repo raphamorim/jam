@@ -1,0 +1,121 @@
+// std.fmt — interpolation-based formatted output.
+//
+// `print` and `eprint` are compile-time functions (`cfn`): the body
+// runs at each call site during astgen and emits a sequence of
+// `@-emit` intrinsic calls into the caller's JIR. The format string
+// is parsed at compile time; per-`{ident}` placeholder, the compiler
+// looks up the named local in the caller's scope and dispatches the
+// right per-type write call.
+//
+// Supported placeholder forms (v1):
+//   {ident}     — substitute the named local. Type-dispatched.
+//   {{          — literal `{`.
+//   }}          — literal `}`.
+//
+// Supported value types: signed/unsigned int (any width up to 64),
+// f32 / f64, bool, and `str` (slice of u8). User types and format
+// specifiers (`{x:5.2}` etc.) are deferrable extensions.
+//
+// Literal-byte batching: consecutive literal bytes between
+// placeholders are flushed as a single `@emitWriteBytes` call rather
+// than one `@emitPutByte` per byte. For `"hello {x}\n"` the runtime
+// binary sees two writes (`"hello "` and `"\n"`) instead of seven.
+// Brace escapes (`{{` / `}}`) cut the run and start a new one — the
+// flushed range includes the first brace, the second is skipped.
+
+// `{` is byte 123, `}` is byte 125 — referenced by ordinal because the
+// cfn body's `if` comparison runs at compile time and `'{'` char-
+// literals haven't landed as a comp form yet. Switch to `'{'` once
+// they do.
+
+pub cfn print(fmt: str) {
+    var i: u32 = 0;
+    var runStart: u32 = 0;
+    while (i < fmt.length) {
+        if (fmt[i] == 123) {
+            if (i + 1 < fmt.length) {
+                if (fmt[i + 1] == 123) {
+                    // `{{` — emit a single literal `{` by extending
+                    // the run through index `i` then resuming after
+                    // the second brace.
+                    @emitWriteBytes(1, fmt, runStart, i + 1);
+                    runStart = i + 2;
+                    i = i + 2;
+                } else {
+                    // `{name}` — flush the literal run, interp.
+                    @emitWriteBytes(1, fmt, runStart, i);
+                    var nameStart: u32 = i + 1;
+                    var nameEnd: u32 = nameStart;
+                    while (fmt[nameEnd] != 125) {
+                        nameEnd = nameEnd + 1;
+                    }
+                    @emitPrintLocalByRange(1, fmt, nameStart, nameEnd);
+                    i = nameEnd + 1;
+                    runStart = i;
+                }
+            } else {
+                // Trailing `{` with no closer — fold into the run.
+                i = i + 1;
+            }
+        } else if (fmt[i] == 125) {
+            if (i + 1 < fmt.length) {
+                if (fmt[i + 1] == 125) {
+                    @emitWriteBytes(1, fmt, runStart, i + 1);
+                    runStart = i + 2;
+                    i = i + 2;
+                } else {
+                    // Bare `}` — keep it as a literal byte in the run.
+                    i = i + 1;
+                }
+            } else {
+                i = i + 1;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    @emitWriteBytes(1, fmt, runStart, fmt.length);
+}
+
+pub cfn eprint(fmt: str) {
+    var i: u32 = 0;
+    var runStart: u32 = 0;
+    while (i < fmt.length) {
+        if (fmt[i] == 123) {
+            if (i + 1 < fmt.length) {
+                if (fmt[i + 1] == 123) {
+                    @emitWriteBytes(2, fmt, runStart, i + 1);
+                    runStart = i + 2;
+                    i = i + 2;
+                } else {
+                    @emitWriteBytes(2, fmt, runStart, i);
+                    var nameStart: u32 = i + 1;
+                    var nameEnd: u32 = nameStart;
+                    while (fmt[nameEnd] != 125) {
+                        nameEnd = nameEnd + 1;
+                    }
+                    @emitPrintLocalByRange(2, fmt, nameStart, nameEnd);
+                    i = nameEnd + 1;
+                    runStart = i;
+                }
+            } else {
+                i = i + 1;
+            }
+        } else if (fmt[i] == 125) {
+            if (i + 1 < fmt.length) {
+                if (fmt[i + 1] == 125) {
+                    @emitWriteBytes(2, fmt, runStart, i + 1);
+                    runStart = i + 2;
+                    i = i + 2;
+                } else {
+                    i = i + 1;
+                }
+            } else {
+                i = i + 1;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    @emitWriteBytes(2, fmt, runStart, fmt.length);
+}

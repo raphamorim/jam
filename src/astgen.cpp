@@ -10,6 +10,8 @@
 #include "abi.h"
 #include "ast.h"
 #include "codegen.h"
+#include "comptime.h"
+#include "jir_codegen.h"
 #include "mangling.h"
 
 #include <string>
@@ -660,9 +662,18 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 				if (r != kNoType) return resolveForCmp(r);
 			}
 			if (k.kind == TypeKind::Named) {
-				TypeIdx a = gctx.ctx.lookupTypeAlias(
-				    gctx.ctx.getStringPool().get(static_cast<StringIdx>(k.a)));
+				const std::string &nm = gctx.ctx.getStringPool().get(
+				    static_cast<StringIdx>(k.a));
+				TypeIdx a = gctx.ctx.lookupTypeAlias(nm);
 				if (a != kNoType) return resolveForCmp(a);
+				// 3+ segment chain through module re-exports — collapse
+				// `w.leaf.Point` to the canonical `Point` so it matches
+				// values produced by `w.leaf.makePoint(...)` whose return
+				// type was registered with the single-segment name.
+				if (nm.find('.') != std::string::npos) {
+					TypeIdx c = gctx.ctx.resolveChainedType(nm);
+					if (c != kNoType) return resolveForCmp(c);
+				}
 			}
 			return t;
 		};
@@ -736,6 +747,67 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n,
 		load.a = it->second;
 		load.ty = gctx.localTypes[name];
 		return emit(gctx, load);
+	}
+	// Comp-param substitution. When the enclosing function was
+	// instantiated with `comp n: u32` bound to a concrete value, refs
+	// to `n` in the body lower to that constant directly — no Param /
+	// Load instruction, no LLVM argument. Locals shadow comp params
+	// (the local-lookup above runs first); module consts and
+	// functions are checked after, so a comp-bound name takes
+	// precedence over a same-named module const.
+	if (const jam::ComptimeValue *cv =
+	        gctx.ctx.lookupCurrentCompSubst(name)) {
+		switch (cv->kind) {
+		case jam::ComptimeValue::Kind::Int: {
+			JirInst ic{};
+			ic.tag = JirTag::Int;
+			ic.a = static_cast<uint32_t>(cv->intVal.bits & 0xFFFFFFFFu);
+			ic.b = static_cast<uint32_t>(cv->intVal.bits >> 32);
+			ic.ty = gctx.ctx.getTypePool().internInt(cv->intVal.width,
+			                                          cv->intVal.isSigned);
+			return emit(gctx, ic);
+		}
+		case jam::ComptimeValue::Kind::Bool: {
+			JirInst ic{};
+			ic.tag = JirTag::Bool;
+			ic.a = cv->boolVal ? 1u : 0u;
+			ic.ty = BuiltinType::Bool;
+			return emit(gctx, ic);
+		}
+		case jam::ComptimeValue::Kind::Str: {
+			JirInst si{};
+			si.tag = JirTag::Str;
+			si.a = cv->strVal;
+			si.ty = gctx.ctx.getTypePool().intern(
+			    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
+			return emit(gctx, si);
+		}
+		case jam::ComptimeValue::Kind::Float: {
+			JirInst fl{};
+			fl.tag = JirTag::Float;
+			uint64_t bits;
+			__builtin_memcpy(&bits, &cv->floatVal.value, sizeof(bits));
+			fl.a = static_cast<uint32_t>(bits & 0xFFFFFFFFu);
+			fl.b = static_cast<uint32_t>(bits >> 32);
+			fl.ty = gctx.ctx.getTypePool().internFloat(cv->floatVal.width);
+			return emit(gctx, fl);
+		}
+		case jam::ComptimeValue::Kind::Type:
+			// Type values have no runtime representation. Reaching
+			// here means a value position used a comp param of meta-
+			// type kind — pure type values shouldn't lower to JIR.
+			return recoverHere(gctx,
+			                   "comp param `" + name +
+			                       "` is of type `type` and has no "
+			                       "runtime representation",
+			                   kNoType);
+		case jam::ComptimeValue::Kind::Aggregate:
+		case jam::ComptimeValue::Kind::None:
+			return recoverHere(
+			    gctx,
+			    "comp param `" + name + "` has no runtime lowering yet",
+			    kNoType);
+		}
 	}
 	if (const auto *mc = gctx.ctx.getModuleConst(name)) {
 		return astgenExpr(gctx, mc->initExpr, mc->declaredType);
@@ -3329,6 +3401,609 @@ static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
 	return callRef;
 }
 
+// Comp-instantiation dispatcher. When the callee fn has any comp
+// params, this evaluates them at compile time, builds a mangled clone
+// name, and (on cache miss) registers + declares + defines a
+// monomorphised version of the fn with the comp params dropped from
+// the signature. Comp param refs in the body resolve to the bound
+// values via `astgenVariable`'s comp-subst path. Returns the result
+// of a regular Call to the clone, with only the runtime args lowered.
+//
+// Mirrors the shape of struct-method instantiation in
+// `JamCodegenContext::instantiateStructExpr`: two-phase isn't needed
+// here because comp-instantiated functions don't have mutual recursion
+// to resolve (one fn, one body).
+// Ensure POSIX `dprintf(int fd, const char *fmt, ...)` is declared in
+// the module so @-emit intrinsics can dispatch through it. Idempotent
+// across calls — the registry check skips after the first.
+static void ensureDprintfForCfn(AstGenCtx &gctx) {
+	if (gctx.ctx.getFunctionAST("dprintf") != nullptr) return;
+	auto fake = std::make_unique<FunctionAST>(
+	    "dprintf",
+	    std::vector<Param>{
+	        Param{"fd", BuiltinType::I32, ParamMode::Let},
+	        Param{"fmt", BuiltinType::U64, ParamMode::Let},
+	    },
+	    BuiltinType::I32, std::vector<NodeIdx>{}, /*isExtern=*/true,
+	    /*isExport=*/false, /*isPub=*/false, /*isTest=*/false,
+	    /*isVarArgs=*/true);
+	gctx.ctx.registerFunctionAST("dprintf", fake.release());
+	JamTypeRef i8PtrType = JamLLVMPointerType(gctx.ctx.getInt8Type(), 0);
+	JamTypeRef paramTypes[2] = {gctx.ctx.getInt32Type(), i8PtrType};
+	JamTypeRef ft = JamLLVMFunctionType(gctx.ctx.getInt32Type(), paramTypes, 2,
+	                                     /*isVarArgs=*/true);
+	JamFunctionRef pf = JamLLVMAddFunction(gctx.ctx.getModule(), "dprintf", ft);
+	JamLLVMApplyDefaultFnAttrs(pf, /*isExtern=*/true);
+}
+
+// Emit `dprintf(fd, fmtSpec, arg)` using only one extra arg after the
+// format string. Used by the per-type interp lowering and by
+// emitPutByte for the "%c" case.
+static void emitDprintfSingleArg(AstGenCtx &gctx, JirRef fdRef,
+                                    const char *fmtSpec, JirRef arg) {
+	TypeIdx sliceTy = gctx.ctx.getTypePool().intern(
+	    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
+	TypeIdx u8PtrTy = gctx.ctx.getTypePool().intern(
+	    TypeKey{TypeKind::PtrMany, 0, 0, BuiltinType::U8, 0});
+	StringIdx fmtId = gctx.ctx.getStringPool().intern(fmtSpec);
+	JirInst fs{};
+	fs.tag = JirTag::Str;
+	fs.a = fmtId;
+	fs.ty = sliceTy;
+	JirRef fmtSlice = emit(gctx, fs);
+	JirInst fp{};
+	fp.tag = JirTag::ExtractValue;
+	fp.a = fmtSlice;
+	fp.b = 0;
+	fp.ty = u8PtrTy;
+	JirRef fmtPtr = emit(gctx, fp);
+	std::vector<uint32_t> pp = {3, static_cast<uint32_t>(fdRef),
+	                             static_cast<uint32_t>(fmtPtr),
+	                             static_cast<uint32_t>(arg)};
+	JirExtraIdx pe = gctx.jfn.pushExtra(pp.data(), pp.size());
+	JirInst c{};
+	c.tag = JirTag::Call;
+	c.a = gctx.ctx.getStringPool().intern("dprintf");
+	c.b = pe;
+	c.ty = BuiltinType::I32;
+	emit(gctx, c);
+}
+
+// Materialise a JirRef holding `value` as an LLVM i32.
+static JirRef literalI32(AstGenCtx &gctx, uint32_t value) {
+	JirInst i{};
+	i.tag = JirTag::Int;
+	i.a = value;
+	i.ty = BuiltinType::I32;
+	return emit(gctx, i);
+}
+
+// Per-type runtime print dispatch used by `@emitPrintLocalByRange`.
+// `val` is the loaded local-variable JirRef; `name` is the source
+// identifier (only used for the diagnostic). The dispatcher widens /
+// extracts as needed and emits one dprintf call per piece.
+static void emitDprintfForValue(AstGenCtx &gctx, jam::Diagnostics &diags,
+                                  jam::SrcLoc loc, JirRef fdRef, JirRef val,
+                                  const std::string &name) {
+	TypeIdx ty = gctx.jfn.getInst(val).ty;
+	const TypeKey &k = gctx.ctx.getTypePool().get(ty);
+	switch (k.kind) {
+	case TypeKind::Int: {
+		bool isSigned = k.b != 0;
+		uint16_t width = static_cast<uint16_t>(k.a);
+		JirRef wideRef = val;
+		if (width < 64) {
+			JirInst ext{};
+			ext.tag = isSigned ? JirTag::SExt : JirTag::ZExt;
+			ext.a = val;
+			ext.ty = BuiltinType::I64;
+			wideRef = emit(gctx, ext);
+		}
+		emitDprintfSingleArg(gctx, fdRef, isSigned ? "%lld" : "%llu",
+		                     wideRef);
+		return;
+	}
+	case TypeKind::Float: {
+		uint16_t width = static_cast<uint16_t>(k.a);
+		JirRef wideRef = val;
+		if (width < 64) {
+			JirInst ext{};
+			ext.tag = JirTag::FPExt;
+			ext.a = val;
+			ext.ty = BuiltinType::F64;
+			wideRef = emit(gctx, ext);
+		}
+		emitDprintfSingleArg(gctx, fdRef, "%g", wideRef);
+		return;
+	}
+	case TypeKind::Bool: {
+		// "true"/"false" via CondBr to two write blocks.
+		JirBlockRef trueB = gctx.jfn.pushBlock("emit.true");
+		JirBlockRef falseB = gctx.jfn.pushBlock("emit.false");
+		JirBlockRef joinB = gctx.jfn.pushBlock("emit.bool.end");
+		emitCondBr(gctx, val, trueB, falseB);
+
+		auto emitStrLit = [&](JirBlockRef block, const char *literal) {
+			gctx.currentBlock = block;
+			TypeIdx sliceTy = gctx.ctx.getTypePool().intern(
+			    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
+			TypeIdx u8PtrTy = gctx.ctx.getTypePool().intern(
+			    TypeKey{TypeKind::PtrMany, 0, 0, BuiltinType::U8, 0});
+			StringIdx litId = gctx.ctx.getStringPool().intern(literal);
+			JirInst si{};
+			si.tag = JirTag::Str;
+			si.a = litId;
+			si.ty = sliceTy;
+			JirRef sl = emit(gctx, si);
+			JirInst pi{};
+			pi.tag = JirTag::ExtractValue;
+			pi.a = sl;
+			pi.b = 0;
+			pi.ty = u8PtrTy;
+			JirRef ptr = emit(gctx, pi);
+			JirInst li{};
+			li.tag = JirTag::ExtractValue;
+			li.a = sl;
+			li.b = 1;
+			li.ty = BuiltinType::U64;
+			JirRef ln = emit(gctx, li);
+			JirInst tr{};
+			tr.tag = JirTag::Trunc;
+			tr.a = ln;
+			tr.ty = BuiltinType::I32;
+			JirRef lnI32 = emit(gctx, tr);
+			StringIdx fmtId = gctx.ctx.getStringPool().intern("%.*s");
+			JirInst fs{};
+			fs.tag = JirTag::Str;
+			fs.a = fmtId;
+			fs.ty = sliceTy;
+			JirRef fmtSlice = emit(gctx, fs);
+			JirInst fp{};
+			fp.tag = JirTag::ExtractValue;
+			fp.a = fmtSlice;
+			fp.b = 0;
+			fp.ty = u8PtrTy;
+			JirRef fmtPtr = emit(gctx, fp);
+			std::vector<uint32_t> pp = {
+			    4, static_cast<uint32_t>(fdRef),
+			    static_cast<uint32_t>(fmtPtr), static_cast<uint32_t>(lnI32),
+			    static_cast<uint32_t>(ptr)};
+			JirExtraIdx pe = gctx.jfn.pushExtra(pp.data(), pp.size());
+			JirInst c{};
+			c.tag = JirTag::Call;
+			c.a = gctx.ctx.getStringPool().intern("dprintf");
+			c.b = pe;
+			c.ty = BuiltinType::I32;
+			emit(gctx, c);
+			emitBr(gctx, joinB);
+		};
+		emitStrLit(trueB, "true");
+		emitStrLit(falseB, "false");
+		gctx.currentBlock = joinB;
+		return;
+	}
+	case TypeKind::Slice: {
+		TypeIdx elem = static_cast<TypeIdx>(k.a);
+		if (elem != BuiltinType::U8) {
+			diags.error(loc, "@emit: slice argument `" + name +
+			                     "` is not a slice of u8");
+			return;
+		}
+		TypeIdx sliceTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
+		TypeIdx u8PtrTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::PtrMany, 0, 0, BuiltinType::U8, 0});
+		JirInst pi{};
+		pi.tag = JirTag::ExtractValue;
+		pi.a = val;
+		pi.b = 0;
+		pi.ty = u8PtrTy;
+		JirRef ptr = emit(gctx, pi);
+		JirInst li{};
+		li.tag = JirTag::ExtractValue;
+		li.a = val;
+		li.b = 1;
+		li.ty = BuiltinType::U64;
+		JirRef ln = emit(gctx, li);
+		JirInst tr{};
+		tr.tag = JirTag::Trunc;
+		tr.a = ln;
+		tr.ty = BuiltinType::I32;
+		JirRef lnI32 = emit(gctx, tr);
+		StringIdx fmtId = gctx.ctx.getStringPool().intern("%.*s");
+		JirInst fs{};
+		fs.tag = JirTag::Str;
+		fs.a = fmtId;
+		fs.ty = sliceTy;
+		JirRef fmtSlice = emit(gctx, fs);
+		JirInst fp{};
+		fp.tag = JirTag::ExtractValue;
+		fp.a = fmtSlice;
+		fp.b = 0;
+		fp.ty = u8PtrTy;
+		JirRef fmtPtr = emit(gctx, fp);
+		std::vector<uint32_t> pp = {
+		    4, static_cast<uint32_t>(fdRef), static_cast<uint32_t>(fmtPtr),
+		    static_cast<uint32_t>(lnI32), static_cast<uint32_t>(ptr)};
+		JirExtraIdx pe = gctx.jfn.pushExtra(pp.data(), pp.size());
+		JirInst c{};
+		c.tag = JirTag::Call;
+		c.a = gctx.ctx.getStringPool().intern("dprintf");
+		c.b = pe;
+		c.ty = BuiltinType::I32;
+		emit(gctx, c);
+		return;
+	}
+	default:
+		diags.error(loc, "@emit: local `" + name + "` has a type that's "
+		                                            "not printable (only "
+		                                            "int / float / bool / "
+		                                            "slice<u8> supported)");
+		return;
+	}
+}
+
+// Astgen-side emitter implementing `CompEmitter`. Owns a reference to
+// the caller's `AstGenCtx` so each `@-emit` intrinsic drops JIR into
+// the right function. Lives only for the duration of one cfn body
+// execution.
+class CfnEmitter : public jam::CompEmitter {
+  public:
+	explicit CfnEmitter(AstGenCtx &gctx) : gctx_(gctx) {}
+
+	jam::ExecResult
+	handleAtCall(const std::string &name,
+	              const std::vector<jam::ComptimeValue> &args,
+	              jam::Diagnostics &diags, jam::SrcLoc loc) override {
+		if (name == "emitPutByte") {
+			return handlePutByte(args, diags, loc);
+		}
+		if (name == "emitPrintLocalByRange") {
+			return handlePrintLocalByRange(args, diags, loc);
+		}
+		if (name == "emitWriteBytes") {
+			return handleWriteBytes(args, diags, loc);
+		}
+		diags.error(loc, "unknown @-emit intrinsic `@" + name + "`");
+		return jam::ExecResult::Error;
+	}
+
+  private:
+	AstGenCtx &gctx_;
+
+	jam::ExecResult
+	handlePutByte(const std::vector<jam::ComptimeValue> &args,
+	               jam::Diagnostics &diags, jam::SrcLoc loc) {
+		if (args.size() != 2 || !args[0].isInt() || !args[1].isInt()) {
+			diags.error(loc,
+			             "@emitPutByte expects (fd: i32, byte: u8)");
+			return jam::ExecResult::Error;
+		}
+		ensureDprintfForCfn(gctx_);
+		JirRef fdRef = literalI32(gctx_,
+		                           static_cast<uint32_t>(args[0].asU64()));
+		JirInst byteI{};
+		byteI.tag = JirTag::Int;
+		byteI.a = static_cast<uint32_t>(args[1].asU64() & 0xFFu);
+		byteI.ty = BuiltinType::I32;  // %c expects an int
+		JirRef byteRef = emit(gctx_, byteI);
+		emitDprintfSingleArg(gctx_, fdRef, "%c", byteRef);
+		return jam::ExecResult::Continue;
+	}
+
+	jam::ExecResult
+	handlePrintLocalByRange(const std::vector<jam::ComptimeValue> &args,
+	                          jam::Diagnostics &diags, jam::SrcLoc loc) {
+		if (args.size() != 4 || !args[0].isInt() || !args[1].isStr() ||
+		    !args[2].isInt() || !args[3].isInt()) {
+			diags.error(loc,
+			             "@emitPrintLocalByRange expects "
+			             "(fd: i32, fmt: str, start: u32, end: u32)");
+			return jam::ExecResult::Error;
+		}
+		uint32_t fd = static_cast<uint32_t>(args[0].asU64());
+		const std::string &fmtStr =
+		    gctx_.ctx.getStringPool().get(args[1].strVal);
+		uint32_t start = static_cast<uint32_t>(args[2].asU64());
+		uint32_t end = static_cast<uint32_t>(args[3].asU64());
+		if (start > end || end > fmtStr.length()) {
+			diags.error(loc,
+			             "@emitPrintLocalByRange: range out of bounds "
+			             "for the format string");
+			return jam::ExecResult::Error;
+		}
+		std::string name = fmtStr.substr(start, end - start);
+		auto it = gctx_.locals.find(name);
+		if (it == gctx_.locals.end()) {
+			diags.error(loc, "unknown variable `" + name +
+			                     "` referenced from cfn format string");
+			return jam::ExecResult::Error;
+		}
+		ensureDprintfForCfn(gctx_);
+		// Load the local.
+		JirInst load{};
+		load.tag = JirTag::Load;
+		load.a = it->second;
+		load.ty = gctx_.localTypes[name];
+		JirRef val = emit(gctx_, load);
+		JirRef fdRef = literalI32(gctx_, fd);
+		emitDprintfForValue(gctx_, diags, loc, fdRef, val, name);
+		return jam::ExecResult::Continue;
+	}
+
+	// Emit a single `dprintf(fd, "%.*s", len, ptr)` for the byte slice
+	// `fmt[start..end]`. Lets a cfn batch consecutive literal bytes
+	// into one runtime write instead of one dprintf per byte. The
+	// substring is interned into the global StringPool at compile
+	// time; the runtime code just hands its `.rodata` ptr + len to
+	// dprintf.
+	jam::ExecResult
+	handleWriteBytes(const std::vector<jam::ComptimeValue> &args,
+	                  jam::Diagnostics &diags, jam::SrcLoc loc) {
+		if (args.size() != 4 || !args[0].isInt() || !args[1].isStr() ||
+		    !args[2].isInt() || !args[3].isInt()) {
+			diags.error(loc,
+			             "@emitWriteBytes expects "
+			             "(fd: i32, fmt: str, start: u32, end: u32)");
+			return jam::ExecResult::Error;
+		}
+		uint32_t fd = static_cast<uint32_t>(args[0].asU64());
+		const std::string &fmtStr =
+		    gctx_.ctx.getStringPool().get(args[1].strVal);
+		uint32_t start = static_cast<uint32_t>(args[2].asU64());
+		uint32_t end = static_cast<uint32_t>(args[3].asU64());
+		if (start > end || end > fmtStr.length()) {
+			diags.error(loc,
+			             "@emitWriteBytes: range out of bounds "
+			             "for the format string");
+			return jam::ExecResult::Error;
+		}
+		if (start == end) {
+			// Empty span — caller-side guard against this is cheap;
+			// be permissive so cfn authors don't need to branch.
+			return jam::ExecResult::Continue;
+		}
+		ensureDprintfForCfn(gctx_);
+		StringIdx litId = gctx_.ctx.getStringPool().intern(
+		    fmtStr.substr(start, end - start));
+		TypeIdx sliceTy = gctx_.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
+		TypeIdx u8PtrTy = gctx_.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::PtrMany, 0, 0, BuiltinType::U8, 0});
+		JirInst sl{};
+		sl.tag = JirTag::Str;
+		sl.a = litId;
+		sl.ty = sliceTy;
+		JirRef litSlice = emit(gctx_, sl);
+		JirInst pi{};
+		pi.tag = JirTag::ExtractValue;
+		pi.a = litSlice;
+		pi.b = 0;
+		pi.ty = u8PtrTy;
+		JirRef ptr = emit(gctx_, pi);
+		JirInst li{};
+		li.tag = JirTag::ExtractValue;
+		li.a = litSlice;
+		li.b = 1;
+		li.ty = BuiltinType::U64;
+		JirRef ln = emit(gctx_, li);
+		JirInst tr{};
+		tr.tag = JirTag::Trunc;
+		tr.a = ln;
+		tr.ty = BuiltinType::I32;
+		JirRef lnI32 = emit(gctx_, tr);
+		StringIdx fmtId = gctx_.ctx.getStringPool().intern("%.*s");
+		JirInst fs{};
+		fs.tag = JirTag::Str;
+		fs.a = fmtId;
+		fs.ty = sliceTy;
+		JirRef fmtSlice = emit(gctx_, fs);
+		JirInst fp{};
+		fp.tag = JirTag::ExtractValue;
+		fp.a = fmtSlice;
+		fp.b = 0;
+		fp.ty = u8PtrTy;
+		JirRef fmtPtr = emit(gctx_, fp);
+		JirRef fdRef = literalI32(gctx_, fd);
+		std::vector<uint32_t> pp = {
+		    4, static_cast<uint32_t>(fdRef), static_cast<uint32_t>(fmtPtr),
+		    static_cast<uint32_t>(lnI32), static_cast<uint32_t>(ptr)};
+		JirExtraIdx pe = gctx_.jfn.pushExtra(pp.data(), pp.size());
+		JirInst c{};
+		c.tag = JirTag::Call;
+		c.a = gctx_.ctx.getStringPool().intern("dprintf");
+		c.b = pe;
+		c.ty = BuiltinType::I32;
+		emit(gctx_, c);
+		return jam::ExecResult::Continue;
+	}
+};
+
+// Compile-time function call dispatcher. Runs `fn`'s body via the
+// ComptimeEvaluator with the call site's args bound into a fresh comp
+// scope. The body must evaluate at compile time; any @-emit intrinsic
+// it contains (Phase 4) generates JIR into the *caller's* gctx — that's
+// how `std.fmt.print` lowers to a sequence of write calls inside the
+// user's main() rather than inside print's own LLVM function.
+static JirRef astgenCompTimeFnCall(AstGenCtx &gctx, const AstNode &n,
+                                     const FunctionAST *fn) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	ExtraIdx argsExtra = static_cast<ExtraIdx>(n.rhs);
+	uint32_t argCount = ns.getExtra(argsExtra);
+
+	// Arg count must match. cfn doesn't support varargs.
+	if (argCount != fn->Args.size()) {
+		return recoverHere(gctx,
+		                   "cfn `" + fn->Name + "` expects " +
+		                       std::to_string(fn->Args.size()) +
+		                       " arg(s), got " + std::to_string(argCount),
+		                   kNoType);
+	}
+
+	// Evaluate each arg at compile time and bind to the param name.
+	jam::ComptimeEvaluator ev(ns, gctx.ctx.getStringPool(),
+	                           gctx.ctx.getTypePool());
+	jam::ComptimeScope outer;
+	jam::Diagnostics &diags = gctx.ctx.diagnostics();
+	jam::SrcLoc loc{gctx.ctx.currentFile(), 0};
+	for (uint32_t i = 0; i < argCount; i++) {
+		NodeIdx argIdx = static_cast<NodeIdx>(ns.getExtra(argsExtra + 1 + i));
+		jam::ComptimeValue v = ev.eval(argIdx, outer);
+		if (v.isNone()) {
+			return recoverHere(gctx,
+			                   "argument to cfn `" + fn->Name + "` (param `" +
+			                       fn->Args[i].Name +
+			                       "`) must be a compile-time constant",
+			                   kNoType);
+		}
+		outer.bind(fn->Args[i].Name, std::move(v));
+	}
+
+	// Install the emitter so @-emit intrinsics inside the body drop
+	// JIR into the caller's gctx. The emitter has a reference to
+	// `gctx` for the duration of the body's execution; clearing it
+	// after prevents accidental reuse.
+	CfnEmitter emitter(gctx);
+	ev.setCallContext(&emitter, &diags, loc);
+	uint32_t iterCounter = 0;
+	jam::ComptimeValue returned;
+	std::vector<NodeIdx> bodyVec(fn->Body.begin(), fn->Body.end());
+	jam::ExecResult r = ev.execBlock(bodyVec.data(), bodyVec.size(), outer,
+	                                  iterCounter,
+	                                  jam::ComptimeEvaluator::kDefaultIterCap,
+	                                  returned, diags, loc);
+	ev.clearCallContext();
+	if (r == jam::ExecResult::Error || r == jam::ExecResult::IterationCap) {
+		// Diagnostic already pushed; return a poison so the rest of
+		// the caller still gets analyzed.
+		return recoverHere(gctx,
+		                   "cfn `" + fn->Name + "` failed during compile-"
+		                                          "time evaluation",
+		                   kNoType);
+	}
+	// cfn returns void in v1; the value (if any) is discarded for now.
+	return kNoJirRef;
+}
+
+static JirRef astgenCompInstantiatedCall(AstGenCtx &gctx, const AstNode &n,
+                                          const FunctionAST *fn) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	ExtraIdx argsExtra = static_cast<ExtraIdx>(n.rhs);
+	uint32_t argCount = ns.getExtra(argsExtra);
+
+	jam::ComptimeEvaluator ev(gctx.ctx.getNodeStore(),
+	                           gctx.ctx.getStringPool(),
+	                           gctx.ctx.getTypePool());
+	jam::ComptimeScope scope;
+	std::unordered_map<std::string, jam::ComptimeValue> compSubst;
+	std::vector<NodeIdx> runtimeArgs;
+	std::string mangleSuffix;
+
+	for (uint32_t i = 0; i < argCount; i++) {
+		NodeIdx argIdx = static_cast<NodeIdx>(ns.getExtra(argsExtra + 1 + i));
+		if (i < fn->Args.size() && fn->Args[i].isComp) {
+			jam::ComptimeValue v = ev.eval(argIdx, scope);
+			if (v.isNone()) {
+				return recoverHere(gctx,
+				                   "argument for comp param `" +
+				                       fn->Args[i].Name +
+				                       "` must be a compile-time constant",
+				                   kNoType);
+			}
+			compSubst[fn->Args[i].Name] = v;
+			// Mangle a unique suffix per comp value.
+			mangleSuffix += "__";
+			switch (v.kind) {
+			case jam::ComptimeValue::Kind::Int:
+				mangleSuffix +=
+				    (v.intVal.isSigned ? "i" : "u") + std::to_string(v.asU64());
+				break;
+			case jam::ComptimeValue::Kind::Bool:
+				mangleSuffix += v.boolVal ? "true" : "false";
+				break;
+			case jam::ComptimeValue::Kind::Str: {
+				// Hash to keep the symbol stable / printable for
+				// arbitrary contents.
+				std::hash<std::string> hash;
+				const std::string &s = gctx.ctx.getStringPool().get(v.strVal);
+				mangleSuffix += "s" + std::to_string(hash(s));
+				break;
+			}
+			case jam::ComptimeValue::Kind::Type: {
+				const TypeKey &tk = gctx.ctx.getTypePool().get(v.typeVal);
+				if (tk.kind == TypeKind::Int) {
+					mangleSuffix +=
+					    (tk.b ? "i" : "u") + std::to_string(tk.a);
+				} else if (tk.kind == TypeKind::Bool) {
+					mangleSuffix += "bool";
+				} else {
+					mangleSuffix += "t" + std::to_string(v.typeVal);
+				}
+				break;
+			}
+			default:
+				mangleSuffix += "x";
+				break;
+			}
+		} else {
+			runtimeArgs.push_back(argIdx);
+		}
+	}
+
+	std::string instName = fn->Name + mangleSuffix;
+
+	// Cache hit? Skip the clone+lower and dispatch to the existing
+	// instantiation.
+	const FunctionAST *clone = gctx.ctx.getFunctionAST(instName);
+	if (clone == nullptr) {
+		// Build a clone whose signature drops the comp params. Body
+		// stays as the original NodeStore indices — astgen reads the
+		// comp subst when it encounters the comp param names.
+		std::vector<Param> instArgs;
+		instArgs.reserve(fn->Args.size());
+		for (const auto &p : fn->Args) {
+			if (!p.isComp) instArgs.push_back(p);
+		}
+		auto cloned = std::make_unique<FunctionAST>(
+		    instName, std::move(instArgs), fn->ReturnType, fn->Body,
+		    fn->isExtern, fn->isExport, fn->isPub, fn->isTest, fn->isVarArgs,
+		    fn->isCfn);
+		clone = gctx.ctx.adoptInstantiatedFunction(std::move(cloned));
+		gctx.ctx.registerFunctionAST(instName,
+		                              const_cast<FunctionAST *>(clone));
+
+		// Save the builder so we can return to the caller's insertion
+		// point once the clone body's been emitted.
+		JamBasicBlockRef savedBB =
+		    JamLLVMGetInsertBlock(gctx.ctx.getBuilder());
+
+		gctx.ctx.setCurrentCompSubst(compSubst);
+		JirFunction jfn = astgenMetadata(*clone, gctx.ctx);
+		jfn.name = clone->Name;
+		jirDeclarePrototype(jfn, gctx.ctx);
+		astgenBodyInto(jfn, *clone, gctx.ctx);
+		jirDefineBody(jfn, gctx.ctx);
+		gctx.ctx.clearCurrentCompSubst();
+
+		if (savedBB) {
+			JamLLVMPositionBuilderAtEnd(gctx.ctx.getBuilder(), savedBB);
+		}
+	}
+
+	// Emit a regular Call to the cloned fn, passing only the runtime
+	// args. lowerArg honours each param's mode (mut/move pass-by-ptr).
+	std::vector<JirRef> argRefs;
+	argRefs.reserve(runtimeArgs.size());
+	for (size_t i = 0; i < runtimeArgs.size(); i++) {
+		if (i < clone->Args.size()) {
+			argRefs.push_back(lowerArg(gctx, runtimeArgs[i], clone->Args[i]));
+		} else {
+			argRefs.push_back(astgenExpr(gctx, runtimeArgs[i], kNoType));
+		}
+	}
+	return emitCall(gctx, clone, argRefs);
+}
+
 static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 	const NodeStore &ns = gctx.ctx.getNodeStore();
 	ExtraIdx argsExtra = static_cast<ExtraIdx>(n.rhs);
@@ -3770,6 +4445,35 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 	}
 
 	const FunctionAST *fn = gctx.ctx.getFunctionAST(callee);
+	if (fn == nullptr && callee.find('.') != std::string::npos) {
+		// Chained module access fallback: `std.fmt.print(...)` etc.
+		// The flat lookup above only knows `handle.X` (single-dot)
+		// entries; this walks ModuleNamespace.moduleAliases for each
+		// intermediate segment and resolves the final segment as a
+		// function in the leaf module's namespace.
+		fn = gctx.ctx.resolveChainedFunction(callee);
+	}
+	// Compile-time function calls: `pub cfn` declared at the top level.
+	// The cfn body executes at compile time, with each call site
+	// generating a fresh execution. Args must be comp-known. The body
+	// is interpreted by `ComptimeEvaluator`; @-emit intrinsics inside
+	// the body drop JIR into the calling function's gctx (Phase 4 wiring).
+	if (fn != nullptr && fn->isCompTimeFn) {
+		return astgenCompTimeFnCall(gctx, n, fn);
+	}
+	// Comp-instantiated calls: fn has at least one `comp` param. Each
+	// unique combination of comp args produces a fresh monomorphisation
+	// (cached in the function registry under a mangled name). Runtime
+	// args are passed through to the clone as normal Call args.
+	if (fn != nullptr) {
+		bool hasComp = false;
+		for (const auto &p : fn->Args) {
+			if (p.isComp) { hasComp = true; break; }
+		}
+		if (hasComp) {
+			return astgenCompInstantiatedCall(gctx, n, fn);
+		}
+	}
 	if (fn == nullptr) {
 		// Before erroring, try the fn-pointer-in-local-or-field paths.
 		// Two cases, both producing a Fn-typed JirRef we can call

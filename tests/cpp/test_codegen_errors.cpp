@@ -131,8 +131,8 @@ class CodegenErrorTests {
 		                  testMixedFloatWidthRejected);
 		framework.addTest("Codegen - destructured non-pub symbol rejected",
 		                  testDestructuredNonPubRejected);
-		framework.addTest("Codegen - `pub` on import rejected",
-		                  testPubOnImportRejected);
+		framework.addTest("Codegen - `pub` re-export compiles",
+		                  testPubReexportCompiles);
 		framework.addTest("Codegen - `pub` on destructuring import rejected",
 		                  testPubOnDestructuringRejected);
 		framework.addTest("Codegen - namespace access to non-pub type rejected",
@@ -308,16 +308,18 @@ fn main() {}
 		ASSERT_TRUE(stderrContains(r, "is not exported from module"));
 	}
 
-	// `pub const x = import(...)` is rejected; re-exports aren't a
-	// feature yet.
-	static void testPubOnImportRejected() {
-		auto r = compileSource("must_fail_pub_import", R"(
-pub const std = import("std");
+	// `pub const X = import(...)` is a re-export. The module that
+	// writes it surfaces the imported module under its own namespace
+	// so a downstream importer can chain through (`outer.X.member`).
+	// Just check that the form parses + compiles cleanly — exercising
+	// the re-export chain end-to-end is the smoke test in
+	// `test_print.cpp` and the unit suite.
+	static void testPubReexportCompiles() {
+		auto r = compileSource("ok_pub_reexport", R"(
+pub const fmt = import("fmt");
 fn main() {}
 )");
-		ASSERT_TRUE(r.exitCode != 0);
-		ASSERT_TRUE(stderrContains(r, "pub"));
-		ASSERT_TRUE(stderrContains(r, "imports"));
+		ASSERT_TRUE(r.exitCode == 0);
 	}
 
 	// `pub const { X } = import(...)` is rejected explicitly so the

@@ -1,0 +1,47 @@
+// Multi-dot type access through a pub-import re-export chain. The
+// leaf module exposes a `Point` struct; `mod_chain_wrap` re-exports
+// the leaf as `pub const leaf = import(...)`. From the test we reach
+// the type through `w.leaf.Point` in every position a type can
+// appear: variable annotation, struct literal target, fn parameter
+// type, and struct field type.
+//
+// Mirrors Zig's uniform type-as-value path
+// (`src/Sema.zig` `fieldVal`/`namespaceLookupVal`): each `.` is a
+// namespace lookup so chained access composes naturally regardless of
+// whether the result lands in a value or type position.
+
+const { assert } = import("test");
+const w = import("mod_chain_wrap");
+
+const Box = struct {
+    inner: w.leaf.Point,
+};
+
+fn takesPoint(p: w.leaf.Point) i32 {
+    return p.x + p.y;
+}
+
+fn pointFromAnnotation() i32 {
+    var p: w.leaf.Point = w.leaf.Point{ x: 3, y: 4 };
+    return p.x + p.y;
+}
+
+fn pointFromInferredLiteral() i32 {
+    var p: w.leaf.Point = w.leaf.makePoint(10, 20);
+    return p.x + p.y;
+}
+
+fn pointAsFnParam() i32 {
+    var p: w.leaf.Point = w.leaf.Point{ x: 5, y: 6 };
+    return takesPoint(p);
+}
+
+fn pointInStructField() i32 {
+    var b: Box = Box{ inner: w.leaf.Point{ x: 1, y: 2 } };
+    return b.inner.x + b.inner.y;
+}
+
+tfn chainedTypeAnnotation() { assert(pointFromAnnotation(), 7); }
+tfn chainedTypeAsFnReturn() { assert(pointFromInferredLiteral(), 30); }
+tfn chainedTypeAsFnParam() { assert(pointAsFnParam(), 11); }
+tfn chainedTypeInStructField() { assert(pointInStructField(), 3); }

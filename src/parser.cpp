@@ -176,16 +176,41 @@ NodeIdx Parser::parsePrimary() {
 	// expression forms; the codegen builds a phi over arm values.
 	if (check(TOK_MATCH)) { return parseMatch(); }
 
-	// `@name(arg)` — comptime intrinsic invocation. Resolved to a
-	// constant at codegen time; LLVM never sees a call. Stage 1 only
-	// supports compiler-supplied intrinsics that take a single TYPE
-	// argument (sizeOf, alignOf); the type is parsed via parseType()
-	// and stored as a TypeIdx in the rhs slot. User-defined cfn bodies
-	// + arbitrary value args arrive in Stage 2 with CTFE.
+	// `@name(arg, ...)` — compiler intrinsic invocation. Two encoding
+	// shapes:
+	//   * Type-arg form (`@sizeOf(T)`, `@alignOf(T)`): single TypeIdx
+	//     stored in rhs. flags=0.
+	//   * Expr-arg multi-form (`@emit*(...)` intrinsics callable from
+	//     cfn bodies): rhs is an ExtraIdx → [argCount, arg0, ...].
+	//     flags bit 0 = 1.
+	// The intrinsic name decides which encoding the parser uses.
 	if (match(TOK_AT)) {
 		consume(TOK_IDENTIFIER, "Expected intrinsic name after '@'");
-		StringIdx nameId = stringPool->intern(previous().text(source_));
+		std::string name(previous().text(source_));
+		StringIdx nameId = stringPool->intern(name);
 		consume(TOK_OPEN_PAREN, "Expected '(' after '@name'");
+		// Names starting with "emit" are the @-emit family; they take
+		// expression args. Everything else (sizeOf, alignOf) stays on
+		// the legacy type-arg path.
+		bool isEmitFamily = name.length() >= 4 && name.substr(0, 4) == "emit";
+		if (isEmitFamily) {
+			std::vector<NodeIdx> args;
+			if (!check(TOK_CLOSE_PAREN)) {
+				do {
+					args.push_back(parseLogicalOr());
+				} while (match(TOK_COMMA));
+			}
+			consume(TOK_CLOSE_PAREN,
+			        "Expected ')' after '@' intrinsic arguments");
+			ExtraIdx extra = nodes->reserveExtra(1 + args.size());
+			nodes->setExtra(extra, static_cast<uint32_t>(args.size()));
+			for (std::size_t i = 0; i < args.size(); i++) {
+				nodes->setExtra(extra + 1 + i, args[i]);
+			}
+			AstNode node{AstTag::AtCall, 0, 0, 0, nameId, extra};
+			node.flags = 1;  // expr-arg multi-form
+			return emit(node);
+		}
 		TypeIdx tyArg = parseType();
 		consume(TOK_CLOSE_PAREN, "Expected ')' after '@' intrinsic argument");
 		return emit(AstNode{AstTag::AtCall, 0, 0, 0, nameId,
@@ -643,15 +668,17 @@ TypeIdx Parser::parseType() {
 			return typePool->internNamed(
 			    stringPool->intern(structContextStack.back()));
 		}
-		// Optional module qualifier: `Handle.TypeName`. main.cpp
-		// registers each main-module import's pub items under
-		// `<handle>.<name>` so the existing struct/enum/union/type-alias
-		// and generic-fn lookups resolve the qualified form transparently.
+		// Optional module qualifier: `Handle.TypeName`, or any longer
+		// chain `Handle.A.B.…TypeName` when the intermediate segments
+		// are pub re-exports (`pub const A = import("…")`). main.cpp
+		// registers single-hop pub items under `<handle>.<name>`; for
+		// 3+ segment chains, codegen falls back to a ModuleNamespace
+		// walk in `resolveChainedType` when the flat alias misses.
 		std::string ident(firstIdent);
-		if (match(TOK_DOT)) {
+		while (match(TOK_DOT)) {
 			consume(TOK_IDENTIFIER, "Expected type name after `.`");
-			ident = std::string(firstIdent) + "." +
-			        std::string(previous().text(source_));
+			ident += ".";
+			ident += previous().text(source_);
 		}
 		if (check(TOK_OPEN_PAREN)) {
 			advance();  // consume `(`
@@ -909,6 +936,104 @@ NodeIdx Parser::parseMatch() {
 }
 
 NodeIdx Parser::parseExpression() {
+	// `comp` prefix at statement-start opts the following construct
+	// into comp-time evaluation:
+	//   comp const X = ...;   — comp-bound constant (rhs bit 1 = comp)
+	//   comp var X = ...;     — mutable comp binding (rhs bit 1 = comp)
+	//   comp if (cond) { ... } else { ... }  — comp-folded branch
+	//                          (IfNode flags bit 0 = comp). The
+	//                          unchosen arm never reaches astgen.
+	// The keyword is the source-level marker; the comp evaluator
+	// implementation lives in src/comptime.h.
+	if (match(TOK_COMP)) {
+		if (match(TOK_CONST) || match(TOK_VAR)) {
+			bool isConst = previous().type == TOK_CONST;
+			consume(TOK_IDENTIFIER, "Expected variable name");
+			StringIdx name = stringPool->intern(previous().text(source_));
+			TypeIdx type = kNoType;
+			if (match(TOK_COLON)) { type = parseType(); }
+			consume(TOK_EQUAL,
+			        "Expected '=' (every variable must be initialized at "
+			        "declaration)");
+			NodeIdx init = parseLogicalOr();
+			consume(TOK_SEMI, "Expected ';' after variable declaration");
+			ExtraIdx extra = nodes->reserveExtra(3);
+			nodes->setExtra(extra, name);
+			nodes->setExtra(extra + 1, type);
+			nodes->setExtra(extra + 2, init);
+			uint32_t rhsFlags = (isConst ? 1u : 0u) | 2u;  // bit 1 = comp
+			return emit(AstNode{AstTag::VarDecl, 0, 0, 0, extra, rhsFlags});
+		}
+		if (match(TOK_IF)) {
+			consume(TOK_OPEN_PAREN, "Expected '(' after `comp if`");
+			NodeIdx cond = parseLogicalOr();
+			consume(TOK_CLOSE_PAREN, "Expected ')' after `comp if` condition");
+			consume(TOK_OPEN_BRACE, "Expected '{' after `comp if` condition");
+			std::vector<NodeIdx> thenBody;
+			while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
+				thenBody.push_back(parseExpression());
+			}
+			consume(TOK_CLOSE_BRACE, "Expected '}' after `comp if` body");
+			std::vector<NodeIdx> elseBody;
+			if (match(TOK_ELSE)) {
+				if (check(TOK_IF) || check(TOK_COMP)) {
+					elseBody.push_back(parseExpression());
+				} else {
+					consume(TOK_OPEN_BRACE,
+					        "Expected '{' or `if` / `comp if` after 'else'");
+					while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
+						elseBody.push_back(parseExpression());
+					}
+					consume(TOK_CLOSE_BRACE,
+					        "Expected '}' after `comp if` else body");
+				}
+			}
+			ExtraIdx extra =
+			    nodes->reserveExtra(2 + thenBody.size() + elseBody.size());
+			nodes->setExtra(extra, static_cast<uint32_t>(thenBody.size()));
+			nodes->setExtra(extra + 1, static_cast<uint32_t>(elseBody.size()));
+			for (size_t i = 0; i < thenBody.size(); i++) {
+				nodes->setExtra(extra + 2 + i, thenBody[i]);
+			}
+			for (size_t i = 0; i < elseBody.size(); i++) {
+				nodes->setExtra(extra + 2 + thenBody.size() + i, elseBody[i]);
+			}
+			AstNode ifNode{AstTag::IfNode, 0, 0, 0,
+			               static_cast<uint32_t>(cond), extra};
+			ifNode.flags = 1;  // bit 0 = comp
+			return emit(ifNode);
+		}
+		parseError("`comp` must be followed by `const`, `var`, or `if`");
+	}
+	// `inline while (cond) { body }` — comp-unrolled loop. The
+	// analyzer evaluates `cond` each iteration via the comp evaluator
+	// and re-lowers the body; mutation of comp vars in the body
+	// updates the comp scope so the next iteration's cond sees the
+	// new value. Bounded iteration cap prevents bad code from hanging
+	// the compiler.
+	if (match(TOK_INLINE)) {
+		consume(TOK_WHILE, "Expected `while` after `inline`");
+		consume(TOK_OPEN_PAREN, "Expected '(' after `inline while`");
+		NodeIdx cond = parseLogicalOr();
+		consume(TOK_CLOSE_PAREN,
+		        "Expected ')' after `inline while` condition");
+		consume(TOK_OPEN_BRACE,
+		        "Expected '{' after `inline while` condition");
+		std::vector<NodeIdx> body;
+		while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
+			body.push_back(parseExpression());
+		}
+		consume(TOK_CLOSE_BRACE, "Expected '}' after `inline while` body");
+		ExtraIdx extra = nodes->reserveExtra(1 + body.size());
+		nodes->setExtra(extra, static_cast<uint32_t>(body.size()));
+		for (size_t i = 0; i < body.size(); i++) {
+			nodes->setExtra(extra + 1 + i, body[i]);
+		}
+		AstNode whileNode{AstTag::WhileNode, 0, 0, 0,
+		                  static_cast<uint32_t>(cond), extra};
+		whileNode.flags = 1;  // bit 0 = inline
+		return emit(whileNode);
+	}
 	if (match(TOK_RETURN)) {
 		if (match(TOK_SEMI)) {
 			return emit(AstNode{AstTag::Return, 0, 0, 0, kNoNode, 0});
@@ -1087,7 +1212,16 @@ NodeIdx Parser::parseExpression() {
 		return expr;
 	}
 
-	return parseLogicalOr();
+	// Bare expression-statement starting with something other than an
+	// identifier (notably `@emit*(...)` / `@sizeOf(T)` etc. in
+	// statement position). parseLogicalOr handles the expression; we
+	// close with `;` if the result is an AtCall (common shape for
+	// cfn-body side-effect calls).
+	NodeIdx expr = parseLogicalOr();
+	if (nodes->get(expr).tag == AstTag::AtCall) {
+		consume(TOK_SEMI, "Expected ';' after `@`-call statement");
+	}
+	return expr;
 }
 
 NodeIdx Parser::parseLogicalOr() {
@@ -1336,6 +1470,15 @@ std::unique_ptr<FunctionAST> Parser::parseFunction() {
 				isVarArgs = true;
 				break;
 			}
+			// Optional `comp` keyword before the parameter name marks
+			// this as a compile-time-only parameter — its value must
+			// be known at the call site and is bound into the
+			// function's substitution map at monomorphisation time.
+			// Same per-call instantiation cache as `T: type` generics.
+			bool isComp = false;
+			if (match(TOK_COMP)) {
+				isComp = true;
+			}
 			consume(TOK_IDENTIFIER, "Expected parameter name");
 			std::string paramName(previous().text(source_));
 
@@ -1356,7 +1499,7 @@ std::unique_ptr<FunctionAST> Parser::parseFunction() {
 			}
 
 			TypeIdx paramType = parseType();
-			args.push_back(Param{std::move(paramName), paramType, mode});
+			args.push_back(Param{std::move(paramName), paramType, mode, isComp});
 		} while (match(TOK_COMMA));
 	}
 
@@ -1610,10 +1753,19 @@ std::unique_ptr<ImportDeclAST> Parser::parseImportDecl() {
 	// doesn't expect.
 	std::string path = previous().lexeme;
 	consume(TOK_CLOSE_PAREN, "Expected ')' after import path");
+
+	auto decl = std::make_unique<ImportDeclAST>(name, path);
+	// Trailing `.seg.seg` re-export chain. Each segment names a pub
+	// `import(...)` alias in the preceding module; the final segment's
+	// resolved path is what `name` will bind to.
+	while (match(TOK_DOT)) {
+		consume(TOK_IDENTIFIER, "Expected identifier after `.` in import chain");
+		decl->chain.emplace_back(previous().text(source_));
+	}
 	consume(TOK_SEMI, "Expected ';' after import declaration");
 
 	importHandles.insert(name);
-	return std::make_unique<ImportDeclAST>(name, path);
+	return decl;
 }
 
 std::unique_ptr<DestructuringImportDeclAST> Parser::parseDestructuringImport() {
@@ -1633,9 +1785,24 @@ std::unique_ptr<DestructuringImportDeclAST> Parser::parseDestructuringImport() {
 	consume(TOK_STRING_LITERAL, "Expected string literal for import path");
 	std::string path = previous().lexeme;
 	consume(TOK_CLOSE_PAREN, "Expected ')' after import path");
-	consume(TOK_SEMI, "Expected ';' after import declaration");
 
-	return std::make_unique<DestructuringImportDeclAST>(std::move(names), path);
+	auto decl = std::make_unique<DestructuringImportDeclAST>(std::move(names),
+	                                                        std::move(path));
+	while (match(TOK_DOT)) {
+		consume(TOK_IDENTIFIER, "Expected identifier after `.` in import chain");
+		decl->chain.emplace_back(previous().text(source_));
+	}
+	consume(TOK_SEMI, "Expected ';' after import declaration");
+	// A destructured name MAY be a re-exported module — `const {fmt}
+	// = import("std");`. The parser has no semantic info to tell that
+	// apart from a function destructure, so we conservatively register
+	// every destructured name as a potential import handle. That makes
+	// the parser route `name.member` as a flat `name.member` callee
+	// (handled later by the chained-namespace resolver) instead of as
+	// a struct-field MemberAccess. Cheap for non-module names — the
+	// flat-key lookup just misses harmlessly.
+	for (const auto &n : decl->Names) { importHandles.insert(n); }
+	return decl;
 }
 
 std::unique_ptr<ConstDeclAST> Parser::parseConstDecl() {
@@ -1713,11 +1880,10 @@ std::unique_ptr<ModuleAST> Parser::parse() {
 				if (check(TOK_EQUAL)) {
 					advance();
 					if (check(TOK_IMPORT)) {
-						if (isPub) {
-							parseError("`pub` is not allowed on imports");
-						}
 						current = saved;
-						module->Imports.push_back(parseImportDecl());
+						auto imp = parseImportDecl();
+						imp->isPub = isPub;
+						module->Imports.push_back(std::move(imp));
 						continue;
 					}
 					if (check(TOK_STRUCT)) {
@@ -1756,7 +1922,25 @@ std::unique_ptr<ModuleAST> Parser::parse() {
 
 		// `pub fn …` falls through here; parseFunction handles `pub`
 		// itself (its modifier-loop accepts `pub`/`extern`/`export`/`tfn`).
-		module->Functions.push_back(parseFunction());
+		// `cfn` at top level has two existing meanings:
+		//   * `cfn drop(self: mut X)` — compiler-callable drop method
+		//     (the historical use). First param is `self`.
+		//   * `cfn print(fmt: str)` — compile-time function (new for
+		//     std.fmt.print). No `self` param.
+		// We disambiguate by inspecting the first param: a leading
+		// `self` keeps `isCfn` and routes through the existing drop /
+		// at / setAt machinery; absence of `self` flips to
+		// `isCompTimeFn` and routes through the comp-time dispatcher.
+		auto fn = parseFunction();
+		if (fn->isCfn) {
+			bool firstIsSelf =
+			    !fn->Args.empty() && fn->Args.front().Name == "self";
+			if (!firstIsSelf) {
+				fn->isCfn = false;
+				fn->isCompTimeFn = true;
+			}
+		}
+		module->Functions.push_back(std::move(fn));
 	}
 
 	if (!sharedAnonStructs) { module->AnonStructs = std::move(anonStructs); }

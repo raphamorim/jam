@@ -1,0 +1,8 @@
+pub const Point = struct {
+    x: i32,
+    y: i32,
+};
+
+pub fn makePoint(a: i32, b: i32) Point {
+    return Point{ x: a, y: b };
+}

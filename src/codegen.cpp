@@ -182,6 +182,14 @@ JamTypeRef JamCodegenContext::getLLVMType(TypeIdx ty) const {
 				result = getLLVMType(aliasTarget);
 				break;
 			}
+			// 3+ segment chain through module re-exports.
+			if (name.find('.') != std::string::npos) {
+				TypeIdx chained = resolveChainedType(name);
+				if (chained != kNoType) {
+					result = getLLVMType(chained);
+					break;
+				}
+			}
 			throw std::runtime_error(
 			    formatNamespaceLookupError("user-defined type", name));
 		}
@@ -226,6 +234,16 @@ JamTypeRef JamCodegenContext::getLLVMType(TypeIdx ty) const {
 		result = JamLLVMPointerType(getInt8Type(), 0);
 		break;
 	}
+	case TypeKind::Module:
+		// Module values have no runtime representation. Reaching here
+		// means a module-typed JIR ref leaked to LLVM lowering — the
+		// MemberAccess / Call paths should consume it before codegen
+		// sees the value. Diagnostic gives the path-string for
+		// debugging.
+		throw std::runtime_error(
+		    "internal: module value `" +
+		    stringPool.get(static_cast<StringIdx>(k.a)) +
+		    "` reached LLVM codegen (modules are compile-time only)");
 	}
 	llvmTypeCache[ty] = result;
 	return result;
@@ -272,6 +290,11 @@ JamCodegenContext::lookupStruct(TypeIdx ty) const {
 	// maps `BoxI32` to the instantiated struct's TypeIdx.
 	TypeIdx aliasTarget = lookupTypeAlias(name);
 	if (aliasTarget != kNoType) { return lookupStruct(aliasTarget); }
+	// 3+ segment chain through module re-exports: `w.lib.Point`.
+	if (name.find('.') != std::string::npos) {
+		TypeIdx chained = resolveChainedType(name);
+		if (chained != kNoType) return lookupStruct(chained);
+	}
 	return nullptr;
 }
 
@@ -321,7 +344,12 @@ JamCodegenContext::lookupUnion(TypeIdx ty) const {
 		return nullptr;
 	}
 	const std::string &name = stringPool.get(static_cast<StringIdx>(k.a));
-	return getUnion(name);
+	if (const UnionInfo *direct = getUnion(name)) return direct;
+	if (name.find('.') != std::string::npos) {
+		TypeIdx chained = resolveChainedType(name);
+		if (chained != kNoType) return lookupUnion(chained);
+	}
+	return nullptr;
 }
 
 TypeIdx
@@ -394,6 +422,10 @@ JamCodegenContext::lookupEnum(TypeIdx ty) const {
 	// Option(i32);` maps `OptI32` to the instantiated enum's TypeIdx.
 	TypeIdx aliasTarget = lookupTypeAlias(name);
 	if (aliasTarget != kNoType) { return lookupEnum(aliasTarget); }
+	if (name.find('.') != std::string::npos) {
+		TypeIdx chained = resolveChainedType(name);
+		if (chained != kNoType) return lookupEnum(chained);
+	}
 	return nullptr;
 }
 
@@ -451,6 +483,77 @@ const JamCodegenContext::ImportHandleInfo *
 JamCodegenContext::getImportHandle(const std::string &handle) const {
 	auto it = importHandles_.find(handle);
 	return (it == importHandles_.end()) ? nullptr : &it->second;
+}
+
+void JamCodegenContext::registerModuleNamespace(ModuleNamespace ns) {
+	std::string key = ns.path;
+	moduleNamespaces_[std::move(key)] = std::move(ns);
+}
+
+const JamCodegenContext::ModuleNamespace *
+JamCodegenContext::getModuleNamespace(const std::string &path) const {
+	auto it = moduleNamespaces_.find(path);
+	return (it == moduleNamespaces_.end()) ? nullptr : &it->second;
+}
+
+// Split `dotted` on `.` into segments. Shared by chained function /
+// type resolution.
+static std::vector<std::string> splitDotted(const std::string &dotted) {
+	std::vector<std::string> segs;
+	size_t start = 0;
+	for (size_t i = 0; i <= dotted.size(); ++i) {
+		if (i == dotted.size() || dotted[i] == '.') {
+			segs.push_back(dotted.substr(start, i - start));
+			start = i + 1;
+		}
+	}
+	return segs;
+}
+
+// Walk `segs[0..segs.size()-1]` through ModuleNamespace re-exports
+// (`moduleAliases`), starting from the import handle named by
+// `segs[0]`. Returns the leaf namespace + the trailing segment name,
+// or `{nullptr, ""}` on any miss. Both `resolveChainedFunction` and
+// `resolveChainedType` share this prefix walk and only diverge on how
+// they look up the final segment.
+struct ChainWalkResult {
+	const JamCodegenContext::ModuleNamespace *leaf;
+	std::string lastSeg;
+};
+static ChainWalkResult
+walkChain(const JamCodegenContext &ctx, const std::string &dotted) {
+	std::vector<std::string> segs = splitDotted(dotted);
+	if (segs.size() < 3) return {nullptr, {}};
+	const auto *handle = ctx.getImportHandle(segs.front());
+	if (!handle) return {nullptr, {}};
+	const auto *ns = ctx.getModuleNamespace(handle->modulePath);
+	if (!ns) return {nullptr, {}};
+	for (size_t i = 1; i + 1 < segs.size(); ++i) {
+		auto it = ns->moduleAliases.find(segs[i]);
+		if (it == ns->moduleAliases.end()) return {nullptr, {}};
+		const TypeKey &k = ctx.getTypePool().get(it->second);
+		if (k.kind != TypeKind::Module) return {nullptr, {}};
+		const std::string &nextPath =
+		    ctx.getStringPool().get(static_cast<StringIdx>(k.a));
+		ns = ctx.getModuleNamespace(nextPath);
+		if (!ns) return {nullptr, {}};
+	}
+	return {ns, segs.back()};
+}
+
+const FunctionAST *
+JamCodegenContext::resolveChainedFunction(const std::string &dotted) const {
+	auto r = walkChain(*this, dotted);
+	if (!r.leaf) return nullptr;
+	auto fit = r.leaf->functions.find(r.lastSeg);
+	return (fit == r.leaf->functions.end()) ? nullptr : fit->second;
+}
+
+TypeIdx JamCodegenContext::resolveChainedType(const std::string &dotted) const {
+	auto r = walkChain(*this, dotted);
+	if (!r.leaf) return kNoType;
+	auto tit = r.leaf->types.find(r.lastSeg);
+	return (tit == r.leaf->types.end()) ? kNoType : tit->second;
 }
 
 std::string JamCodegenContext::formatNamespaceLookupError(
@@ -608,6 +711,9 @@ uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
 	case TypeKind::Fn:
 		// Function value = code pointer = pointer width.
 		return 8;
+	case TypeKind::Module:
+		// Modules are compile-time-only values.
+		return 0;
 	}
 	throw std::runtime_error("typeSize: unhandled type kind");
 }
@@ -698,6 +804,8 @@ uint64_t JamCodegenContext::typeAlign(TypeIdx ty) const {
 	case TypeKind::Fn:
 		// Function pointer alignment.
 		return 8;
+	case TypeKind::Module:
+		return 1;
 	}
 	throw std::runtime_error("typeAlign: unhandled type kind");
 }

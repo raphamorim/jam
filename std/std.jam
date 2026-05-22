@@ -1,0 +1,14 @@
+// std — namespace aggregator for the Jam standard library.
+//
+// Lets user code write `const std = import("std");` once and then
+// reach individual modules as `std.fmt`, `std.collections`, etc.
+// Each pub `import(...)` here is a re-export: it does not duplicate
+// the module, it just adds an alias so chained member access through
+// std resolves to the underlying file.
+//
+// Add a new line here when a new module is added under std/.
+
+pub const fmt = import("fmt");
+pub const collections = import("collections");
+pub const option = import("option");
+pub const string = import("string");

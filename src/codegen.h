@@ -9,6 +9,7 @@
 #define CODEGEN_H
 
 #include "ast_flat.h"
+#include "comptime.h"
 #include "decl.h"
 #include "diagnostics.h"
 #include "drop_registry.h"
@@ -282,9 +283,55 @@ class JamCodegenContext {
 	std::string formatNamespaceLookupError(const std::string &kind,
 	                                       const std::string &qualified) const;
 
+	// Per-loaded-module namespace. Indexes the module's `pub` members
+	// by source-level name so that member access on a Module value
+	// (e.g. `std.fmt`) can resolve to a concrete FunctionAST, TypeIdx,
+	// or another Module value (re-exports).
+	//
+	// Populated when a module is resolved (Phase 2+). Distinct from
+	// `importHandles_`, which keys by the *binding-site* handle name
+	// (e.g. `fmt` from `const fmt = import("fmt");`); ModuleNamespace
+	// keys by the *resolved canonical path* (e.g. "fmt", "std/fmt") so
+	// re-exports and aliases all converge on one entry per file.
+	struct ModuleNamespace {
+		// Canonical resolved path (e.g. "fmt", "std/fmt"). Same string
+		// stored in TypeKind::Module's `a` field.
+		std::string path;
+		// `pub fn`, `pub cfn`, `pub tfn` by source-level name.
+		std::unordered_map<std::string, const FunctionAST *> functions;
+		// `pub struct`, `pub enum`, `pub union`, `pub const Foo = T`
+		// by source-level name. TypeIdx points into the global TypePool.
+		std::unordered_map<std::string, TypeIdx> types;
+		// `pub const X = import(...)`-style re-exports: name → the
+		// Module TypeIdx for the re-exported module.
+		std::unordered_map<std::string, TypeIdx> moduleAliases;
+	};
+	void registerModuleNamespace(ModuleNamespace ns);
+	const ModuleNamespace *getModuleNamespace(const std::string &path) const;
+
+	// Walk a dotted-name callee through the chained module-namespace
+	// graph. Used as a fallback when the flat
+	// `getFunctionAST("handle.X")` lookup misses on a 3+ segment path
+	// like `std.fmt.print`. Returns nullptr if any segment fails to
+	// resolve to a Module → Module → ... → Function chain.
+	const FunctionAST *
+	resolveChainedFunction(const std::string &dotted) const;
+
+	// Sibling of `resolveChainedFunction` for types. A type annotation
+	// or struct literal like `w.lib.Point` parses into a Named type
+	// keyed on the literal string `"w.lib.Point"`. Single-hop
+	// `handle.X` is registered as a flat alias in main.cpp; for 3+
+	// segment chains we walk `moduleAliases` per segment and look up
+	// the final segment in the leaf module's `types` map. Returns
+	// `kNoType` on any failure (caller falls through to the standard
+	// "user-defined type" error).
+	TypeIdx resolveChainedType(const std::string &dotted) const;
+
   private:
 	std::unordered_map<std::string, const FunctionAST *> functionAsts;
 	std::unordered_map<std::string, ImportHandleInfo> importHandles_;
+	// Resolved canonical path → namespace decl table. See ModuleNamespace.
+	std::unordered_map<std::string, ModuleNamespace> moduleNamespaces_;
 
 	// `genericResolutions_` memoizes per-callsite: every unique
 	// `TypeKind::GenericCall` TypeIdx maps to the resolved TypeIdx.
@@ -355,6 +402,10 @@ class JamCodegenContext {
 	// __anon_struct_N) consult this map first. Set/cleared around
 	// jirDeclarePrototype + jirDefineBody calls in instantiateStructExpr.
 	mutable std::unordered_map<std::string, TypeIdx> currentSubst_;
+	// Parallel comp-value substitution context. See
+	// setCurrentCompSubst.
+	mutable std::unordered_map<std::string, jam::ComptimeValue>
+	    currentCompSubst_;
 
   public:
 	// resolve a `TypeKind::GenericCall` TypeIdx to a concrete
@@ -397,6 +448,37 @@ class JamCodegenContext {
 		auto it = currentSubst_.find(name);
 		if (it != currentSubst_.end()) return it->second;
 		return kNoType;
+	}
+
+	// Comp-value substitution context. Parallel to currentSubst_ but
+	// carries ComptimeValue (Int/Bool/Str/Type/Aggregate) instead of
+	// just TypeIdx. Active during codegen of a fn body whose comp
+	// params have been bound (e.g. `fn f(comp n: u32)` called with
+	// n=7 — astgen reads the value when lowering Variable references
+	// to `n` and emits the corresponding constant). Set/cleared by
+	// the comp-fn instantiation path.
+	void setCurrentCompSubst(
+	    std::unordered_map<std::string, jam::ComptimeValue> s) const {
+		currentCompSubst_ = std::move(s);
+	}
+	void clearCurrentCompSubst() const { currentCompSubst_.clear(); }
+	const jam::ComptimeValue *
+	lookupCurrentCompSubst(const std::string &name) const {
+		auto it = currentCompSubst_.find(name);
+		if (it != currentCompSubst_.end()) return &it->second;
+		return nullptr;
+	}
+
+	// Take ownership of a cloned FunctionAST (used by
+	// comp-instantiation / monomorphisation paths). The clone lives
+	// for the rest of the compilation so its LLVM symbol stays
+	// referenceable. Caller is expected to also `registerFunctionAST`
+	// the clone so name-based lookups find it.
+	FunctionAST *adoptInstantiatedFunction(
+	    std::unique_ptr<FunctionAST> cloned) const {
+		FunctionAST *p = cloned.get();
+		instantiatedMethods_.push_back(std::move(cloned));
+		return p;
 	}
 
   private:
