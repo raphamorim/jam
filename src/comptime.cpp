@@ -18,7 +18,7 @@ ComptimeValue ComptimeValue::makeNone() {
 }
 
 ComptimeValue ComptimeValue::makeInt(uint64_t bits, uint16_t width,
-                                      bool isSigned) {
+                                     bool isSigned) {
 	ComptimeValue v;
 	v.kind = Kind::Int;
 	v.intVal.bits = bits;
@@ -56,8 +56,7 @@ ComptimeValue ComptimeValue::makeType(TypeIdx t) {
 	return v;
 }
 
-ComptimeValue
-ComptimeValue::makeAggregate(std::vector<ComptimeValue> fields) {
+ComptimeValue ComptimeValue::makeAggregate(std::vector<ComptimeValue> fields) {
 	ComptimeValue v;
 	v.kind = Kind::Aggregate;
 	v.aggFields = std::move(fields);
@@ -120,12 +119,12 @@ const ComptimeValue *ComptimeScope::lookup(const std::string &name) const {
 // ─── Evaluator ──────────────────────────────────────────────────
 
 ComptimeEvaluator::ComptimeEvaluator(const NodeStore &nodes,
-                                       const StringPool &strings,
-                                       const TypePool &types)
+                                     const StringPool &strings,
+                                     const TypePool &types)
     : nodes_(nodes), strings_(strings), types_(types) {}
 
 ComptimeValue ComptimeEvaluator::eval(NodeIdx expr,
-                                       const ComptimeScope &scope) const {
+                                      const ComptimeScope &scope) const {
 	if (expr == kNoNode) return ComptimeValue::makeNone();
 	const AstNode &n = nodes_.get(expr);
 	switch (n.tag) {
@@ -155,16 +154,13 @@ ComptimeValue ComptimeEvaluator::eval(NodeIdx expr,
 	}
 }
 
-ComptimeValue
-ComptimeEvaluator::evalAtCall(const AstNode &n,
-                                const ComptimeScope &scope) const {
+ComptimeValue ComptimeEvaluator::evalAtCall(const AstNode &n,
+                                            const ComptimeScope &scope) const {
 	// Type-arg single form (`@sizeOf(T)` / `@alignOf(T)`) doesn't
 	// belong here — those produce a value the regular astgen path
 	// turns into a JIR Int. From inside a cfn body, those still
 	// return None (caller can do its own dispatch if it wants).
-	if ((n.flags & 1) == 0) {
-		return ComptimeValue::makeNone();
-	}
+	if ((n.flags & 1) == 0) { return ComptimeValue::makeNone(); }
 
 	// Expr-arg multi-form: rhs = ExtraIdx → [argCount, arg0, ...].
 	ExtraIdx extra = static_cast<ExtraIdx>(n.rhs);
@@ -176,10 +172,9 @@ ComptimeEvaluator::evalAtCall(const AstNode &n,
 		ComptimeValue v = eval(argIdx, scope);
 		if (v.isNone()) {
 			if (diags_ != nullptr) {
-				diags_->error(loc_,
-				               "@-emit argument must be a compile-time "
-				               "constant (arg #" +
-				                   std::to_string(i) + ")");
+				diags_->error(loc_, "@-emit argument must be a compile-time "
+				                    "constant (arg #" +
+				                        std::to_string(i) + ")");
 			}
 			return ComptimeValue::makeNone();
 		}
@@ -205,20 +200,20 @@ ComptimeEvaluator::evalAtCall(const AstNode &n,
 }
 
 ComptimeValue ComptimeEvaluator::evalRequired(NodeIdx expr,
-                                                const ComptimeScope &scope,
-                                                Diagnostics &diags,
-                                                SrcLoc loc) const {
+                                              const ComptimeScope &scope,
+                                              Diagnostics &diags,
+                                              SrcLoc loc) const {
 	ComptimeValue v = eval(expr, scope);
 	if (v.isNone()) {
 		diags.error(std::move(loc),
-		             "expression cannot be evaluated at compile time");
+		            "expression cannot be evaluated at compile time");
 	}
 	return v;
 }
 
 ComptimeValue ComptimeEvaluator::evalNumberLit(const AstNode &n) const {
-	uint64_t bits = static_cast<uint64_t>(n.lhs) |
-	                (static_cast<uint64_t>(n.rhs) << 32);
+	uint64_t bits =
+	    static_cast<uint64_t>(n.lhs) | (static_cast<uint64_t>(n.rhs) << 32);
 	bool isNeg = (n.flags & 1) != 0;
 	bool isFloat = (n.flags & 2) != 0;
 	if (isFloat) {
@@ -233,8 +228,8 @@ ComptimeValue ComptimeEvaluator::evalNumberLit(const AstNode &n) const {
 	// during folding.
 	if (isNeg) {
 		uint64_t magnitude = bits;
-		uint64_t signedBits = static_cast<uint64_t>(
-		    -static_cast<int64_t>(magnitude));
+		uint64_t signedBits =
+		    static_cast<uint64_t>(-static_cast<int64_t>(magnitude));
 		return ComptimeValue::makeInt(signedBits, 64, /*isSigned=*/true);
 	}
 	return ComptimeValue::makeInt(bits, 64, /*isSigned=*/false);
@@ -250,16 +245,15 @@ ComptimeValue ComptimeEvaluator::evalStringLit(const AstNode &n) const {
 
 ComptimeValue
 ComptimeEvaluator::evalVariable(const AstNode &n,
-                                 const ComptimeScope &scope) const {
+                                const ComptimeScope &scope) const {
 	const std::string &name = strings_.get(static_cast<StringIdx>(n.lhs));
 	const ComptimeValue *v = scope.lookup(name);
 	if (v == nullptr) return ComptimeValue::makeNone();
 	return *v;
 }
 
-ComptimeValue
-ComptimeEvaluator::evalUnaryOp(const AstNode &n,
-                                const ComptimeScope &scope) const {
+ComptimeValue ComptimeEvaluator::evalUnaryOp(const AstNode &n,
+                                             const ComptimeScope &scope) const {
 	NodeIdx operand = static_cast<NodeIdx>(n.lhs);
 	ComptimeValue v = eval(operand, scope);
 	if (v.isNone()) return v;
@@ -267,20 +261,24 @@ ComptimeEvaluator::evalUnaryOp(const AstNode &n,
 	switch (op) {
 	case UnaryOp::Neg:
 		if (v.kind == ComptimeValue::Kind::Int) {
-			uint64_t neg = static_cast<uint64_t>(-static_cast<int64_t>(v.asU64()));
+			uint64_t neg =
+			    static_cast<uint64_t>(-static_cast<int64_t>(v.asU64()));
 			return ComptimeValue::makeInt(neg, v.intVal.width, true);
 		}
 		if (v.kind == ComptimeValue::Kind::Float) {
-			return ComptimeValue::makeFloat(-v.floatVal.value, v.floatVal.width);
+			return ComptimeValue::makeFloat(-v.floatVal.value,
+			                                v.floatVal.width);
 		}
 		return ComptimeValue::makeNone();
 	case UnaryOp::LogNot:
-		if (v.kind != ComptimeValue::Kind::Bool) return ComptimeValue::makeNone();
+		if (v.kind != ComptimeValue::Kind::Bool)
+			return ComptimeValue::makeNone();
 		return ComptimeValue::makeBool(!v.boolVal);
 	case UnaryOp::BitNot:
-		if (v.kind != ComptimeValue::Kind::Int) return ComptimeValue::makeNone();
+		if (v.kind != ComptimeValue::Kind::Int)
+			return ComptimeValue::makeNone();
 		return ComptimeValue::makeInt(~v.intVal.bits, v.intVal.width,
-		                               v.intVal.isSigned);
+		                              v.intVal.isSigned);
 	default:
 		return ComptimeValue::makeNone();
 	}
@@ -288,7 +286,7 @@ ComptimeEvaluator::evalUnaryOp(const AstNode &n,
 
 ComptimeValue
 ComptimeEvaluator::evalBinaryOp(const AstNode &n,
-                                 const ComptimeScope &scope) const {
+                                const ComptimeScope &scope) const {
 	NodeIdx lhsIdx = static_cast<NodeIdx>(n.lhs);
 	NodeIdx rhsIdx = static_cast<NodeIdx>(n.rhs);
 	BinOp op = static_cast<BinOp>(n.op);
@@ -297,12 +295,14 @@ ComptimeEvaluator::evalBinaryOp(const AstNode &n,
 	// and avoid evaluating the RHS when the LHS settles the answer.
 	if (op == BinOp::LogAnd || op == BinOp::LogOr) {
 		ComptimeValue l = eval(lhsIdx, scope);
-		if (l.kind != ComptimeValue::Kind::Bool) return ComptimeValue::makeNone();
+		if (l.kind != ComptimeValue::Kind::Bool)
+			return ComptimeValue::makeNone();
 		bool lb = l.boolVal;
 		if (op == BinOp::LogAnd && !lb) return ComptimeValue::makeBool(false);
 		if (op == BinOp::LogOr && lb) return ComptimeValue::makeBool(true);
 		ComptimeValue r = eval(rhsIdx, scope);
-		if (r.kind != ComptimeValue::Kind::Bool) return ComptimeValue::makeNone();
+		if (r.kind != ComptimeValue::Kind::Bool)
+			return ComptimeValue::makeNone();
 		return ComptimeValue::makeBool(r.boolVal);
 	}
 
@@ -321,8 +321,8 @@ ComptimeEvaluator::evalBinaryOp(const AstNode &n,
 	if (l.kind == ComptimeValue::Kind::Int &&
 	    r.kind == ComptimeValue::Kind::Int) {
 		bool isComparison = op == BinOp::Eq || op == BinOp::Ne ||
-		                     op == BinOp::Lt || op == BinOp::Le ||
-		                     op == BinOp::Gt || op == BinOp::Ge;
+		                    op == BinOp::Lt || op == BinOp::Le ||
+		                    op == BinOp::Gt || op == BinOp::Ge;
 		if (l.intVal.width != r.intVal.width) {
 			if (!isComparison || l.intVal.isSigned != r.intVal.isSigned) {
 				return ComptimeValue::makeNone();
@@ -355,7 +355,7 @@ ComptimeEvaluator::evalBinaryOp(const AstNode &n,
 			if (sgn) {
 				return ComptimeValue::makeInt(
 				    static_cast<uint64_t>(static_cast<int64_t>(a) /
-				                           static_cast<int64_t>(b)),
+				                          static_cast<int64_t>(b)),
 				    w, sgn);
 			}
 			return ComptimeValue::makeInt(a / b, w, sgn);
@@ -364,7 +364,7 @@ ComptimeEvaluator::evalBinaryOp(const AstNode &n,
 			if (sgn) {
 				return ComptimeValue::makeInt(
 				    static_cast<uint64_t>(static_cast<int64_t>(a) %
-				                           static_cast<int64_t>(b)),
+				                          static_cast<int64_t>(b)),
 				    w, sgn);
 			}
 			return ComptimeValue::makeInt(a % b, w, sgn);
@@ -379,7 +379,8 @@ ComptimeEvaluator::evalBinaryOp(const AstNode &n,
 		case BinOp::Shr:
 			if (sgn) {
 				return ComptimeValue::makeInt(
-				    static_cast<uint64_t>(static_cast<int64_t>(a) >> b), w, sgn);
+				    static_cast<uint64_t>(static_cast<int64_t>(a) >> b), w,
+				    sgn);
 			}
 			return ComptimeValue::makeInt(a >> b, w, sgn);
 		case BinOp::Eq:
@@ -387,24 +388,20 @@ ComptimeEvaluator::evalBinaryOp(const AstNode &n,
 		case BinOp::Ne:
 			return ComptimeValue::makeBool(a != b);
 		case BinOp::Lt:
-			return sgn
-			           ? ComptimeValue::makeBool(static_cast<int64_t>(a) <
-			                                       static_cast<int64_t>(b))
+			return sgn ? ComptimeValue::makeBool(static_cast<int64_t>(a) <
+			                                     static_cast<int64_t>(b))
 			           : ComptimeValue::makeBool(a < b);
 		case BinOp::Le:
-			return sgn
-			           ? ComptimeValue::makeBool(static_cast<int64_t>(a) <=
-			                                       static_cast<int64_t>(b))
+			return sgn ? ComptimeValue::makeBool(static_cast<int64_t>(a) <=
+			                                     static_cast<int64_t>(b))
 			           : ComptimeValue::makeBool(a <= b);
 		case BinOp::Gt:
-			return sgn
-			           ? ComptimeValue::makeBool(static_cast<int64_t>(a) >
-			                                       static_cast<int64_t>(b))
+			return sgn ? ComptimeValue::makeBool(static_cast<int64_t>(a) >
+			                                     static_cast<int64_t>(b))
 			           : ComptimeValue::makeBool(a > b);
 		case BinOp::Ge:
-			return sgn
-			           ? ComptimeValue::makeBool(static_cast<int64_t>(a) >=
-			                                       static_cast<int64_t>(b))
+			return sgn ? ComptimeValue::makeBool(static_cast<int64_t>(a) >=
+			                                     static_cast<int64_t>(b))
 			           : ComptimeValue::makeBool(a >= b);
 		default:
 			return ComptimeValue::makeNone();
@@ -445,7 +442,7 @@ ComptimeEvaluator::evalBinaryOp(const AstNode &n,
 
 ComptimeValue
 ComptimeEvaluator::evalMemberAccess(const AstNode &n,
-                                     const ComptimeScope &scope) const {
+                                    const ComptimeScope &scope) const {
 	// Member access on a comp value. v1 supports `.length` on a comp
 	// str (returns u32 byte count). Future: struct field access on a
 	// comp-known aggregate.
@@ -457,17 +454,15 @@ ComptimeEvaluator::evalMemberAccess(const AstNode &n,
 	if (base.kind == ComptimeValue::Kind::Str && member == "length") {
 		const std::string &s = strings_.get(base.strVal);
 		return ComptimeValue::makeInt(static_cast<uint64_t>(s.length()), 64,
-		                               /*isSigned=*/false);
+		                              /*isSigned=*/false);
 	}
 	return ComptimeValue::makeNone();
 }
 
 ExecResult ComptimeEvaluator::execStmt(NodeIdx stmt, ComptimeScope &scope,
-                                        uint32_t &iterCounter,
-                                        uint32_t iterCap,
-                                        ComptimeValue &outReturnValue,
-                                        Diagnostics &diags,
-                                        SrcLoc loc) const {
+                                       uint32_t &iterCounter, uint32_t iterCap,
+                                       ComptimeValue &outReturnValue,
+                                       Diagnostics &diags, SrcLoc loc) const {
 	if (stmt == kNoNode) return ExecResult::Continue;
 	const AstNode &n = nodes_.get(stmt);
 
@@ -482,9 +477,8 @@ ExecResult ComptimeEvaluator::execStmt(NodeIdx stmt, ComptimeScope &scope,
 		NodeIdx initIdx = static_cast<NodeIdx>(nodes_.getExtra(extra + 2));
 		ComptimeValue v = eval(initIdx, scope);
 		if (v.isNone()) {
-			diags.error(loc,
-			             "comp var-decl initializer must be a "
-			             "compile-time-known value");
+			diags.error(loc, "comp var-decl initializer must be a "
+			                 "compile-time-known value");
 			return ExecResult::Error;
 		}
 		scope.bind(strings_.get(nameId), std::move(v));
@@ -496,25 +490,22 @@ ExecResult ComptimeEvaluator::execStmt(NodeIdx stmt, ComptimeScope &scope,
 		NodeIdx valueIdx = static_cast<NodeIdx>(n.rhs);
 		const AstNode &target = nodes_.get(targetIdx);
 		if (target.tag != AstTag::Variable) {
-			diags.error(loc,
-			             "comp assignment target must be a bare "
-			             "variable (member-access / index targets are "
-			             "not supported in v1)");
+			diags.error(loc, "comp assignment target must be a bare "
+			                 "variable (member-access / index targets are "
+			                 "not supported in v1)");
 			return ExecResult::Error;
 		}
 		StringIdx nameId = static_cast<StringIdx>(target.lhs);
 		const std::string &name = strings_.get(nameId);
 		ComptimeValue v = eval(valueIdx, scope);
 		if (v.isNone()) {
-			diags.error(loc,
-			             "comp assignment value must be a compile-"
-			             "time-known value");
+			diags.error(loc, "comp assignment value must be a compile-"
+			                 "time-known value");
 			return ExecResult::Error;
 		}
 		if (!scope.set(name, std::move(v))) {
-			diags.error(loc,
-			             "assignment to undeclared variable `" + name +
-			                 "` (declare with `var` first)");
+			diags.error(loc, "assignment to undeclared variable `" + name +
+			                     "` (declare with `var` first)");
 			return ExecResult::Error;
 		}
 		return ExecResult::Continue;
@@ -540,9 +531,8 @@ ExecResult ComptimeEvaluator::execStmt(NodeIdx stmt, ComptimeScope &scope,
 				stmts.push_back(
 				    static_cast<NodeIdx>(nodes_.getExtra(extra + 2 + i)));
 			}
-			return execBlock(stmts.data(), stmts.size(), inner,
-			                 iterCounter, iterCap, outReturnValue, diags,
-			                 loc);
+			return execBlock(stmts.data(), stmts.size(), inner, iterCounter,
+			                 iterCap, outReturnValue, diags, loc);
 		}
 		std::vector<NodeIdx> stmts;
 		stmts.reserve(elseCount);
@@ -567,22 +557,20 @@ ExecResult ComptimeEvaluator::execStmt(NodeIdx stmt, ComptimeScope &scope,
 		while (true) {
 			ComptimeValue c = eval(condIdx, scope);
 			if (c.kind != ComptimeValue::Kind::Bool) {
-				diags.error(loc,
-				             "comp `while` condition must fold to bool");
+				diags.error(loc, "comp `while` condition must fold to bool");
 				return ExecResult::Error;
 			}
 			if (!c.boolVal) break;
 			if (++iterCounter > iterCap) {
-				diags.error(loc,
-				             "comp evaluation iteration cap (" +
-				                 std::to_string(iterCap) +
-				                 ") exceeded — possible infinite loop");
+				diags.error(loc, "comp evaluation iteration cap (" +
+				                     std::to_string(iterCap) +
+				                     ") exceeded — possible infinite loop");
 				return ExecResult::IterationCap;
 			}
 			ComptimeScope iter(&scope);
-			ExecResult r = execBlock(body.data(), body.size(), iter,
-			                          iterCounter, iterCap, outReturnValue,
-			                          diags, loc);
+			ExecResult r =
+			    execBlock(body.data(), body.size(), iter, iterCounter, iterCap,
+			              outReturnValue, diags, loc);
 			if (r != ExecResult::Continue) return r;
 		}
 		return ExecResult::Continue;
@@ -595,9 +583,8 @@ ExecResult ComptimeEvaluator::execStmt(NodeIdx stmt, ComptimeScope &scope,
 		} else {
 			outReturnValue = eval(valIdx, scope);
 			if (outReturnValue.isNone()) {
-				diags.error(loc,
-				             "comp `return` expression must fold to a "
-				             "value");
+				diags.error(loc, "comp `return` expression must fold to a "
+				                 "value");
 				return ExecResult::Error;
 			}
 		}
@@ -614,26 +601,21 @@ ExecResult ComptimeEvaluator::execStmt(NodeIdx stmt, ComptimeScope &scope,
 	}
 }
 
-ExecResult ComptimeEvaluator::execBlock(const NodeIdx *stmts,
-                                          std::size_t count,
-                                          ComptimeScope &scope,
-                                          uint32_t &iterCounter,
-                                          uint32_t iterCap,
-                                          ComptimeValue &outReturnValue,
-                                          Diagnostics &diags,
-                                          SrcLoc loc) const {
+ExecResult ComptimeEvaluator::execBlock(const NodeIdx *stmts, std::size_t count,
+                                        ComptimeScope &scope,
+                                        uint32_t &iterCounter, uint32_t iterCap,
+                                        ComptimeValue &outReturnValue,
+                                        Diagnostics &diags, SrcLoc loc) const {
 	for (std::size_t i = 0; i < count; i++) {
-		ExecResult r =
-		    execStmt(stmts[i], scope, iterCounter, iterCap, outReturnValue,
-		             diags, loc);
+		ExecResult r = execStmt(stmts[i], scope, iterCounter, iterCap,
+		                        outReturnValue, diags, loc);
 		if (r != ExecResult::Continue) return r;
 	}
 	return ExecResult::Continue;
 }
 
-ComptimeValue
-ComptimeEvaluator::evalIndex(const AstNode &n,
-                              const ComptimeScope &scope) const {
+ComptimeValue ComptimeEvaluator::evalIndex(const AstNode &n,
+                                           const ComptimeScope &scope) const {
 	NodeIdx baseIdx = static_cast<NodeIdx>(n.lhs);
 	NodeIdx idxIdx = static_cast<NodeIdx>(n.rhs);
 	ComptimeValue base = eval(baseIdx, scope);
@@ -647,9 +629,9 @@ ComptimeEvaluator::evalIndex(const AstNode &n,
 		const std::string &s = strings_.get(base.strVal);
 		if (i >= s.length()) return ComptimeValue::makeNone();
 		// Result is the byte value as a u8.
-		return ComptimeValue::makeInt(static_cast<uint64_t>(
-		                                  static_cast<uint8_t>(s[i])),
-		                               8, /*isSigned=*/false);
+		return ComptimeValue::makeInt(
+		    static_cast<uint64_t>(static_cast<uint8_t>(s[i])), 8,
+		    /*isSigned=*/false);
 	}
 	if (base.kind == ComptimeValue::Kind::Aggregate) {
 		if (i >= base.aggFields.size()) return ComptimeValue::makeNone();

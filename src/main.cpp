@@ -127,8 +127,7 @@ static int compileAndRun(const std::string &filename,
 	// `pub const X = import(...)` alias in the preceding module; we
 	// recurse so a re-export that itself walks a chain composes.
 	auto resolveImportChain =
-	    [&](const std::string &basePath,
-	        const std::vector<std::string> &chain,
+	    [&](const std::string &basePath, const std::vector<std::string> &chain,
 	        auto &self) -> std::pair<std::string, ModuleAST *> {
 		std::string curPath = basePath;
 		ModuleAST *curMod = resolver.getOrLoadModule(curPath);
@@ -376,46 +375,45 @@ static int compileAndRun(const std::string &filename,
 	// Register every flat `handle.X` mapping for a given (handle name,
 	// resolved module). Shared by direct-import bindings and module-
 	// valued destructuring bindings (`const {fmt} = import("std");`).
-	auto registerHandleFlats =
-	    [&](const std::string &handle, const std::string &modulePath,
-	        ModuleAST *importedModule) {
-		    codegenCtx.registerImportHandle(handle, modulePath);
-		    auto aliasNamed = [&](const std::string &bare) {
-			    TypeIdx target = codegenCtx.getTypePool().internNamed(
-			        codegenCtx.getStringPool().intern(bare));
-			    codegenCtx.registerTypeAlias(handle + "." + bare, target);
-		    };
-		    for (auto &func : importedModule->Functions) {
-			    if (func->isPub) {
-				    codegenCtx.registerFunctionAST(handle + "." + func->Name,
-				                                   func.get());
-			    } else {
-				    codegenCtx.registerPrivateName(handle, func->Name);
-			    }
-		    }
-		    for (auto &s : importedModule->Structs) {
-			    if (s->isPub) {
-				    aliasNamed(s->Name);
-				    for (auto &m : s->Methods) {
-					    if (m->isPub) {
-						    codegenCtx.registerFunctionAST(
-						        handle + "." + s->Name + "." + m->Name,
-						        m.get());
-					    }
-				    }
-			    } else {
-				    codegenCtx.registerPrivateName(handle, s->Name);
-			    }
-		    }
-		    for (auto &e : importedModule->Enums) {
-			    if (e->isPub) aliasNamed(e->Name);
-			    else codegenCtx.registerPrivateName(handle, e->Name);
-		    }
-		    for (auto &u : importedModule->Unions) {
-			    if (u->isPub) aliasNamed(u->Name);
-			    else codegenCtx.registerPrivateName(handle, u->Name);
-		    }
-	    };
+	auto registerHandleFlats = [&](const std::string &handle,
+	                               const std::string &modulePath,
+	                               ModuleAST *importedModule) {
+		codegenCtx.registerImportHandle(handle, modulePath);
+		auto aliasNamed = [&](const std::string &bare) {
+			TypeIdx target = codegenCtx.getTypePool().internNamed(
+			    codegenCtx.getStringPool().intern(bare));
+			codegenCtx.registerTypeAlias(handle + "." + bare, target);
+		};
+		for (auto &func : importedModule->Functions) {
+			if (func->isPub) {
+				codegenCtx.registerFunctionAST(handle + "." + func->Name,
+				                               func.get());
+			} else {
+				codegenCtx.registerPrivateName(handle, func->Name);
+			}
+		}
+		for (auto &s : importedModule->Structs) {
+			if (s->isPub) {
+				aliasNamed(s->Name);
+				for (auto &m : s->Methods) {
+					if (m->isPub) {
+						codegenCtx.registerFunctionAST(
+						    handle + "." + s->Name + "." + m->Name, m.get());
+					}
+				}
+			} else {
+				codegenCtx.registerPrivateName(handle, s->Name);
+			}
+		}
+		for (auto &e : importedModule->Enums) {
+			if (e->isPub) aliasNamed(e->Name);
+			else codegenCtx.registerPrivateName(handle, e->Name);
+		}
+		for (auto &u : importedModule->Unions) {
+			if (u->isPub) aliasNamed(u->Name);
+			else codegenCtx.registerPrivateName(handle, u->Name);
+		}
+	};
 
 	for (auto &import : module->Imports) {
 		if (import->Path == "test") continue;

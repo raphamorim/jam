@@ -998,8 +998,8 @@ NodeIdx Parser::parseExpression() {
 			for (size_t i = 0; i < elseBody.size(); i++) {
 				nodes->setExtra(extra + 2 + thenBody.size() + i, elseBody[i]);
 			}
-			AstNode ifNode{AstTag::IfNode, 0, 0, 0,
-			               static_cast<uint32_t>(cond), extra};
+			AstNode ifNode{AstTag::IfNode, 0, 0, 0, static_cast<uint32_t>(cond),
+			               extra};
 			ifNode.flags = 1;  // bit 0 = comp
 			return emit(ifNode);
 		}
@@ -1015,10 +1015,8 @@ NodeIdx Parser::parseExpression() {
 		consume(TOK_WHILE, "Expected `while` after `inline`");
 		consume(TOK_OPEN_PAREN, "Expected '(' after `inline while`");
 		NodeIdx cond = parseLogicalOr();
-		consume(TOK_CLOSE_PAREN,
-		        "Expected ')' after `inline while` condition");
-		consume(TOK_OPEN_BRACE,
-		        "Expected '{' after `inline while` condition");
+		consume(TOK_CLOSE_PAREN, "Expected ')' after `inline while` condition");
+		consume(TOK_OPEN_BRACE, "Expected '{' after `inline while` condition");
 		std::vector<NodeIdx> body;
 		while (!check(TOK_CLOSE_BRACE) && !isAtEnd()) {
 			body.push_back(parseExpression());
@@ -1029,7 +1027,7 @@ NodeIdx Parser::parseExpression() {
 		for (size_t i = 0; i < body.size(); i++) {
 			nodes->setExtra(extra + 1 + i, body[i]);
 		}
-		AstNode whileNode{AstTag::WhileNode, 0, 0, 0,
+		AstNode whileNode{AstTag::WhileNode,           0,    0, 0,
 		                  static_cast<uint32_t>(cond), extra};
 		whileNode.flags = 1;  // bit 0 = inline
 		return emit(whileNode);
@@ -1476,9 +1474,7 @@ std::unique_ptr<FunctionAST> Parser::parseFunction() {
 			// function's substitution map at monomorphisation time.
 			// Same per-call instantiation cache as `T: type` generics.
 			bool isComp = false;
-			if (match(TOK_COMP)) {
-				isComp = true;
-			}
+			if (match(TOK_COMP)) { isComp = true; }
 			consume(TOK_IDENTIFIER, "Expected parameter name");
 			std::string paramName(previous().text(source_));
 
@@ -1499,7 +1495,8 @@ std::unique_ptr<FunctionAST> Parser::parseFunction() {
 			}
 
 			TypeIdx paramType = parseType();
-			args.push_back(Param{std::move(paramName), paramType, mode, isComp});
+			args.push_back(
+			    Param{std::move(paramName), paramType, mode, isComp});
 		} while (match(TOK_COMMA));
 	}
 
@@ -1759,7 +1756,8 @@ std::unique_ptr<ImportDeclAST> Parser::parseImportDecl() {
 	// `import(...)` alias in the preceding module; the final segment's
 	// resolved path is what `name` will bind to.
 	while (match(TOK_DOT)) {
-		consume(TOK_IDENTIFIER, "Expected identifier after `.` in import chain");
+		consume(TOK_IDENTIFIER,
+		        "Expected identifier after `.` in import chain");
 		decl->chain.emplace_back(previous().text(source_));
 	}
 	consume(TOK_SEMI, "Expected ';' after import declaration");
@@ -1787,9 +1785,10 @@ std::unique_ptr<DestructuringImportDeclAST> Parser::parseDestructuringImport() {
 	consume(TOK_CLOSE_PAREN, "Expected ')' after import path");
 
 	auto decl = std::make_unique<DestructuringImportDeclAST>(std::move(names),
-	                                                        std::move(path));
+	                                                         std::move(path));
 	while (match(TOK_DOT)) {
-		consume(TOK_IDENTIFIER, "Expected identifier after `.` in import chain");
+		consume(TOK_IDENTIFIER,
+		        "Expected identifier after `.` in import chain");
 		decl->chain.emplace_back(previous().text(source_));
 	}
 	consume(TOK_SEMI, "Expected ';' after import declaration");

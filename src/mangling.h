@@ -46,8 +46,7 @@ inline std::string mangledFunctionName(const FunctionAST &fn,
 	// mut A)` and `cfn drop(self: mut B)` get distinct symbols. Only
 	// kicks in when parentStruct is empty — in-struct `cfn drop` goes
 	// through the standard FQN path below.
-	if (fn.parentStruct.empty() && fn.Name == "drop" &&
-	    fn.Args.size() == 1) {
+	if (fn.parentStruct.empty() && fn.Name == "drop" && fn.Args.size() == 1) {
 		const Param &p = fn.Args[0];
 		if (p.Name == "self" && p.Mode == ParamMode::Mut) {
 			const TypeKey &k = types.get(p.Type);

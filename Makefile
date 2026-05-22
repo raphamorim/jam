@@ -171,7 +171,14 @@ test-comptime: build
 	@clang++ -o $(OUT)/comptime_tests $(OUT)/test_comptime.o $(OUT)/comptime.o $(OUT)/diagnostics.o
 	@$(OUT)/comptime_tests
 
-test: test-unit test-init test-abi test-codegen-errors test-jir test-diagnostics test-decl test-analyzer test-comptime
+test-print: build
+	@echo ""
+	@echo "Building and running @-emit cfn-print end-to-end tests..."
+	@clang++ -c ./tests/cpp/test_print.cpp -o $(OUT)/test_print.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
+	@clang++ -o $(OUT)/print_tests $(OUT)/test_print.o
+	@$(OUT)/print_tests
+
+test: test-unit test-init test-abi test-codegen-errors test-jir test-diagnostics test-decl test-analyzer test-comptime test-print
 test-release: test test-unit-release
 
 fmt: format

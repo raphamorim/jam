@@ -47,9 +47,10 @@ struct LoopFrame {
 // order so drop calls are emitted in REVERSE order at scope exit.
 struct DropTrack {
 	std::string varName;
-	JirRef slot;             // alloca for the variable
-	TypeIdx type;            // source-level type
-	std::string llvmFnName;  // canonical drop fn — FQN like `T.drop` / `m.T.drop`
+	JirRef slot;   // alloca for the variable
+	TypeIdx type;  // source-level type
+	std::string
+	    llvmFnName;  // canonical drop fn — FQN like `T.drop` / `m.T.drop`
 };
 
 struct AstGenCtx {
@@ -662,8 +663,8 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 				if (r != kNoType) return resolveForCmp(r);
 			}
 			if (k.kind == TypeKind::Named) {
-				const std::string &nm = gctx.ctx.getStringPool().get(
-				    static_cast<StringIdx>(k.a));
+				const std::string &nm =
+				    gctx.ctx.getStringPool().get(static_cast<StringIdx>(k.a));
 				TypeIdx a = gctx.ctx.lookupTypeAlias(nm);
 				if (a != kNoType) return resolveForCmp(a);
 				// 3+ segment chain through module re-exports — collapse
@@ -755,8 +756,7 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n,
 	// (the local-lookup above runs first); module consts and
 	// functions are checked after, so a comp-bound name takes
 	// precedence over a same-named module const.
-	if (const jam::ComptimeValue *cv =
-	        gctx.ctx.lookupCurrentCompSubst(name)) {
+	if (const jam::ComptimeValue *cv = gctx.ctx.lookupCurrentCompSubst(name)) {
 		switch (cv->kind) {
 		case jam::ComptimeValue::Kind::Int: {
 			JirInst ic{};
@@ -764,7 +764,7 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n,
 			ic.a = static_cast<uint32_t>(cv->intVal.bits & 0xFFFFFFFFu);
 			ic.b = static_cast<uint32_t>(cv->intVal.bits >> 32);
 			ic.ty = gctx.ctx.getTypePool().internInt(cv->intVal.width,
-			                                          cv->intVal.isSigned);
+			                                         cv->intVal.isSigned);
 			return emit(gctx, ic);
 		}
 		case jam::ComptimeValue::Kind::Bool: {
@@ -804,8 +804,7 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n,
 		case jam::ComptimeValue::Kind::Aggregate:
 		case jam::ComptimeValue::Kind::None:
 			return recoverHere(
-			    gctx,
-			    "comp param `" + name + "` has no runtime lowering yet",
+			    gctx, "comp param `" + name + "` has no runtime lowering yet",
 			    kNoType);
 		}
 	}
@@ -3431,7 +3430,7 @@ static void ensureDprintfForCfn(AstGenCtx &gctx) {
 	JamTypeRef i8PtrType = JamLLVMPointerType(gctx.ctx.getInt8Type(), 0);
 	JamTypeRef paramTypes[2] = {gctx.ctx.getInt32Type(), i8PtrType};
 	JamTypeRef ft = JamLLVMFunctionType(gctx.ctx.getInt32Type(), paramTypes, 2,
-	                                     /*isVarArgs=*/true);
+	                                    /*isVarArgs=*/true);
 	JamFunctionRef pf = JamLLVMAddFunction(gctx.ctx.getModule(), "dprintf", ft);
 	JamLLVMApplyDefaultFnAttrs(pf, /*isExtern=*/true);
 }
@@ -3440,7 +3439,7 @@ static void ensureDprintfForCfn(AstGenCtx &gctx) {
 // format string. Used by the per-type interp lowering and by
 // emitPutByte for the "%c" case.
 static void emitDprintfSingleArg(AstGenCtx &gctx, JirRef fdRef,
-                                    const char *fmtSpec, JirRef arg) {
+                                 const char *fmtSpec, JirRef arg) {
 	TypeIdx sliceTy = gctx.ctx.getTypePool().intern(
 	    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
 	TypeIdx u8PtrTy = gctx.ctx.getTypePool().intern(
@@ -3458,8 +3457,8 @@ static void emitDprintfSingleArg(AstGenCtx &gctx, JirRef fdRef,
 	fp.ty = u8PtrTy;
 	JirRef fmtPtr = emit(gctx, fp);
 	std::vector<uint32_t> pp = {3, static_cast<uint32_t>(fdRef),
-	                             static_cast<uint32_t>(fmtPtr),
-	                             static_cast<uint32_t>(arg)};
+	                            static_cast<uint32_t>(fmtPtr),
+	                            static_cast<uint32_t>(arg)};
 	JirExtraIdx pe = gctx.jfn.pushExtra(pp.data(), pp.size());
 	JirInst c{};
 	c.tag = JirTag::Call;
@@ -3483,8 +3482,8 @@ static JirRef literalI32(AstGenCtx &gctx, uint32_t value) {
 // identifier (only used for the diagnostic). The dispatcher widens /
 // extracts as needed and emits one dprintf call per piece.
 static void emitDprintfForValue(AstGenCtx &gctx, jam::Diagnostics &diags,
-                                  jam::SrcLoc loc, JirRef fdRef, JirRef val,
-                                  const std::string &name) {
+                                jam::SrcLoc loc, JirRef fdRef, JirRef val,
+                                const std::string &name) {
 	TypeIdx ty = gctx.jfn.getInst(val).ty;
 	const TypeKey &k = gctx.ctx.getTypePool().get(ty);
 	switch (k.kind) {
@@ -3499,8 +3498,7 @@ static void emitDprintfForValue(AstGenCtx &gctx, jam::Diagnostics &diags,
 			ext.ty = BuiltinType::I64;
 			wideRef = emit(gctx, ext);
 		}
-		emitDprintfSingleArg(gctx, fdRef, isSigned ? "%lld" : "%llu",
-		                     wideRef);
+		emitDprintfSingleArg(gctx, fdRef, isSigned ? "%lld" : "%llu", wideRef);
 		return;
 	}
 	case TypeKind::Float: {
@@ -3565,9 +3563,8 @@ static void emitDprintfForValue(AstGenCtx &gctx, jam::Diagnostics &diags,
 			fp.ty = u8PtrTy;
 			JirRef fmtPtr = emit(gctx, fp);
 			std::vector<uint32_t> pp = {
-			    4, static_cast<uint32_t>(fdRef),
-			    static_cast<uint32_t>(fmtPtr), static_cast<uint32_t>(lnI32),
-			    static_cast<uint32_t>(ptr)};
+			    4, static_cast<uint32_t>(fdRef), static_cast<uint32_t>(fmtPtr),
+			    static_cast<uint32_t>(lnI32), static_cast<uint32_t>(ptr)};
 			JirExtraIdx pe = gctx.jfn.pushExtra(pp.data(), pp.size());
 			JirInst c{};
 			c.tag = JirTag::Call;
@@ -3635,10 +3632,11 @@ static void emitDprintfForValue(AstGenCtx &gctx, jam::Diagnostics &diags,
 		return;
 	}
 	default:
-		diags.error(loc, "@emit: local `" + name + "` has a type that's "
-		                                            "not printable (only "
-		                                            "int / float / bool / "
-		                                            "slice<u8> supported)");
+		diags.error(loc, "@emit: local `" + name +
+		                     "` has a type that's "
+		                     "not printable (only "
+		                     "int / float / bool / "
+		                     "slice<u8> supported)");
 		return;
 	}
 }
@@ -3651,13 +3649,11 @@ class CfnEmitter : public jam::CompEmitter {
   public:
 	explicit CfnEmitter(AstGenCtx &gctx) : gctx_(gctx) {}
 
-	jam::ExecResult
-	handleAtCall(const std::string &name,
-	              const std::vector<jam::ComptimeValue> &args,
-	              jam::Diagnostics &diags, jam::SrcLoc loc) override {
-		if (name == "emitPutByte") {
-			return handlePutByte(args, diags, loc);
-		}
+	jam::ExecResult handleAtCall(const std::string &name,
+	                             const std::vector<jam::ComptimeValue> &args,
+	                             jam::Diagnostics &diags,
+	                             jam::SrcLoc loc) override {
+		if (name == "emitPutByte") { return handlePutByte(args, diags, loc); }
 		if (name == "emitPrintLocalByRange") {
 			return handlePrintLocalByRange(args, diags, loc);
 		}
@@ -3671,17 +3667,15 @@ class CfnEmitter : public jam::CompEmitter {
   private:
 	AstGenCtx &gctx_;
 
-	jam::ExecResult
-	handlePutByte(const std::vector<jam::ComptimeValue> &args,
-	               jam::Diagnostics &diags, jam::SrcLoc loc) {
+	jam::ExecResult handlePutByte(const std::vector<jam::ComptimeValue> &args,
+	                              jam::Diagnostics &diags, jam::SrcLoc loc) {
 		if (args.size() != 2 || !args[0].isInt() || !args[1].isInt()) {
-			diags.error(loc,
-			             "@emitPutByte expects (fd: i32, byte: u8)");
+			diags.error(loc, "@emitPutByte expects (fd: i32, byte: u8)");
 			return jam::ExecResult::Error;
 		}
 		ensureDprintfForCfn(gctx_);
-		JirRef fdRef = literalI32(gctx_,
-		                           static_cast<uint32_t>(args[0].asU64()));
+		JirRef fdRef =
+		    literalI32(gctx_, static_cast<uint32_t>(args[0].asU64()));
 		JirInst byteI{};
 		byteI.tag = JirTag::Int;
 		byteI.a = static_cast<uint32_t>(args[1].asU64() & 0xFFu);
@@ -3693,12 +3687,11 @@ class CfnEmitter : public jam::CompEmitter {
 
 	jam::ExecResult
 	handlePrintLocalByRange(const std::vector<jam::ComptimeValue> &args,
-	                          jam::Diagnostics &diags, jam::SrcLoc loc) {
+	                        jam::Diagnostics &diags, jam::SrcLoc loc) {
 		if (args.size() != 4 || !args[0].isInt() || !args[1].isStr() ||
 		    !args[2].isInt() || !args[3].isInt()) {
-			diags.error(loc,
-			             "@emitPrintLocalByRange expects "
-			             "(fd: i32, fmt: str, start: u32, end: u32)");
+			diags.error(loc, "@emitPrintLocalByRange expects "
+			                 "(fd: i32, fmt: str, start: u32, end: u32)");
 			return jam::ExecResult::Error;
 		}
 		uint32_t fd = static_cast<uint32_t>(args[0].asU64());
@@ -3707,9 +3700,8 @@ class CfnEmitter : public jam::CompEmitter {
 		uint32_t start = static_cast<uint32_t>(args[2].asU64());
 		uint32_t end = static_cast<uint32_t>(args[3].asU64());
 		if (start > end || end > fmtStr.length()) {
-			diags.error(loc,
-			             "@emitPrintLocalByRange: range out of bounds "
-			             "for the format string");
+			diags.error(loc, "@emitPrintLocalByRange: range out of bounds "
+			                 "for the format string");
 			return jam::ExecResult::Error;
 		}
 		std::string name = fmtStr.substr(start, end - start);
@@ -3739,12 +3731,11 @@ class CfnEmitter : public jam::CompEmitter {
 	// dprintf.
 	jam::ExecResult
 	handleWriteBytes(const std::vector<jam::ComptimeValue> &args,
-	                  jam::Diagnostics &diags, jam::SrcLoc loc) {
+	                 jam::Diagnostics &diags, jam::SrcLoc loc) {
 		if (args.size() != 4 || !args[0].isInt() || !args[1].isStr() ||
 		    !args[2].isInt() || !args[3].isInt()) {
-			diags.error(loc,
-			             "@emitWriteBytes expects "
-			             "(fd: i32, fmt: str, start: u32, end: u32)");
+			diags.error(loc, "@emitWriteBytes expects "
+			                 "(fd: i32, fmt: str, start: u32, end: u32)");
 			return jam::ExecResult::Error;
 		}
 		uint32_t fd = static_cast<uint32_t>(args[0].asU64());
@@ -3753,9 +3744,8 @@ class CfnEmitter : public jam::CompEmitter {
 		uint32_t start = static_cast<uint32_t>(args[2].asU64());
 		uint32_t end = static_cast<uint32_t>(args[3].asU64());
 		if (start > end || end > fmtStr.length()) {
-			diags.error(loc,
-			             "@emitWriteBytes: range out of bounds "
-			             "for the format string");
+			diags.error(loc, "@emitWriteBytes: range out of bounds "
+			                 "for the format string");
 			return jam::ExecResult::Error;
 		}
 		if (start == end) {
@@ -3764,8 +3754,8 @@ class CfnEmitter : public jam::CompEmitter {
 			return jam::ExecResult::Continue;
 		}
 		ensureDprintfForCfn(gctx_);
-		StringIdx litId = gctx_.ctx.getStringPool().intern(
-		    fmtStr.substr(start, end - start));
+		StringIdx litId =
+		    gctx_.ctx.getStringPool().intern(fmtStr.substr(start, end - start));
 		TypeIdx sliceTy = gctx_.ctx.getTypePool().intern(
 		    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
 		TypeIdx u8PtrTy = gctx_.ctx.getTypePool().intern(
@@ -3826,7 +3816,7 @@ class CfnEmitter : public jam::CompEmitter {
 // how `std.fmt.print` lowers to a sequence of write calls inside the
 // user's main() rather than inside print's own LLVM function.
 static JirRef astgenCompTimeFnCall(AstGenCtx &gctx, const AstNode &n,
-                                     const FunctionAST *fn) {
+                                   const FunctionAST *fn) {
 	const NodeStore &ns = gctx.ctx.getNodeStore();
 	ExtraIdx argsExtra = static_cast<ExtraIdx>(n.rhs);
 	uint32_t argCount = ns.getExtra(argsExtra);
@@ -3842,7 +3832,7 @@ static JirRef astgenCompTimeFnCall(AstGenCtx &gctx, const AstNode &n,
 
 	// Evaluate each arg at compile time and bind to the param name.
 	jam::ComptimeEvaluator ev(ns, gctx.ctx.getStringPool(),
-	                           gctx.ctx.getTypePool());
+	                          gctx.ctx.getTypePool());
 	jam::ComptimeScope outer;
 	jam::Diagnostics &diags = gctx.ctx.diagnostics();
 	jam::SrcLoc loc{gctx.ctx.currentFile(), 0};
@@ -3868,17 +3858,17 @@ static JirRef astgenCompTimeFnCall(AstGenCtx &gctx, const AstNode &n,
 	uint32_t iterCounter = 0;
 	jam::ComptimeValue returned;
 	std::vector<NodeIdx> bodyVec(fn->Body.begin(), fn->Body.end());
-	jam::ExecResult r = ev.execBlock(bodyVec.data(), bodyVec.size(), outer,
-	                                  iterCounter,
-	                                  jam::ComptimeEvaluator::kDefaultIterCap,
-	                                  returned, diags, loc);
+	jam::ExecResult r = ev.execBlock(
+	    bodyVec.data(), bodyVec.size(), outer, iterCounter,
+	    jam::ComptimeEvaluator::kDefaultIterCap, returned, diags, loc);
 	ev.clearCallContext();
 	if (r == jam::ExecResult::Error || r == jam::ExecResult::IterationCap) {
 		// Diagnostic already pushed; return a poison so the rest of
 		// the caller still gets analyzed.
 		return recoverHere(gctx,
-		                   "cfn `" + fn->Name + "` failed during compile-"
-		                                          "time evaluation",
+		                   "cfn `" + fn->Name +
+		                       "` failed during compile-"
+		                       "time evaluation",
 		                   kNoType);
 	}
 	// cfn returns void in v1; the value (if any) is discarded for now.
@@ -3886,14 +3876,13 @@ static JirRef astgenCompTimeFnCall(AstGenCtx &gctx, const AstNode &n,
 }
 
 static JirRef astgenCompInstantiatedCall(AstGenCtx &gctx, const AstNode &n,
-                                          const FunctionAST *fn) {
+                                         const FunctionAST *fn) {
 	const NodeStore &ns = gctx.ctx.getNodeStore();
 	ExtraIdx argsExtra = static_cast<ExtraIdx>(n.rhs);
 	uint32_t argCount = ns.getExtra(argsExtra);
 
-	jam::ComptimeEvaluator ev(gctx.ctx.getNodeStore(),
-	                           gctx.ctx.getStringPool(),
-	                           gctx.ctx.getTypePool());
+	jam::ComptimeEvaluator ev(gctx.ctx.getNodeStore(), gctx.ctx.getStringPool(),
+	                          gctx.ctx.getTypePool());
 	jam::ComptimeScope scope;
 	std::unordered_map<std::string, jam::ComptimeValue> compSubst;
 	std::vector<NodeIdx> runtimeArgs;
@@ -3932,8 +3921,7 @@ static JirRef astgenCompInstantiatedCall(AstGenCtx &gctx, const AstNode &n,
 			case jam::ComptimeValue::Kind::Type: {
 				const TypeKey &tk = gctx.ctx.getTypePool().get(v.typeVal);
 				if (tk.kind == TypeKind::Int) {
-					mangleSuffix +=
-					    (tk.b ? "i" : "u") + std::to_string(tk.a);
+					mangleSuffix += (tk.b ? "i" : "u") + std::to_string(tk.a);
 				} else if (tk.kind == TypeKind::Bool) {
 					mangleSuffix += "bool";
 				} else {
@@ -3970,12 +3958,11 @@ static JirRef astgenCompInstantiatedCall(AstGenCtx &gctx, const AstNode &n,
 		    fn->isCfn);
 		clone = gctx.ctx.adoptInstantiatedFunction(std::move(cloned));
 		gctx.ctx.registerFunctionAST(instName,
-		                              const_cast<FunctionAST *>(clone));
+		                             const_cast<FunctionAST *>(clone));
 
 		// Save the builder so we can return to the caller's insertion
 		// point once the clone body's been emitted.
-		JamBasicBlockRef savedBB =
-		    JamLLVMGetInsertBlock(gctx.ctx.getBuilder());
+		JamBasicBlockRef savedBB = JamLLVMGetInsertBlock(gctx.ctx.getBuilder());
 
 		gctx.ctx.setCurrentCompSubst(compSubst);
 		JirFunction jfn = astgenMetadata(*clone, gctx.ctx);
@@ -4468,11 +4455,12 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 	if (fn != nullptr) {
 		bool hasComp = false;
 		for (const auto &p : fn->Args) {
-			if (p.isComp) { hasComp = true; break; }
+			if (p.isComp) {
+				hasComp = true;
+				break;
+			}
 		}
-		if (hasComp) {
-			return astgenCompInstantiatedCall(gctx, n, fn);
-		}
+		if (hasComp) { return astgenCompInstantiatedCall(gctx, n, fn); }
 	}
 	if (fn == nullptr) {
 		// Before erroring, try the fn-pointer-in-local-or-field paths.

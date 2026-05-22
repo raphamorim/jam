@@ -314,8 +314,7 @@ class JamCodegenContext {
 	// `getFunctionAST("handle.X")` lookup misses on a 3+ segment path
 	// like `std.fmt.print`. Returns nullptr if any segment fails to
 	// resolve to a Module → Module → ... → Function chain.
-	const FunctionAST *
-	resolveChainedFunction(const std::string &dotted) const;
+	const FunctionAST *resolveChainedFunction(const std::string &dotted) const;
 
 	// Sibling of `resolveChainedFunction` for types. A type annotation
 	// or struct literal like `w.lib.Point` parses into a Named type
@@ -474,8 +473,8 @@ class JamCodegenContext {
 	// for the rest of the compilation so its LLVM symbol stays
 	// referenceable. Caller is expected to also `registerFunctionAST`
 	// the clone so name-based lookups find it.
-	FunctionAST *adoptInstantiatedFunction(
-	    std::unique_ptr<FunctionAST> cloned) const {
+	FunctionAST *
+	adoptInstantiatedFunction(std::unique_ptr<FunctionAST> cloned) const {
 		FunctionAST *p = cloned.get();
 		instantiatedMethods_.push_back(std::move(cloned));
 		return p;

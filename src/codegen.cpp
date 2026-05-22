@@ -520,8 +520,8 @@ struct ChainWalkResult {
 	const JamCodegenContext::ModuleNamespace *leaf;
 	std::string lastSeg;
 };
-static ChainWalkResult
-walkChain(const JamCodegenContext &ctx, const std::string &dotted) {
+static ChainWalkResult walkChain(const JamCodegenContext &ctx,
+                                 const std::string &dotted) {
 	std::vector<std::string> segs = splitDotted(dotted);
 	if (segs.size() < 3) return {nullptr, {}};
 	const auto *handle = ctx.getImportHandle(segs.front());

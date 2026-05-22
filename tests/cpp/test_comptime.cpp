@@ -164,11 +164,11 @@ void testIntAddSubMul() {
 	NodeIdx a = mkInt(ns, 10);
 	NodeIdx b = mkInt(ns, 3);
 	ASSERT_EQ(static_cast<uint64_t>(13),
-	           e.eval(mkBinOp(ns, BinOp::Add, a, b), scope).asU64());
+	          e.eval(mkBinOp(ns, BinOp::Add, a, b), scope).asU64());
 	ASSERT_EQ(static_cast<uint64_t>(7),
-	           e.eval(mkBinOp(ns, BinOp::Sub, a, b), scope).asU64());
+	          e.eval(mkBinOp(ns, BinOp::Sub, a, b), scope).asU64());
 	ASSERT_EQ(static_cast<uint64_t>(30),
-	           e.eval(mkBinOp(ns, BinOp::Mul, a, b), scope).asU64());
+	          e.eval(mkBinOp(ns, BinOp::Mul, a, b), scope).asU64());
 }
 
 void testIntDivByZeroIsNone() {
@@ -208,11 +208,11 @@ void testBitwise() {
 	NodeIdx a = mkInt(ns, 0b1100);
 	NodeIdx b = mkInt(ns, 0b1010);
 	ASSERT_EQ(static_cast<uint64_t>(0b1000),
-	           e.eval(mkBinOp(ns, BinOp::BitAnd, a, b), scope).asU64());
+	          e.eval(mkBinOp(ns, BinOp::BitAnd, a, b), scope).asU64());
 	ASSERT_EQ(static_cast<uint64_t>(0b1110),
-	           e.eval(mkBinOp(ns, BinOp::BitOr, a, b), scope).asU64());
+	          e.eval(mkBinOp(ns, BinOp::BitOr, a, b), scope).asU64());
 	ASSERT_EQ(static_cast<uint64_t>(0b0110),
-	           e.eval(mkBinOp(ns, BinOp::BitXor, a, b), scope).asU64());
+	          e.eval(mkBinOp(ns, BinOp::BitXor, a, b), scope).asU64());
 }
 
 // ── Logical operators (short-circuit) ────────────────────────────
@@ -226,7 +226,8 @@ void testLogAndShortCircuits() {
 	NodeIdx f = mkBool(ns, false);
 	// RHS references missing variable — would return None if eval'd.
 	NodeIdx missing = mkVar(ns, sp, "z");
-	jam::ComptimeValue v = e.eval(mkBinOp(ns, BinOp::LogAnd, f, missing), scope);
+	jam::ComptimeValue v =
+	    e.eval(mkBinOp(ns, BinOp::LogAnd, f, missing), scope);
 	ASSERT_TRUE(v.isBool());
 	ASSERT_FALSE(v.boolVal);  // LHS=false short-circuits, never touched RHS
 }
@@ -325,7 +326,8 @@ void testAggregateIndexing() {
 	fields.push_back(jam::ComptimeValue::makeInt(10, 32, true));
 	fields.push_back(jam::ComptimeValue::makeInt(20, 32, true));
 	fields.push_back(jam::ComptimeValue::makeInt(30, 32, true));
-	jam::ComptimeValue agg = jam::ComptimeValue::makeAggregate(std::move(fields));
+	jam::ComptimeValue agg =
+	    jam::ComptimeValue::makeAggregate(std::move(fields));
 
 	NodeStore ns;
 	StringPool sp;
@@ -401,7 +403,7 @@ void testScopeSetWalksUpToParent() {
 // ── Helper builders for statement nodes ──────────────────────────
 
 NodeIdx mkVarDecl(NodeStore &ns, StringPool &sp, const std::string &name,
-                   NodeIdx init) {
+                  NodeIdx init) {
 	ExtraIdx extra = ns.reserveExtra(3);
 	ns.setExtra(extra, sp.intern(name));
 	ns.setExtra(extra + 1, kNoType);  // type — ignored by comp evaluator
@@ -422,8 +424,8 @@ NodeIdx mkAssign(NodeStore &ns, NodeIdx target, NodeIdx value) {
 }
 
 NodeIdx mkIfNode(NodeStore &ns, NodeIdx cond,
-                  const std::vector<NodeIdx> &thenStmts,
-                  const std::vector<NodeIdx> &elseStmts) {
+                 const std::vector<NodeIdx> &thenStmts,
+                 const std::vector<NodeIdx> &elseStmts) {
 	std::size_t total = 2 + thenStmts.size() + elseStmts.size();
 	ExtraIdx extra = ns.reserveExtra(total);
 	ns.setExtra(extra, static_cast<uint32_t>(thenStmts.size()));
@@ -442,7 +444,7 @@ NodeIdx mkIfNode(NodeStore &ns, NodeIdx cond,
 }
 
 NodeIdx mkWhileNode(NodeStore &ns, NodeIdx cond,
-                     const std::vector<NodeIdx> &body) {
+                    const std::vector<NodeIdx> &body) {
 	ExtraIdx extra = ns.reserveExtra(1 + body.size());
 	ns.setExtra(extra, static_cast<uint32_t>(body.size()));
 	for (std::size_t i = 0; i < body.size(); i++) {
@@ -456,7 +458,7 @@ NodeIdx mkWhileNode(NodeStore &ns, NodeIdx cond,
 }
 
 NodeIdx mkMemberAccess(NodeStore &ns, StringPool &sp, NodeIdx base,
-                        const std::string &member) {
+                       const std::string &member) {
 	AstNode node{};
 	node.tag = AstTag::MemberAccess;
 	node.lhs = base;
@@ -539,8 +541,7 @@ void testExecIfPicksTrueBranch() {
 	// if (true) { x = 1; } else { x = 2; }
 	NodeIdx thenAsn = mkAssign(ns, mkVar(ns, sp, "x"), mkInt(ns, 1));
 	NodeIdx elseAsn = mkAssign(ns, mkVar(ns, sp, "x"), mkInt(ns, 2));
-	NodeIdx ifNode =
-	    mkIfNode(ns, mkBool(ns, true), {thenAsn}, {elseAsn});
+	NodeIdx ifNode = mkIfNode(ns, mkBool(ns, true), {thenAsn}, {elseAsn});
 	jam::ExecResult r = e.execStmt(ifNode, scope, iter, 1000, ret, diags, loc);
 	ASSERT_TRUE(r == jam::ExecResult::Continue);
 	ASSERT_EQ(static_cast<uint64_t>(1), scope.lookup("x")->asU64());
@@ -560,8 +561,7 @@ void testExecIfPicksFalseBranch() {
 	scope.bind("x", jam::ComptimeValue::makeInt(0, 64, false));
 	NodeIdx thenAsn = mkAssign(ns, mkVar(ns, sp, "x"), mkInt(ns, 1));
 	NodeIdx elseAsn = mkAssign(ns, mkVar(ns, sp, "x"), mkInt(ns, 2));
-	NodeIdx ifNode =
-	    mkIfNode(ns, mkBool(ns, false), {thenAsn}, {elseAsn});
+	NodeIdx ifNode = mkIfNode(ns, mkBool(ns, false), {thenAsn}, {elseAsn});
 	e.execStmt(ifNode, scope, iter, 1000, ret, diags, loc);
 	ASSERT_EQ(static_cast<uint64_t>(2), scope.lookup("x")->asU64());
 }
@@ -632,8 +632,8 @@ void testExecBlockShortCircuitsOnError() {
 	NodeIdx bad = mkAssign(ns, mkVar(ns, sp, "y"), mkInt(ns, 1));
 	NodeIdx good = mkAssign(ns, mkVar(ns, sp, "x"), mkInt(ns, 99));
 	std::vector<NodeIdx> body = {d, bad, good};
-	jam::ExecResult r = e.execBlock(body.data(), body.size(), scope, iter,
-	                                  1000, ret, diags, loc);
+	jam::ExecResult r = e.execBlock(body.data(), body.size(), scope, iter, 1000,
+	                                ret, diags, loc);
 	ASSERT_TRUE(r == jam::ExecResult::Error);
 	// x stays at 0 (the good assign never ran).
 	ASSERT_EQ(static_cast<uint64_t>(0), scope.lookup("x")->asU64());
@@ -657,7 +657,8 @@ void testMemberAccessStrLength() {
 
 int main() {
 	TestFramework framework;
-	framework.addTest("Comptime - NumberLit folds to Int", testNumberLitFoldsToInt);
+	framework.addTest("Comptime - NumberLit folds to Int",
+	                  testNumberLitFoldsToInt);
 	framework.addTest("Comptime - BoolLit folds", testBoolLitFolds);
 	framework.addTest("Comptime - StringLit folds", testStringLitFolds);
 	framework.addTest("Comptime - Variable lookup from scope",
@@ -682,11 +683,9 @@ int main() {
 	framework.addTest("Comptime - string index out-of-bounds None",
 	                  testStringIndexOutOfBoundsIsNone);
 	framework.addTest("Comptime - type equality", testTypeEquality);
-	framework.addTest("Comptime - aggregate indexing",
-	                  testAggregateIndexing);
-	framework.addTest(
-	    "Comptime - evalRequired pushes diagnostic on fail",
-	    testEvalRequiredPushesDiagnosticOnFail);
+	framework.addTest("Comptime - aggregate indexing", testAggregateIndexing);
+	framework.addTest("Comptime - evalRequired pushes diagnostic on fail",
+	                  testEvalRequiredPushesDiagnosticOnFail);
 	framework.addTest("Comptime - scope set mutates existing",
 	                  testScopeSetMutatesExistingBinding);
 	framework.addTest("Comptime - scope set returns false for unknown",

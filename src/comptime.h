@@ -147,8 +147,8 @@ class CompEmitter {
   public:
 	virtual ~CompEmitter() = default;
 	virtual ExecResult handleAtCall(const std::string &name,
-	                                  const std::vector<ComptimeValue> &args,
-	                                  Diagnostics &diags, SrcLoc loc) = 0;
+	                                const std::vector<ComptimeValue> &args,
+	                                Diagnostics &diags, SrcLoc loc) = 0;
 };
 
 // Folds AST expression nodes to compile-time values. Failure modes
@@ -164,7 +164,7 @@ class CompEmitter {
 class ComptimeEvaluator {
   public:
 	ComptimeEvaluator(const NodeStore &nodes, const StringPool &strings,
-	                   const TypePool &types);
+	                  const TypePool &types);
 
 	// Try to fold `expr` to a value. Returns None on any failure.
 	ComptimeValue eval(NodeIdx expr, const ComptimeScope &scope) const;
@@ -174,7 +174,7 @@ class ComptimeEvaluator {
 	// explicitly marked as requiring fold) and by control-flow primitives
 	// where a non-fold is a hard error.
 	ComptimeValue evalRequired(NodeIdx expr, const ComptimeScope &scope,
-	                            Diagnostics &diags, SrcLoc loc) const;
+	                           Diagnostics &diags, SrcLoc loc) const;
 
 	// Execute a statement node. The scope is mutated for var-decls and
 	// assignments; control-flow statements (if/while) recurse. The
@@ -189,17 +189,17 @@ class ComptimeEvaluator {
 	// fires; otherwise it's left None.
 	static constexpr uint32_t kDefaultIterCap = 10'000;
 	ExecResult execStmt(NodeIdx stmt, ComptimeScope &scope,
-	                     uint32_t &iterCounter, uint32_t iterCap,
-	                     ComptimeValue &outReturnValue, Diagnostics &diags,
-	                     SrcLoc loc) const;
+	                    uint32_t &iterCounter, uint32_t iterCap,
+	                    ComptimeValue &outReturnValue, Diagnostics &diags,
+	                    SrcLoc loc) const;
 
 	// Execute a sequence of statements in order. Returns the first
 	// non-Continue result. Wraps a list of NodeIdx from an Extra slice
 	// like a fn body or if/while body.
 	ExecResult execBlock(const NodeIdx *stmts, std::size_t count,
-	                      ComptimeScope &scope, uint32_t &iterCounter,
-	                      uint32_t iterCap, ComptimeValue &outReturnValue,
-	                      Diagnostics &diags, SrcLoc loc) const;
+	                     ComptimeScope &scope, uint32_t &iterCounter,
+	                     uint32_t iterCap, ComptimeValue &outReturnValue,
+	                     Diagnostics &diags, SrcLoc loc) const;
 
 	// Install / clear the AtCall emitter + the diagnostic context.
 	// Active for the duration of a cfn body's execution; cleared
@@ -231,22 +231,21 @@ class ComptimeEvaluator {
 	// is forwarded to the installed emitter; returns None as well
 	// (the @-emit family produces side effects, not values).
 	ComptimeValue evalAtCall(const AstNode &n,
-	                          const ComptimeScope &scope) const;
+	                         const ComptimeScope &scope) const;
 
 	// Per-tag handlers. Each returns None on failure; callers compose.
 	ComptimeValue evalNumberLit(const AstNode &n) const;
 	ComptimeValue evalBoolLit(const AstNode &n) const;
 	ComptimeValue evalStringLit(const AstNode &n) const;
 	ComptimeValue evalVariable(const AstNode &n,
-	                            const ComptimeScope &scope) const;
-	ComptimeValue evalUnaryOp(const AstNode &n,
 	                           const ComptimeScope &scope) const;
+	ComptimeValue evalUnaryOp(const AstNode &n,
+	                          const ComptimeScope &scope) const;
 	ComptimeValue evalBinaryOp(const AstNode &n,
-	                            const ComptimeScope &scope) const;
-	ComptimeValue evalIndex(const AstNode &n,
-	                         const ComptimeScope &scope) const;
+	                           const ComptimeScope &scope) const;
+	ComptimeValue evalIndex(const AstNode &n, const ComptimeScope &scope) const;
 	ComptimeValue evalMemberAccess(const AstNode &n,
-	                                const ComptimeScope &scope) const;
+	                               const ComptimeScope &scope) const;
 };
 
 }  // namespace jam

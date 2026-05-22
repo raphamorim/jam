@@ -57,7 +57,7 @@ RunResult compileAndRun(const std::string &name, const std::string &source) {
 	}
 
 	std::string compileCmd = "./output/jam.out -o " + binPath + " " + srcPath +
-	                           " >" + compileLog + " 2>&1";
+	                         " >" + compileLog + " 2>&1";
 	int compileStatus = std::system(compileCmd.c_str());
 	int compileExit =
 	    WIFEXITED(compileStatus) ? WEXITSTATUS(compileStatus) : -1;
@@ -66,8 +66,7 @@ RunResult compileAndRun(const std::string &name, const std::string &source) {
 		return {compileExit, -1, std::move(compileOut), "", ""};
 	}
 
-	std::string runCmd =
-	    binPath + " >" + stdoutFile + " 2>" + stderrFile;
+	std::string runCmd = binPath + " >" + stdoutFile + " 2>" + stderrFile;
 	int runStatus = std::system(runCmd.c_str());
 	int runExit = WIFEXITED(runStatus) ? WEXITSTATUS(runStatus) : -1;
 	std::string stdoutContent = readFile(stdoutFile);
@@ -289,8 +288,7 @@ fn main() i32 {
 }
 )");
 	ASSERT_EQ(0, r.runExit);
-	ASSERT_EQ(std::string(
-	             "hello, world! the answer is 42, have a nice day\n"),
+	ASSERT_EQ(std::string("hello, world! the answer is 42, have a nice day\n"),
 	          r.stdout_);
 }
 
