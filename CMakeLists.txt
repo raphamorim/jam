@@ -21,6 +21,7 @@ add_executable(jam
   src/astgen.cpp
   src/cabi.cpp
   src/codegen.cpp
+  src/comptime.cpp
   src/decl.cpp
   src/diagnostics.cpp
   src/drop_registry.cpp
