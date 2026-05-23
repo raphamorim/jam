@@ -162,6 +162,13 @@ enum class JirTag : uint8_t {
 	// Call: `a` = StringIdx (callee qualified name);
 	//       `b` = ExtraIdx -> [argCount, arg0, arg1, ...]
 	//       `ty` = return type (kNoType for void).
+	//
+	// sret-returning callees: astgen prepends the result slot as the
+	// leading arg (arg0). The slot may be a caller-owned destination
+	// from the result_ptr plumbing (zero-copy place-into-destination)
+	// or a fresh Alloca emitted by `emitCall`. jir_codegen passes the
+	// args through unchanged and surfaces `arg0` as the Call's value
+	// for byref consumers.
 	Call,
 	// CallIndirect: `a` = JirRef of a fn-typed value (the function
 	//               pointer); `b` = ExtraIdx -> [argCount, arg0, ...];
@@ -184,6 +191,13 @@ enum class JirTag : uint8_t {
 	// Function parameter access
 	// Param: `a` = parameter index; `ty` = param type.
 	Param,
+	// SretArg: evaluates to the function's hidden sret pointer (param
+	// 0 when `jirReturnIsSret` holds). Used by `astgenReturn` to
+	// thread the return slot through as a result_ptr so a `return
+	// StructLit {...}` writes its fields directly into the caller-
+	// owned slot — no temp alloca + memcpy hop. `ty` is the sret
+	// pointee (the function's return type).
+	SretArg,
 
 	// Aggregates
 	// StructLit:    `b` = ExtraIdx -> [fieldCount, field0_val, field1_val,

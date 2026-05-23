@@ -56,28 +56,39 @@ struct ReturnABI {
 	uint32_t sretAlign;     // Indirect: pointee alignment in bytes.
 };
 
-// Classify a parameter (mode, type) pair. Pure function of its inputs;
-// safe to call any number of times. See docs/ABI.md §4.
+// Is this type carried by-reference at the codegen level?
 //
-//   mut                    -> always ByPointer
-//   let / move, scalar T   -> ByValue
-//   let / move, aggregate
-//     size <= kByValueMaxBytes -> ByValue (LLVM handles register packing)
-//     size  > kByValueMaxBytes -> ByPointer
+//   Byref: arrays / structs / non-packed unions / payloaded enums —
+//   anything whose natural runtime form lives in memory and whose
+//   JIR-level value is a pointer to that storage. This is *codegen*
+//   shape, distinct from the source-level ABI / param-mode
+//   classification — even a small 2-field struct returns true here.
+//
+//   Not byref: scalars (Int / Float / Bool), Pointer types (PtrSingle
+//   / PtrMany / Slice — Slice is a 2-field aggregate but is treated
+//   as a packed { ptr, len } pair that LLVM passes in registers), Fn
+//   pointers, unit-only enums (lower to a bare i8 tag).
+//
+// Single source of truth: codegen reroutings (StructLit / ArrayLit /
+// Store / Load / FieldAccess) and `classifyParam` / `classifyReturn`
+// all dispatch on this.
+bool isByRef(TypeIdx ty, const JamCodegenContext &ctx);
+
+// Classify a parameter (mode, type) pair. Pure function of its inputs;
+// safe to call any number of times.
+//
+//   mut                       -> ByPointer (always — caller storage)
+//   isByRef(T)                -> ByPointer (byref aggregate)
+//   anything else             -> ByValue (rides in registers)
 ParamABI classifyParam(ParamMode mode, TypeIdx ty,
                        const JamCodegenContext &ctx);
 
-// Classify a return type. See docs/ABI.md §4.
+// Classify a return type.
 //
-//   scalar T                       -> Direct
-//   aggregate with size <= 16 B    -> Direct (LLVM packs into return regs)
-//   aggregate with size  > 16 B    -> Indirect (sret)
+//   void / kNoType            -> Direct void
+//   isByRef(T)                -> Indirect (sret)
+//   anything else             -> Direct (rides in return regs)
 ReturnABI classifyReturn(TypeIdx ty, const JamCodegenContext &ctx);
-
-// Threshold above which an owned aggregate is passed/returned by pointer
-// rather than by value. Matches the System V AMD64 ABI's two-eightbyte
-// MEMORY classification and Rust's observed behavior at -C opt-level=0.
-constexpr uint64_t kByValueMaxBytes = 16;
 
 }  // namespace abi
 }  // namespace jam

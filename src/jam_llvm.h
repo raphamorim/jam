@@ -247,6 +247,13 @@ JAM_EXTERN_C JamValueRef JamLLVMBuildLoad(JamBuilderRef builder,
                                           const char *name);
 JAM_EXTERN_C JamValueRef JamLLVMBuildStore(JamBuilderRef builder,
                                            JamValueRef val, JamValueRef ptr);
+// `@llvm.memcpy.p0.p0.i64(dst, src, size, false)` — bulk byte copy
+// between two memory regions. Used to replace the load+store of large
+// aggregates that SROA would otherwise decompose into giant
+// insertvalue chains in the sret return path.
+JAM_EXTERN_C void JamLLVMBuildMemCpy(JamBuilderRef builder, JamValueRef dst,
+                                     uint64_t dstAlign, JamValueRef src,
+                                     uint64_t srcAlign, uint64_t size);
 // In-bounds GEP for indexing into a fixed-size array: gep [N x T], ptr, 0, idx.
 // `arrayType` must be the array aggregate type that `ptr` points to.
 JAM_EXTERN_C JamValueRef JamLLVMBuildArrayGEP(JamBuilderRef builder,

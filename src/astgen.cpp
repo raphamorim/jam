@@ -320,7 +320,33 @@ static void emitCondBr(AstGenCtx &gctx, JirRef cond, JirBlockRef thenB,
                        JirBlockRef elseB);
 static void emitDrops(AstGenCtx &gctx, const std::vector<DropTrack> &bindings);
 static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
-                       const std::vector<JirRef> &argRefs);
+                       const std::vector<JirRef> &argRefs,
+                       JirRef destPtr = kNoJirRef);
+// Forward decls for the Call / TypeMethodCall paths so the
+// astgenExprIntoPtr place-into-destination helper can drive them
+// before their definitions appear later in this file.
+static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n,
+                         JirRef destPtr = kNoJirRef);
+static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n,
+                                   JirRef destPtr = kNoJirRef);
+// Forward decl: place-into-destination dispatcher used by VarDecl,
+// Return, and StructLitInto. See its definition for which expression
+// shapes it recognises (StructLit, sret Calls).
+static bool astgenExprIntoPtr(AstGenCtx &gctx, NodeIdx exprIdx,
+                              TypeIdx expectedTy, JirRef destPtr);
+
+// Emit a `JirTag::SretArg` referencing this function's hidden sret
+// pointer. The pointer's pointee type is the function's return type.
+// Used as the result_ptr for byref returns so a `return X` writes X
+// straight into the caller-owned slot.
+static JirRef emitSretArg(AstGenCtx &gctx, TypeIdx retTy) {
+	TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
+	    TypeKey{TypeKind::PtrSingle, 0, 0, retTy, 0});
+	JirInst s{};
+	s.tag = JirTag::SretArg;
+	s.ty = ptrTy;
+	return emit(gctx, s);
+}
 // `v[i]` desugar dispatch — see `emitStructCfnDispatch` for the body.
 // Forward-declared so astgenAssign (in this file, above the
 // definition) can call it for `v[i] = x` -> setAt routing.
@@ -474,8 +500,27 @@ static JirRef astgenBoolLit(AstGenCtx &gctx, const AstNode &n) {
 static void astgenReturn(AstGenCtx &gctx, const AstNode &n) {
 	JirRef valRef = kNoJirRef;
 	if (n.lhs != 0) {
-		valRef =
-		    astgenExpr(gctx, static_cast<NodeIdx>(n.lhs), gctx.jfn.returnType);
+		NodeIdx valIdx = static_cast<NodeIdx>(n.lhs);
+		// When the function returns via sret, hand the sret slot
+		// pointer to the value expression as a result_ptr. Byref-
+		// producing exprs (StructLit / ArrayLit / sret Call) write
+		// fields directly into the slot and return kNoJirRef — no
+		// temp alloca, no trailing memcpy. Byval returns still flow
+		// the value through and let Ret's standard store handle it.
+		TypeIdx retTy = gctx.jfn.returnType;
+		bool sretFn = retTy != kNoType &&
+		              jam::abi::classifyReturn(retTy, gctx.ctx).kind ==
+		                  jam::abi::ReturnABI::Kind::Indirect;
+		if (sretFn &&
+		    astgenExprIntoPtr(gctx, valIdx, retTy, emitSretArg(gctx, retTy))) {
+			emitDropsThroughScope(gctx, 0);
+			JirInst ret{};
+			ret.tag = JirTag::Ret;
+			ret.a = kNoJirRef;
+			emit(gctx, ret);
+			return;
+		}
+		valRef = astgenExpr(gctx, valIdx, retTy);
 	}
 	// Drop every active scope before exiting the function.
 	emitDropsThroughScope(gctx, 0);
@@ -629,98 +674,111 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 		gctx.localTypes[name] = type;
 		if (!gctx.localScopes.empty()) { gctx.localScopes.back().insert(name); }
 
-		initRef = astgenExpr(gctx, initIdx, type);
+		// Try the place-into-destination path first: StructLit and
+		// sret Calls can write directly into `allocaRef`, skipping
+		// the SSA aggregate (and the insertvalue chain) the value-
+		// form would build. When placed, `initRef` stays kNoJirRef
+		// so the trailing Store below short-circuits.
+		if (astgenExprIntoPtr(gctx, initIdx, type, allocaRef)) {
+			initRef = kNoJirRef;
+		} else {
+			initRef = astgenExpr(gctx, initIdx, type);
 
-		// Type-check the init against the declared type. The
-		// astgenNumberLit path already narrows integer literals to
-		// the declared int width when `expected` is an Int, so
-		// `var x: i32 = 5;` lands as ik=I32. Anything else that
-		// doesn't match is a real mismatch — including
-		// `var x: f32 = 3;` (int into float), `var x: bool = 1.0;`
-		// (float into bool), `var x: u8 = "s";` (slice into u8),
-		// etc.
-		//
-		// Both sides are resolved through generic-call / type-alias
-		// chains first so `var a: Identity(i32) = 42;` compares
-		// `i32 == i32` instead of the unresolved `GenericCall ≠ Int`.
-		// Pointer-target types are also resolved per-side so
-		// `var p: *const T = &x` (where `T` is an alias) matches.
-		std::function<TypeIdx(TypeIdx)> resolveForCmp =
-		    [&](TypeIdx t) -> TypeIdx {
-			if (t == kNoType) return t;
-			const TypeKey &k = gctx.ctx.getTypePool().get(t);
-			// Generic substitution wins (inside an instantiated
-			// method body, `T` resolves to whatever the
-			// instantiation supplied).
-			if (k.kind == TypeKind::Named) {
-				const std::string &name =
-				    gctx.ctx.getStringPool().get(static_cast<StringIdx>(k.a));
-				TypeIdx sub = gctx.ctx.lookupCurrentSubst(name);
-				if (sub != kNoType) return resolveForCmp(sub);
-			}
-			if (k.kind == TypeKind::GenericCall) {
-				TypeIdx r = gctx.ctx.resolveGenericCall(t);
-				if (r != kNoType) return resolveForCmp(r);
-			}
-			if (k.kind == TypeKind::Named) {
-				const std::string &nm =
-				    gctx.ctx.getStringPool().get(static_cast<StringIdx>(k.a));
-				TypeIdx a = gctx.ctx.lookupTypeAlias(nm);
-				if (a != kNoType) return resolveForCmp(a);
-				// 3+ segment chain through module re-exports — collapse
-				// `w.leaf.Point` to the canonical `Point` so it matches
-				// values produced by `w.leaf.makePoint(...)` whose return
-				// type was registered with the single-segment name.
-				if (nm.find('.') != std::string::npos) {
-					TypeIdx c = gctx.ctx.resolveChainedType(nm);
-					if (c != kNoType) return resolveForCmp(c);
+			// Type-check the init against the declared type. The
+			// astgenNumberLit path already narrows integer literals to
+			// the declared int width when `expected` is an Int, so
+			// `var x: i32 = 5;` lands as ik=I32. Anything else that
+			// doesn't match is a real mismatch — including
+			// `var x: f32 = 3;` (int into float), `var x: bool = 1.0;`
+			// (float into bool), `var x: u8 = "s";` (slice into u8),
+			// etc.
+			//
+			// Both sides are resolved through generic-call / type-alias
+			// chains first so `var a: Identity(i32) = 42;` compares
+			// `i32 == i32` instead of the unresolved `GenericCall ≠ Int`.
+			// Pointer-target types are also resolved per-side so
+			// `var p: *const T = &x` (where `T` is an alias) matches.
+			std::function<TypeIdx(TypeIdx)> resolveForCmp =
+			    [&](TypeIdx t) -> TypeIdx {
+				if (t == kNoType) return t;
+				const TypeKey &k = gctx.ctx.getTypePool().get(t);
+				// Generic substitution wins (inside an instantiated
+				// method body, `T` resolves to whatever the
+				// instantiation supplied).
+				if (k.kind == TypeKind::Named) {
+					const std::string &name = gctx.ctx.getStringPool().get(
+					    static_cast<StringIdx>(k.a));
+					TypeIdx sub = gctx.ctx.lookupCurrentSubst(name);
+					if (sub != kNoType) return resolveForCmp(sub);
 				}
+				if (k.kind == TypeKind::GenericCall) {
+					TypeIdx r = gctx.ctx.resolveGenericCall(t);
+					if (r != kNoType) return resolveForCmp(r);
+				}
+				if (k.kind == TypeKind::Named) {
+					const std::string &nm = gctx.ctx.getStringPool().get(
+					    static_cast<StringIdx>(k.a));
+					TypeIdx a = gctx.ctx.lookupTypeAlias(nm);
+					if (a != kNoType) return resolveForCmp(a);
+					// 3+ segment chain through module re-exports — collapse
+					// `w.leaf.Point` to the canonical `Point` so it matches
+					// values produced by `w.leaf.makePoint(...)` whose return
+					// type was registered with the single-segment name.
+					if (nm.find('.') != std::string::npos) {
+						TypeIdx c = gctx.ctx.resolveChainedType(nm);
+						if (c != kNoType) return resolveForCmp(c);
+					}
+				}
+				return t;
+			};
+			TypeIdx initTy = gctx.jfn.getInst(initRef).ty;
+			TypeIdx declRes = resolveForCmp(type);
+			TypeIdx initRes = resolveForCmp(initTy);
+			// Pointer-shape leniency: PtrSingle(T) and PtrMany(T) share
+			// the runtime representation (a plain `ptr`), so `&arr[i]`
+			// (which lowers to PtrSingle(T)) is accepted in a PtrMany(T)
+			// slot as a zero-cost retag. The rule is permissive because
+			// we don't currently distinguish pointer-to-array from
+			// pointer-to-element at the JIR level — revisit when an
+			// Array-pointer kind lands and the source can carry its
+			// length statically.
+			auto pointerCompatible = [&](TypeIdx a, TypeIdx b) -> bool {
+				if (a == kNoType || b == kNoType) return false;
+				const TypeKey &ka = gctx.ctx.getTypePool().get(a);
+				const TypeKey &kb = gctx.ctx.getTypePool().get(b);
+				bool aPtr = ka.kind == TypeKind::PtrSingle ||
+				            ka.kind == TypeKind::PtrMany;
+				bool bPtr = kb.kind == TypeKind::PtrSingle ||
+				            kb.kind == TypeKind::PtrMany;
+				return aPtr && bPtr && ka.a == kb.a;
+			};
+			bool typesMatch =
+			    (declRes == initRes) || pointerCompatible(declRes, initRes);
+			if (initTy != kNoType && !typesMatch) {
+				const TypeKey &dk = gctx.ctx.getTypePool().get(declRes);
+				const TypeKey &ik = gctx.ctx.getTypePool().get(initRes);
+				// Specialize the message for the two patterns users hit
+				// most often; everything else gets the generic mismatch.
+				if (dk.kind == TypeKind::Float && ik.kind == TypeKind::Int) {
+					failHere(gctx, "cannot assign integer to float-typed `" +
+					                   name +
+					                   "`; use a float literal (e.g. `3.0`) "
+					                   "or an explicit `as` cast");
+				}
+				failHere(gctx,
+				         "type mismatch in `" + name +
+				             "`: declared and initialised values disagree");
 			}
-			return t;
-		};
-		TypeIdx initTy = gctx.jfn.getInst(initRef).ty;
-		TypeIdx declRes = resolveForCmp(type);
-		TypeIdx initRes = resolveForCmp(initTy);
-		// Pointer-shape leniency: PtrSingle(T) and PtrMany(T) share
-		// the runtime representation (a plain `ptr`), so `&arr[i]`
-		// (which lowers to PtrSingle(T)) is accepted in a PtrMany(T)
-		// slot as a zero-cost retag. The rule is permissive because
-		// we don't currently distinguish pointer-to-array from
-		// pointer-to-element at the JIR level — revisit when an
-		// Array-pointer kind lands and the source can carry its
-		// length statically.
-		auto pointerCompatible = [&](TypeIdx a, TypeIdx b) -> bool {
-			if (a == kNoType || b == kNoType) return false;
-			const TypeKey &ka = gctx.ctx.getTypePool().get(a);
-			const TypeKey &kb = gctx.ctx.getTypePool().get(b);
-			bool aPtr =
-			    ka.kind == TypeKind::PtrSingle || ka.kind == TypeKind::PtrMany;
-			bool bPtr =
-			    kb.kind == TypeKind::PtrSingle || kb.kind == TypeKind::PtrMany;
-			return aPtr && bPtr && ka.a == kb.a;
-		};
-		bool typesMatch =
-		    (declRes == initRes) || pointerCompatible(declRes, initRes);
-		if (initTy != kNoType && !typesMatch) {
-			const TypeKey &dk = gctx.ctx.getTypePool().get(declRes);
-			const TypeKey &ik = gctx.ctx.getTypePool().get(initRes);
-			// Specialize the message for the two patterns users hit
-			// most often; everything else gets the generic mismatch.
-			if (dk.kind == TypeKind::Float && ik.kind == TypeKind::Int) {
-				failHere(gctx, "cannot assign integer to float-typed `" + name +
-				                   "`; use a float literal (e.g. `3.0`) "
-				                   "or an explicit `as` cast");
-			}
-			failHere(gctx, "type mismatch in `" + name +
-			                   "`: declared and initialised values disagree");
-		}
+		}  // close: place-into-destination else
 	}
 
-	JirInst store{};
-	store.tag = JirTag::Store;
-	store.a = allocaRef;
-	store.b = initRef;
-	emit(gctx, store);
+	if (initRef != kNoJirRef) {
+		JirInst store{};
+		store.tag = JirTag::Store;
+		store.a = allocaRef;
+		store.b = initRef;
+		emit(gctx, store);
+	}
 
 	// If this binding's type has a registered drop fn, track it on
 	// the top of the drop-scope stack so the next scope-exit (or
@@ -1079,6 +1137,211 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 	inst.b = extra;
 	inst.ty = ty;
 	return emit(gctx, inst);
+}
+
+// Write a struct literal directly into `destPtr` (a pointer to the
+// struct slot) instead of building an SSA aggregate via an
+// InsertValue chain. For each field we emit FieldAddr → recursive
+// place into the field's slot (StructLit / sret Call) or a value
+// compile + Store fallback for everything else.
+//
+// Why this matters for build perf: when an outer `var b: Bus = Bus
+// { ..., cdrom: Cdrom.init() }` would otherwise build %Bus via 22
+// InsertValue, after O3 inlining + SROA every multi-byte field inside
+// the struct gets decomposed into per-byte InsertValue (a [2352]u8
+// field expands into 2352 of them). AArch64 ISel's DAGCombine then
+// goes quadratic on the resulting store chain. Routing through
+// per-field stores into the destination keeps those large aggregates
+// in memory rather than in SSA registers.
+static void astgenStructLitInto(AstGenCtx &gctx, const AstNode &n,
+                                TypeIdx expectedTy, JirRef destPtr) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	TypeIdx ty = static_cast<TypeIdx>(n.lhs);
+	if (ty == kNoType) ty = expectedTy;
+	if (ty == kNoType) {
+		failHere(gctx, "astgen: struct literal without target type");
+	}
+
+	// Unions and non-struct types: fall back to value-form StructLit
+	// + Store. Unions are small enough that the perf pathology doesn't
+	// trigger, and they have specialized lowering already.
+	const auto *info = gctx.ctx.lookupStruct(ty);
+	if (info == nullptr || gctx.ctx.lookupUnion(ty) != nullptr) {
+		JirRef val = astgenStructLit(gctx, n, expectedTy);
+		JirInst store{};
+		store.tag = JirTag::Store;
+		store.a = destPtr;
+		store.b = val;
+		emit(gctx, store);
+		return;
+	}
+
+	ExtraIdx fieldsExtra = static_cast<ExtraIdx>(n.rhs);
+	uint32_t fieldCount = ns.getExtra(fieldsExtra);
+
+	// Map declared-field index -> source NodeIdx of the initializer.
+	std::vector<NodeIdx> exprByIdx(info->fields.size(), 0);
+	std::vector<uint8_t> hasField(info->fields.size(), 0);
+	for (uint32_t i = 0; i < fieldCount; i++) {
+		StringIdx nameId =
+		    static_cast<StringIdx>(ns.getExtra(fieldsExtra + 1 + i * 2));
+		NodeIdx exprIdx =
+		    static_cast<NodeIdx>(ns.getExtra(fieldsExtra + 2 + i * 2));
+		const std::string &fieldName = gctx.ctx.getStringPool().get(nameId);
+		int idx = gctx.ctx.getFieldIndex(info->name, fieldName);
+		if (idx < 0) {
+			appendErrorHere(gctx, "unknown struct field `" + fieldName + "`");
+			continue;
+		}
+		exprByIdx[idx] = exprIdx;
+		hasField[idx] = 1;
+	}
+
+	for (size_t i = 0; i < info->fields.size(); i++) {
+		if (!hasField[i]) {
+			failHere(gctx, "astgen: struct literal missing field `" +
+			                   info->fields[i].first + "`");
+		}
+		TypeIdx expectedField = info->fields[i].second;
+		TypeIdx fieldPtrTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::PtrSingle, 0, 0, expectedField, 0});
+		JirInst fieldAddr{};
+		fieldAddr.tag = JirTag::FieldAddr;
+		fieldAddr.a = destPtr;
+		fieldAddr.b = static_cast<uint32_t>(i);
+		fieldAddr.ty = fieldPtrTy;
+		JirRef fieldPtr = emit(gctx, fieldAddr);
+
+		// Try the place path (recursive StructLit or sret Call with
+		// destPtr forwarded). Fall back to value-compile + Store for
+		// anything else.
+		if (!astgenExprIntoPtr(gctx, exprByIdx[i], expectedField, fieldPtr)) {
+			JirRef val = astgenExpr(gctx, exprByIdx[i], expectedField);
+			// Silent int->float widening — mirrors astgenStructLit.
+			TypeIdx vt = gctx.jfn.getInst(val).ty;
+			if (vt != expectedField && vt != kNoType) {
+				const TypeKey &fk = gctx.ctx.getTypePool().get(expectedField);
+				const TypeKey &vk = gctx.ctx.getTypePool().get(vt);
+				if (fk.kind == TypeKind::Float && vk.kind == TypeKind::Int) {
+					JirInst c{};
+					c.tag = vk.b != 0 ? JirTag::SIToFP : JirTag::UIToFP;
+					c.a = val;
+					c.ty = expectedField;
+					val = emit(gctx, c);
+				}
+			}
+			JirInst store{};
+			store.tag = JirTag::Store;
+			store.a = fieldPtr;
+			store.b = val;
+			emit(gctx, store);
+		}
+	}
+}
+
+// Try to lower an expression directly into `destPtr`. Returns true on
+// success — when the destination has been written and no SSA value
+// remains for the caller to bind. Returns false to let the caller
+// take the standard astgenExpr + Store path.
+//
+// Recognises:
+//   - StructLit              -> per-field FieldAddr + Store into destPtr
+//   - ArrayLit / ArrayRepeat -> per-element IndexAddr + Store into destPtr
+//   - Call / TypeMethodCall  -> forward destPtr as the sret slot so
+//                                the callee writes its result through
+//                                the caller's storage (no temp alloca)
+//
+// Everything else (scalars, ptr-typed values, small aggregates that
+// the ABI passes by value) returns false. The pathology this helper
+// dodges only kicks in for large-aggregate stores anyway.
+static bool astgenExprIntoPtr(AstGenCtx &gctx, NodeIdx exprIdx,
+                              TypeIdx expectedTy, JirRef destPtr) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	const AstNode &n = ns.get(exprIdx);
+	switch (n.tag) {
+	case AstTag::StructLit: {
+		astgenStructLitInto(gctx, n, expectedTy, destPtr);
+		return true;
+	}
+	case AstTag::ArrayLit: {
+		// Per-element write into destPtr. Element type comes from
+		// the surrounding context or from compiling the first elem.
+		TypeIdx elemTy = static_cast<TypeIdx>(n.lhs);
+		if (elemTy == kNoType && expectedTy != kNoType) {
+			const TypeKey &ek = gctx.ctx.getTypePool().get(expectedTy);
+			if (ek.kind == TypeKind::Array) {
+				elemTy = static_cast<TypeIdx>(ek.a);
+			}
+		}
+		if (elemTy == kNoType) return false;
+		ExtraIdx elemsExtra = static_cast<ExtraIdx>(n.rhs);
+		uint32_t count = ns.getExtra(elemsExtra);
+		TypeIdx u64Ty = BuiltinType::U64;
+		TypeIdx elemPtrTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::PtrSingle, 0, 0, elemTy, 0});
+		for (uint32_t i = 0; i < count; i++) {
+			NodeIdx eIdx =
+			    static_cast<NodeIdx>(ns.getExtra(elemsExtra + 1 + i));
+			JirInst idxInst{};
+			idxInst.tag = JirTag::Int;
+			idxInst.a = i;
+			idxInst.ty = u64Ty;
+			JirRef idxRef = emit(gctx, idxInst);
+			JirInst ia{};
+			ia.tag = JirTag::IndexAddr;
+			ia.a = destPtr;
+			ia.b = idxRef;
+			ia.ty = elemPtrTy;
+			JirRef ep = emit(gctx, ia);
+			if (!astgenExprIntoPtr(gctx, eIdx, elemTy, ep)) {
+				JirRef ev = astgenExpr(gctx, eIdx, elemTy);
+				JirInst st{};
+				st.tag = JirTag::Store;
+				st.a = ep;
+				st.b = ev;
+				emit(gctx, st);
+			}
+		}
+		return true;
+	}
+	// ArrayRepeat (`[expr; N]`) deliberately falls through to the
+	// astgenExpr + Store path. Unrolling N stores at astgen time
+	// bloats JIR (`[0; 2352]` becomes 2352 IndexAddr+Store JIR
+	// instructions); JirTag::ArrayLit's byref codegen already emits
+	// the same per-element stores at LLVM-IR time but keeps the JIR
+	// itself compact. The trailing memcpy that the value-path leaves
+	// behind is one extra instruction LLVM cleans up — much cheaper
+	// than inflating astgen's per-fn IR-build cost.
+	case AstTag::Call: {
+		JirRef r = astgenCall(gctx, n, destPtr);
+		// kNoJirRef -> emitCall used destPtr as the sret slot and the
+		// result has been written in-place. A real ref -> the call
+		// had a Direct (ByValue) return, so we finish the place by
+		// storing the produced SSA value. Either way the field has
+		// been written; signal handled.
+		if (r != kNoJirRef) {
+			JirInst store{};
+			store.tag = JirTag::Store;
+			store.a = destPtr;
+			store.b = r;
+			emit(gctx, store);
+		}
+		return true;
+	}
+	case AstTag::TypeMethodCall: {
+		JirRef r = astgenTypeMethodCall(gctx, n, destPtr);
+		if (r != kNoJirRef) {
+			JirInst store{};
+			store.tag = JirTag::Store;
+			store.a = destPtr;
+			store.b = r;
+			emit(gctx, store);
+		}
+		return true;
+	}
+	default:
+		return false;
+	}
 }
 
 // AstGen for `MemberAccess`. Two cases:
@@ -3031,7 +3294,8 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 // into astgenCall. Instantiation runs the full astgen -> jirDefineBody
 // pipeline in `JamCodegenContext::instantiateStructExpr`, so the JIR
 // Call here resolves cleanly by LLVM name at codegen time.
-static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n) {
+static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n,
+                                   JirRef destPtr) {
 	const NodeStore &nsConst = gctx.ctx.getNodeStore();
 	NodeStore &ns = const_cast<NodeStore &>(nsConst);
 	TypeIdx recvTy = static_cast<TypeIdx>(n.lhs);
@@ -3173,7 +3437,7 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n) {
 		TypeIdx expectArg = (i < fn->Args.size()) ? fn->Args[i].Type : kNoType;
 		argRefs.push_back(astgenExpr(gctx, argIdx, expectArg));
 	}
-	return emitCall(gctx, fn, argRefs);
+	return emitCall(gctx, fn, argRefs, destPtr);
 }
 
 // AstGen for `AtCall` — comptime intrinsic (`@sizeOf(T)` / `@alignOf(T)`).
@@ -3402,24 +3666,54 @@ static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 	// let/move-by-ptr through the lvalue path saves the otherwise-
 	// dead value-load + spill at every call site.
 	const AstNode &argNode = gctx.ctx.getNodeStore().get(argIdx);
+	const NodeStore &ns = gctx.ctx.getNodeStore();
 	TypeIdx leafTy = kNoType;
+	// `Color.Red` and friends look syntactically like a MemberAccess
+	// but are enum-variant constructors that astgenLvalue can't
+	// resolve — its `Color` lookup falls through every lvalue path.
+	// Detect the shape upfront and route through the value+spill
+	// fallback below. Same for any MemberAccess on a base Variable
+	// whose name resolves to an enum/struct/module, not a local.
+	auto memberAccessOnNonLvalue = [&](const AstNode &n) -> bool {
+		if (n.tag != AstTag::MemberAccess) return false;
+		NodeIdx baseIdx = static_cast<NodeIdx>(n.lhs);
+		const AstNode &baseNode = ns.get(baseIdx);
+		if (baseNode.tag != AstTag::Variable) return false;
+		const std::string &name =
+		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(baseNode.lhs));
+		if (gctx.locals.find(name) != gctx.locals.end()) return false;
+		// Not a local — likely an enum / module / type name.
+		// Treat as non-lvalueable so the spill path takes over.
+		return gctx.ctx.getEnum(name) != nullptr ||
+		       gctx.ctx.getStruct(name) != nullptr ||
+		       gctx.ctx.getImportHandle(name) != nullptr;
+	};
 	switch (argNode.tag) {
 	case AstTag::Variable:
-	case AstTag::MemberAccess:
 	case AstTag::Index:
 	case AstTag::Deref:
 		return astgenLvalue(gctx, argIdx, leafTy);
+	case AstTag::MemberAccess:
+		if (!memberAccessOnNonLvalue(argNode)) {
+			return astgenLvalue(gctx, argIdx, leafTy);
+		}
+		break;  // fall through to spill path
 	case AstTag::AddressOf:
 		return astgenExpr(gctx, argIdx, kNoType);
 	default:
 		break;
 	}
-	JirRef val = astgenExpr(gctx, argIdx, p.Type);
-	leafTy = gctx.jfn.getInst(val).ty;
+	// Spill: hold an rvalue in a fresh stack slot so the callee can
+	// receive a pointer. Try the place path first — byref producers
+	// (StructLit / ArrayLit / sret Call) write directly into the
+	// alloca, skipping the temp + memcpy two-hop. Fall back to value
+	// compile + Store for byval rvalues.
 	JirInst alloca{};
 	alloca.tag = JirTag::Alloca;
-	alloca.ty = leafTy;
+	alloca.ty = p.Type;
 	JirRef ptr = emitAllocaHoisted(gctx, alloca);
+	if (astgenExprIntoPtr(gctx, argIdx, p.Type, ptr)) { return ptr; }
+	JirRef val = astgenExpr(gctx, argIdx, p.Type);
 	JirInst store{};
 	store.tag = JirTag::Store;
 	store.a = ptr;
@@ -3429,14 +3723,40 @@ static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 }
 
 static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
-                       const std::vector<JirRef> &argRefs) {
+                       const std::vector<JirRef> &argRefs, JirRef destPtr) {
 	std::string mangled = mangledFunctionName(*fn, gctx.ctx.getTypePool(),
 	                                          gctx.ctx.getStringPool());
 	StringIdx calleeId = gctx.ctx.getStringPool().intern(mangled);
+	// Unified Call shape: sret-returning callees get their result slot
+	// as a leading arg, the same way LLVM expects it. astgen owns the
+	// slot — either the caller's destPtr (when known) or a fresh
+	// alloca — so jir_codegen no longer allocates anything at call
+	// time. The Call's JirRef value is the slot pointer when sret;
+	// downstream `isByRef`-aware code paths treat it as the byref
+	// result. When destPtr was supplied, the JirRef is kNoJirRef so
+	// the caller can detect that the result was placed in-line.
+	bool sretCallee = fn->ReturnType != kNoType &&
+	                  jam::abi::classifyReturn(fn->ReturnType, gctx.ctx).kind ==
+	                      jam::abi::ReturnABI::Kind::Indirect;
+	JirRef sretSlot = kNoJirRef;
+	std::vector<JirRef> allArgs;
+	allArgs.reserve(argRefs.size() + (sretCallee ? 1u : 0u));
+	if (sretCallee) {
+		if (destPtr != kNoJirRef) {
+			sretSlot = destPtr;
+		} else {
+			JirInst a{};
+			a.tag = JirTag::Alloca;
+			a.ty = fn->ReturnType;
+			sretSlot = emitAllocaHoisted(gctx, a);
+		}
+		allArgs.push_back(sretSlot);
+	}
+	for (JirRef r : argRefs) allArgs.push_back(r);
 	std::vector<uint32_t> packed;
-	packed.reserve(1 + argRefs.size());
-	packed.push_back(static_cast<uint32_t>(argRefs.size()));
-	for (JirRef r : argRefs) packed.push_back(r);
+	packed.reserve(1 + allArgs.size());
+	packed.push_back(static_cast<uint32_t>(allArgs.size()));
+	for (JirRef r : allArgs) packed.push_back(r);
 	JirExtraIdx extra = gctx.jfn.pushExtra(packed.data(), packed.size());
 	JirInst call{};
 	call.tag = JirTag::Call;
@@ -3447,11 +3767,19 @@ static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
 	// Calling a `noreturn` function diverges. Terminate the current
 	// block with Unreachable so downstream code is dead and the JIR
 	// is well-formed (every reachable block ends in a terminator).
-	// Mirrors what the legacy codegen did via LLVM's `unreachable`.
 	if (fn->ReturnType == BuiltinType::NoReturn) {
 		JirInst u{};
 		u.tag = JirTag::Unreachable;
 		emit(gctx, u);
+	}
+	if (sretCallee) {
+		// Place-call: the value was written through destPtr, so the
+		// caller shouldn't bind any JirRef.
+		if (destPtr != kNoJirRef) { return kNoJirRef; }
+		// Otherwise the slot ptr we just allocated *is* the call
+		// result — codegen returns it from the Call JirRef so byref
+		// consumers see a pointer to the freshly-written aggregate.
+		return callRef;
 	}
 	return callRef;
 }
@@ -4047,7 +4375,7 @@ static JirRef astgenCompInstantiatedCall(AstGenCtx &gctx, const AstNode &n,
 	return emitCall(gctx, clone, argRefs);
 }
 
-static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
+static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 	const NodeStore &ns = gctx.ctx.getNodeStore();
 	ExtraIdx argsExtra = static_cast<ExtraIdx>(n.rhs);
 	uint32_t argCount = ns.getExtra(argsExtra);
@@ -4185,14 +4513,23 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 		}
 		ParamMode mode =
 		    method->Args.empty() ? ParamMode::Let : method->Args[0].Mode;
+		// Dispatch on the full ABI, not just ParamMode: a `let
+		// self: Self` where Self is byref now arrives ByPointer too,
+		// so the receiver needs to land as a pointer rather than the
+		// loaded aggregate value.
+		jam::abi::ParamABI recvAbi =
+		    jam::abi::classifyParam(mode, recvTy, gctx.ctx);
 		JirRef recvArg;
-		if (mode == ParamMode::Mut || mode == ParamMode::Move) {
+		if (recvAbi.kind == jam::abi::ParamABI::Kind::ByPointer) {
 			if (recvLvaluePtr != kNoJirRef) {
 				recvArg = recvLvaluePtr;
 			} else {
-				// Non-lvalue receiver with a mut/move method: spill the
-				// already-computed value to a fresh alloca so the
-				// callee gets a stable storage address.
+				// Non-lvalue receiver with a by-pointer method: spill
+				// the already-computed value to a fresh alloca so the
+				// callee gets a stable storage address. For byref-
+				// typed rvalues `recvVal` is itself a pointer (from
+				// the new StructLit / Call codegen), so the spill is
+				// a memcpy via the Store JIR tag.
 				JirInst alloca{};
 				alloca.tag = JirTag::Alloca;
 				alloca.ty = recvTy;
@@ -4208,10 +4545,6 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 			if (recvVal != kNoJirRef) {
 				recvArg = recvVal;
 			} else {
-				// Lvalue receiver + by-value method: Load through the
-				// ptr now. This is the only spot where a full-aggregate
-				// load is unavoidable; the previous design emitted it
-				// unconditionally even when the method took a pointer.
 				JirInst load{};
 				load.tag = JirTag::Load;
 				load.a = recvLvaluePtr;
@@ -4230,7 +4563,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 			                        : kNoType;
 			argRefs.push_back(astgenExpr(gctx, argIdx, expectArg));
 		}
-		return emitCall(gctx, method, argRefs);
+		return emitCall(gctx, method, argRefs, destPtr);
 	}
 
 	StringIdx calleeId = static_cast<StringIdx>(n.lhs);
@@ -4259,7 +4592,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 					argRefs.push_back(astgenExpr(gctx, argIdx, kNoType));
 				}
 			}
-			return emitCall(gctx, method, argRefs);
+			return emitCall(gctx, method, argRefs, destPtr);
 		}
 	}
 
@@ -4426,7 +4759,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 					}
 					// `emitCall` mangles drop and test names — no need
 					// to special-case here.
-					return emitCall(gctx, method, argRefs);
+					return emitCall(gctx, method, argRefs, destPtr);
 				}
 				// Prefix resolved to a real struct / enum but the
 				// method doesn't exist. The common trigger is a
@@ -4482,11 +4815,16 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 					const FunctionAST *method =
 					    gctx.ctx.getFunctionAST(qualified);
 					if (method != nullptr && !method->Args.empty()) {
-						// Build the receiver as either &inst (mut/move)
-						// or a Load of inst (let/const).
+						// Dispatch on the full ABI — a `let self:
+						// Self` where Self is byref arrives ByPointer,
+						// so the receiver must land as a pointer to
+						// the local's storage, not a loaded value.
 						ParamMode mode = method->Args[0].Mode;
+						jam::abi::ParamABI recvAbi =
+						    jam::abi::classifyParam(mode, instTy, gctx.ctx);
 						JirRef recvRef;
-						if (mode == ParamMode::Mut || mode == ParamMode::Move) {
+						if (recvAbi.kind ==
+						    jam::abi::ParamABI::Kind::ByPointer) {
 							TypeIdx pointee = instTy;
 							TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
 							    TypeKey{TypeKind::PtrSingle, 0, 0, pointee, 0});
@@ -4514,7 +4852,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 							argRefs.push_back(
 							    astgenExpr(gctx, argIdx, expectArg));
 						}
-						return emitCall(gctx, method, argRefs);
+						return emitCall(gctx, method, argRefs, destPtr);
 					}
 				}
 			}
@@ -4661,7 +4999,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n) {
 		}
 	}
 	(void)calleeId;
-	return emitCall(gctx, fn, argRefs);
+	return emitCall(gctx, fn, argRefs, destPtr);
 }
 
 static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
@@ -4996,8 +5334,8 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 	//     the alloca as the local so reads emit Load(alloca) like any
 	//     ordinary local.
 	//   - ByPointer: param arrives as a pointer to caller-owned
-	//     storage (mut / move always; let / const for aggregates >
-	//     kByValueMaxBytes). Register the param JirRef directly as
+	//     storage (mut / move always; let / const for any byref
+	//     aggregate). Register the param JirRef directly as
 	//     the local's "alloca" so reads, writes, and field access all
 	//     operate on that pointer. JIR flag bit 0 on Param tells
 	//     jir_codegen + FieldAddr/IndexAddr to treat the value as a

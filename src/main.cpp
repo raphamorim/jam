@@ -1138,6 +1138,21 @@ static std::vector<std::string> collectJamFiles(const std::string &dir) {
 	return files;
 }
 
+// JAM_VERSION_BASE pins the semver-ish prefix; the suffix is the git
+// short SHA the binary was built from, baked in by the Makefile via
+// `-D JAM_VERSION_SHA="..."`. Falls back to "unknown" when the build
+// system doesn't supply one (out-of-tree, no .git, etc.).
+#ifndef JAM_VERSION_BASE
+#define JAM_VERSION_BASE "0.0.1"
+#endif
+#ifndef JAM_VERSION_SHA
+#define JAM_VERSION_SHA "unknown"
+#endif
+
+static void printVersion() {
+	std::cout << JAM_VERSION_BASE "-" JAM_VERSION_SHA "\n";
+}
+
 static void printHelp(const char *prog) {
 	std::cout
 	    << "Usage: " << prog
@@ -1190,6 +1205,7 @@ static void printHelp(const char *prog) {
 	       "  -l<name>, --library <name>\n"
 	       "                  Link against system library <name>\n"
 	       "  -h, --help      Show this help and exit\n"
+	       "  -V, --version   Print version and exit\n"
 	       "\n"
 	       "Examples:\n"
 	       "  "
@@ -1382,6 +1398,10 @@ int main(int argc, char *argv[]) {
 		// Compile-only / test-mode flags.
 		if (arg == "--help" || arg == "-h") {
 			printHelp(argv[0]);
+			return 0;
+		}
+		if (arg == "--version" || arg == "-V") {
+			printVersion();
 			return 0;
 		}
 		if (arg == "--target-info") {

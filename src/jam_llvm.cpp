@@ -775,6 +775,21 @@ JamValueRef JamLLVMBuildUnreachable(JamBuilderRef builder) {
 	return WRAP_VALUE(UNWRAP_BUILDER(builder)->CreateUnreachable());
 }
 
+// Emit `@llvm.memcpy.p0.p0.i64(dst, src, size, isVolatile=false)`.
+// Used by jir_codegen's Ret handler to convert load-aggregate +
+// store-aggregate into a single memcpy when the return value comes
+// from a known stack slot. The load+store form would force SROA to
+// decompose every multi-byte field into per-byte insertvalues into
+// an SSA aggregate — the exact pattern that makes AArch64 DAGCombine
+// go quadratic on large sret returns.
+JAM_EXTERN_C void JamLLVMBuildMemCpy(JamBuilderRef builder, JamValueRef dst,
+                                     uint64_t dstAlign, JamValueRef src,
+                                     uint64_t srcAlign, uint64_t size) {
+	UNWRAP_BUILDER(builder)->CreateMemCpy(
+	    UNWRAP_VALUE(dst), llvm::MaybeAlign(dstAlign), UNWRAP_VALUE(src),
+	    llvm::MaybeAlign(srcAlign), size);
+}
+
 JamValueRef JamLLVMBuildCall(JamBuilderRef builder, JamFunctionRef func,
                              JamValueRef *args, unsigned numArgs,
                              const char *name) {

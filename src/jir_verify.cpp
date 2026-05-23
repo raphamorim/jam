@@ -155,6 +155,8 @@ const char *tagName(JirTag t) {
 		return "CallIndirect";
 	case JirTag::Param:
 		return "Param";
+	case JirTag::SretArg:
+		return "SretArg";
 	case JirTag::StructLit:
 		return "StructLit";
 	case JirTag::FieldAccess:
@@ -330,6 +332,7 @@ struct Verifier {
 		case JirTag::Bool:
 		case JirTag::Str:
 		case JirTag::Param:
+		case JirTag::SretArg:
 		case JirTag::Unreachable:
 			return;
 		case JirTag::Alloca:

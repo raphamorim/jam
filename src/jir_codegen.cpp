@@ -138,9 +138,9 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 	}
 	case JirTag::Param: {
 		// flags & 1 means the param is ByPointer (mut / move always;
-		// let / const for aggregates > kByValueMaxBytes). We hand back
-		// the LLVM pointer directly so the local map can use it as
-		// the alloca-equivalent for field access / self-style reads.
+		// let / const for any byref aggregate). We hand back the LLVM
+		// pointer directly so the local map can use it as the alloca-
+		// equivalent for field access / self-style reads.
 		// When the function uses sret, the source-level param at JIR
 		// index `i` lives at LLVM index `i + 1` (the sret slot owns
 		// LLVM index 0).
@@ -157,12 +157,33 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 	}
 	case JirTag::Load: {
 		JamValueRef ptr = emitInst(lctx, inst.a);
+		// Byref aggregates live in memory at the JIR layer — the
+		// "value" of a byref JirRef is the storage pointer itself.
+		// Skip the `load %T, ptr` here so we don't materialize the
+		// aggregate in SSA (the path that drove DAGCombine quadratic
+		// on large structs). Downstream Store / Ret / arg-passing
+		// recognises a byref-typed JirRef as a pointer and emits
+		// memcpy / pointer-forward.
+		if (jam::abi::isByRef(inst.ty, lctx.ctx)) { return ptr; }
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
 		return JamLLVMBuildLoad(lctx.ctx.getBuilder(), ty, ptr, "load");
 	}
 	case JirTag::Store: {
 		JamValueRef ptr = emitInst(lctx, inst.a);
 		JamValueRef val = emitInst(lctx, inst.b);
+		// Byref store: `val` is a pointer to a byref aggregate in
+		// memory. Copy bytes into `ptr` instead of `store %T %v` —
+		// the latter forces SROA to decompose the aggregate value
+		// later and recreates the insertvalue chain we're trying to
+		// avoid.
+		TypeIdx valTy = lctx.jfn.getInst(inst.b).ty;
+		if (jam::abi::isByRef(valTy, lctx.ctx)) {
+			uint64_t size = lctx.ctx.typeSize(valTy);
+			uint64_t align = lctx.ctx.typeAlign(valTy);
+			JamLLVMBuildMemCpy(lctx.ctx.getBuilder(), ptr, align, val, align,
+			                   size);
+			return nullptr;
+		}
 		JamLLVMBuildStore(lctx.ctx.getBuilder(), val, ptr);
 		return nullptr;
 	}
@@ -407,6 +428,39 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
 		JirExtraIdx extra = static_cast<JirExtraIdx>(inst.b);
 		uint32_t count = lctx.jfn.getExtra(extra);
+		// Byref aggregate (struct / union):
+		// materialize in memory via an alloca and per-field stores.
+		// The JirRef *value* of the literal is the alloca pointer,
+		// not an SSA aggregate — downstream Load/Store/FieldAccess
+		// dispatch on `isByRef` and handle the pointer form.
+		//
+		// Allocas are hoisted to the entry block so mem2reg/SROA can
+		// promote them back to scalars when the bytes don't escape.
+		if (jam::abi::isByRef(inst.ty, lctx.ctx)) {
+			// `JamLLVMBuildAlloca` already hoists to the entry
+			// block (positioned at `entry.begin()`). No save/
+			// restore dance needed here.
+			uint64_t align = lctx.ctx.typeAlign(inst.ty);
+			JamValueRef slot =
+			    JamLLVMBuildAlloca(lctx.ctx.getBuilder(), ty, align, "lit");
+			for (uint32_t i = 0; i < count; i++) {
+				JirRef fr =
+				    static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
+				JamValueRef fv = emitInst(lctx, fr);
+				JamValueRef fp = JamLLVMBuildStructGEP(lctx.ctx.getBuilder(),
+				                                       ty, slot, i, "lit.f");
+				TypeIdx ft = lctx.jfn.getInst(fr).ty;
+				if (jam::abi::isByRef(ft, lctx.ctx)) {
+					uint64_t fsz = lctx.ctx.typeSize(ft);
+					uint64_t fal = lctx.ctx.typeAlign(ft);
+					JamLLVMBuildMemCpy(lctx.ctx.getBuilder(), fp, fal, fv, fal,
+					                   fsz);
+				} else {
+					JamLLVMBuildStore(lctx.ctx.getBuilder(), fv, fp);
+				}
+			}
+			return slot;
+		}
 		JamValueRef agg = JamLLVMGetUndef(ty);
 		for (uint32_t i = 0; i < count; i++) {
 			JirRef fr = static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
@@ -419,6 +473,21 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 	case JirTag::FieldAccess:
 	case JirTag::ExtractValue: {
 		JamValueRef base = emitInst(lctx, inst.a);
+		// Byref base: `base` is a pointer to the aggregate in memory.
+		// GEP to the field; then return the field's pointer (when
+		// the field type is itself byref) or load the field value
+		// (when the field is byval / scalar). Slices etc. that aren't
+		// byref still go through the old extractvalue path.
+		TypeIdx baseTy = lctx.jfn.getInst(inst.a).ty;
+		if (jam::abi::isByRef(baseTy, lctx.ctx)) {
+			JamTypeRef structTy = lctx.ctx.getLLVMType(baseTy);
+			JamValueRef fp = JamLLVMBuildStructGEP(
+			    lctx.ctx.getBuilder(), structTy, base, inst.b, "fa");
+			if (jam::abi::isByRef(inst.ty, lctx.ctx)) { return fp; }
+			JamTypeRef fieldTy = lctx.ctx.getLLVMType(inst.ty);
+			return JamLLVMBuildLoad(lctx.ctx.getBuilder(), fieldTy, fp,
+			                        "field");
+		}
 		return JamLLVMBuildExtractValue(lctx.ctx.getBuilder(), base, inst.b,
 		                                "field");
 	}
@@ -426,6 +495,34 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamTypeRef ty = lctx.ctx.getLLVMType(inst.ty);
 		JirExtraIdx extra = static_cast<JirExtraIdx>(inst.b);
 		uint32_t count = lctx.jfn.getExtra(extra);
+		// Byref array: build in an entry-block alloca, store each
+		// element through an indexed GEP, return the storage pointer.
+		// Same shape as StructLit's byref path.
+		if (jam::abi::isByRef(inst.ty, lctx.ctx)) {
+			// JamLLVMBuildAlloca auto-hoists to entry.begin().
+			uint64_t align = lctx.ctx.typeAlign(inst.ty);
+			JamValueRef slot =
+			    JamLLVMBuildAlloca(lctx.ctx.getBuilder(), ty, align, "alit");
+			JamTypeRef i64Ty = lctx.ctx.getInt64Type();
+			for (uint32_t i = 0; i < count; i++) {
+				JirRef er =
+				    static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
+				JamValueRef ev = emitInst(lctx, er);
+				JamValueRef idxVal = JamLLVMConstInt(i64Ty, i, false);
+				JamValueRef ep = JamLLVMBuildArrayGEP(lctx.ctx.getBuilder(), ty,
+				                                      slot, idxVal, "alit.e");
+				TypeIdx et = lctx.jfn.getInst(er).ty;
+				if (jam::abi::isByRef(et, lctx.ctx)) {
+					uint64_t esz = lctx.ctx.typeSize(et);
+					uint64_t eal = lctx.ctx.typeAlign(et);
+					JamLLVMBuildMemCpy(lctx.ctx.getBuilder(), ep, eal, ev, eal,
+					                   esz);
+				} else {
+					JamLLVMBuildStore(lctx.ctx.getBuilder(), ev, ep);
+				}
+			}
+			return slot;
+		}
 		JamValueRef agg = JamLLVMGetUndef(ty);
 		for (uint32_t i = 0; i < count; i++) {
 			JirRef er = static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
@@ -600,6 +697,12 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// `__test_`; methods get dotted FQNs like `T.drop` or
 		// `m.T.drop`; instantiated cloned methods keep their
 		// `Vec__i32.push` form). Codegen does a single lookup.
+		//
+		// Extra layout `[argCount, arg0, arg1, ...]` is uniform: for
+		// sret-returning callees, astgen prepends the result slot as
+		// `arg0`. No alloca emission lives in jir_codegen anymore —
+		// the slot may be a caller-owned destination (zero-copy place
+		// path) or a fresh alloca emitted at astgen time.
 		StringIdx calleeId = static_cast<StringIdx>(inst.a);
 		const std::string &symbol = lctx.ctx.getStringPool().get(calleeId);
 		JamFunctionRef f =
@@ -612,32 +715,19 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		uint32_t argCount = lctx.jfn.getExtra(extra);
 		bool calleeUsesSret = JamLLVMFunctionUsesSret(f);
 		std::vector<JamValueRef> args;
-		args.reserve(argCount + (calleeUsesSret ? 1u : 0u));
-		JamValueRef sretSlot = nullptr;
-		if (calleeUsesSret) {
-			// Allocate caller-owned storage for the result, prepend
-			// its pointer as the hidden first argument. The slot type
-			// comes from the callee's sret attribute, which carries
-			// the pointee type. Result is loaded back after the call.
-			JamTypeRef pointee = JamLLVMFunctionSretPointeeType(f);
-			uint64_t align = lctx.ctx.typeAlign(inst.ty);
-			sretSlot = JamLLVMBuildAlloca(lctx.ctx.getBuilder(), pointee, align,
-			                              "sret.slot");
-			args.push_back(sretSlot);
-		}
+		args.reserve(argCount);
 		for (uint32_t i = 0; i < argCount; i++) {
 			JirRef ar = static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
 			args.push_back(emitInst(lctx, ar));
 		}
 		if (calleeUsesSret) {
-			// The LLVM call itself returns void; the value lives in
-			// the sret slot. Load it so the JirRef -> LLVM value map
-			// holds the materialized return value.
+			// The LLVM call returns void; the result already lives in
+			// args[0] (the sret slot). The Call's JirRef value is
+			// that slot pointer so byref consumers see a pointer to
+			// the freshly-written aggregate.
 			JamLLVMBuildCall(lctx.ctx.getBuilder(), f, args.data(),
 			                 static_cast<unsigned>(args.size()), "");
-			JamTypeRef retLlvmTy = lctx.ctx.getLLVMType(inst.ty);
-			return JamLLVMBuildLoad(lctx.ctx.getBuilder(), retLlvmTy, sretSlot,
-			                        "sret.val");
+			return args[0];
 		}
 		const char *resultName = (inst.ty == kNoType) ? "" : "call";
 		return JamLLVMBuildCall(lctx.ctx.getBuilder(), f, args.data(),
@@ -761,17 +851,38 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		}
 		return nullptr;
 	}
+	case JirTag::SretArg: {
+		// Resolve to the function's hidden sret pointer (param 0
+		// when the return is Indirect). astgen emits this when it
+		// needs to plumb the return slot into a result_ptr.
+		JamFunctionRef f =
+		    JamLLVMGetFunction(lctx.ctx.getModule(), lctx.jfn.name.c_str());
+		return JamLLVMGetParam(f, 0);
+	}
 	case JirTag::Ret: {
-		// sret return: store the value through the leading hidden
-		// `ptr sret(%T)` arg and emit `ret void`. The caller already
-		// owns the slot, so we don't allocate anything here.
+		// sret return: copy the result into the leading hidden
+		// `ptr sret(%T)` slot and emit `ret void`. Under the
+		// byref model, the return value's JirRef is a
+		// pointer to the aggregate's storage — emit a single memcpy
+		// rather than a `store %T %v` which SROA would later
+		// decompose into per-field insertvalue work (the AArch64
+		// DAGCombine quadratic-blowup path).
 		if (jirReturnIsSret(lctx.jfn, lctx.ctx)) {
 			JamFunctionRef f =
 			    JamLLVMGetFunction(lctx.ctx.getModule(), lctx.jfn.name.c_str());
 			JamValueRef sretSlot = JamLLVMGetParam(f, 0);
 			if (inst.a != kNoJirRef) {
-				JamValueRef v = emitInst(lctx, inst.a);
-				JamLLVMBuildStore(lctx.ctx.getBuilder(), v, sretSlot);
+				TypeIdx vty = lctx.jfn.getInst(inst.a).ty;
+				if (jam::abi::isByRef(vty, lctx.ctx)) {
+					JamValueRef src = emitInst(lctx, inst.a);
+					uint64_t size = lctx.ctx.typeSize(vty);
+					uint64_t align = lctx.ctx.typeAlign(vty);
+					JamLLVMBuildMemCpy(lctx.ctx.getBuilder(), sretSlot, align,
+					                   src, align, size);
+				} else {
+					JamValueRef v = emitInst(lctx, inst.a);
+					JamLLVMBuildStore(lctx.ctx.getBuilder(), v, sretSlot);
+				}
 			}
 			JamLLVMBuildRetVoid(lctx.ctx.getBuilder());
 			return nullptr;

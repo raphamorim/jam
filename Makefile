@@ -4,6 +4,21 @@
 LLVM_CONFIG=$(shell which llvm-config 2>/dev/null || echo "llvm-config")
 OPTFLAGS ?= -O2 -DNDEBUG
 
+# Short SHA of the build commit, baked into the binary so `jam --version`
+# can report exactly which tree it was built from. Falls back to
+# `unknown` outside a git checkout. Appends `-dirty` when the worktree
+# has uncommitted changes — keeps "this isn't quite the tagged build"
+# obvious in bug reports.
+JAM_VERSION_SHA := $(shell \
+  if git rev-parse --short HEAD >/dev/null 2>&1; then \
+    sha=$$(git rev-parse --short HEAD); \
+    if ! git diff --quiet HEAD 2>/dev/null; then sha="$$sha-dirty"; fi; \
+    echo "$$sha"; \
+  else \
+    echo "unknown"; \
+  fi)
+VERSION_FLAGS := -DJAM_VERSION_SHA=\"$(JAM_VERSION_SHA)\"
+
 CLANG_FORMAT ?= clang-format
 CLANG_FORMAT_STYLE := file:clang-format
 FORMAT_SOURCES := $(wildcard src/*.cpp src/*.h) $(wildcard tests/cpp/*.cpp tests/cpp/*.h)
@@ -41,7 +56,9 @@ build:
 	@mkdir -p $(OUT)
 	@for name in $(SRC_NAMES); do \
 		echo "  CC:  src/$$name.cpp -> $(OUT)/$$name.o"; \
-		clang++ -c ./src/$$name.cpp -o $(OUT)/$$name.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS) || exit $$?; \
+		extra=""; \
+		if [ "$$name" = "main" ]; then extra="$(VERSION_FLAGS)"; fi; \
+		clang++ -c ./src/$$name.cpp -o $(OUT)/$$name.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS) $$extra || exit $$?; \
 	done
 	@echo "  LD: $(OUT)/jam.out"
 	@clang++ -o $(OUT)/jam.out $(OBJS) `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
