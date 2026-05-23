@@ -31,8 +31,7 @@ CompileResult compileSource(const std::string &name,
 	// Explicit `-o` avoids the default output name (`./output`)
 	// colliding with the build tree's `output/` directory.
 	std::string outBin = "/tmp/" + name + ".bin";
-	std::string cmd =
-	    "./output/jam.out -o " + outBin + " " + path + " 2>&1";
+	std::string cmd = "./output/jam.out -o " + outBin + " " + path + " 2>&1";
 
 	std::string output;
 	FILE *pipe = popen(cmd.c_str(), "r");
