@@ -30,6 +30,10 @@ SRC_NAMES := jam_llvm main lexer parser codegen target cabi \
              init_analysis drop_registry abi diagnostics decl \
              analyzer comptime astgen jir_codegen jir_verify
 OBJS := $(addprefix $(OUT)/, $(addsuffix .o, $(SRC_NAMES)))
+# Compiler objects sans `main.o` — C++ tests in tests/cpp ship their own
+# `main()`; linking them against the full OBJS list pulls in jam's CLI
+# entry point and triggers a duplicate-symbol error.
+LIB_OBJS := $(filter-out $(OUT)/main.o,$(OBJS))
 
 # Check if we're on macOS or Linux
 UNAME_S := $(shell uname -s)
@@ -145,10 +149,10 @@ define CXX_TEST_TARGET
 endef
 
 test-init: build
-	$(call CXX_TEST_TARGET,init_analysis,$(OBJS))
+	$(call CXX_TEST_TARGET,init_analysis,$(LIB_OBJS))
 
 test-abi: build
-	$(call CXX_TEST_TARGET,abi,$(OBJS))
+	$(call CXX_TEST_TARGET,abi,$(LIB_OBJS))
 
 test-codegen-errors: build
 	@echo ""
@@ -179,7 +183,7 @@ test-decl: build
 	@$(OUT)/decl_tests
 
 test-analyzer: build
-	$(call CXX_TEST_TARGET,analyzer,$(OBJS))
+	$(call CXX_TEST_TARGET,analyzer,$(LIB_OBJS))
 
 test-comptime: build
 	@echo ""
