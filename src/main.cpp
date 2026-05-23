@@ -968,11 +968,17 @@ static int compileAndRun(const std::string &filename,
 		JamLLVMVerifyFunction(mainFunc);
 	}
 
-	// Optionally print LLVM IR
+	// `--emit-ir` is a "print IR and exit" mode — skipping the object
+	// emit + link step matches clang's `-emit-llvm -S` / rustc's
+	// `--emit=llvm-ir` / zig's `-femit-llvm-ir` behavior. Critically
+	// it also dodges the default output name (`./output`) colliding
+	// with the build tree's `output/` directory in this repo.
 	if (emitIR) {
 		char *irStr = JamLLVMPrintModuleToString(codegenCtx.getModule());
 		std::cout << irStr;
 		JamLLVMDisposeMessage(irStr);
+		progress.stop();
+		return 0;
 	}
 
 	// Get target triple

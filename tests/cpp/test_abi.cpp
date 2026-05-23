@@ -70,23 +70,27 @@ void testMoveU8IsByValueScalar() {
 	ASSERT_TRUE(a.kind == jam::abi::ParamABI::Kind::ByValue);
 }
 
-void testLetSmallStructIsByValue() {
-	// { u32, u32 } = 8 bytes ≤ 16
+void testLetSmallStructIsByPointer() {
+	// Every aggregate is byref under the current ABI — `let` of an
+	// 8-byte struct lands ByPointer same as a 24-byte one. LLVM
+	// mem2reg/SROA re-promotes the storage back to registers when
+	// the bytes don't escape, so the perf cost is opt-time only.
 	JamCodegenContext ctx("test");
 	TypeIdx pair = buildStruct(
 	    ctx, "Pair", {{"a", BuiltinType::U32}, {"b", BuiltinType::U32}});
 	auto a = jam::abi::classifyParam(ParamMode::Let, pair, ctx);
-	ASSERT_TRUE(a.kind == jam::abi::ParamABI::Kind::ByValue);
-	ASSERT_TRUE(a.llvmType != nullptr);
+	ASSERT_TRUE(a.kind == jam::abi::ParamABI::Kind::ByPointer);
+	ASSERT_EQ(static_cast<uint32_t>(4), a.pointerAlign);
 }
 
-void testLet16ByteStructIsByValue() {
-	// { u64, u64 } = 16 bytes (boundary case — should be ByValue)
+void testLet16ByteStructIsByPointer() {
+	// 16-byte struct: still byref (no size threshold).
 	JamCodegenContext ctx("test");
 	TypeIdx pair = buildStruct(
 	    ctx, "Pair64", {{"a", BuiltinType::U64}, {"b", BuiltinType::U64}});
 	auto a = jam::abi::classifyParam(ParamMode::Let, pair, ctx);
-	ASSERT_TRUE(a.kind == jam::abi::ParamABI::Kind::ByValue);
+	ASSERT_TRUE(a.kind == jam::abi::ParamABI::Kind::ByPointer);
+	ASSERT_EQ(static_cast<uint32_t>(8), a.pointerAlign);
 }
 
 void testLetLargeStructIsByPointer() {
@@ -166,12 +170,15 @@ void testReturnU32IsDirect() {
 	ASSERT_TRUE(r.kind == jam::abi::ReturnABI::Kind::Direct);
 }
 
-void testReturn16ByteAggregateIsDirect() {
+void testReturn16ByteAggregateIsIndirect() {
+	// Aggregate returns are always sret (no size threshold). Caller
+	// owns the slot; callee writes through the hidden first arg.
 	JamCodegenContext ctx("test");
 	TypeIdx pair = buildStruct(
 	    ctx, "PairR", {{"a", BuiltinType::U64}, {"b", BuiltinType::U64}});
 	auto r = jam::abi::classifyReturn(pair, ctx);
-	ASSERT_TRUE(r.kind == jam::abi::ReturnABI::Kind::Direct);
+	ASSERT_TRUE(r.kind == jam::abi::ReturnABI::Kind::Indirect);
+	ASSERT_EQ(static_cast<uint32_t>(8), r.sretAlign);
 }
 
 void testReturnLargeAggregateIsIndirect() {
@@ -197,11 +204,10 @@ class ABITests {
 		                  testMutU32IsByPointer);
 		framework.addTest("ABI classifyParam - move u8 ByValue",
 		                  testMoveU8IsByValueScalar);
-		framework.addTest("ABI classifyParam - let small struct ByValue",
-		                  testLetSmallStructIsByValue);
-		framework.addTest(
-		    "ABI classifyParam - let 16-byte struct ByValue (boundary)",
-		    testLet16ByteStructIsByValue);
+		framework.addTest("ABI classifyParam - let small struct ByPointer",
+		                  testLetSmallStructIsByPointer);
+		framework.addTest("ABI classifyParam - let 16-byte struct ByPointer",
+		                  testLet16ByteStructIsByPointer);
 		framework.addTest("ABI classifyParam - let 24-byte struct ByPointer",
 		                  testLetLargeStructIsByPointer);
 		framework.addTest("ABI classifyParam - move 24-byte struct ByPointer",
@@ -223,8 +229,8 @@ class ABITests {
 		                  testReturnVoidIsDirect);
 		framework.addTest("ABI classifyReturn - u32 Direct",
 		                  testReturnU32IsDirect);
-		framework.addTest("ABI classifyReturn - 16-byte aggregate Direct",
-		                  testReturn16ByteAggregateIsDirect);
+		framework.addTest("ABI classifyReturn - 16-byte aggregate Indirect",
+		                  testReturn16ByteAggregateIsIndirect);
 		framework.addTest("ABI classifyReturn - 24-byte aggregate Indirect",
 		                  testReturnLargeAggregateIsIndirect);
 	}

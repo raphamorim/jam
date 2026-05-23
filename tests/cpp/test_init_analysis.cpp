@@ -1,4 +1,4 @@
-// In-process tests for the MVS init analyzer (P4 through P8.2).
+// In-process tests for the MVS init analyzer.
 //
 // Each test compiles a Jam source string through lexer + parser, runs
 // init_analysis::analyze on every function in the parsed module, and
@@ -79,7 +79,7 @@ bool diagsAbout(const std::vector<jam::init_analysis::Diagnostic> &diags,
 	return false;
 }
 
-// P4 — callsite mode propagation
+// Callsite mode propagation: how a `move` arg drains the caller's binding.
 
 void testReadAfterMove() {
 	auto r = analyzeSource(R"(
@@ -125,7 +125,8 @@ fn caller() u32 {
 	ASSERT_EQ(static_cast<size_t>(0), r.diagnostics.size());
 }
 
-// P5 — exclusivity rule
+// Exclusivity rule: at most one `mut` borrow per path, no `mut` + `let`
+// or `mut` + `move` simultaneously, no overlapping field paths.
 
 void testExclusivityMutLet() {
 	auto r = analyzeSource(R"(
@@ -185,7 +186,8 @@ fn caller() u32 {
 	ASSERT_EQ(static_cast<size_t>(0), r.diagnostics.size());
 }
 
-// P5.5 — scope-escape check
+// Scope-escape check: `&mut` to a function-local can't outlive the
+// frame via a return / out-param.
 
 void testEscapeMutParam() {
 	auto r = analyzeSource(R"(
@@ -224,16 +226,17 @@ fn doubleIt(x: mut u32) u32 {
 	ASSERT_EQ(static_cast<size_t>(0), r.diagnostics.size());
 }
 
-// P8 — drop registry foundation
+// Drop registry interaction: `move` on a drop-bearing binding is the
+// hazard the analyzer prevents (without move-aware drop tracking the
+// codegen would auto-fire drop on a moved-out slot — double-free).
 
 void testMoveOnDropBearingRejected() {
 	// A type with a user-defined `cfn drop(self: mut T)` is "drop-
 	// bearing" — `cfn` is the explicit opt-in that hands the
 	// destructor call to the compiler's auto-fire path (see
-	// drop_registry.cpp's `considerDropCandidate`). Until move-aware
-	// drop tracking lands, the analyzer rejects `move` on a drop-
-	// bearing binding to prevent the codegen from emitting drop on a
-	// moved-out slot (double-free).
+	// drop_registry.cpp's `considerDropCandidate`). The analyzer
+	// rejects `move` on a drop-bearing binding so the codegen can't
+	// emit drop on a moved-out slot.
 	auto r = analyzeSource(R"(
 const File = struct {
     fd: i32,
@@ -258,7 +261,7 @@ fn caller() i32 {
 
 void testLetOnDropBearingOK() {
 	// Passing a drop-bearing binding by `let` (read-only borrow, default)
-	// or `mut` is fine — only `move` is rejected in P8 foundation.
+	// or `mut` is fine — only `move` is rejected.
 	auto r = analyzeSource(R"(
 const File = struct {
     fd: i32,
@@ -329,39 +332,38 @@ fn caller() u32 {
 class InitAnalysisTests {
   public:
 	static void registerAllTests(TestFramework &framework) {
-		// P4 — callsite mode propagation
-		framework.addTest("InitAnalysis P4 - read after move",
-		                  testReadAfterMove);
-		framework.addTest("InitAnalysis P4 - double move", testDoubleMove);
-		framework.addTest("InitAnalysis P4 - move then separate binding OK",
+		// Callsite mode propagation
+		framework.addTest("InitAnalysis - read after move", testReadAfterMove);
+		framework.addTest("InitAnalysis - double move", testDoubleMove);
+		framework.addTest("InitAnalysis - move then separate binding OK",
 		                  testMoveThenSeparateBindingOK);
 
-		// P5 — exclusivity
-		framework.addTest("InitAnalysis P5 - mut + let same binding",
+		// Exclusivity
+		framework.addTest("InitAnalysis - mut + let same binding",
 		                  testExclusivityMutLet);
-		framework.addTest("InitAnalysis P5 - two moves same binding",
+		framework.addTest("InitAnalysis - two moves same binding",
 		                  testExclusivityTwoMoves);
-		framework.addTest("InitAnalysis P5 - overlapping path",
+		framework.addTest("InitAnalysis - overlapping path",
 		                  testExclusivityOverlappingPath);
-		framework.addTest("InitAnalysis P5 - disjoint fields OK",
+		framework.addTest("InitAnalysis - disjoint fields OK",
 		                  testExclusivityDisjointFieldsOK);
 
-		// P5.5 — scope escape
-		framework.addTest("InitAnalysis P5.5 - escape &mut param",
+		// Scope escape
+		framework.addTest("InitAnalysis - escape &mut param",
 		                  testEscapeMutParam);
-		framework.addTest("InitAnalysis P5.5 - escape &mut field",
+		framework.addTest("InitAnalysis - escape &mut field",
 		                  testEscapeMutField);
-		framework.addTest("InitAnalysis P5.5 - mut param by-value return OK",
+		framework.addTest("InitAnalysis - mut param by-value return OK",
 		                  testReturnMutParamByValueOK);
 
-		// P8 — drop registry foundation
-		framework.addTest("InitAnalysis P8 - move on drop-bearing rejected",
+		// Drop registry interaction
+		framework.addTest("InitAnalysis - move on drop-bearing rejected",
 		                  testMoveOnDropBearingRejected);
-		framework.addTest("InitAnalysis P8 - let on drop-bearing OK",
+		framework.addTest("InitAnalysis - let on drop-bearing OK",
 		                  testLetOnDropBearingOK);
-		framework.addTest("InitAnalysis P8 - mut on drop-bearing OK",
+		framework.addTest("InitAnalysis - mut on drop-bearing OK",
 		                  testMutOnDropBearingOK);
-		framework.addTest("InitAnalysis P8 - move on non-drop OK",
+		framework.addTest("InitAnalysis - move on non-drop OK",
 		                  testNonDropBearingMoveOK);
 	}
 };
