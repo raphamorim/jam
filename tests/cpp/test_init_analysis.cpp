@@ -227,16 +227,19 @@ fn doubleIt(x: mut u32) u32 {
 // P8 — drop registry foundation
 
 void testMoveOnDropBearingRejected() {
-	// A type with a user-defined `fn drop(self: mut T)` is "drop-bearing".
-	// Until P8.1 lands move-aware drop tracking, the analyzer rejects
-	// `move` on drop-bearing bindings to prevent the codegen from emitting
-	// drop on a moved-out slot (double-free).
+	// A type with a user-defined `cfn drop(self: mut T)` is "drop-
+	// bearing" — `cfn` is the explicit opt-in that hands the
+	// destructor call to the compiler's auto-fire path (see
+	// drop_registry.cpp's `considerDropCandidate`). Until move-aware
+	// drop tracking lands, the analyzer rejects `move` on a drop-
+	// bearing binding to prevent the codegen from emitting drop on a
+	// moved-out slot (double-free).
 	auto r = analyzeSource(R"(
 const File = struct {
     fd: i32,
 };
 
-fn drop(self: mut File) {
+cfn drop(self: mut File) {
     self.fd = 0;
 }
 
