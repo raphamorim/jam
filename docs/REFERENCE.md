@@ -656,8 +656,12 @@ fn show() {
 }
 
 // Destructured binding, pulls specific names into the current scope.
-const { Vec, Option } = import("collections");
-const { assert }      = import("test");
+// Re-exports under `std` can be reached via chained access on the
+// import expression — pick the names you need without binding the
+// whole module.
+const { Vec }    = import("std").collections;
+const { Option } = import("std").option;
+const { assert } = import("test");
 ```
 
 The path is resolved relative to the file (`./collections.jam` or `std/string.jam`) or

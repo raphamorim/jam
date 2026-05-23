@@ -4,7 +4,7 @@
 // when walking the import graph, so Option is loaded transitively
 // without the user naming it anywhere in this file.
 const { assert } = import("test");
-const { Vec } = import("std/collections");
+const { Vec } = import("std").collections;
 
 tfn popWithoutExplicitOptionImport() {
     var v: Vec(i32) = Vec(i32).empty();

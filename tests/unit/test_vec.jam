@@ -1,7 +1,7 @@
 // `Vec(T)` from std.collections; `Option(T)` from std.option.
 const { assert } = import("test");
-const { Vec } = import("std/collections");
-const { Option } = import("std/option");
+const { Vec }    = import("std").collections;
+const { Option } = import("std").option;
 
 const VecI32 = Vec(i32);
 const VecU8  = Vec(u8);
