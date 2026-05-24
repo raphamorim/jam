@@ -926,6 +926,14 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 	// resolve to the same FunctionAST (main.cpp registers both forms).
 	// Look it up by whichever name the caller used.
 	const FunctionAST *generic = getFunctionAST(calleeName);
+	if (!generic && calleeDecl != jam::kNoDecl) {
+		// Demand-driven resolution (Zig-style): the eager import pass may
+		// not have reached this generic's defining module yet
+		// (getLoadedModules() is an unordered_map), so resolve it on
+		// reference straight from the decl index, which registerTopLevelDecls
+		// populated for every imported module before any prototype is declared.
+		generic = declTable_.get(calleeDecl).fnAst;
+	}
 	if (!generic) {
 		throw std::runtime_error(
 		    formatNamespaceLookupError("generic", calleeName));

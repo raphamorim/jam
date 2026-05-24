@@ -686,6 +686,17 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 			    lctx.ctx.getBuilder(), lctx.ctx.getInt8Type(), payloadAreaPtr,
 			    off, "enum.payload.off");
 		}
+		// A byref aggregate payload (struct / array / union / nested
+		// payloaded enum) follows the same convention as JirTag::Load:
+		// its "value" is the storage pointer, so hand back `fieldPtr`
+		// directly. Loading it into an SSA value here would feed a
+		// downstream Store an aggregate value, which then memcpy's *from
+		// the value* as though it were a pointer — a malformed
+		// `memcpy(dst, %Struct val, ...)` that reads a wild address and
+		// segfaults. Scalars (ints, floats, bools, pointers) load byval.
+		if (jam::abi::isByRef(inst.ty, lctx.ctx)) {
+			return fieldPtr;
+		}
 		JamTypeRef fieldTy = lctx.ctx.getLLVMType(inst.ty);
 		return JamLLVMBuildLoad(lctx.ctx.getBuilder(), fieldTy, fieldPtr,
 		                        "enum.payload.val");

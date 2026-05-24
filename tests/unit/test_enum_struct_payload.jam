@@ -1,0 +1,89 @@
+// Enum variants carrying a *struct* (byref aggregate) payload.
+//
+// Regression test for a codegen bug: matching `Option(SomeStruct).Some(s)`
+// loaded the payload into an SSA aggregate value and then handed it to a
+// Store, which memcpy'd *from the value* as if it were a pointer — a
+// malformed `memcpy(dst, %Struct val, ...)` that read a wild address and
+// segfaulted. Scalar payloads (ints, bools, pointers) were unaffected.
+// The fix makes enum-payload extraction follow the same byref convention
+// as Load: an aggregate payload's "value" is its storage pointer.
+
+const { assert } = import("test");
+const { Option } = import("std").option;
+
+const Point = struct { x: u32, y: u32 };
+
+fn wrapPoint(x: u32, y: u32) Option(Point) {
+    var p: Point = Point { x: x, y: y };
+    return Option(Point).Some(p);
+}
+
+fn sumPoint(o: Option(Point)) u32 {
+    match (o) {
+        Option(Point).Some(p) { return p.x + p.y; }
+        Option(Point).None    { return 0; }
+    }
+    return 999;
+}
+
+// Struct fields round-trip through construction + match extraction.
+tfn optionStructSome() { assert(sumPoint(wrapPoint(30, 12)), 42); }
+
+// None still works for a struct-payload Option.
+tfn optionStructNone() { assert(sumPoint(Option(Point).None()), 0); }
+
+// Struct payload behind a `mut` cursor parameter — the std.process
+// iterator shape (next(&cursor) -> Option(struct)).
+const Cursor = struct { i: u32, n: u32 };
+
+fn step(c: mut Cursor) Option(Point) {
+    if (c.i >= c.n) { return Option(Point).None(); }
+    var p: Point = Point { x: c.i, y: 0 };
+    c.i = c.i + 1;
+    return Option(Point).Some(p);
+}
+
+tfn mutCursorStructPayload() {
+    var c: Cursor = Cursor { i: 0, n: 4 };
+    var total: u32 = 0;
+    var more: bool = true;
+    while (more) {
+        match (step(c)) {
+            Option(Point).Some(p) { total = total + p.x; }
+            Option(Point).None    { more = false; }
+        }
+    }
+    assert(total, 6);  // 0 + 1 + 2 + 3
+}
+
+// Struct payload containing a pointer field (mirrors a borrowed view).
+const Span = struct { ptr: *const[] u8, len: u64 };
+
+tfn structPayloadWithPointer() {
+    var s: []u8 = "hello";
+    var sp: Span = Span { ptr: s.ptr, len: s.len };
+    var got: u64 = 0;
+    match (Option(Span).Some(sp)) {
+        Option(Span).Some(v) { got = v.len; }
+        Option(Span).None    { got = 0; }
+    }
+    assert(got as u32, 5);
+}
+
+// Custom (non-Option) enum with a struct-payload variant.
+const Pair = struct { a: u32, b: u32 };
+const Msg = enum {
+    Empty,
+    Load(Pair),
+};
+
+fn evalMsg(m: Msg) u32 {
+    match (m) {
+        Msg.Empty   { return 0; }
+        Msg.Load(p) { return p.a * 10 + p.b; }
+    }
+    return 99;
+}
+
+tfn customEnumStructPayloadLoad()  { assert(evalMsg(Msg.Load(Pair { a: 4, b: 2 })), 42); }
+tfn customEnumStructPayloadEmpty() { assert(evalMsg(Msg.Empty), 0); }
