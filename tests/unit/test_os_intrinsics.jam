@@ -1,0 +1,52 @@
+// Target-OS comptime intrinsics: @os(), @isDarwin(), @isLinux(),
+// @isUnix(), @isWindows().
+//
+// These are target-dependent, so the suite must pass on macOS AND Linux
+// CI — we cannot hardcode one OS. Two techniques keep it portable:
+//   1. assert *target-independent invariants* (implications, mutual
+//      exclusion) that hold on every target;
+//   2. lean on the comptime folding itself — only the matching `@isX()`
+//      arm survives to codegen, so each arm's expectation is correct on
+//      whatever target it compiles for.
+//
+// Note: logical `&&`/`||` aren't accepted bare in a call argument (call
+// args parse at comparison precedence), so the boolean combinations are
+// wrapped in parens.
+
+const { assert } = import("test");
+const std = import("std");
+
+// @os() agrees with whichever predicate is active on this target. Only
+// the matching arm compiles (the rest fold away), so this is correct
+// everywhere without naming a specific OS.
+tfn osNameMatchesActivePredicate() {
+    if (@isDarwin()) {
+        assert(std.string.eq(@os(), "macos"), true);
+    } else if (@isLinux()) {
+        assert(std.string.eq(@os(), "linux"), true);
+    } else if (@isWindows()) {
+        assert(std.string.eq(@os(), "windows"), true);
+    }
+}
+
+// @os() is never empty (even an unrecognized target yields "unknown").
+tfn osNameNonEmpty() {
+    var name: []u8 = @os();
+    assert(name.len > 0, true);
+}
+
+// Windows and Unix are mutually exclusive on any target.
+tfn windowsAndUnixExclusive() {
+    assert((@isWindows() && @isUnix()), false);
+}
+
+// Family implications — hold regardless of which OS we build for.
+tfn darwinImpliesUnix() {
+    assert((!@isDarwin() || @isUnix()), true);
+}
+tfn linuxImpliesUnix() {
+    assert((!@isLinux() || @isUnix()), true);
+}
+tfn windowsExcludesUnix() {
+    assert((!@isWindows() || !@isUnix()), true);
+}

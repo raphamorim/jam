@@ -211,6 +211,13 @@ NodeIdx Parser::parsePrimary() {
 			node.flags = 1;  // expr-arg multi-form
 			return emit(node);
 		}
+		// No-arg form (`@isMacOS()`, `@isLinux()`, `@isUnix()`,
+		// `@isWindows()`, ...): empty parens. rhs is unused — astgenAtCall
+		// dispatches purely by name.
+		if (check(TOK_CLOSE_PAREN)) {
+			consume(TOK_CLOSE_PAREN, "Expected ')' after '@' intrinsic name");
+			return emit(AstNode{AstTag::AtCall, 0, 0, 0, nameId, 0});
+		}
 		TypeIdx tyArg = parseType();
 		consume(TOK_CLOSE_PAREN, "Expected ')' after '@' intrinsic argument");
 		return emit(AstNode{AstTag::AtCall, 0, 0, 0, nameId,

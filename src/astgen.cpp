@@ -13,6 +13,7 @@
 #include "comptime.h"
 #include "jir_codegen.h"
 #include "mangling.h"
+#include "target.h"
 
 #include <string>
 #include <unordered_map>
@@ -3446,6 +3447,55 @@ static JirRef astgenAtCall(AstGenCtx &gctx, const AstNode &n) {
 	const std::string &name =
 	    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
 	TypeIdx tyArg = static_cast<TypeIdx>(n.rhs);
+	if (name == "isDarwin" || name == "isLinux" || name == "isWindows" ||
+	    name == "isUnix") {
+		// Target-OS predicates, resolved at astgen time to a `Bool`
+		// constant. Because the result is a `JirTag::Bool` literal,
+		// `emitCondBr` folds `if (@isLinux())` to an unconditional branch
+		// and jirDefineBody's reachability pass drops the dead arm — so a
+		// macOS-only `_NSGetArgv` call never reaches codegen (or the
+		// linker) on Linux. Sourced from the host target, which is the
+		// only target today; switch to the selected target once
+		// cross-compilation lands.
+		// `isDarwin` follows Zig (std.Target.Os.Tag.isDarwin = the Apple
+		// family). Jam's OS enum only has MacOS today, so it reduces to
+		// that and widens automatically if iOS/tvOS/etc. are ever added.
+		// `isUnix` is "not Windows" for the current enum.
+		jam::OS os = jam::Target::getHostTarget().os;
+		bool v = (name == "isDarwin")  ? (os == jam::OS::MacOS)
+		         : (name == "isLinux") ? (os == jam::OS::Linux)
+		         : (name == "isWindows")
+		             ? (os == jam::OS::Windows)
+		             : (os == jam::OS::MacOS || os == jam::OS::Linux ||
+		                os == jam::OS::FreeBSD);  // isUnix
+		JirInst inst{};
+		inst.tag = JirTag::Bool;
+		inst.a = v ? 1u : 0u;
+		inst.ty = BuiltinType::Bool;
+		return emit(gctx, inst);
+	}
+	if (name == "os") {
+		// `@os()` → the OS name as a `[]u8`, mirroring Zig's
+		// `@tagName(builtin.os.tag)` (e.g. "macos", "linux"). This is the
+		// display form: unlike the boolean predicates it does NOT fold a
+		// branch (string `==` isn't comptime-evaluated), so keep using
+		// `@isDarwin()` & co. for conditional compilation / dead-code
+		// elimination. Emits the same JIR a string literal would.
+		jam::OS os = jam::Target::getHostTarget().os;
+		const char *osName = (os == jam::OS::MacOS)     ? "macos"
+		                     : (os == jam::OS::Linux)   ? "linux"
+		                     : (os == jam::OS::Windows) ? "windows"
+		                     : (os == jam::OS::FreeBSD) ? "freebsd"
+		                                                : "unknown";
+		StringIdx s = gctx.ctx.getStringPool().intern(osName);
+		TypeIdx sliceTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
+		JirInst inst{};
+		inst.tag = JirTag::Str;
+		inst.a = s;
+		inst.ty = sliceTy;
+		return emit(gctx, inst);
+	}
 	if (name == "sizeOf") {
 		uint64_t bytes = gctx.ctx.typeSize(tyArg);
 		JirInst inst{};

@@ -1010,6 +1010,63 @@ void jirDeclarePrototype(const JirFunction &jfn, JamCodegenContext &ctx) {
 	}
 }
 
+// Mark every block reachable from the entry block (1) by walking
+// terminator successors (Br / CondBr / Switch). Blocks left unmarked are
+// dead — they arise when `emitCondBr` folds a constant-`Bool` condition
+// (e.g. `if (@isLinux())`) to an unconditional branch, orphaning the
+// untaken arm. Skipping them in codegen is frontend dead-code
+// elimination: the arm's instructions (and any extern *calls* they
+// contain) never reach LLVM, so a macOS-only `_NSGetArgv` reference is
+// gone on Linux rather than becoming an undefined-symbol link error.
+// Terminator decoding mirrors `predecessorCount` in astgen.cpp.
+static std::vector<bool> computeReachableBlocks(const JirFunction &jfn) {
+	std::vector<bool> reachable(jfn.blocks.size(), false);
+	if (jfn.blocks.size() <= 1) return reachable;  // sentinel only
+	std::vector<JirBlockRef> stack;
+	reachable[1] = true;  // entry block
+	stack.push_back(1);
+	auto visit = [&](uint32_t t) {
+		if (t >= 1 && t < jfn.blocks.size() && !reachable[t]) {
+			reachable[t] = true;
+			stack.push_back(static_cast<JirBlockRef>(t));
+		}
+	};
+	while (!stack.empty()) {
+		JirBlockRef b = stack.back();
+		stack.pop_back();
+		const JirBlock &blk = jfn.getBlock(b);
+		if (blk.insts.empty()) continue;
+		const JirInst &last = jfn.getInst(blk.insts.back());
+		switch (last.tag) {
+		case JirTag::Br:
+			visit(last.a);
+			break;
+		case JirTag::CondBr: {
+			uint32_t ex = last.b;
+			if (ex + 2 <= jfn.extra.size()) {
+				visit(jfn.extra[ex]);
+				visit(jfn.extra[ex + 1]);
+			}
+			break;
+		}
+		case JirTag::Switch: {
+			uint32_t ex = last.b;
+			if (ex + 2 > jfn.extra.size()) break;
+			visit(jfn.extra[ex]);  // default
+			uint32_t caseCount = jfn.extra[ex + 1];
+			for (uint32_t i = 0; i < caseCount; i++) {
+				uint32_t caseSlot = ex + 2 + i * 4 + 3;
+				if (caseSlot < jfn.extra.size()) visit(jfn.extra[caseSlot]);
+			}
+			break;
+		}
+		default:
+			break;  // Ret / Unreachable: no successors
+		}
+	}
+	return reachable;
+}
+
 void jirDefineBody(const JirFunction &jfn, JamCodegenContext &ctx) {
 	if (jfn.isExtern) return;
 
@@ -1021,9 +1078,17 @@ void jirDefineBody(const JirFunction &jfn, JamCodegenContext &ctx) {
 
 	JirCodegenCtx lctx{jfn, ctx, {}, {}};
 
+	// Dead-code elimination: only blocks reachable from entry get
+	// lowered. A constant-folded `if (@isLinux())` leaves the untaken
+	// arm orphaned (zero predecessors); skipping it here keeps its
+	// instructions — including extern calls like `_NSGetArgv` on a
+	// non-macOS target — out of the LLVM module entirely.
+	std::vector<bool> reachable = computeReachableBlocks(jfn);
+
 	// Create LLVM blocks first so terminators can resolve forward
-	// references. Skip the sentinel block at index 0.
+	// references. Skip the sentinel block at index 0 and dead blocks.
 	for (JirBlockRef b = 1; b < jfn.blocks.size(); b++) {
+		if (!reachable[b]) continue;
 		JamBasicBlockRef bb =
 		    JamLLVMAppendBasicBlock(f, jfn.getBlock(b).name.c_str());
 		lctx.blockMap[b] = bb;
@@ -1031,6 +1096,7 @@ void jirDefineBody(const JirFunction &jfn, JamCodegenContext &ctx) {
 
 	// Emit instructions block-by-block.
 	for (JirBlockRef b = 1; b < jfn.blocks.size(); b++) {
+		if (!reachable[b]) continue;
 		JamLLVMPositionBuilderAtEnd(ctx.getBuilder(), lctx.blockMap[b]);
 		for (JirRef r : jfn.getBlock(b).insts) {
 			JamValueRef v = emitInst(lctx, r);
