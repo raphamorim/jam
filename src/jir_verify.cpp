@@ -165,6 +165,10 @@ const char *tagName(JirTag t) {
 		return "ExtractValue";
 	case JirTag::ArrayLit:
 		return "ArrayLit";
+	case JirTag::MakeSlice:
+		return "MakeSlice";
+	case JirTag::MemSet:
+		return "MemSet";
 	case JirTag::Index:
 		return "Index";
 	case JirTag::FieldAddr:
@@ -527,6 +531,18 @@ struct Verifier {
 				JirRef fr = static_cast<JirRef>(jfn.extra[inst.b + 1 + i]);
 				checkRef(fr, false, r, "agg-field");
 			}
+			return;
+		}
+		case JirTag::MakeSlice: {
+			// a = data ptr, b = length — both refs.
+			checkRef(inst.a, false, r, "slice-ptr");
+			checkRef(inst.b, false, r, "slice-len");
+			return;
+		}
+		case JirTag::MemSet: {
+			// a = dest ptr ref; b = byte length (raw constant, not a ref);
+			// flags = fill byte. Only `a` is a ref.
+			checkRef(inst.a, false, r, "memset-dst");
 			return;
 		}
 		}

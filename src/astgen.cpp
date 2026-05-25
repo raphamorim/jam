@@ -1607,6 +1607,31 @@ static JirRef astgenArrayRepeat(AstGenCtx &gctx, const AstNode &n,
 		    TypeKind::Array, 0, 0, elemTy, static_cast<uint32_t>(count)});
 	}
 
+	// Zig-style fill: a constant byte fill (especially `[0; N]`)
+	// lowers to one memset instead of N unrolled IndexAddr+Store.
+	// memset covers any zero fill (zeros every element type) and a
+	// byte-element fill; other constant fills use the per-element path.
+	{
+		const JirInst &vinst = gctx.jfn.getInst(val);
+		if (vinst.tag == JirTag::Int) {
+			uint64_t fv = static_cast<uint64_t>(vinst.a) |
+			              (static_cast<uint64_t>(vinst.b) << 32);
+			uint64_t elemSz = gctx.ctx.typeSize(elemTy);
+			if (fv == 0 || (elemSz == 1 && fv <= 255)) {
+				JirInst al{};
+				al.tag = JirTag::Alloca;
+				al.ty = arrTy;
+				JirRef slot = emitAllocaHoisted(gctx, al);
+				JirInst ms{};
+				ms.tag = JirTag::MemSet;
+				ms.a = slot;
+				ms.b = static_cast<uint32_t>(count * elemSz);
+				ms.flags = static_cast<uint16_t>(fv & 0xFF);
+				emit(gctx, ms);
+				return slot;
+			}
+		}
+	}
 	std::vector<uint32_t> packed;
 	packed.reserve(1 + count);
 	packed.push_back(static_cast<uint32_t>(count));
@@ -1917,6 +1942,24 @@ static JirRef astgenSlice(AstGenCtx &gctx, const AstNode &n) {
 
 	JirRef startRef = astgenExpr(gctx, startIdx, BuiltinType::U64);
 	JirRef endRef = astgenExpr(gctx, endIdx, BuiltinType::U64);
+
+	// Slice bounds drive both the IndexAddr offset and the
+	// (end - start) length, which need matching u64 operands.
+	// Zero-extend narrower (unsigned) bounds; a u64 bound is as-is.
+	if (gctx.jfn.getInst(startRef).ty != BuiltinType::U64) {
+		JirInst zs{};
+		zs.tag = JirTag::ZExt;
+		zs.a = startRef;
+		zs.ty = BuiltinType::U64;
+		startRef = emit(gctx, zs);
+	}
+	if (gctx.jfn.getInst(endRef).ty != BuiltinType::U64) {
+		JirInst ze{};
+		ze.tag = JirTag::ZExt;
+		ze.a = endRef;
+		ze.ty = BuiltinType::U64;
+		endRef = emit(gctx, ze);
+	}
 
 	// ptr = &base[start]
 	JirInst ia{};

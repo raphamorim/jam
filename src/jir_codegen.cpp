@@ -149,6 +149,16 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		                                "slice.len");
 		return slice;
 	}
+	case JirTag::MemSet: {
+		// Bulk fill: a = dest ptr, b = byte length (constant), flags =
+		// fill byte. One memset instead of N unrolled stores.
+		JamValueRef ptr = emitInst(lctx, inst.a);
+		JamValueRef byteVal = JamLLVMConstInt(
+		    lctx.ctx.getInt8Type(), static_cast<uint64_t>(inst.flags), false);
+		JamLLVMBuildMemSet(lctx.ctx.getBuilder(), ptr, byteVal,
+		                   static_cast<uint64_t>(inst.b), 1);
+		return nullptr;
+	}
 	case JirTag::Param: {
 		// flags & 1 means the param is ByPointer (mut / move always;
 		// let / const for any byref aggregate). We hand back the LLVM

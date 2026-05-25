@@ -254,6 +254,9 @@ JAM_EXTERN_C JamValueRef JamLLVMBuildStore(JamBuilderRef builder,
 JAM_EXTERN_C void JamLLVMBuildMemCpy(JamBuilderRef builder, JamValueRef dst,
                                      uint64_t dstAlign, JamValueRef src,
                                      uint64_t srcAlign, uint64_t size);
+JAM_EXTERN_C void JamLLVMBuildMemSet(JamBuilderRef builder, JamValueRef dst,
+                                     JamValueRef value, uint64_t size,
+                                     uint64_t align);
 // In-bounds GEP for indexing into a fixed-size array: gep [N x T], ptr, 0, idx.
 // `arrayType` must be the array aggregate type that `ptr` points to.
 JAM_EXTERN_C JamValueRef JamLLVMBuildArrayGEP(JamBuilderRef builder,

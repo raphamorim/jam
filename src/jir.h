@@ -218,6 +218,11 @@ enum class JirTag : uint8_t {
 	FieldAccess,
 	ExtractValue,
 	ArrayLit,
+
+	// MemSet: `a` = dest ptr ref, `b` = length in BYTES (raw constant,
+	// not a JirRef), `flags` = fill byte (0..255). Lowers to one LLVM
+	// memset — backs `[fill; N]` zero/byte fills instead of N stores.
+	MemSet,
 	Index,
 	// FieldAddr: `a` = base pointer ref; `b` = field index;
 	//            `ty` = pointer-to-field-type. Lowers to a StructGEP.

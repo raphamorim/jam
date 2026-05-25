@@ -790,6 +790,13 @@ JAM_EXTERN_C void JamLLVMBuildMemCpy(JamBuilderRef builder, JamValueRef dst,
 	    llvm::MaybeAlign(srcAlign), size);
 }
 
+JAM_EXTERN_C void JamLLVMBuildMemSet(JamBuilderRef builder, JamValueRef dst,
+                                     JamValueRef value, uint64_t size,
+                                     uint64_t align) {
+	UNWRAP_BUILDER(builder)->CreateMemSet(
+	    UNWRAP_VALUE(dst), UNWRAP_VALUE(value), size, llvm::MaybeAlign(align));
+}
+
 JamValueRef JamLLVMBuildCall(JamBuilderRef builder, JamFunctionRef func,
                              JamValueRef *args, unsigned numArgs,
                              const char *name) {
