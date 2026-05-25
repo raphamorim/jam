@@ -1,0 +1,35 @@
+// std.fs — File.open / size / readAll / close. Portable cases only
+// (no fixture files): a missing path yields None, and /dev/null (present
+// on macOS and Linux CI) opens successfully with size 0.
+
+const { File } = import("std/fs");
+const { Option } = import("std").option;
+const { Vec } = import("std").collections;
+const { assert } = import("test");
+
+// A nonexistent path must yield None (exercises the NULL-handle path).
+tfn missingFileIsNone() {
+    var opened: u32 = 0;
+    match (File.open("/no/such/file/xyz123.nope")) {
+        Option(File).Some(f) { f.close(); opened = 1; }
+        Option(File).None    { opened = 0; }
+    }
+    assert(opened, 0);
+}
+
+// An existing file opens; /dev/null has size 0.
+tfn opensDevNull() {
+    var ok: u32 = 0;
+    var sz: u64 = 99;
+    match (File.open("/dev/null")) {
+        Option(File).Some(f) {
+            sz = f.size();
+            var empty: Vec(u8) = f.readAll();
+            f.close();
+            ok = 1;
+        }
+        Option(File).None { ok = 0; }
+    }
+    assert(ok, 1);
+    assert(sz as u32, 0);
+}

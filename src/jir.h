@@ -57,6 +57,12 @@ enum class JirTag : uint8_t {
 	Bool,
 	Str,
 
+	// MakeSlice: build a `{ptr,len}` slice value. `a` = ptr ref,
+	// `b` = len ref (u64); `ty` = the slice type []T. Reverse of
+	// the ExtractValue used to read a slice's fields. Backs the
+	// `ptr[start..end]` slice expression.
+	MakeSlice,
+
 	// Storage
 	// Alloca: `ty` = pointee type. Result type is implicitly ptr-to-`ty`.
 	// Load:   `a` = ptr ref; `ty` = loaded type.

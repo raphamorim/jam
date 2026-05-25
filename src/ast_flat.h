@@ -54,6 +54,7 @@ enum class AstTag : uint8_t {
 	Variable,      // d.lhs = StringIdx (name)
 	MemberAccess,  // d.lhs = NodeIdx (object), d.rhs = StringIdx (member)
 	Index,         // d.lhs = NodeIdx (object), d.rhs = NodeIdx (index)
+	Slice,         // d.lhs = NodeIdx (base), d.rhs = ExtraIdx -> [start, end]
 	Deref,         // d.lhs = NodeIdx (operand)
 	AddressOf,     // d.lhs = NodeIdx (operand)
 

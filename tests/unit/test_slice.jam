@@ -1,0 +1,49 @@
+// `base[start..end]` range-slicing: builds a []T value {ptr+start,
+// end-start} from a many-item pointer. v1 covers many-item pointer bases.
+
+const { assert } = import("test");
+
+extern fn strlen(s: *const[] u8) u64;
+
+// Full span of a literal's bytes via its pointer.
+tfn sliceFull() {
+    var lit: []u8 = "hello";
+    var s: []u8 = lit.ptr[0..5];
+    assert(s.len as u32, 5);
+    assert(s[0], 104);  // 'h'
+    assert(s[4], 111);  // 'o'
+}
+
+// Sub-range with non-zero start.
+tfn sliceSubrange() {
+    var lit: []u8 = "hello";
+    var s: []u8 = lit.ptr[1..4];   // "ell"
+    assert(s.len as u32, 3);
+    assert(s[0], 101);  // 'e'
+    assert(s[2], 108);  // 'l'
+}
+
+// End bound from a runtime expression (strlen).
+tfn sliceRuntimeEnd() {
+    var lit: []u8 = "world!";
+    var n: u64 = strlen(lit.ptr);
+    var s: []u8 = lit.ptr[0..n];
+    assert(s.len as u32, 6);
+    assert(s[5], 33);   // '!'
+}
+
+// Empty slice (start == end).
+tfn sliceEmpty() {
+    var lit: []u8 = "abc";
+    var s: []u8 = lit.ptr[2..2];
+    assert(s.len as u32, 0);
+}
+
+// Slicing through a pointer binding (not just an inline member access).
+tfn sliceViaPointerVar() {
+    var lit: []u8 = "abcdef";
+    var p: *const[] u8 = lit.ptr;
+    var s: []u8 = p[2..5];   // "cde"
+    assert(s.len as u32, 3);
+    assert(s[0], 99);   // 'c'
+}

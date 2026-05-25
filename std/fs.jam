@@ -1,0 +1,81 @@
+// std.fs — minimal file I/O. A `File` wraps a libc `FILE*`.
+//
+//     const { File } = import("std/fs");
+//
+//     match (File.open("path.txt")) {
+//         Option(File).Some(f) {
+//             var data: Vec(u8) = f.readAll();
+//             f.close();
+//         }
+//         Option(File).None { /* open failed */ }
+//     }
+//
+// Methods are `pub` so they dispatch from importing modules (a non-pub
+// method on an imported struct is invisible to the caller). Fallibility
+// is carried in the return type via `Option`, mirroring Zig's `!File` /
+// Rust's `io::Result<File>`.
+
+const { Option } = import("option");
+const { Vec } = import("collections");
+
+// `pub extern` so the libc declarations are visible when these methods
+// are codegen'd in an importer's compilation context.
+pub extern fn fopen(path: *const[] u8, mode: *const[] u8) *mut[] u8;
+pub extern fn fread(buf: *mut[] u8, size: u64, n: u64, f: *mut[] u8) u64;
+pub extern fn fclose(f: *mut[] u8) i32;
+pub extern fn fseek(f: *mut[] u8, off: i64, whence: i32) i32;
+pub extern fn ftell(f: *mut[] u8) i64;
+
+const SEEK_SET: i32 = 0;
+const SEEK_END: i32 = 2;
+
+pub const File = struct {
+    handle: *mut[] u8,
+
+    // Open `path` for binary reading. Returns None if it can't be opened.
+    // The path is copied into a NUL-terminated buffer first — a `[]u8`
+    // carries no trailing NUL (Zig `toPosixPath` / Rust `CString` style).
+    pub fn open(path: []u8) Option(File) {
+        var buf: [4096]u8 = [0; 4096];
+        var i: u64 = 0;
+        while (i < path.len && i < 4095) {
+            buf[i] = path.ptr[i];
+            i = i + 1;
+        }
+        buf[i] = 0;
+        var mode: []u8 = "rb";
+        var h: *mut[] u8 = fopen(buf.asPtr(), mode.ptr);
+        // libc returns NULL on failure; Jam can't compare a pointer to
+        // null directly, so reinterpret as an integer address.
+        if ((h as u64) == 0) {
+            return Option(File).None();
+        }
+        return Option(File).Some(File { handle: h });
+    }
+
+    // Read up to `dst.len` bytes into `dst`; returns the number read.
+    pub fn read(self: File, dst: []u8) u64 {
+        return fread(dst.ptr as *mut[] u8, 1, dst.len, self.handle);
+    }
+
+    // Total size of the file in bytes.
+    pub fn size(self: File) u64 {
+        fseek(self.handle, 0, SEEK_END);
+        var n: i64 = ftell(self.handle);
+        fseek(self.handle, 0, SEEK_SET);
+        return n as u64;
+    }
+
+    // Read the whole file into a freshly-allocated Vec(u8).
+    pub fn readAll(self: File) Vec(u8) {
+        var n: u64 = self.size();
+        var v: Vec(u8) = Vec(u8).withCapacity(n as u32);
+        var got: u64 = fread(v.ptr, 1, n, self.handle);
+        v.setLen(got as u32);
+        return v;
+    }
+
+    pub fn close(self: File) {
+        fclose(self.handle);
+    }
+};

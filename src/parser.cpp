@@ -379,11 +379,22 @@ NodeIdx Parser::parsePrimary() {
 			}
 			if (match(TOK_OPEN_BRACKET)) {
 				chainStarted = true;
-				NodeIdx idx = parseLogicalOr();
+				NodeIdx start = parseLogicalOr();
+				if (match(TOK_DOTDOT)) {
+					NodeIdx end = parseLogicalOr();
+					consume(TOK_CLOSE_BRACKET,
+					        "Expected ']' after slice range");
+					ExtraIdx sx = nodes->reserveExtra(2);
+					nodes->setExtra(sx, static_cast<uint32_t>(start));
+					nodes->setExtra(sx + 1, static_cast<uint32_t>(end));
+					expr = emit(AstNode{AstTag::Slice, 0, 0, 0,
+					                    static_cast<uint32_t>(expr), sx});
+					continue;
+				}
 				consume(TOK_CLOSE_BRACKET, "Expected ']' after index");
 				expr = emit(AstNode{AstTag::Index, 0, 0, 0,
 				                    static_cast<uint32_t>(expr),
-				                    static_cast<uint32_t>(idx)});
+				                    static_cast<uint32_t>(start)});
 				continue;
 			}
 
@@ -836,9 +847,36 @@ NodeIdx Parser::parsePatternAtom() {
 			return emit(AstNode{AstTag::PatEnumVariant, 0, 0, 0, enumNameId,
 			                    variantNameId});
 		}
-		current = saved;
-		parseError("Bare identifier patterns are not yet supported "
-		           "(use `EnumName.Variant`, an integer literal, or `_`)");
+		// Bare variant `Variant` / `Variant(bindings)` -- the enum type
+		// is inferred from the match scrutinee. flags bit 2 (=4) marks
+		// "infer receiver"; the receiver slot is unused. (`saved` is the
+		// variant-name token; `current` is already just past it.)
+		StringIdx bareVariantId =
+		    stringPool->intern(tokens[saved].text(source_));
+		if (match(TOK_OPEN_PAREN)) {
+			std::vector<StringIdx> bindings;
+			if (!check(TOK_CLOSE_PAREN)) {
+				do {
+					consume(TOK_IDENTIFIER,
+					        "Expected binding name in variant payload");
+					bindings.push_back(
+					    stringPool->intern(previous().text(source_)));
+				} while (match(TOK_COMMA));
+			}
+			consume(TOK_CLOSE_PAREN, "Expected `)` to close payload bindings");
+			ExtraIdx extra = nodes->reserveExtra(3 + bindings.size());
+			nodes->setExtra(extra, 0u);  // receiver unused (inferred)
+			nodes->setExtra(extra + 1, bareVariantId);
+			nodes->setExtra(extra + 2, static_cast<uint32_t>(bindings.size()));
+			for (size_t k = 0; k < bindings.size(); k++) {
+				nodes->setExtra(extra + 3 + k, bindings[k]);
+			}
+			// flags = 5 (bit 0 bindings | bit 2 infer-receiver)
+			return emit(AstNode{AstTag::PatEnumVariant, 0, 5u, 0, extra, 0});
+		}
+		// flags = 4 (bit 2 infer-receiver, no bindings).
+		return emit(
+		    AstNode{AstTag::PatEnumVariant, 0, 4u, 0, 0u, bareVariantId});
 	}
 	if (match(TOK_NUMBER)) {
 		bool isNegative = false;

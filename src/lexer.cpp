@@ -492,6 +492,9 @@ std::vector<Token> Lexer::scanTokens() {
 				advance();
 				advance();
 				addToken(TOK_DOTDOT_EQ, "..=");
+			} else if (peek() == '.') {
+				advance();
+				addToken(TOK_DOTDOT, "..");
 			} else {
 				addToken(TOK_DOT, ".");
 			}

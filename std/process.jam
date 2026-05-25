@@ -1,43 +1,31 @@
 // std.process — access to the program's command-line arguments.
 //
-// `args()` returns an `Args` cursor; `next(&cursor)` yields each argument
-// in turn (argv[0] is the program path, by convention) until exhausted:
+// `args()` returns an `Args` cursor; `next(cursor)` yields each argument
+// as a `[]u8` (argv[0] is the program path, by convention) until done:
 //
 //     var it: Args = args();
 //     match (next(it)) {
-//         Option(Arg).Some(a) { /* a.ptr is a NUL-terminated C string */ }
-//         Option(Arg).None    { /* done */ }
+//         Option([]u8).Some(arg) { /* arg is a []u8 */ }
+//         Option([]u8).None      { /* exhausted */ }
 //     }
 //
 // The cursor API is function-style (`next(it)`, `count(it)`) rather than
-// method-style (`it.next()`): Jam can't currently dispatch a method on a
-// local var whose type comes from another module.
+// method-style: Jam can't currently dispatch a method on a local var
+// whose type comes from another module.
 //
 // The capture mechanism is chosen at comptime via `@isDarwin()`, so the
 // inactive branch is dead-code-eliminated — no `_NSGetArgv` reference
 // survives on a non-Darwin target, where that symbol doesn't exist:
-//   * Darwin: libSystem's _NSGetArgc / _NSGetArgv (live pointers, no copy).
+//   * Darwin: libSystem's _NSGetArgc / _NSGetArgv (live pointers).
 //   * other:  empty for now (Linux /proc/self/cmdline is a TODO).
-//
-// `next()` yields an `Arg` — a borrowed, NUL-terminated C string plus its
-// length — rather than `[]u8`, because Jam can't yet build a slice from a
-// raw pointer. `arg.ptr` feeds straight into fopen / access / etc. Once a
-// `@slice(ptr, len)` builtin lands, this can return `[]u8` instead.
 
 const { Option } = import("option");
 
 // `pub extern` so the declarations are visible when these functions are
-// codegen'd in an importer's compilation context (mirrors how
-// std.collections exposes malloc/free/realloc).
+// codegen'd in an importer's compilation context (mirrors std.collections).
 pub extern fn strlen(s: *const[] u8) u64;
 pub extern fn _NSGetArgc() u64;   // C: int*    (Darwin / libSystem)
 pub extern fn _NSGetArgv() u64;   // C: char***
-
-// A single borrowed command-line argument.
-pub const Arg = struct {
-    ptr: *const[] u8,   // NUL-terminated; valid for the process lifetime
-    len: u64,           // byte length, excluding the trailing NUL
-};
 
 // Cursor over argv. `table` points at the argv array (each slot an
 // 8-byte `char*`); `index` is the next slot to yield; `n` is argc.
@@ -51,8 +39,6 @@ pub fn args() Args {
     if (@isDarwin()) {
         // _NSGetArgc() -> int*   : deref for argc.
         // _NSGetArgv() -> char***: deref once for the char** argv table.
-        // (Cast to a binding first — Jam can't index a parenthesized
-        // cast expression like `(_NSGetArgc() as *mut[] i32)[0]`.)
         var argcPtr: *mut[] i32 = _NSGetArgc() as *mut[] i32;
         var argc:    u32        = argcPtr[0] as u32;
         var pp:      *mut[] u64 = _NSGetArgv() as *mut[] u64;   // &argv
@@ -66,15 +52,16 @@ pub fn args() Args {
     return Args { table: none, index: 0, n: 0 };
 }
 
-// Yield the next argument, advancing the cursor, or None once exhausted.
-pub fn next(it: mut Args) Option(Arg) {
+// Next argument as a []u8 (borrows argv's memory — valid for the process
+// lifetime), advancing the cursor; None once every argument is consumed.
+pub fn next(it: mut Args) Option([]u8) {
     if (it.index >= it.n) {
-        return Option(Arg).None();
+        return Option([]u8).None();
     }
     var cstr: *const[] u8 = it.table[it.index] as *const[] u8;
     it.index = it.index + 1;
-    var a: Arg = Arg { ptr: cstr, len: strlen(cstr) };
-    return Option(Arg).Some(a);
+    var s: []u8 = cstr[0..strlen(cstr)];
+    return Option([]u8).Some(s);
 }
 
 // Total number of arguments (argc), including argv[0].

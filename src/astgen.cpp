@@ -1893,6 +1893,56 @@ static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 // wraps the resulting pointer in an AddrOf so the JIR Type is the
 // expected pointer-to-leaf-type. Non-lvalue operands rvalue-spill
 // to a fresh alloca so `&someExpr` lowers cleanly.
+// AstGen for `Slice` -- `base[start..end]`. Builds a `[]T` value
+// { ptr = &base[start], len = end - start }. v1 supports many-item
+// pointer bases (the std.process / argv case); array and slice bases
+// can layer on later. Uses MakeSlice to assemble the {ptr,len} aggregate.
+static JirRef astgenSlice(AstGenCtx &gctx, const AstNode &n) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	NodeIdx baseIdx = static_cast<NodeIdx>(n.lhs);
+	ExtraIdx ex = static_cast<ExtraIdx>(n.rhs);
+	NodeIdx startIdx = static_cast<NodeIdx>(ns.getExtra(ex));
+	NodeIdx endIdx = static_cast<NodeIdx>(ns.getExtra(ex + 1));
+
+	JirRef baseRef = astgenExpr(gctx, baseIdx, kNoType);
+	TypeIdx baseTy = gctx.jfn.getInst(baseRef).ty;
+	const TypeKey &bk = gctx.ctx.getTypePool().get(baseTy);
+	if (bk.kind != TypeKind::PtrMany && bk.kind != TypeKind::PtrSingle) {
+		return recoverHere(
+		    gctx,
+		    "slice expression `base[a..b]` needs a many-item pointer base",
+		    kNoType);
+	}
+	TypeIdx elemTy = static_cast<TypeIdx>(bk.a);
+
+	JirRef startRef = astgenExpr(gctx, startIdx, BuiltinType::U64);
+	JirRef endRef = astgenExpr(gctx, endIdx, BuiltinType::U64);
+
+	// ptr = &base[start]
+	JirInst ia{};
+	ia.tag = JirTag::IndexAddr;
+	ia.a = baseRef;
+	ia.b = startRef;
+	ia.ty = gctx.ctx.getTypePool().internPtrMany(elemTy);
+	JirRef ptrRef = emit(gctx, ia);
+
+	// len = end - start
+	JirInst sub{};
+	sub.tag = JirTag::Sub;
+	sub.a = endRef;
+	sub.b = startRef;
+	sub.ty = BuiltinType::U64;
+	JirRef lenRef = emit(gctx, sub);
+
+	// { ptr, len }
+	JirInst ms{};
+	ms.tag = JirTag::MakeSlice;
+	ms.a = ptrRef;
+	ms.b = lenRef;
+	ms.ty = gctx.ctx.getTypePool().internSlice(elemTy);
+	return emit(gctx, ms);
+}
+
 static JirRef astgenAddressOf(AstGenCtx &gctx, const AstNode &n) {
 	NodeIdx opIdx = static_cast<NodeIdx>(n.lhs);
 	const AstNode &op = gctx.ctx.getNodeStore().get(opIdx);
@@ -2883,6 +2933,7 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx, JirRef scrut,
 		//              lookupEnum); else it's a StringIdx
 		bool hasBindings = (p.flags & 1) != 0;
 		bool typeIdxReceiver = (p.flags & 2) != 0;
+		bool inferReceiver = (p.flags & 4) != 0;
 		uint32_t recvSlot;
 		StringIdx variantNameId;
 		uint32_t bindingCount = 0;
@@ -2901,7 +2952,13 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx, JirRef scrut,
 		std::string enumName;
 		const auto *einfo =
 		    static_cast<const decltype(gctx.ctx.getEnum(""))>(nullptr);
-		if (typeIdxReceiver) {
+		if (inferReceiver) {
+			// Bare variant: resolve against the scrutinee's enum type.
+			if (const auto *info = gctx.ctx.lookupEnum(scrutTy)) {
+				enumName = info->name;
+				einfo = info;
+			}
+		} else if (typeIdxReceiver) {
 			TypeIdx ty = static_cast<TypeIdx>(recvSlot);
 			if (const auto *info = gctx.ctx.lookupEnum(ty)) {
 				enumName = info->name;
@@ -5258,6 +5315,9 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
 		break;
 	case AstTag::Index:
 		result = astgenIndex(gctx, n);
+		break;
+	case AstTag::Slice:
+		result = astgenSlice(gctx, n);
 		break;
 	case AstTag::AddressOf:
 		result = astgenAddressOf(gctx, n);

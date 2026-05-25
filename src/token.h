@@ -83,6 +83,7 @@ enum TokenType {
 	TOK_MOVE,       // move keyword (parameter mode: consume ownership)
 	TOK_ELLIPSIS,   // ... (variadic marker in extern fn parameters)
 	TOK_MATCH,      // match keyword
+	TOK_DOTDOT,     // .. (exclusive range / slice)
 	TOK_DOTDOT_EQ,  // ..= (inclusive range in match patterns)
 	TOK_AS,         // as keyword (explicit type cast)
 	TOK_AT,         // @ — prefix for comptime-function invocations:

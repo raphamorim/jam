@@ -13,3 +13,4 @@ pub const collections = import("collections");
 pub const option = import("option");
 pub const string = import("string");
 pub const process = import("process");
+pub const fs = import("fs");

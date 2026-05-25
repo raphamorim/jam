@@ -136,6 +136,19 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		    1, "slice_len");
 		return slice;
 	}
+	case JirTag::MakeSlice: {
+		// Build a {ptr, len} slice from a raw pointer (a) and length
+		// (b). Mirrors the JirTag::Str aggregate build above.
+		JamValueRef ptrV = emitInst(lctx, inst.a);
+		JamValueRef lenV = emitInst(lctx, inst.b);
+		JamTypeRef sliceTy = lctx.ctx.getLLVMType(inst.ty);
+		JamValueRef slice = JamLLVMGetUndef(sliceTy);
+		slice = JamLLVMBuildInsertValue(lctx.ctx.getBuilder(), slice, ptrV, 0,
+		                                "slice.ptr");
+		slice = JamLLVMBuildInsertValue(lctx.ctx.getBuilder(), slice, lenV, 1,
+		                                "slice.len");
+		return slice;
+	}
 	case JirTag::Param: {
 		// flags & 1 means the param is ByPointer (mut / move always;
 		// let / const for any byref aggregate). We hand back the LLVM
@@ -694,9 +707,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// the value* as though it were a pointer — a malformed
 		// `memcpy(dst, %Struct val, ...)` that reads a wild address and
 		// segfaults. Scalars (ints, floats, bools, pointers) load byval.
-		if (jam::abi::isByRef(inst.ty, lctx.ctx)) {
-			return fieldPtr;
-		}
+		if (jam::abi::isByRef(inst.ty, lctx.ctx)) { return fieldPtr; }
 		JamTypeRef fieldTy = lctx.ctx.getLLVMType(inst.ty);
 		return JamLLVMBuildLoad(lctx.ctx.getBuilder(), fieldTy, fieldPtr,
 		                        "enum.payload.val");

@@ -1,0 +1,49 @@
+// Bare (unqualified) variant patterns in `match` — the variant's enum is
+// inferred from the scrutinee's type, so `Some(x)` / `None` work without
+// the `Option(T).` prefix. Qualified patterns still work (see other
+// tests); these cover the inferred form.
+
+const { assert } = import("test");
+const { Option } = import("std").option;
+
+const Pt = struct { x: u32, y: u32 };
+
+fn sumOpt(o: Option(Pt)) u32 {
+    match (o) {
+        Some(p) { return p.x + p.y; }   // bare variant + payload binding
+        None    { return 0; }           // bare unit variant
+    }
+    return 99;
+}
+
+tfn bareSome() { assert(sumOpt(Option(Pt).Some(Pt { x: 30, y: 12 })), 42); }
+tfn bareNone() { assert(sumOpt(Option(Pt).None()), 0); }
+
+// Bare variants on a custom enum (multi-field payload + unit variant).
+const Msg = enum {
+    Quit,
+    Move(u32, u32),
+};
+
+fn area(m: Msg) u32 {
+    match (m) {
+        Move(a, b) { return a * b; }
+        Quit       { return 0; }
+    }
+    return 99;
+}
+
+tfn bareCustomPayload() { assert(area(Msg.Move(6, 7)), 42); }
+tfn bareCustomUnit()    { assert(area(Msg.Quit), 0); }
+
+// Bare variant mixed with the `_` wildcard.
+fn isQuit(m: Msg) u32 {
+    match (m) {
+        Quit { return 1; }
+        _    { return 0; }
+    }
+    return 99;
+}
+
+tfn bareWithWildcardMatch()   { assert(isQuit(Msg.Quit), 1); }
+tfn bareWithWildcardDefault() { assert(isQuit(Msg.Move(1, 2)), 0); }
