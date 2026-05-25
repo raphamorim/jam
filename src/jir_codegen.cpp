@@ -591,14 +591,28 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 			return JamLLVMBuildLoad(lctx.ctx.getBuilder(), elemLLVMTy, gep,
 			                        "idx");
 		}
-		// Array case: spill the SSA value to a temp alloca and GEP.
+		// Array case. Arrays are byref (abi::isByRef is always true for
+		// TypeKind::Array), so `emitInst` returns a *pointer* to the
+		// backing storage — GEP straight into it, mirroring Zig's
+		// airArrayElemVal byref branch (references/zig-0.10.1
+		// src/codegen/llvm.zig:5724: resolveInst gives a pointer, then
+		// inBoundsGEP {0, idx}). The previous code unconditionally
+		// spilled `base` into a fresh alloca; for a byref base that
+		// stores the *pointer bits* into a [N]T slot and then indexes
+		// garbage — the bug behind module-const array reads (`TABLE[i]`)
+		// returning junk (a const read re-evaluates its init as an SSA
+		// ArrayLit, which lowers byref to a pointer). Only a genuine
+		// by-value aggregate would need the spill; guard on isByRef.
 		JamValueRef base = emitInst(lctx, inst.a);
-		uint64_t align = lctx.ctx.typeAlign(baseInst.ty);
-		JamValueRef tmp = JamLLVMBuildAlloca(lctx.ctx.getBuilder(), baseLLVMTy,
-		                                     align, "arr.tmp");
-		JamLLVMBuildStore(lctx.ctx.getBuilder(), base, tmp);
+		JamValueRef storage = base;
+		if (!jam::abi::isByRef(baseInst.ty, lctx.ctx)) {
+			uint64_t align = lctx.ctx.typeAlign(baseInst.ty);
+			storage = JamLLVMBuildAlloca(lctx.ctx.getBuilder(), baseLLVMTy,
+			                             align, "arr.tmp");
+			JamLLVMBuildStore(lctx.ctx.getBuilder(), base, storage);
+		}
 		JamValueRef gep = JamLLVMBuildArrayGEP(
-		    lctx.ctx.getBuilder(), baseLLVMTy, tmp, idxVal, "idx.gep");
+		    lctx.ctx.getBuilder(), baseLLVMTy, storage, idxVal, "idx.gep");
 		return JamLLVMBuildLoad(lctx.ctx.getBuilder(), elemLLVMTy, gep, "idx");
 	}
 	case JirTag::AddrOf: {

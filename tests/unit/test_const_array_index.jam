@@ -1,0 +1,55 @@
+const { assert } = import("test");
+
+// Regression: indexing a module-level `const [N]T = [...]` with a
+// *runtime* index used to return garbage.
+//
+// A module-const read re-evaluates its init expression (astgen.cpp), so
+// `TABLE` lowers to an SSA ArrayLit. Arrays are byref (abi.cpp), so that
+// value is a *pointer* to the storage. JirTag::Index's array case then
+// stored the pointer into a fresh [N]T alloca and indexed *that* —
+// reading the pointer bits instead of the array data. Fixed to GEP the
+// byref pointer directly, like Zig's airArrayElemVal byref branch.
+
+const SMALL: [4]u8 = [10, 20, 30, 40];
+const WIDE:  [8]u32 = [0x100, 0x200, 0x300, 0x400,
+                       0x500, 0x600, 0x700, 0x800];
+const SIGNED: [3]i32 = [0 - 5, 7, 0 - 9];
+
+fn atSmall(i: u32) u8  { return SMALL[i]; }
+fn atWide(i: u32)  u32 { return WIDE[i]; }
+fn atSigned(i: u32) u32 { return SIGNED[i] as u32; }
+
+// Runtime-index loop over a module-const array (the hot-path shape the
+// GTE divide LUT needs).
+fn sumSmall() u32 {
+    var s: u32 = 0;
+    var i: u32 = 0;
+    while (i < 4) {
+        s = s + (SMALL[i] as u32);
+        i = i + 1;
+    }
+    return s;
+}
+
+tfn constArrU8() {
+    assert(atSmall(0) as u32, 10);
+    assert(atSmall(1) as u32, 20);
+    assert(atSmall(2) as u32, 30);
+    assert(atSmall(3) as u32, 40);
+}
+
+tfn constArrU32() {
+    assert(atWide(0), 0x100);
+    assert(atWide(3), 0x400);
+    assert(atWide(7), 0x800);
+}
+
+tfn constArrSigned() {
+    assert(atSigned(0), 0xFFFFFFFB);   // -5 sign-extended
+    assert(atSigned(1), 7);
+    assert(atSigned(2), 0xFFFFFFF7);   // -9 sign-extended
+}
+
+tfn constArrLoopSum() {
+    assert(sumSmall(), 100);           // 10+20+30+40
+}
