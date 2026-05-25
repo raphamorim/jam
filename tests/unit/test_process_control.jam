@@ -1,0 +1,26 @@
+// std.process.exit / std.process.abort are noreturn bindings to libc
+// exit(3) / abort(3) (see std/process.jam). This is a COMPILE-ONLY guard
+// — actually calling either would terminate the test runner. Defining
+// wrappers that call them exercises:
+//   * the `import("std").process` path resolving `exit` / `abort`,
+//   * their `noreturn` signatures (a noreturn-typed call lets these
+//     wrappers omit a return and satisfy the "body diverges" check),
+// without ever executing them. The runner only invokes `tfn`s, so the
+// `fn` wrappers below are type-checked but never run.
+const { assert } = import("test");
+const { exit, abort } = import("std").process;
+
+fn callsExit() noreturn {
+    exit(1);
+}
+
+fn callsAbort() noreturn {
+    abort();
+}
+
+tfn processControlCompiles() {
+    // Reaching here means the wrappers above compiled, i.e. both
+    // std.process.exit and std.process.abort imported with valid
+    // noreturn signatures.
+    assert(1, 1);
+}

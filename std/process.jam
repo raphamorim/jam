@@ -27,6 +27,23 @@ pub extern fn strlen(s: *const[] u8) u64;
 pub extern fn _NSGetArgc() u64;   // C: int*    (Darwin / libSystem)
 pub extern fn _NSGetArgv() u64;   // C: char***
 
+// Terminate the process with status `code`, never returning. A noreturn
+// binding to libc exit(3) — the same model as Rust's
+// `std::process::exit(code: i32) -> !` and Zig's `std.os.exit`, both of
+// which bottom out in the C `exit` when linked against libc. The status
+// is an i32 to match C's `exit(int)`; POSIX masks it to the low 8 bits.
+// `noreturn` lets callers treat the call site as diverging (no return /
+// dead code after it required).
+pub extern fn exit(code: i32) noreturn;
+
+// Abnormal termination: raise SIGABRT (core dump / debugger trap) and
+// never return. A noreturn binding to libc abort(3) — mirrors Rust's
+// `std::process::abort()` and Zig's `std.os.abort` (both noreturn
+// libc-abort bindings; Zig raises SIGABRT by hand when not linked
+// against libc). Use for unrecoverable invariant violations where no
+// meaningful exit status exists; prefer `exit(code)` for normal failure.
+pub extern fn abort() noreturn;
+
 // Cursor over argv. `table` points at the argv array (each slot an
 // 8-byte `char*`); `index` is the next slot to yield; `n` is argc.
 pub const Args = struct {
