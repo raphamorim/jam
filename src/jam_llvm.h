@@ -137,6 +137,21 @@ JAM_EXTERN_C unsigned JamLLVMGetIntTypeWidth(JamTypeRef type);
 JAM_EXTERN_C JamValueRef JamLLVMConstInt(JamTypeRef type, uint64_t val,
                                          bool signExtend);
 JAM_EXTERN_C JamValueRef JamLLVMConstReal(JamTypeRef type, double val);
+// Parse a decimal/hex float lexeme (sign-stripped, underscores removed) into an
+// IEEE-754 binary128 (f128) value — the widest float, used as the precision-
+// preserving intermediate for a literal. Then pick the smallest lossless
+// storage: if the f128 round-trips through f64 with no loss, write the f64 bit
+// pattern to *outF64 and return false; otherwise write the 128-bit pattern to
+// outQuad[4] (little-endian word order) and return true. Rounding to the final
+// f32/f64 type happens later, at the coercion point — so a literal is rounded
+// to its target exactly once, never decimal→f64→f32.
+JAM_EXTERN_C bool JamLLVMParseDecimalFloat(const char *str, unsigned len,
+                                           uint64_t *outF64, uint32_t *outQuad);
+// Round an f128 value (the 4×u32 pattern above) once to f32 (toF32=true) or f64,
+// returned widened to a C double (an f32 result is exact in f64). This is the
+// single, final rounding — no double-rounding through f64.
+JAM_EXTERN_C double JamLLVMQuadToTargetAsDouble(const uint32_t *quad,
+                                                bool toF32);
 JAM_EXTERN_C JamValueRef JamLLVMConstNull(JamTypeRef type);
 JAM_EXTERN_C JamValueRef JamLLVMConstString(JamContextRef ctx, const char *str,
                                             unsigned length,

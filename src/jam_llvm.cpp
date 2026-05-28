@@ -11,6 +11,9 @@
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -26,6 +29,7 @@
 #include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
@@ -283,6 +287,58 @@ JamValueRef JamLLVMConstInt(JamTypeRef type, uint64_t val, bool signExtend) {
 
 JamValueRef JamLLVMConstReal(JamTypeRef type, double val) {
 	return WRAP_VALUE(llvm::ConstantFP::get(UNWRAP_TYPE(type), val));
+}
+
+bool JamLLVMParseDecimalFloat(const char *str, unsigned len, uint64_t *outF64,
+                             uint32_t *outQuad) {
+	// Parse the decimal/hex float text into IEEE binary128 with one correctly
+	// rounded step (APFloat is arbitrary-precision internally — this is the
+	// path clang uses for float literals). f128 is wide enough that a later
+	// round to f32/f64 matches rounding the original decimal directly.
+	llvm::APFloat q(llvm::APFloat::IEEEquad());
+	auto parsed = q.convertFromString(llvm::StringRef(str, len),
+	                                  llvm::APFloat::rmNearestTiesToEven);
+	if (!parsed) {
+		llvm::consumeError(parsed.takeError());
+		*outF64 = 0;  // 0.0 — shouldn't happen (tokenizer already validated)
+		return false;
+	}
+	// If the f128 round-trips through f64 with no loss of precision, store the
+	// compact f64 form instead of the full f128.
+	llvm::APFloat asF64 = q;
+	bool lostInfo = false;
+	asF64.convert(llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven,
+	              &lostInfo);
+	if (!lostInfo) {
+		*outF64 = asF64.bitcastToAPInt().getZExtValue();
+		return false;  // fits f64 losslessly — caller stores f64 inline
+	}
+	llvm::APInt bits = q.bitcastToAPInt();  // 128-bit pattern
+	const uint64_t *raw = bits.getRawData();  // raw[0] = low 64, raw[1] = high 64
+	outQuad[0] = static_cast<uint32_t>(raw[0] & 0xFFFFFFFFu);
+	outQuad[1] = static_cast<uint32_t>(raw[0] >> 32);
+	outQuad[2] = static_cast<uint32_t>(raw[1] & 0xFFFFFFFFu);
+	outQuad[3] = static_cast<uint32_t>(raw[1] >> 32);
+	return true;  // needs the full f128
+}
+
+double JamLLVMQuadToTargetAsDouble(const uint32_t *quad, bool toF32) {
+	uint64_t words[2] = {
+	    static_cast<uint64_t>(quad[0]) | (static_cast<uint64_t>(quad[1]) << 32),
+	    static_cast<uint64_t>(quad[2]) | (static_cast<uint64_t>(quad[3]) << 32),
+	};
+	llvm::APInt bits(128, llvm::ArrayRef<uint64_t>(words, 2));
+	llvm::APFloat q(llvm::APFloat::IEEEquad(), bits);
+	bool lostInfo = false;
+	// The single, final rounding: f128 → target semantics.
+	q.convert(toF32 ? llvm::APFloat::IEEEsingle() : llvm::APFloat::IEEEdouble(),
+	          llvm::APFloat::rmNearestTiesToEven, &lostInfo);
+	// Widen an f32 result to f64 for the C-ABI return — exact, no rounding.
+	if (toF32) {
+		q.convert(llvm::APFloat::IEEEdouble(),
+		          llvm::APFloat::rmNearestTiesToEven, &lostInfo);
+	}
+	return q.convertToDouble();
 }
 
 JamValueRef JamLLVMConstNull(JamTypeRef type) {

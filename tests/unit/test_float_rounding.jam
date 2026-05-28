@@ -1,0 +1,55 @@
+// Float-literal rounding parity.
+//
+// A decimal float must be rounded to its target f32/f64 type in ONE step
+// (as a C `…f` literal is), not via the intermediate `decimal -> f64 -> f32`
+// chain, which double-rounds.
+//
+// The probe value 1.0000000596046447753906250000001 sits just above the f32
+// midpoint between 1.0 (0x3f800000) and 1.0+2^-23 (0x3f800001), but within
+// half an f64 ULP of that midpoint. So:
+//   - correct single rounding  decimal -> f32  = 0x3f800001
+//   - the old double rounding   decimal -> f64 -> f32 = 0x3f800000
+// (verified against clang strtof / LLVM APFloat).
+
+const { assert } = import("test");
+
+const FloatBits = union { i: u32, f: f32 };
+const DoubleBits = union { i: u64, f: f64 };
+
+// Explicit `as f32` cast — the form the jamstation GPU-timing constants use.
+tfn f32CastRoundsOnce() {
+    const x: f32 = 1.0000000596046447753906250000001 as f32;
+    var b: FloatBits = FloatBits { f: x };
+    assert(b.i, 0x3f800001);
+}
+
+// Bare f32 type annotation — exercises peer-type propagation into the literal.
+tfn f32AnnotationRoundsOnce() {
+    const x: f32 = 1.0000000596046447753906250000001;
+    var b: FloatBits = FloatBits { f: x };
+    assert(b.i, 0x3f800001);
+}
+
+// Sign is applied after the (single) round of the magnitude.
+tfn f32NegativeRoundsOnce() {
+    const x: f32 = -1.0000000596046447753906250000001 as f32;
+    var b: FloatBits = FloatBits { f: x };
+    assert(b.i, 0xbf800001);
+}
+
+// f64 literals are unaffected: decimal -> f128 -> f64 equals decimal -> f64.
+tfn f64LiteralUnchanged() {
+    const x: f64 = 0.1;
+    var b: DoubleBits = DoubleBits { f: x };
+    assert(b.i, 0x3fb999999999999a);
+}
+
+// f64-inline storage path: exactly 1 + 2^-24 (the f32 midpoint) is f64-exact,
+// so it's stored inline rather than as f128. Rounding f64->f32 is round-to-
+// nearest-EVEN, so the midpoint goes to 1.0 (0x3f800000), not 0x3f800001.
+// Complements f32CastRoundsOnce (just *above* the midpoint -> f128 path -> up).
+tfn f32MidpointRoundsToEven() {
+    const x: f32 = 1.000000059604644775390625 as f32;
+    var b: FloatBits = FloatBits { f: x };
+    assert(b.i, 0x3f800000);
+}

@@ -6,8 +6,10 @@
  */
 
 #include "parser.h"
+#include "jam_llvm.h"
 #include "number_literal.h"
 #include <cstring>
+#include <string>
 
 // Validate a number lexeme via the dedicated validator
 // (number_literal.cpp). Strips a leading `-` sign before delegating —
@@ -225,22 +227,51 @@ NodeIdx Parser::parsePrimary() {
 	}
 
 	if (match(TOK_NUMBER)) {
-		// `parseNumLexeme` returns the magnitude; the sign is recorded in
-		// the node's flags bit 0 (negative) and bit 1 (isFloat: when
-		// set the magnitude is the bit pattern of a `double`).
+		// `parseNumLexeme` validates the lexeme and classifies it; the sign
+		// is recorded in the node's flags bit 0 (negative) and bit 1
+		// (isFloat). For integers `lhs`/`rhs` hold the 64-bit magnitude.
 		bool isNegative = false;
 		bool isFloat = false;
 		uint64_t mag =
 		    parseNumLexeme(previous().text(source_), isNegative, isFloat);
 		uint16_t flags = 0;
 		if (isNegative) flags |= 1;
-		if (isFloat) flags |= 2;
-		AstNode n{AstTag::NumberLit,
-		          0,
-		          flags,
-		          0,
-		          static_cast<uint32_t>(mag & 0xFFFFFFFFu),
-		          static_cast<uint32_t>(mag >> 32)};
+		uint32_t lhsSlot = 0;
+		uint32_t rhsSlot = 0;
+		if (isFloat) {
+			flags |= 2;
+			// Parse the decimal to f128 ONCE here (the widest float), then pick
+			// the smallest lossless storage: an f128 that round-trips through
+			// f64 is stored inline as f64 bits (lhs/rhs); otherwise the full
+			// f128 goes in the extra pool (lhs = ExtraIdx) and flag bit 2 is
+			// set. Rounding to the target f32/f64 is deferred to coercion
+			// (astgen), so we never double-round through f64.
+			std::string_view raw = previous().text(source_);
+			if (isNegative && !raw.empty() && raw.front() == '-') {
+				raw.remove_prefix(1);
+			}
+			std::string clean;
+			clean.reserve(raw.size());
+			for (char c : raw) {
+				if (c != '_') clean.push_back(c);
+			}
+			uint64_t f64bits = 0;
+			uint32_t quad[4] = {0, 0, 0, 0};
+			if (JamLLVMParseDecimalFloat(clean.data(),
+			                             static_cast<unsigned>(clean.size()),
+			                             &f64bits, quad)) {
+				flags |= 4;  // value needs full f128, held in the extra pool
+				lhsSlot = static_cast<uint32_t>(nodes->pushExtraSpan(quad, 4));
+			} else {
+				// Fits f64 losslessly — store the f64 bit pattern inline.
+				lhsSlot = static_cast<uint32_t>(f64bits & 0xFFFFFFFFu);
+				rhsSlot = static_cast<uint32_t>(f64bits >> 32);
+			}
+		} else {
+			lhsSlot = static_cast<uint32_t>(mag & 0xFFFFFFFFu);
+			rhsSlot = static_cast<uint32_t>(mag >> 32);
+		}
+		AstNode n{AstTag::NumberLit, 0, flags, 0, lhsSlot, rhsSlot};
 		return emit(n);
 	}
 	if (match(TOK_TRUE)) {

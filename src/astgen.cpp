@@ -415,13 +415,34 @@ static JirRef astgenNumberLit(AstGenCtx &gctx, const AstNode &n,
 	    gctx.jfn.insts.empty() ? 0 : static_cast<uint32_t>(0);  // patched below
 
 	if (isFloat) {
+		// This is the coercion point (we know `expected`), so produce the
+		// value rounded ONCE to the target f32/f64, avoiding the
+		// decimal→f64→f32 double-round. Codegen is unchanged: it emits the
+		// already-correctly-rounded value via ConstReal.
+		bool toF32 = (expected != kNoType && expected == BuiltinType::F32);
+		double d;
+		if ((n.flags & 4) != 0) {
+			// Full f128 in the extra pool — round it to the target here.
+			const NodeStore &ns = gctx.ctx.getNodeStore();
+			ExtraIdx ei = static_cast<ExtraIdx>(n.lhs);
+			uint32_t quad[4] = {ns.getExtra(ei), ns.getExtra(ei + 1),
+			                    ns.getExtra(ei + 2), ns.getExtra(ei + 3)};
+			d = JamLLVMQuadToTargetAsDouble(quad, toF32);
+		} else {
+			// f64 stored inline, and it is the exact f128 value (lossless), so
+			// codegen's ConstReal(target, d) rounds it once to the target with
+			// no double-rounding (f64→f32 here == f128→f32).
+			uint64_t bits = static_cast<uint64_t>(n.lhs) |
+			                (static_cast<uint64_t>(n.rhs) << 32);
+			__builtin_memcpy(&d, &bits, sizeof(d));
+		}
+		uint64_t bits;
+		__builtin_memcpy(&bits, &d, sizeof(bits));
 		inst.tag = JirTag::Float;
-		inst.a = static_cast<uint32_t>(val & 0xFFFFFFFFu);
-		inst.b = static_cast<uint32_t>(val >> 32);
+		inst.a = static_cast<uint32_t>(bits & 0xFFFFFFFFu);
+		inst.b = static_cast<uint32_t>(bits >> 32);
 		if (isNeg) inst.flags |= 1;  // sign bit applied at codegen
-		inst.ty = (expected != kNoType && expected == BuiltinType::F32)
-		              ? BuiltinType::F32
-		              : BuiltinType::F64;
+		inst.ty = toF32 ? BuiltinType::F32 : BuiltinType::F64;
 		return emit(gctx, inst);
 	}
 
@@ -2060,7 +2081,13 @@ static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 		}
 	}
 	const TypeKey &dst = gctx.ctx.getTypePool().get(dstTy);
-	TypeIdx hint = (dst.kind == TypeKind::Int) ? dstTy : kNoType;
+	// Pass the destination as a peer-type hint for Int *and* Float so a
+	// numeric literal operand settles directly at the target width. For
+	// floats this is essential: `<lit> as f32` must round the literal to f32
+	// in one step, not lower it at f64 and then FPTrunc (which double-rounds).
+	TypeIdx hint =
+	    (dst.kind == TypeKind::Int || dst.kind == TypeKind::Float) ? dstTy
+	                                                               : kNoType;
 	JirRef val = astgenExpr(gctx, operandIdx, hint);
 	TypeIdx srcTy = gctx.jfn.getInst(val).ty;
 	if (srcTy == dstTy) return val;
