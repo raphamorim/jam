@@ -7,13 +7,13 @@
 
 #include "jam_llvm.h"
 
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
-#include "llvm/ADT/APFloat.h"
-#include "llvm/ADT/APInt.h"
-#include "llvm/ADT/ArrayRef.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -290,7 +290,7 @@ JamValueRef JamLLVMConstReal(JamTypeRef type, double val) {
 }
 
 bool JamLLVMParseDecimalFloat(const char *str, unsigned len, uint64_t *outF64,
-                             uint32_t *outQuad) {
+                              uint32_t *outQuad) {
 	// Parse the decimal/hex float text into IEEE binary128 with one correctly
 	// rounded step (APFloat is arbitrary-precision internally — this is the
 	// path clang uses for float literals). f128 is wide enough that a later
@@ -307,14 +307,15 @@ bool JamLLVMParseDecimalFloat(const char *str, unsigned len, uint64_t *outF64,
 	// compact f64 form instead of the full f128.
 	llvm::APFloat asF64 = q;
 	bool lostInfo = false;
-	asF64.convert(llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven,
-	              &lostInfo);
+	asF64.convert(llvm::APFloat::IEEEdouble(),
+	              llvm::APFloat::rmNearestTiesToEven, &lostInfo);
 	if (!lostInfo) {
 		*outF64 = asF64.bitcastToAPInt().getZExtValue();
 		return false;  // fits f64 losslessly — caller stores f64 inline
 	}
 	llvm::APInt bits = q.bitcastToAPInt();  // 128-bit pattern
-	const uint64_t *raw = bits.getRawData();  // raw[0] = low 64, raw[1] = high 64
+	const uint64_t *raw =
+	    bits.getRawData();  // raw[0] = low 64, raw[1] = high 64
 	outQuad[0] = static_cast<uint32_t>(raw[0] & 0xFFFFFFFFu);
 	outQuad[1] = static_cast<uint32_t>(raw[0] >> 32);
 	outQuad[2] = static_cast<uint32_t>(raw[1] & 0xFFFFFFFFu);

@@ -147,9 +147,9 @@ JAM_EXTERN_C JamValueRef JamLLVMConstReal(JamTypeRef type, double val);
 // to its target exactly once, never decimal→f64→f32.
 JAM_EXTERN_C bool JamLLVMParseDecimalFloat(const char *str, unsigned len,
                                            uint64_t *outF64, uint32_t *outQuad);
-// Round an f128 value (the 4×u32 pattern above) once to f32 (toF32=true) or f64,
-// returned widened to a C double (an f32 result is exact in f64). This is the
-// single, final rounding — no double-rounding through f64.
+// Round an f128 value (the 4×u32 pattern above) once to f32 (toF32=true) or
+// f64, returned widened to a C double (an f32 result is exact in f64). This is
+// the single, final rounding — no double-rounding through f64.
 JAM_EXTERN_C double JamLLVMQuadToTargetAsDouble(const uint32_t *quad,
                                                 bool toF32);
 JAM_EXTERN_C JamValueRef JamLLVMConstNull(JamTypeRef type);

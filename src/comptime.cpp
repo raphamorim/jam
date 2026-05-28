@@ -218,14 +218,15 @@ ComptimeValue ComptimeEvaluator::evalNumberLit(const AstNode &n) const {
 	bool isFloat = (n.flags & 2) != 0;
 	if (isFloat) {
 		// The comptime float value is f64. Either the literal is stored inline
-		// as f64 bits (lossless), or as full f128 in the extra pool (flag bit 2)
-		// which we round once to f64 (f128→f64 equals decimal→f64; no double-
-		// rounding). See the parser / astgenNumberLit.
+		// as f64 bits (lossless), or as full f128 in the extra pool (flag bit
+		// 2) which we round once to f64 (f128→f64 equals decimal→f64; no
+		// double- rounding). See the parser / astgenNumberLit.
 		double v;
 		if ((n.flags & 4) != 0) {
 			ExtraIdx ei = static_cast<ExtraIdx>(n.lhs);
 			uint32_t quad[4] = {nodes_.getExtra(ei), nodes_.getExtra(ei + 1),
-			                    nodes_.getExtra(ei + 2), nodes_.getExtra(ei + 3)};
+			                    nodes_.getExtra(ei + 2),
+			                    nodes_.getExtra(ei + 3)};
 			v = JamLLVMQuadToTargetAsDouble(quad, /*toF32=*/false);
 		} else {
 			uint64_t bits = static_cast<uint64_t>(n.lhs) |

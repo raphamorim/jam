@@ -574,6 +574,24 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamTypeRef baseLLVMTy = lctx.ctx.getLLVMType(baseInst.ty);
 		JamTypeRef elemLLVMTy = lctx.ctx.getLLVMType(inst.ty);
 
+		// Byref aggregate element types (Struct / Array / Union / payloaded
+		// Enum) follow the same convention as JirTag::Load above: the
+		// JirRef VALUE is the storage pointer, never a materialized
+		// aggregate in SSA. Skip the trailing `load %T, ptr %gep`;
+		// downstream Store / Ret / arg-passing then sees a byref pointer
+		// and emits memcpy / pointer-forward. Mirrors the byref branch in
+		// Zig's airSliceElemVal / airPtrElemVal / airArrayElemVal
+		// (references/zig-0.10.1 src/codegen/llvm.zig ~5678/5716/5745):
+		// they do the same GEP + return-pointer-for-byref-elem. jam's
+		// universal "byref JirRef = pointer" invariant means we don't
+		// need Zig's `loadByRef` fallback — every downstream byref
+		// consumer (Store/Ret/Call) already memcpy's from the pointer.
+		// Without this guard the aggregate was loaded into SSA, but the
+		// byref consumer still treated the JirRef as a pointer — the
+		// result was a malformed memcpy passing a struct value where a
+		// src pointer was expected. Byval elements (scalars / pointers /
+		// slices) keep the GEP+Load path.
+		const bool elemByRef = jam::abi::isByRef(inst.ty, lctx.ctx);
 		if (basek.kind == TypeKind::Slice) {
 			// SSA slice value: extract the pointer field (0), GEP by elem.
 			JamValueRef base = emitInst(lctx, inst.a);
@@ -581,6 +599,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 			                                           base, 0, "slice.ptr");
 			JamValueRef gep = JamLLVMBuildPtrGEP(
 			    lctx.ctx.getBuilder(), elemLLVMTy, ptr, idxVal, "idx.gep");
+			if (elemByRef) { return gep; }
 			return JamLLVMBuildLoad(lctx.ctx.getBuilder(), elemLLVMTy, gep,
 			                        "idx");
 		}
@@ -588,6 +607,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 			JamValueRef base = emitInst(lctx, inst.a);
 			JamValueRef gep = JamLLVMBuildPtrGEP(
 			    lctx.ctx.getBuilder(), elemLLVMTy, base, idxVal, "idx.gep");
+			if (elemByRef) { return gep; }
 			return JamLLVMBuildLoad(lctx.ctx.getBuilder(), elemLLVMTy, gep,
 			                        "idx");
 		}
@@ -613,6 +633,7 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		}
 		JamValueRef gep = JamLLVMBuildArrayGEP(
 		    lctx.ctx.getBuilder(), baseLLVMTy, storage, idxVal, "idx.gep");
+		if (elemByRef) { return gep; }
 		return JamLLVMBuildLoad(lctx.ctx.getBuilder(), elemLLVMTy, gep, "idx");
 	}
 	case JirTag::AddrOf: {

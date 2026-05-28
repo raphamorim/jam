@@ -2085,9 +2085,9 @@ static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 	// numeric literal operand settles directly at the target width. For
 	// floats this is essential: `<lit> as f32` must round the literal to f32
 	// in one step, not lower it at f64 and then FPTrunc (which double-rounds).
-	TypeIdx hint =
-	    (dst.kind == TypeKind::Int || dst.kind == TypeKind::Float) ? dstTy
-	                                                               : kNoType;
+	TypeIdx hint = (dst.kind == TypeKind::Int || dst.kind == TypeKind::Float)
+	                   ? dstTy
+	                   : kNoType;
 	JirRef val = astgenExpr(gctx, operandIdx, hint);
 	TypeIdx srcTy = gctx.jfn.getInst(val).ty;
 	if (srcTy == dstTy) return val;
