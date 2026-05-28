@@ -338,9 +338,13 @@ static int compileAndRun(const std::string &filename,
 		JamCodegenContext::ModuleNamespace ns;
 		ns.path = path;
 		for (auto &func : importedModule->Functions) {
+			// All functions (pub + private) go into the per-module ns
+			// so a body in this module can resolve a sibling helper
+			// regardless of pub status. Only pub ones leak into the
+			// global flat map.
+			ns.functions[func->Name] = func.get();
 			if (func->isPub) {
 				codegenCtx.registerFunctionAST(func->Name, func.get());
-				ns.functions[func->Name] = func.get();
 				// Eagerly declare LLVM prototypes for pub-extern fns
 				// (libc allocator, write, putchar, …). A generic
 				// instantiation in Pass B may emit a Call to one of
@@ -352,9 +356,9 @@ static int compileAndRun(const std::string &filename,
 				// those to Pass B.
 				if (func->isExtern && !func->isGeneric()) {
 					JirFunction jfn = astgenMetadata(*func, codegenCtx);
-					jfn.name = mangledFunctionName(
-					    *func, codegenCtx.getTypePool(),
-					    codegenCtx.getStringPool());
+					jfn.name =
+					    mangledFunctionName(*func, codegenCtx.getTypePool(),
+					                        codegenCtx.getStringPool());
 					jirDeclarePrototype(jfn, codegenCtx);
 				}
 			}
@@ -393,12 +397,15 @@ static int compileAndRun(const std::string &filename,
 	// fallback, against the generic's defining-module namespace.
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
 		for (auto &func : importedModule->Functions) {
-			if (func->isPub && !func->isGeneric()) {
-				JirFunction jfn = astgenMetadata(*func, codegenCtx);
-				jfn.name = mangledFunctionName(*func, codegenCtx.getTypePool(),
-				                               codegenCtx.getStringPool());
-				jirDeclarePrototype(jfn, codegenCtx);
-			}
+			if (func->isGeneric()) continue;
+			// Pub fns need prototypes so callers can call them. Private
+			// helpers also need them so the pub bodies above that
+			// reference them (via defining-module-scope lookup) resolve
+			// at LLVM codegen time.
+			JirFunction jfn = astgenMetadata(*func, codegenCtx);
+			jfn.name = mangledFunctionName(*func, codegenCtx.getTypePool(),
+			                               codegenCtx.getStringPool());
+			jirDeclarePrototype(jfn, codegenCtx);
 		}
 	}
 	// Register every flat `handle.X` mapping for a given (handle name,
@@ -792,17 +799,26 @@ static int compileAndRun(const std::string &filename,
 		}
 	}
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
+		// Push the defining module so the bodies of `pub` functions
+		// imported from it can resolve bare-name calls (e.g. a private
+		// helper called from a pub fn) against that module's namespace,
+		// not the caller's. Same mechanism the generic-instantiation
+		// path uses — see JamCodegenContext::pushBodyModule.
+		codegenCtx.pushBodyModule(path);
 		for (auto &func : importedModule->Functions) {
-			if (func->isPub && !func->isGeneric()) {
-				try {
-					JirFunction jfn = astgenFunction(*func, codegenCtx);
-					jfn.name =
-					    mangledFunctionName(*func, codegenCtx.getTypePool(),
-					                        codegenCtx.getStringPool());
-					jirFunctions.push_back(std::move(jfn));
-				} catch (const AstGenAnalysisFail &) {
-					// diagnostic already pushed
-				}
+			if (func->isGeneric()) continue;
+			if (func->isExtern) continue;
+			// Emit bodies for ALL non-extern fns in the imported
+			// module (pub + private). A pub fn that calls a private
+			// helper needs the helper's body emitted in the same
+			// compilation unit so LLVM has a definition to link.
+			try {
+				JirFunction jfn = astgenFunction(*func, codegenCtx);
+				jfn.name = mangledFunctionName(*func, codegenCtx.getTypePool(),
+				                               codegenCtx.getStringPool());
+				jirFunctions.push_back(std::move(jfn));
+			} catch (const AstGenAnalysisFail &) {
+				// diagnostic already pushed
 			}
 		}
 		for (auto &s : importedModule->Structs) {
@@ -818,6 +834,7 @@ static int compileAndRun(const std::string &filename,
 				}
 			}
 		}
+		codegenCtx.popBodyModule();
 	}
 
 	// Astgen accumulated every per-decl diagnostic onto the

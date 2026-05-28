@@ -484,9 +484,7 @@ JamCodegenContext::getFunctionAST(const std::string &name) const {
 			auto nsIt = moduleNamespaces_.find(defMod);
 			if (nsIt != moduleNamespaces_.end()) {
 				auto fIt = nsIt->second.functions.find(name);
-				if (fIt != nsIt->second.functions.end()) {
-					return fIt->second;
-				}
+				if (fIt != nsIt->second.functions.end()) { return fIt->second; }
 			}
 		}
 	}

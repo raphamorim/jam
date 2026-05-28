@@ -2210,14 +2210,39 @@ static JirRef astgenAsCast(AstGenCtx &gctx, const AstNode &n) {
 		return emit(gctx, inst);
 	}
 	// Pointer ↔ integer cast — only u64 is wide enough to round-trip
-	// a pointer on every supported target, so restrict to that width.
-	// `myPtr as u64` or `addr as *mut[] u8`. Stays out of the int↔int
-	// path below because that one issues SExt/Trunc instead.
+	// a pointer on every supported target, so restrict to that width
+	// for the ptr→int direction. `myPtr as u64` stays the canonical form.
 	if (isPtr(src) && dst.kind == TypeKind::Int && dst.a == 64) {
 		return emitCast(JirTag::PtrToInt);
 	}
-	if (src.kind == TypeKind::Int && src.a == 64 && isPtr(dst)) {
-		return emitCast(JirTag::IntToPtr);
+	// Int → thin pointer (PtrSingle / PtrMany). Accepts any integer
+	// width — matches Rust's *addr-ptr-cast* (compiler/rustc_hir_typeck/
+	// src/cast.rs:1101 check_addr_ptr_cast), which permits the cast as
+	// long as the target pointer is sized/thin. Narrower-than-pointer
+	// sources are zero/sign-extended to u64 first so LLVM's IntToPtr
+	// gets a pointer-width operand. The slice type ([]T, which carries
+	// a length field) is intentionally excluded by `isPtr` — round-
+	// tripping that needs an explicit (ptr, len) pair.
+	if (src.kind == TypeKind::Int && isPtr(dst)) {
+		JirRef widened = val;
+		if (src.a < 64) {
+			JirInst ext{};
+			ext.tag = (src.b != 0) ? JirTag::SExt : JirTag::ZExt;
+			ext.a = val;
+			ext.ty = gctx.ctx.getTypePool().internInt(64, false);
+			widened = emit(gctx, ext);
+		} else if (src.a > 64) {
+			JirInst tr{};
+			tr.tag = JirTag::Trunc;
+			tr.a = val;
+			tr.ty = gctx.ctx.getTypePool().internInt(64, false);
+			widened = emit(gctx, tr);
+		}
+		JirInst i2p{};
+		i2p.tag = JirTag::IntToPtr;
+		i2p.a = widened;
+		i2p.ty = dstTy;
+		return emit(gctx, i2p);
 	}
 	if (src.kind == TypeKind::Int && dst.kind == TypeKind::Int) {
 		uint32_t sw = src.a;

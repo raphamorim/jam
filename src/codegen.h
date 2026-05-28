@@ -504,11 +504,12 @@ class JamCodegenContext {
 	// concrete generic args, creates a fresh LLVM struct type with a
 	// synthesized name, and returns a Named TypeIdx pointing at it.
 	// Memoizes by instantiated name.
-	TypeIdx instantiateStructExpr(
-	    const AstNode &exprNode, const std::string &calleeName,
-	    const std::vector<TypeIdx> &args,
-	    const std::unordered_map<std::string, TypeIdx> &subst,
-	    const std::string &definingModulePath) const;
+	TypeIdx
+	instantiateStructExpr(const AstNode &exprNode,
+	                      const std::string &calleeName,
+	                      const std::vector<TypeIdx> &args,
+	                      const std::unordered_map<std::string, TypeIdx> &subst,
+	                      const std::string &definingModulePath) const;
 
 	// Mirror of instantiateStructExpr for `enum { ... }` expressions.
 	// Substitutes each variant's payload types with the concrete
