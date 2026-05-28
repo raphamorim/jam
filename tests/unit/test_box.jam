@@ -1,0 +1,43 @@
+// std.box — Box(T) unit tests.
+//
+// Exercises the API end-to-end: init/get, set, struct payload, and a
+// raw-pointer round-trip via libc memset. Drop firing on scope exit is
+// implicit — the test passing without crashing means the drop registry
+// hooked the cfn drop correctly.
+
+const { assert } = import("test");
+const { Box } = import("std/box");
+
+extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+
+const Point = struct { x: i32, y: i32 };
+
+// Construct + read back.
+tfn boxInitGetU32() {
+    const b: Box(u32) = Box(u32).init(42);
+    assert(b.get(), 42);
+}
+
+// Overwrite then read.
+tfn boxSetU32() {
+    var b: Box(u32) = Box(u32).init(10);
+    b.set(99);
+    assert(b.get(), 99);
+}
+
+// Struct payload — the slot holds one full struct, not a pointer to one.
+tfn boxStructPayload() {
+    var b: Box(Point) = Box(Point).init(Point { x: 3, y: 4 });
+    const got: Point = b.get();
+    assert(got.x, 3);
+    assert(got.y, 4);
+}
+
+// Raw-pointer escape hatch: memset the byte buffer to 0xFF and read the
+// new value back through .get(). Confirms ptrMut/raw alias the same
+// allocation and the slot survives an FFI write.
+tfn boxRawFFIRoundtrip() {
+    var b: Box(u64) = Box(u64).init(0);
+    memset(b.raw(), 0xFF, 8);
+    assert(b.get(), 0xFFFFFFFFFFFFFFFF);
+}

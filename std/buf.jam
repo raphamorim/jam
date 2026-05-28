@@ -1,0 +1,106 @@
+// std.buf — owning fixed-size heap slice of `T`.
+//
+// Sibling to `std/box`: where `Box(T)` owns exactly one T, `Buf(T)` owns
+// a contiguous run of N Ts. N is set at allocation (runtime-sized), not at
+// the type level — making `Buf(T)` the closest jam analog to Rust's
+// `Box<[T]>`. The backing allocator is libc malloc/free, same TODO as Vec
+// re: pluggable Allocator support once function pointers land.
+//
+// API:
+//   Buf(T).filled(v, n) — alloc + per-slot typed write of `v`. The primary
+//                         (and only) constructor — Buf is always initialised.
+//                         Safe for any T; optimizer recovers a memset for
+//                         primitive T at -O1+.
+//   Buf(T).fromRaw(p,n) — UNSAFE: take ownership of an existing heap
+//                         allocation. For ownership transfers (Vec→Buf, FFI).
+//   buf.len()           — element count (set at construction)
+//   buf[i] / buf[i] = v — indexed read / write (cfn at / cfn setAt hooks)
+//   buf.typed()         — *mut[] T borrow (pass through to APIs taking that)
+//   buf.raw()           — *mut[] u8 borrow (for FFI that asks for bytes)
+//
+// Drop semantics: leaving the owning scope calls `cfn drop`, which frees
+// the allocation. Move-only — copying would double-free; the drop registry
+// enforces this via MVS at the use-site.
+//
+// TODO: re-introduce typed-uninit construction via `Buf(Maybe(T))`. The
+// design landed once (see std/maybe.jam's `Maybe(T).assumeInitBuf`) but
+// needs three jam-compiler pieces before it can ship as the public uninit
+// path without leaking unsafe escape hatches:
+//   - a typed-uninit constructor (e.g. `Buf(Maybe(T)).new(n)`) that
+//     doesn't expose an `allocUninit` for `T` itself;
+//   - `as` cast support for typed-pointer ↔ typed-pointer (currently must
+//     bridge via `*mut[] u8`);
+//   - safer move semantics in `assumeInitBuf` so the disarm-via-null
+//     dance can drop. Until then, `Buf` is always initialised and the
+//     uninit-fill case lives in `Vec(T).withCapacity` + `setLen`.
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+
+pub fn Buf(T: type) type {
+    return struct {
+        ptr: *mut[] T,
+        length: u32,
+
+        // Construct a Buf from raw parts (a typed pointer to a heap
+        // allocation of `length` Ts that the new Buf takes ownership of
+        // and frees on drop). UNSAFE: caller must ensure `ptr` came from
+        // `malloc`-compatible allocation sized for `length` Ts AND that
+        // no other Buf owns the same pointer (else double-free). Useful
+        // for ownership transfers (e.g. Vec → Buf conversion, FFI handoffs)
+        // and the typed-uninit upgrade in std/maybe.jam's `assumeInitBuf`.
+        pub fn fromRaw(ptr: *mut[] T, length: u32) Self {
+            return Self { ptr: ptr, length: length };
+        }
+
+        // The primary constructor: allocate `n` Ts and fill every slot
+        // with `v` via typed writes. Safe for any T — no raw-byte
+        // interpretation; the value `v` is what lands in every slot. For
+        // primitive T (u8 / u32) the loop collapses to an `llvm.memset`
+        // at -O1+, so `Buf(u8).filled(0, N)` is the safe stand-in for an
+        // `extern fn memset` zero-fill.
+        //
+        // Buf is **always initialized** — there's no uninit-alloc form.
+        // For "alloc then fread into bytes" use Vec(T)'s `withCapacity`+
+        // `setLen` pattern; convert to Buf via `fromRaw` if needed.
+        fn filled(v: T, n: u32) Self {
+            const bytes: u64 = (n as u64) * @sizeOf(T);
+            var raw: *mut[] u8 = malloc(bytes);
+            var s: Self = Self { ptr: raw as *mut[] T, length: n };
+            var i: u32 = 0;
+            while (i < n) {
+                s.ptr[i] = v;
+                i = i + 1;
+            }
+            return s;
+        }
+
+        pub fn len(self: Self) u32 { return self.length; }
+
+        // Typed pointer borrow — for device APIs that already take a
+        // `*mut[] T` (`pub fn dmaUpdate(d: *mut[] u32, ...)`). The Buf
+        // remains the owner; the borrow is valid while the Buf is in scope.
+        pub fn typed(self: Self) *mut[] T { return self.ptr; }
+
+        // Byte-pointer borrow — for libc fns (memset / memcpy / fwrite)
+        // and SDL FFI calls that take `*mut[] u8`.
+        pub fn raw(self: Self) *mut[] u8 { return self.ptr as *mut[] u8; }
+
+        // `buf[i]` (rvalue) and `buf[i] = v` (lvalue) dispatch hooks. Pure
+        // value semantics — no `&` / no address ever produced — matching
+        // Vec's at / setAt contract in std/collections.
+        cfn at(self: Self, i: u32) T { return self.ptr[i]; }
+        cfn setAt(self: mut Self, i: u32, v: T) { self.ptr[i] = v; }
+
+        // Hooks the buf into MVS auto-cleanup. Same `cfn drop` pattern as
+        // Box and Vec. The null-pointer guard lets ownership-transfer
+        // helpers (std/maybe_init.jam's `assumeInitBuf`) disarm a source
+        // Buf by zeroing `ptr` — drop on the disarmed source then no-ops
+        // instead of double-freeing.
+        cfn drop(self: mut Self) {
+            if ((self.ptr as u64) != 0) {
+                free(self.ptr as *mut[] u8);
+            }
+        }
+    };
+}

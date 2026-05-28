@@ -50,8 +50,6 @@ class ModuleResolver {
 	std::vector<std::unique_ptr<StructDeclAST>> *sharedAnonStructs_ = nullptr;
 	std::vector<std::unique_ptr<EnumDeclAST>> *sharedAnonEnums_ = nullptr;
 	std::unordered_map<std::string, std::unique_ptr<ModuleAST>> loadedModules;
-	std::unordered_set<std::string>
-	    currentlyLoading;  // For circular import detection
 
 	std::string readFile(const std::string &path) const;
 

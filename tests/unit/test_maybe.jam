@@ -1,0 +1,29 @@
+// std.maybe — Maybe(T) tests.
+//
+// Single-value init / assumeInit round-trip. The Buf-upgrade pattern
+// (`Maybe(T).assumeInitBuf(buf)`) remains in std/maybe.jam as a future-
+// proofing hook, but Buf is currently always-initialised (no public uninit
+// alloc form), so there's no ergonomic way to construct a `Buf(Maybe(T))`
+// to upgrade. When jam grows a `Buf.fromRaw`-based uninit construction
+// helper or a `Vec(T).intoBuf` ownership-transfer path, those tests can
+// be added back.
+
+const { assert } = import("test");
+const { Maybe } = import("std/maybe");
+
+tfn maybeU32() {
+    const m: Maybe(u32) = Maybe(u32).init(42);
+    assert(m.assumeInit(), 42);
+}
+
+// Same shape for a struct payload — confirms the wrapper handles
+// non-primitive Ts (sizeof + layout right) and assumeInit returns the
+// struct by value.
+const Point = struct { x: i32, y: i32 };
+
+tfn maybeStruct() {
+    const m: Maybe(Point) = Maybe(Point).init(Point { x: 3, y: 4 });
+    const p: Point = m.assumeInit();
+    assert(p.x, 3);
+    assert(p.y, 4);
+}

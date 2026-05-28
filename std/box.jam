@@ -1,0 +1,58 @@
+// std.box — owning single-value heap pointer.
+//
+// `Box(T)` holds exactly one heap-allocated T and frees it on scope exit
+// via the drop registry. The backing allocator is libc malloc/free; a
+// pluggable Allocator interface is deferred until function-pointer support
+// lands in the compiler (same TODO as Vec in std/collections).
+//
+// API:
+//   Box(T).init(v)      — alloc sizeof(T) and write v
+//   box.get()           — read by value
+//   box.set(v)          — overwrite by value
+//   box.ptrMut()        — typed *mut[] T borrow (FFI / mutate-through)
+//   box.raw()           — *mut[] u8 borrow (libc memset / memcpy / etc.)
+//
+// Drop semantics: leaving the owning scope calls `cfn drop`, which frees
+// the allocation. Box is move-only — copying it would double-free. The
+// drop registry enforces this via MVS at the use-site.
+
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
+
+pub fn Box(T: type) type {
+    return struct {
+        ptr: *mut[] T,
+
+        // Allocate sizeof(T) bytes on the heap and initialize the slot
+        // with `v`. Panics on OOM (matches Vec.empty's libc-aborts-on-NULL
+        // contract — a pluggable allocator can return an error later).
+        fn init(v: T) Self {
+            const bytes: u64 = @sizeOf(T);
+            var raw: *mut[] u8 = malloc(bytes);
+            var t: *mut[] T = raw as *mut[] T;
+            t[0] = v;
+            return Self { ptr: t };
+        }
+
+        // Read the contained value by copy.
+        pub fn get(self: Self) T { return self.ptr[0]; }
+
+        // Overwrite the contained value.
+        pub fn set(self: mut Self, v: T) { self.ptr[0] = v; }
+
+        // Typed pointer borrow — for code that wants to mutate via the
+        // pointer (e.g. an FFI fn taking `*mut SDL_AudioSpec`). The Box
+        // remains the owner; the borrow is valid for the Box's scope.
+        pub fn ptrMut(self: Self) *mut[] T { return self.ptr; }
+
+        // Byte-pointer borrow — for libc fns (memset / memcpy / fwrite).
+        pub fn raw(self: Self) *mut[] u8 { return self.ptr as *mut[] u8; }
+
+        // Hooks the box into MVS auto-cleanup. The `cfn` variant (not a
+        // plain `fn`) is what the drop registry recognizes — see Vec's
+        // drop in std/collections for the same machinery.
+        cfn drop(self: mut Self) {
+            free(self.ptr as *mut[] u8);
+        }
+    };
+}

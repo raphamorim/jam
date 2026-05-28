@@ -1,0 +1,65 @@
+// std.buf — Buf(T) unit tests.
+//
+// Buf is always initialised — there's no uninit alloc form. The sole
+// constructor is `filled(v, n)`, which fills every slot with `v` via typed
+// writes (safe for any T). Drop firing on scope exit is implicit — the
+// test passing without crashing means the drop registry hooked cfn drop.
+//
+const { assert } = import("test");
+const { Buf } = import("std/buf");
+
+extern fn memset(dst: *mut[] u8, c: i32, n: u64) *mut[] u8;
+
+const Point = struct { x: i32, y: i32 };
+
+// Length tag is set at construction.
+tfn bufLenAfterFilled() {
+    const b: Buf(u8) = Buf(u8).filled(0, 64);
+    assert(b.len(), 64);
+}
+
+// `filled(v, n)` writes `v` into every slot (typed; safe for any T).
+tfn bufFilledIsValue() {
+    const b: Buf(u32) = Buf(u32).filled(7, 4);
+    assert(b[0], 7);
+    assert(b[1], 7);
+    assert(b[2], 7);
+    assert(b[3], 7);
+}
+
+// `buf[i] = v` then `buf[i]` round-trips every slot (primitive T).
+tfn bufIndexRoundtrip() {
+    var b: Buf(u32) = Buf(u32).filled(0, 4);
+    b[0] = 11;
+    b[1] = 22;
+    b[2] = 33;
+    b[3] = 44;
+    assert(b[0], 11);
+    assert(b[1], 22);
+    assert(b[2], 33);
+    assert(b[3], 44);
+}
+
+// `.raw()` aliases the same allocation as `[i]` — memset through the byte
+// pointer is observable on the typed read.
+tfn bufRawFFIRoundtrip() {
+    var b: Buf(u8) = Buf(u8).filled(0, 8);
+    memset(b.raw(), 0xAB, 8);
+    assert(b[0], 0xAB);
+    assert(b[7], 0xAB);
+}
+
+// Struct elements — write via `[i] = v`, read via `[i]` (the JirTag::Index
+// codegen now returns the GEP pointer for byref element types, so a
+// struct read through `cfn at` lands in the sret slot directly).
+tfn bufStructElement() {
+    var b: Buf(Point) = Buf(Point).filled(Point { x: 0, y: 0 }, 2);
+    b[0] = Point { x: 1, y: 2 };
+    b[1] = Point { x: 3, y: 4 };
+    const p0: Point = b[0];
+    const p1: Point = b[1];
+    assert(p0.x, 1);
+    assert(p0.y, 2);
+    assert(p1.x, 3);
+    assert(p1.y, 4);
+}

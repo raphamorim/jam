@@ -170,12 +170,6 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 	auto it = loadedModules.find(importPath);
 	if (it != loadedModules.end()) { return it->second.get(); }
 
-	if (currentlyLoading.count(importPath) > 0) {
-		std::cerr << "Error: Circular import detected for module: "
-		          << importPath << std::endl;
-		return nullptr;
-	}
-
 	std::string resolvedPath = resolve(importPath);
 	if (resolvedPath.empty()) {
 		std::cerr << "Error: Cannot resolve import path: " << importPath
@@ -189,12 +183,10 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 		return loadedModules[importPath].get();
 	}
 
-	currentlyLoading.insert(importPath);
 	std::string source = readFile(resolvedPath);
 	if (source.empty()) {
 		std::cerr << "Error: Cannot read module file: " << resolvedPath
 		          << std::endl;
-		currentlyLoading.erase(importPath);
 		return nullptr;
 	}
 
@@ -202,9 +194,20 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 	if (!module) {
 		std::cerr << "Error: Failed to parse module: " << resolvedPath
 		          << std::endl;
-		currentlyLoading.erase(importPath);
 		return nullptr;
 	}
+
+	// Register the parsed module in the cache BEFORE recursing into its
+	// imports. Mirrors Zig's Module.importFile (Module.zig:4946 —
+	// import_table.getOrPut returns the cached File* as soon as it
+	// exists, no cycle check). A cyclic import (`bus.jam` imports
+	// `dma.jam` imports `bus.jam`) now hits the cache and returns this
+	// same partially-initialised ModuleAST instead of erroring. The
+	// post-parse passes below (loadNested + module-path stamping) mutate
+	// the module in place — by the time codegen / semantic analysis
+	// touches a cyclic-import target, it's complete.
+	ModuleAST *modPtr = module.get();
+	loadedModules[importPath] = std::move(module);
 
 	// Recursively load both regular imports (`const x = import(...)`)
 	// and destructuring imports (`const { X } = import(...)`). The
@@ -223,8 +226,8 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 			getOrLoadModule(importPath);
 		}
 	};
-	for (const auto &import : module->Imports) { loadNested(import->Path); }
-	for (const auto &destImport : module->DestructuringImports) {
+	for (const auto &import : modPtr->Imports) { loadNested(import->Path); }
+	for (const auto &destImport : modPtr->DestructuringImports) {
 		loadNested(destImport->Path);
 	}
 
@@ -238,20 +241,18 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 	// symbols by bare name (`malloc`, `free`, `printf`) and the
 	// linker has to find those exactly. Same for export — the user
 	// asked for that exact symbol to be visible to C callers.
-	for (auto &fn : module->Functions) {
+	for (auto &fn : modPtr->Functions) {
 		if (fn->isExtern || fn->isExport) continue;
 		fn->modulePath = importPath;
 	}
-	for (auto &s : module->Structs) {
+	for (auto &s : modPtr->Structs) {
 		for (auto &m : s->Methods) {
 			if (m->isExtern || m->isExport) continue;
 			m->modulePath = importPath;
 		}
 	}
 
-	currentlyLoading.erase(importPath);
-	loadedModules[importPath] = std::move(module);
-	return loadedModules[importPath].get();
+	return modPtr;
 }
 
 bool ModuleResolver::isLoaded(const std::string &importPath) const {

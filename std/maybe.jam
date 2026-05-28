@@ -1,0 +1,68 @@
+// std.maybe — typed-uninitialized storage wrapper.
+//
+// `Maybe(T)` is the jam analog of Rust's `std::mem::MaybeUninit<T>`: a
+// same-sized-as-T wrapper whose contained bytes may not yet be a valid T
+// (uninitialised, partially init, freshly freed). The type system marks
+// it as not-yet-readable — to extract a real T, call `assumeInit()`,
+// asserting that the bytes ARE a valid T and taking responsibility for
+// the safety contract. Reading the storage as a T while it isn't one is
+// undefined behaviour.
+//
+// Distinct from `std/option`:
+//   - `Option(T)`: a sum type — None or Some(T). Has a discriminant.
+//                  Models "may or may not have a value" at runtime.
+//   - `Maybe(T)`:  a same-sized storage wrapper — bytes either ARE a
+//                  valid T or aren't yet. No discriminant. Models the
+//                  "initialisation gap" between alloc and use.
+//
+// Use cases:
+//   - Two-stage construction: declare a slot, fill it, call assumeInit.
+//   - `Buf(Maybe(T)).allocUninit(n)` + `assumeInitBuf` — a fixed-size
+//     heap slice that's allocated uninitialised, filled (per-slot writes,
+//     fread, etc.), then type-promoted to `Buf(T)` exactly once. The
+//     Rust pattern: `Box::new_uninit_slice(n)` → fill → `.assume_init()`.
+
+const { Buf } = import("std/buf");
+
+pub fn Maybe(T: type) type {
+    return struct {
+        // T-sized storage slot. Layout-identical to T at runtime — the
+        // wrapper is a pure type-system marker. The `value` field is
+        // internal; callers should never read it directly (they should
+        // call `assumeInit()`).
+        value: T,
+
+        // Wrap an already-initialised T in a Maybe slot. Useful for the
+        // `buf[i] = Maybe(T).init(v)` write pattern.
+        pub fn init(v: T) Self { return Self { value: v }; }
+
+        // Read the contained T. Caller asserts the backing storage has
+        // been written with a valid T — UB if not. jam has no init-
+        // tracking; this is your contract.
+        pub fn assumeInit(self: Self) T { return self.value; }
+
+        // Consume a `Buf(Maybe(T))` and return a `Buf(T)` over the same
+        // memory, asserting that every slot has been written with a
+        // valid T. UB if any slot is still uninitialised. Called as
+        // `Maybe(u8).assumeInitBuf(raw)` — T is bound by the Maybe(u8)
+        // type-constructor dispatch (the same mechanism `Vec(u32).empty()`
+        // uses to bind its T).
+        //
+        // Ownership transfer: `b: move` hands b to this function, AND we
+        // explicitly disarm b by zeroing `ptr`/`length`. `Buf.drop`'s
+        // null guard makes the disarmed source's drop a no-op when its
+        // scope ends. The new `Buf(T)` is the sole owner of the storage.
+        pub fn assumeInitBuf(b: move Buf(Self)) Buf(T) {
+            // Layout: Maybe(T) is a single-field struct wrapping T, so
+            // `*mut[] Maybe(T)` and `*mut[] T` alias the same bytes. jam's
+            // `as` requires a `*mut[] u8` bridge between typed pointers
+            // (same shape Vec uses for malloc'd storage). Ownership of the
+            // storage transfers via `b: move` — jam's drop registry treats
+            // the consumed b as no longer in scope, so its drop doesn't
+            // fire; the new Buf(T) is the sole owner.
+            var bytePtr: *mut[] u8 = b.ptr as *mut[] u8;
+            var length:  u32       = b.length;
+            return Buf(T).fromRaw(bytePtr as *mut[] T, length);
+        }
+    };
+}
