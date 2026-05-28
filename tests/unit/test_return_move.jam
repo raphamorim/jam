@@ -1,0 +1,152 @@
+// Tests for return-as-move semantics on drop-bearing types.
+//
+// When a function has `var v: T = ...; return v;` where T has a `cfn drop`,
+// the local `v`'s drop is SUPPRESSED at function exit — ownership has
+// been transferred to the caller's binding. Without this, every helper
+// that constructs a drop-bearing value via a named local and returns it
+// would double-free: the local drops at function exit, then the caller's
+// binding holds the same (now-freed) pointer.
+//
+// Verification mirrors test_drop_in_place.jam: a Sentinel struct's
+// `cfn drop` increments a heap counter, and tests assert the counter
+// reaches exactly the expected value (one drop per owning scope).
+
+const { assert } = import("test");
+const { Vec } = import("std/collections");
+
+const Sentinel = struct {
+    counter: *mut[] u32,
+
+    cfn drop(self: mut Self) {
+        self.counter[0] = self.counter[0] + 1;
+    }
+};
+
+// Baseline: a helper that constructs a Sentinel into a `var` and
+// returns the var. With return-move the local's drop is suppressed
+// and the caller's binding becomes the sole owner.
+fn makeSentinel(c: *mut[] u32) Sentinel {
+    var s: Sentinel = Sentinel { counter: c };
+    return s;
+}
+
+// Helper variant that returns the result of another call — no `var`
+// binding, no return-move analysis needed. Confirms the simple
+// "return temporary" path isn't perturbed.
+fn forwardSentinel(c: *mut[] u32) Sentinel {
+    return makeSentinel(c);
+}
+
+// Conditional return: each path's analysis should be independent.
+// Both branches return the same tracked var; both should suppress
+// its drop. The other-branch flow doesn't matter because only one
+// path executes.
+fn conditionalReturn(c: *mut[] u32, take: u8) Sentinel {
+    var s: Sentinel = Sentinel { counter: c };
+    if (take != 0) {
+        return s;
+    }
+    return s;
+}
+
+// Early-return path doesn't return the local — local should still
+// drop normally on the early-return because no move analysis fires.
+// The late-return DOES move the local out.
+fn earlyOther(c: *mut[] u32, takeEarly: u8) Sentinel {
+    var s: Sentinel = Sentinel { counter: c };
+    if (takeEarly != 0) {
+        // Return a freshly-constructed Sentinel; `s` is not the
+        // returned expression, so its drop should fire here.
+        return Sentinel { counter: c };
+    }
+    return s;
+}
+
+// Helper: owns the returned Sentinel for one scope so we can observe
+// its drop firing on this fn's exit. Returning into a `var` here AND
+// from the tfn would otherwise leak the drop firing into the test's
+// scope and the assertions would run before the drops landed.
+fn dropAfterMakeSentinel(c: *mut[] u32) {
+    var got: Sentinel = makeSentinel(c);
+    // No assertion inside this fn (the counter is only readable in
+    // the caller's scope), but the fn's exit fires got.drop exactly
+    // once — caller can then observe the count.
+}
+
+fn dropAfterForwardSentinel(c: *mut[] u32) {
+    var got: Sentinel = forwardSentinel(c);
+}
+
+fn dropAfterConditional(c: *mut[] u32, take: u8) {
+    var got: Sentinel = conditionalReturn(c, take);
+}
+
+fn dropAfterEarlyOther(c: *mut[] u32, takeEarly: u8) {
+    var got: Sentinel = earlyOther(c, takeEarly);
+}
+
+// Heap counter helper — single-slot Vec(u32) so it lives until the
+// surrounding tfn returns. Vec auto-drops the backing on tfn exit.
+fn newCounter() Vec(u32) {
+    return Vec(u32).filled(0, 1);
+}
+
+// Single return-move: the local doesn't fire its drop; the caller's
+// binding does on its scope's exit. Net count = 1.
+tfn returnMoveBasic() {
+    var c: Vec(u32) = newCounter();
+    dropAfterMakeSentinel(c.ptr);
+    assert(c[0], 1);
+}
+
+// Two-step return-through-helper: the inner helper moves its var to
+// the outer helper's return path, which moves it to the caller. One
+// net drop.
+tfn returnMoveChained() {
+    var c: Vec(u32) = newCounter();
+    dropAfterForwardSentinel(c.ptr);
+    assert(c[0], 1);
+}
+
+// Conditional-return (both branches return the same local): either
+// path suppresses the local's drop. Caller's binding is sole owner.
+// One net drop.
+tfn returnMoveConditional() {
+    var c: Vec(u32) = newCounter();
+    dropAfterConditional(c.ptr, 1);
+    assert(c[0], 1);
+}
+
+// Early-return path through earlyOther returns a fresh Sentinel; the
+// local `s` is NOT the returned expression so its drop must fire
+// before the early return. Two net drops total (local + caller's).
+tfn returnMoveEarlyOther() {
+    var c: Vec(u32) = newCounter();
+    dropAfterEarlyOther(c.ptr, 1);
+    assert(c[0], 2);
+}
+
+// Late-return path through earlyOther moves the local; only the
+// caller's binding fires drop. One net drop.
+tfn returnMoveLatePath() {
+    var c: Vec(u32) = newCounter();
+    dropAfterEarlyOther(c.ptr, 0);
+    assert(c[0], 1);
+}
+
+// Negative: a helper that returns a NEW value (not a tracked local).
+// No tracked local exists in this helper, so there's nothing to move.
+// Caller owns the result. One net drop.
+fn makeFresh(c: *mut[] u32) Sentinel {
+    return Sentinel { counter: c };
+}
+
+fn dropAfterMakeFresh(c: *mut[] u32) {
+    var got: Sentinel = makeFresh(c);
+}
+
+tfn returnFreshNoMove() {
+    var c: Vec(u32) = newCounter();
+    dropAfterMakeFresh(c.ptr);
+    assert(c[0], 1);
+}

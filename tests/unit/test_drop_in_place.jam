@@ -1,0 +1,106 @@
+// Tests for the `@dropInPlace(ptr)` compiler intrinsic — the analog of
+// Rust's `core::ptr::drop_in_place::<T>(*mut T)`. The intrinsic
+// synthesizes the drop sequence for T at the call site:
+//   - If T has a registered `cfn drop`, emit a Call to T.drop(ptr).
+//   - If T is a struct with droppable fields, recurse into each field.
+//   - Otherwise (primitive, no-drop type), emit nothing.
+//
+// We verify by side-effect: a `Sentinel` struct's `cfn drop` bumps a
+// counter visible through a borrowed pointer. After `@dropInPlace` runs
+// on a constructed value, the counter increments by exactly one per
+// expected drop invocation.
+
+const { assert } = import("test");
+const { Vec } = import("std/collections");
+const { Box } = import("std/box");
+
+// Sentinel — its cfn drop increments the u32 at `counter`. Used to
+// instrument tests so we can read drop firing as a number.
+const Sentinel = struct {
+    counter: *mut[] u32,
+
+    cfn drop(self: mut Self) {
+        self.counter[0] = self.counter[0] + 1;
+    }
+};
+
+// Holder — a struct with a Sentinel field but no drop of its own. Used
+// to test that @dropInPlace recurses into struct fields and fires their
+// drops.
+const Holder = struct {
+    s: Sentinel,
+};
+
+// Two-field holder — verifies declaration-order traversal and that
+// non-droppable fields (u32) are skipped without affecting the others.
+const TwoHolder = struct {
+    first:  Sentinel,
+    pad:    u32,
+    second: Sentinel,
+};
+
+// Heap-counter helper: a one-slot u32 buffer used by all tests to
+// observe drop firings. We allocate via Vec(u32).filled(0, 1) so the
+// counter lives until the surrounding tfn returns (Vec auto-drops via
+// the cfn drop the drop_registry tracks for stack-local `var` bindings).
+fn newCounter() Vec(u32) {
+    return Vec(u32).filled(0, 1);
+}
+
+// Direct invocation: `@dropInPlace(&s)` on a struct with its own cfn drop
+// should fire that drop exactly once.
+tfn directDrop() {
+    var counter: Vec(u32) = newCounter();
+    var s: Sentinel = Sentinel { counter: counter.ptr };
+    @dropInPlace(&s);
+    assert(counter[0], 1);
+}
+
+// `@dropInPlace(&h)` on a Holder (no own drop) should recurse into the
+// Sentinel field and fire its drop.
+tfn structFieldDrop() {
+    var counter: Vec(u32) = newCounter();
+    var h: Holder = Holder { s: Sentinel { counter: counter.ptr } };
+    @dropInPlace(&h);
+    assert(counter[0], 1);
+}
+
+// Two Sentinel fields with a non-drop u32 in between — verifies both
+// fire and the u32 is correctly skipped.
+tfn twoFieldsDrop() {
+    var counter: Vec(u32) = newCounter();
+    var h: TwoHolder = TwoHolder {
+        first:  Sentinel { counter: counter.ptr },
+        pad:    42,
+        second: Sentinel { counter: counter.ptr },
+    };
+    @dropInPlace(&h);
+    assert(counter[0], 2);
+}
+
+// Repeated invocation on the same pointer: drop is a side-effect, so
+// calling @dropInPlace twice fires drop twice. (Caller is responsible
+// for not invoking @dropInPlace twice on real owning code — this just
+// confirms the intrinsic emits one call per invocation, no caching.)
+tfn repeatedInvocation() {
+    var counter: Vec(u32) = newCounter();
+    var s: Sentinel = Sentinel { counter: counter.ptr };
+    @dropInPlace(&s);
+    @dropInPlace(&s);
+    assert(counter[0], 2);
+}
+
+// Pointer through a raw `*mut[] Sentinel` — fires drop on the indexed
+// element exactly once. We go through `v.ptr` rather than `&v[0]`
+// because Vec's `cfn at` is value-shaped, so `&v[0]` doesn't yield an
+// lvalue. `v.ptr[i]` IS lvalue-indexable.
+tfn vecElementDrop() {
+    var counter: Vec(u32) = newCounter();
+    var v: Vec(Sentinel) = Vec(Sentinel).withCapacity(2);
+    v.push(Sentinel { counter: counter.ptr });
+    v.push(Sentinel { counter: counter.ptr });
+    @dropInPlace(&v.ptr[0]);
+    assert(counter[0], 1);
+    @dropInPlace(&v.ptr[1]);
+    assert(counter[0], 2);
+}
