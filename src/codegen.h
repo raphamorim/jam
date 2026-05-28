@@ -271,6 +271,19 @@ class JamCodegenContext {
 	void registerFunctionAST(const std::string &name, const FunctionAST *fn);
 	const FunctionAST *getFunctionAST(const std::string &name) const;
 
+	// Push/pop the module path whose body is currently being lowered.
+	// A generic instantiated from a different module needs its body's
+	// bare-identifier lookups to resolve against the generic's
+	// defining module — e.g. Vec(T).drop calling `free` resolves
+	// against std/collections.jam (where `pub extern fn free` lives),
+	// not the caller's scope. `astgenBodyInto` of an instantiated
+	// generic pushes the originating modulePath before lowering and
+	// pops after; `getFunctionAST` consults the top-of-stack module's
+	// namespace first.
+	void pushBodyModule(const std::string &modulePath);
+	void popBodyModule();
+	const std::string &currentBodyModule() const;
+
 	struct ImportHandleInfo {
 		std::string modulePath;
 		std::unordered_set<std::string> privateNames;
@@ -331,6 +344,11 @@ class JamCodegenContext {
 	std::unordered_map<std::string, ImportHandleInfo> importHandles_;
 	// Resolved canonical path -> namespace decl table. See ModuleNamespace.
 	std::unordered_map<std::string, ModuleNamespace> moduleNamespaces_;
+	// Stack of `modulePath` strings for the bodies currently being lowered.
+	// Top-of-stack is the defining module of the innermost generic body —
+	// consulted by `getFunctionAST` to resolve identifiers against the
+	// generic's home module.
+	std::vector<std::string> bodyModuleStack_;
 
 	// `genericResolutions_` memoizes per-callsite: every unique
 	// `TypeKind::GenericCall` TypeIdx maps to the resolved TypeIdx.
@@ -489,7 +507,8 @@ class JamCodegenContext {
 	TypeIdx instantiateStructExpr(
 	    const AstNode &exprNode, const std::string &calleeName,
 	    const std::vector<TypeIdx> &args,
-	    const std::unordered_map<std::string, TypeIdx> &subst) const;
+	    const std::unordered_map<std::string, TypeIdx> &subst,
+	    const std::string &definingModulePath) const;
 
 	// Mirror of instantiateStructExpr for `enum { ... }` expressions.
 	// Substitutes each variant's payload types with the concrete

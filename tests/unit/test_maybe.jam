@@ -1,12 +1,10 @@
 // std.maybe — Maybe(T) tests.
 //
-// Single-value init / assumeInit round-trip. The Buf-upgrade pattern
-// (`Maybe(T).assumeInitBuf(buf)`) remains in std/maybe.jam as a future-
-// proofing hook, but Buf is currently always-initialised (no public uninit
-// alloc form), so there's no ergonomic way to construct a `Buf(Maybe(T))`
-// to upgrade. When jam grows a `Buf.fromRaw`-based uninit construction
-// helper or a `Vec(T).intoBuf` ownership-transfer path, those tests can
-// be added back.
+// Single-value init / assumeInit round-trip. The Vec-upgrade pattern
+// (`Maybe(T).assumeInitVec(vec)` — Rust's `Box::new_uninit_slice + assume_init`)
+// is TODO in std/maybe.jam; it needs a `Vec.allocUninit(n)` constructor
+// first. When that lands, add a test that allocates Vec(Maybe(T)), fills
+// every slot, and round-trips to Vec(T).
 
 const { assert } = import("test");
 const { Maybe } = import("std/maybe");

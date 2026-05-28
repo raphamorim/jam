@@ -325,22 +325,38 @@ static int compileAndRun(const std::string &filename,
 	// methods. Those methods call externs from the same imported
 	// module (e.g. `malloc`), so the externs need prototypes
 	// declared by the time the instantiation runs.
+	//
+	// Split into two passes so iteration order over loaded modules
+	// doesn't matter: Pass A registers every module's pub fns +
+	// ModuleNamespace into the global registry; Pass B emits the LLVM
+	// prototypes. Without the split, if `bus.jam` is iterated before
+	// `std/collections` (unordered_map order), bus's `dma: Vec(u32)`
+	// field triggers Vec instantiation whose body calls `malloc` —
+	// but std/collections's `malloc` hasn't been globally registered
+	// yet, so the body fails to compile.
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
-		// Per-loaded-module namespace, keyed by the canonical import
-		// path (e.g. "fmt", "std/fmt"). This is the table member-access
-		// on a Module value will consult later.
 		JamCodegenContext::ModuleNamespace ns;
 		ns.path = path;
 		for (auto &func : importedModule->Functions) {
-			if (func->isPub && !func->isGeneric()) {
-				JirFunction jfn = astgenMetadata(*func, codegenCtx);
-				jfn.name = mangledFunctionName(*func, codegenCtx.getTypePool(),
-				                               codegenCtx.getStringPool());
-				jirDeclarePrototype(jfn, codegenCtx);
-			}
 			if (func->isPub) {
 				codegenCtx.registerFunctionAST(func->Name, func.get());
 				ns.functions[func->Name] = func.get();
+				// Eagerly declare LLVM prototypes for pub-extern fns
+				// (libc allocator, write, putchar, …). A generic
+				// instantiation in Pass B may emit a Call to one of
+				// these BEFORE the iteration reaches its defining
+				// module — without an eager declaration, the call
+				// lowers to "unknown callee `malloc`". Non-extern
+				// pub fns still need their full signature to be
+				// resolved against module-level types, so we defer
+				// those to Pass B.
+				if (func->isExtern && !func->isGeneric()) {
+					JirFunction jfn = astgenMetadata(*func, codegenCtx);
+					jfn.name = mangledFunctionName(
+					    *func, codegenCtx.getTypePool(),
+					    codegenCtx.getStringPool());
+					jirDeclarePrototype(jfn, codegenCtx);
+				}
 			}
 		}
 		for (auto &s : importedModule->Structs) {
@@ -361,8 +377,6 @@ static int compileAndRun(const std::string &filename,
 				    codegenCtx.getStringPool().intern(u->Name));
 			}
 		}
-		// `pub const X = import(...)` re-exports — surface the inner
-		// module as a Module-typed alias on this module's namespace.
 		for (auto &reexport : importedModule->Imports) {
 			if (!reexport->isPub) continue;
 			if (reexport->Path == "test") continue;
@@ -371,6 +385,21 @@ static int compileAndRun(const std::string &filename,
 			ns.moduleAliases[reexport->Name] = modTy;
 		}
 		codegenCtx.registerModuleNamespace(std::move(ns));
+	}
+	// Pass B: now that every module's pub fns are visible, emit LLVM
+	// prototypes. Any generic instantiation triggered by a parameter
+	// or return type resolves its body's externs against the
+	// already-populated global registry — or, via getFunctionAST's
+	// fallback, against the generic's defining-module namespace.
+	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
+		for (auto &func : importedModule->Functions) {
+			if (func->isPub && !func->isGeneric()) {
+				JirFunction jfn = astgenMetadata(*func, codegenCtx);
+				jfn.name = mangledFunctionName(*func, codegenCtx.getTypePool(),
+				                               codegenCtx.getStringPool());
+				jirDeclarePrototype(jfn, codegenCtx);
+			}
+		}
 	}
 	// Register every flat `handle.X` mapping for a given (handle name,
 	// resolved module). Shared by direct-import bindings and module-

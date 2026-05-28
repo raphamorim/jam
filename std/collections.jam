@@ -48,6 +48,23 @@ pub fn Vec(T: type) type {
             return Self { ptr: raw as *mut[] T, length: 0, capacity: actualCap };
         }
 
+        // Rust's `vec![v; n]`. Allocates `n` slots, writes `v` to each,
+        // and sets length to `n`. The right constructor for fixed-size
+        // buffers whose every slot is meaningful at construction
+        // (zero-initialized device state, default-filled padding); use
+        // `withCapacity(n)` instead when the caller intends to fill via
+        // `push` and start at length=0.
+        fn filled(value: T, n: u32) Self {
+            var v: Self = Self.withCapacity(n);
+            var i: u32 = 0;
+            while (i < n) {
+                v.ptr[i] = value;
+                i = i + 1;
+            }
+            v.length = n;
+            return v;
+        }
+
         fn push(self: mut Self, value: T) {
             if (self.length == self.capacity) {
                 self.grow();

@@ -465,8 +465,46 @@ void JamCodegenContext::registerFunctionAST(const std::string &name,
 
 const FunctionAST *
 JamCodegenContext::getFunctionAST(const std::string &name) const {
+	// When lowering the body of a generic instantiated from a different
+	// module, resolve identifiers against the DEFINING MODULE's
+	// namespace first — never the caller's. A body like Vec(T).drop
+	// calling `free` must find `pub extern fn free` in
+	// std/collections.jam (where Vec lives) regardless of whether the
+	// caller module independently imports it.
+	//
+	// Falls back to the flat global map for two cases the per-module
+	// table doesn't cover: (a) generic instantiations registered by
+	// mangled name (`Vec__u32.withCapacity` etc.) that live in the
+	// global map but not in any source module's pub-fn table; (b)
+	// names looked up outside any instantiation body (normal entry-
+	// module function bodies).
+	if (!bodyModuleStack_.empty()) {
+		const std::string &defMod = bodyModuleStack_.back();
+		if (!defMod.empty()) {
+			auto nsIt = moduleNamespaces_.find(defMod);
+			if (nsIt != moduleNamespaces_.end()) {
+				auto fIt = nsIt->second.functions.find(name);
+				if (fIt != nsIt->second.functions.end()) {
+					return fIt->second;
+				}
+			}
+		}
+	}
 	auto it = functionAsts.find(name);
 	return (it == functionAsts.end()) ? nullptr : it->second;
+}
+
+void JamCodegenContext::pushBodyModule(const std::string &modulePath) {
+	bodyModuleStack_.push_back(modulePath);
+}
+
+void JamCodegenContext::popBodyModule() {
+	if (!bodyModuleStack_.empty()) bodyModuleStack_.pop_back();
+}
+
+const std::string &JamCodegenContext::currentBodyModule() const {
+	static const std::string kEmpty;
+	return bodyModuleStack_.empty() ? kEmpty : bodyModuleStack_.back();
 }
 
 void JamCodegenContext::registerImportHandle(const std::string &handle,
@@ -1004,8 +1042,13 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 		if (value.tag == AstTag::StructExpr) {
 			// Use generic->Name (the bare source-level name) for the
 			// instantiated struct name so syntactic prefixes like
-			// `c.Vec` don't bake into `Vec__i32`.
-			result = instantiateStructExpr(value, generic->Name, args, subst);
+			// `c.Vec` don't bake into `Vec__i32`. Pass the generic's
+			// modulePath so the cloned methods inherit it — anon-struct
+			// methods returned from `pub fn Vec(T)` aren't visible to
+			// module_resolver, so we propagate the originating module
+			// here for body-scope identifier resolution.
+			result = instantiateStructExpr(value, generic->Name, args, subst,
+			                               generic->modulePath);
 			break;
 		}
 		if (value.tag == AstTag::EnumExpr) {
@@ -1036,7 +1079,8 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 TypeIdx JamCodegenContext::instantiateStructExpr(
     const AstNode &exprNode, const std::string &calleeName,
     const std::vector<TypeIdx> &args,
-    const std::unordered_map<std::string, TypeIdx> &subst) const {
+    const std::unordered_map<std::string, TypeIdx> &subst,
+    const std::string &definingModulePath_) const {
 	if (!anonStructs_) {
 		throw std::runtime_error(
 		    "internal: anonymous struct table not registered on "
@@ -1164,6 +1208,11 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 			    origMethod->Body, origMethod->isExtern, origMethod->isExport,
 			    origMethod->isPub, origMethod->isTest, origMethod->isVarArgs,
 			    origMethod->isCfn);
+			// Note: modulePath stays empty on the clone — stamping it
+			// would alter the mangled symbol name (mangling.h:60
+			// includes modulePath in the FQN). Body-scope identifier
+			// resolution is carried separately via bodyModuleStack_,
+			// pushed at the astgenBodyInto call site below.
 			FunctionAST *clonePtr = cloned.get();
 			instantiatedMethods_.push_back(std::move(cloned));
 
@@ -1211,15 +1260,22 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 			jam::Diagnostic::Trace traceFrame{/*loc=*/{},
 			                                  /*decl=*/im.clonePtr->Name};
 			jam::RefTraceFrame guard(refTrace_, std::move(traceFrame));
+			// Push the generic's defining module so bare-identifier
+			// lookups in the body (e.g. `free` in Vec(T).drop)
+			// resolve against that module's namespace. RAII via
+			// try/catch: pop on every exit path.
+			mutCtx.pushBodyModule(definingModulePath_);
 			try {
 				astgenBodyInto(im.passOneJir, *im.clonePtr, mutCtx);
 			} catch (const AstGenAnalysisFail &) {
 				// diagnostic already pushed; trace was attached via
 				// the helper. Continue with the next method so the
 				// user sees every error in this instantiation.
+				mutCtx.popBodyModule();
 				clearCurrentSubst();
 				continue;
 			}
+			mutCtx.popBodyModule();
 			auto diags = verifyJirFunction(
 			    im.passOneJir, &typePool, &stringPool,
 			    +[](void *c, TypeIdx t) -> TypeIdx {

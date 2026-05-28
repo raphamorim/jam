@@ -4517,6 +4517,10 @@ static JirRef astgenCompInstantiatedCall(AstGenCtx &gctx, const AstNode &n,
 		    instName, std::move(instArgs), fn->ReturnType, fn->Body,
 		    fn->isExtern, fn->isExport, fn->isPub, fn->isTest, fn->isVarArgs,
 		    fn->isCfn);
+		// Note: modulePath stays empty on the clone — stamping it
+		// would alter the mangled symbol name (mangling.h:60). Body-
+		// scope identifier resolution is carried separately via
+		// bodyModuleStack_, pushed below around astgenBodyInto.
 		clone = gctx.ctx.adoptInstantiatedFunction(std::move(cloned));
 		gctx.ctx.registerFunctionAST(instName,
 		                             const_cast<FunctionAST *>(clone));
@@ -4529,7 +4533,9 @@ static JirRef astgenCompInstantiatedCall(AstGenCtx &gctx, const AstNode &n,
 		JirFunction jfn = astgenMetadata(*clone, gctx.ctx);
 		jfn.name = clone->Name;
 		jirDeclarePrototype(jfn, gctx.ctx);
+		gctx.ctx.pushBodyModule(fn->modulePath);
 		astgenBodyInto(jfn, *clone, gctx.ctx);
+		gctx.ctx.popBodyModule();
 		jirDefineBody(jfn, gctx.ctx);
 		gctx.ctx.clearCurrentCompSubst();
 
