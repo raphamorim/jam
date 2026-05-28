@@ -320,6 +320,12 @@ static void emitBr(AstGenCtx &gctx, JirBlockRef target);
 static void emitCondBr(AstGenCtx &gctx, JirRef cond, JirBlockRef thenB,
                        JirBlockRef elseB);
 static void emitDrops(AstGenCtx &gctx, const std::vector<DropTrack> &bindings);
+// Field-walking drop-glue helpers — used both by emitDrops (auto field
+// drop at scope exit for structs whose fields need drop) and by the
+// `@dropInPlace(ptr)` intrinsic. Defined later; declared here so
+// emitDrops + astgenVarDecl can call them.
+static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy);
+static bool typeNeedsDrop(AstGenCtx &gctx, TypeIdx ty);
 static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
                        const std::vector<JirRef> &argRefs,
                        JirRef destPtr = kNoJirRef);
@@ -376,6 +382,66 @@ static inline void emitDropsThroughScope(AstGenCtx &gctx,
 	if (gctx.dropScopes.size() <= targetIdx) return;
 	for (std::size_t i = gctx.dropScopes.size(); i > targetIdx; i--) {
 		emitDrops(gctx, gctx.dropScopes[i - 1]);
+	}
+}
+
+// If `exprIdx` is a bare `Variable` referring to a tracked drop local,
+// remove that local from `gctx.dropScopes` so the scope-exit drop won't
+// fire for it. The local's value has been captured by the surrounding
+// owner (a struct-literal field, an array element, etc.); the new owner
+// is responsible for the drop. Mirrors Rust's move semantics for non-
+// Copy types — without this, every `Foo { f: v }` pattern leaves the
+// local `v` to drop at scope exit, double-freeing the storage the
+// struct field now holds.
+//
+// Permanent removal (rather than the path-local filter used for return-
+// move) matches Rust's "definitely moved at this point" model for
+// straight-line code. Conditionally-moved vars in branchy code would
+// need drop-flag tracking; that's deferred. Practical impact for now:
+// `if (cond) Foo { f: v } else { /* doesn't move v */ }` will silently
+// leak `v` in the else branch instead of crashing.
+static void consumeMovedVariable(AstGenCtx &gctx, NodeIdx exprIdx) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	const AstNode &expr = ns.get(exprIdx);
+	if (expr.tag != AstTag::Variable) return;
+	StringIdx nameId = static_cast<StringIdx>(expr.lhs);
+	const std::string &name = gctx.ctx.getStringPool().get(nameId);
+	for (auto &scope : gctx.dropScopes) {
+		for (auto it = scope.begin(); it != scope.end(); ++it) {
+			if (it->varName == name) {
+				scope.erase(it);
+				return;
+			}
+		}
+	}
+}
+
+// Like emitDropsThroughScope but skips the drop for one specific tracked
+// variable. Used by return-as-move: when the return expression is a bare
+// `Variable` referring to a tracked local, that local's ownership has
+// been transferred to the caller's binding, so the function-scope drop
+// must NOT fire (otherwise the caller holds a freshly-freed pointer).
+// We rebuild a filtered DropTrack vector per scope rather than mutating
+// `gctx.dropScopes`, so other return paths in the same function (e.g.
+// a branch that returns a different value) still see and drop the local
+// correctly. Mirrors Rust's per-return move analysis.
+static inline void emitDropsThroughScopeMovedOut(AstGenCtx &gctx,
+                                                 std::size_t targetIdx,
+                                                 const std::string &movedVar) {
+	if (gctx.dropScopes.size() <= targetIdx) return;
+	for (std::size_t i = gctx.dropScopes.size(); i > targetIdx; i--) {
+		const auto &orig = gctx.dropScopes[i - 1];
+		std::vector<DropTrack> filtered;
+		filtered.reserve(orig.size());
+		bool removed = false;
+		for (const auto &d : orig) {
+			if (!removed && d.varName == movedVar) {
+				removed = true;
+				continue;  // skip this entry: ownership moved to caller
+			}
+			filtered.push_back(d);
+		}
+		emitDrops(gctx, filtered);
 	}
 }
 
@@ -519,10 +585,35 @@ static JirRef astgenBoolLit(AstGenCtx &gctx, const AstNode &n) {
 // receives the function's declared return type as expected hint.
 // Drop calls for every drop-tracked binding currently in scope are
 // emitted before the Ret instruction, in reverse declaration order.
+// Detect `return <var>` where <var> names a tracked drop-bearing local —
+// the var's ownership is moved to the caller's binding, so the function-
+// scope drop must not fire for it. Returns the var's name or "" if the
+// returned expression isn't a bare Variable referencing a tracked local.
+// Only the simple `return v` shape is recognized — partial moves out of
+// fields (`return v.field`) or struct literals (`return Foo { v: v }`)
+// stay on the conservative path and fire v.drop. The struct-literal
+// case is the next compiler task; once that lands here, the unsafe
+// `var v = ...; return Foo { v: v }` pattern stops double-freeing too.
+static std::string detectReturnMove(AstGenCtx &gctx, NodeIdx valIdx) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	const AstNode &returned = ns.get(valIdx);
+	if (returned.tag != AstTag::Variable) return std::string();
+	StringIdx nameId = static_cast<StringIdx>(returned.lhs);
+	const std::string &name = gctx.ctx.getStringPool().get(nameId);
+	for (const auto &scope : gctx.dropScopes) {
+		for (const auto &d : scope) {
+			if (d.varName == name) return name;
+		}
+	}
+	return std::string();
+}
+
 static void astgenReturn(AstGenCtx &gctx, const AstNode &n) {
 	JirRef valRef = kNoJirRef;
+	std::string movedVar;
 	if (n.lhs != 0) {
 		NodeIdx valIdx = static_cast<NodeIdx>(n.lhs);
+		movedVar = detectReturnMove(gctx, valIdx);
 		// When the function returns via sret, hand the sret slot
 		// pointer to the value expression as a result_ptr. Byref-
 		// producing exprs (StructLit / ArrayLit / sret Call) write
@@ -535,7 +626,11 @@ static void astgenReturn(AstGenCtx &gctx, const AstNode &n) {
 		                  jam::abi::ReturnABI::Kind::Indirect;
 		if (sretFn &&
 		    astgenExprIntoPtr(gctx, valIdx, retTy, emitSretArg(gctx, retTy))) {
-			emitDropsThroughScope(gctx, 0);
+			if (movedVar.empty()) {
+				emitDropsThroughScope(gctx, 0);
+			} else {
+				emitDropsThroughScopeMovedOut(gctx, 0, movedVar);
+			}
 			JirInst ret{};
 			ret.tag = JirTag::Ret;
 			ret.a = kNoJirRef;
@@ -544,8 +639,13 @@ static void astgenReturn(AstGenCtx &gctx, const AstNode &n) {
 		}
 		valRef = astgenExpr(gctx, valIdx, retTy);
 	}
-	// Drop every active scope before exiting the function.
-	emitDropsThroughScope(gctx, 0);
+	// Drop every active scope before exiting the function — minus the
+	// moved-out var, if any.
+	if (movedVar.empty()) {
+		emitDropsThroughScope(gctx, 0);
+	} else {
+		emitDropsThroughScopeMovedOut(gctx, 0, movedVar);
+	}
 	JirInst ret{};
 	ret.tag = JirTag::Ret;
 	ret.a = valRef;
@@ -607,23 +707,16 @@ static std::string lookupDropFnLLVMName(AstGenCtx &gctx, TypeIdx ty) {
 }
 
 // Emit drop calls for every binding in `bindings` in REVERSE order
-// (LIFO — last-pushed dropped first). The argument is &binding (the
-// alloca pointer itself, since `fn drop(self: mut T)` takes a *T).
+// (LIFO — last-pushed dropped first). Each binding gets the full Rust-
+// style `drop_in_place::<T>` sequence: if T has its own drop fn, it
+// fires first; then T's droppable fields fire in declaration order.
+// Routing both the with-fn and no-fn paths through emitDropInPlace
+// keeps the semantics consistent — a tracked var of any droppable
+// type drops the same way whether the user wrote `cfn drop` or only
+// has droppable fields.
 static void emitDrops(AstGenCtx &gctx, const std::vector<DropTrack> &bindings) {
-	// Emit explicit DropBinding JIR instructions in reverse declaration
-	// order. Each carries the binding's alloca JirRef and the LLVM
-	// symbol of the drop fn as a StringIdx. Codegen mechanically
-	// lowers to `call void <symbol>(ptr <alloca>)` — no per-call
-	// AddrOf+pack ceremony, no metadata fallback.
 	for (auto it = bindings.rbegin(); it != bindings.rend(); ++it) {
-		const DropTrack &d = *it;
-		StringIdx symId = gctx.ctx.getStringPool().intern(d.llvmFnName);
-		JirInst drop{};
-		drop.tag = JirTag::DropBinding;
-		drop.a = d.slot;
-		drop.b = symId;
-		drop.ty = kNoType;
-		emit(gctx, drop);
+		emitDropInPlace(gctx, it->slot, it->type);
 	}
 }
 
@@ -802,13 +895,32 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 		emit(gctx, store);
 	}
 
-	// If this binding's type has a registered drop fn, track it on
-	// the top of the drop-scope stack so the next scope-exit (or
-	// the function-end Return) emits drop(self=&binding).
+	// If this binding's type owns heap, track it on the top of the
+	// drop-scope stack so scope-exit (or the function-end Return)
+	// fires the cleanup. Two flavors share the same DropTrack slot:
+	//   - Types with a registered `cfn drop`: emit a direct call to
+	//     that fn (existing path, `llvmFnName` non-empty).
+	//   - Types whose own struct doesn't have `cfn drop` but whose
+	//     fields recursively do (e.g. `Bus { dma: Vec(u32), ... }`):
+	//     `llvmFnName` stays empty; emitDrops invokes emitDropInPlace
+	//     to walk the fields at the drop site. Matches Rust's
+	//     `needs_drop<T>()` which auto-drops a struct when any of its
+	//     fields does, even without an explicit Drop impl.
 	std::string dropName = lookupDropFnLLVMName(gctx, type);
 	if (!dropName.empty()) {
 		if (gctx.dropScopes.empty()) pushDropScope(gctx);
 		gctx.dropScopes.back().push_back({name, allocaRef, type, dropName});
+	} else if (typeNeedsDrop(gctx, type)) {
+		// Struct without its own `cfn drop` but with droppable fields
+		// (e.g. `Bus { dma: Vec(u32), ... }`). Track the binding so
+		// scope-exit invokes `emitDropInPlace(slot, type)` which walks
+		// fields. Safe in combination with return-move and struct-
+		// literal-capture-move: the source local of every `Struct
+		// { f: src }` and `return src` is consumed, so the only firing
+		// is on the final owner. Matches Rust's `needs_drop<T>()`.
+		if (gctx.dropScopes.empty()) pushDropScope(gctx);
+		gctx.dropScopes.back().push_back(
+		    {name, allocaRef, type, std::string()});
 	}
 }
 
@@ -1120,6 +1232,12 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 		}
 		TypeIdx expectedField = info->fields[idx].second;
 		JirRef fieldVal = astgenExpr(gctx, exprIdx, expectedField);
+		// Struct-literal field capture is a MOVE for drop-bearing types:
+		// if the field's value came from a tracked local Variable, mark
+		// that local as moved so its scope-exit drop doesn't fire — the
+		// struct field now owns the value, and dropping the original
+		// would double-free what the field still references.
+		consumeMovedVariable(gctx, exprIdx);
 		// Silent int->float widening matches the legacy struct codegen:
 		// `Vec3 { x: 0 }` with `x: f32` lands an integer literal here;
 		// emit SIToFP / UIToFP to settle the IR type instead of letting
@@ -1258,6 +1376,12 @@ static void astgenStructLitInto(AstGenCtx &gctx, const AstNode &n,
 			store.b = val;
 			emit(gctx, store);
 		}
+		// Mirror the byval path: a tracked-local Variable used as a
+		// field initializer is MOVED into the struct field; suppress
+		// its scope-exit drop. Applies whether the lowering went
+		// through astgenExpr+Store or the byref astgenExprIntoPtr fast
+		// path.
+		consumeMovedVariable(gctx, exprByIdx[i]);
 	}
 }
 
@@ -3593,11 +3717,153 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n,
 	return emitCall(gctx, fn, argRefs, destPtr);
 }
 
+// Collapse a GenericCall + type-alias chain to its concrete struct
+// instantiation. Walks at most `kMaxHops` levels — covers
+//   const BumperI32 = Bumper(i32);     // alias → GenericCall → Named
+//   const NestedBumper = Bumper(BumperI32);
+// where a substituted field type lands as `Named("BumperI32")` and the
+// drop-fn lookup has to chase the alias to reach `Bumper__i32` whose
+// drop is registered.
+static TypeIdx resolveGenericIfAny(AstGenCtx &gctx, TypeIdx ty) {
+	const auto &types = gctx.ctx.getTypePool();
+	const auto &strings = gctx.ctx.getStringPool();
+	constexpr int kMaxHops = 8;
+	for (int i = 0; i < kMaxHops; i++) {
+		const TypeKey &tk = types.get(ty);
+		if (tk.kind == TypeKind::GenericCall) {
+			TypeIdx r = gctx.ctx.resolveGenericCall(ty);
+			if (r == kNoType || r == ty) break;
+			ty = r;
+			continue;
+		}
+		if (tk.kind == TypeKind::Named) {
+			const std::string &name = strings.get(static_cast<StringIdx>(tk.a));
+			TypeIdx alias = gctx.ctx.lookupTypeAlias(name);
+			if (alias != kNoType && alias != ty) {
+				ty = alias;
+				continue;
+			}
+		}
+		break;
+	}
+	return ty;
+}
+
+// True if `ty` carries any heap ownership or field that does. Used to
+// decide whether a `var` binding needs scope-exit drop tracking even
+// when its type doesn't itself declare `cfn drop`. Mirrors Rust's
+// `needs_drop<T>()` which recurses into struct fields. Cycles are not
+// possible for non-pointer/named-only descent — pointer fields are
+// treated as primitives (Rust's same answer: a raw pointer doesn't
+// auto-drop its pointee; if the user wants that, they own a Box/Vec
+// whose own `cfn drop` handles deallocation).
+static bool typeNeedsDrop(AstGenCtx &gctx, TypeIdx ty) {
+	ty = resolveGenericIfAny(gctx, ty);
+	if (!lookupDropFnLLVMName(gctx, ty).empty()) return true;
+	const TypeKey &tk = gctx.ctx.getTypePool().get(ty);
+	if (tk.kind != TypeKind::Struct && tk.kind != TypeKind::Named) {
+		return false;
+	}
+	const std::string &name =
+	    gctx.ctx.getStringPool().get(static_cast<StringIdx>(tk.a));
+	const auto *sinfo = gctx.ctx.getStruct(name);
+	if (sinfo == nullptr) return false;
+	for (const auto &f : sinfo->fields) {
+		if (typeNeedsDrop(gctx, f.second)) return true;
+	}
+	return false;
+}
+
+// Synthesize a Rust-style `drop_in_place::<T>(*T)` call sequence at `ptrRef`
+// for pointee type `pointeeTy`. Walks the type recursively:
+//   1. If T has a registered `cfn drop`: emit a Call to T.drop(ptrRef).
+//   2. Else if T is a struct: for each field with `needsDrop`, GEP its
+//      address and recurse with the field type.
+//   3. Else (primitive, no-drop type): emit nothing.
+// All emission is inline — there's no synthesized helper function, no
+// runtime cost beyond the explicit drop calls. The compiler-known type
+// of `ptrRef` is the dispatch key.
+// Walk T's struct fields and recursively emit @dropInPlace on each that
+// needs drop. Does NOT fire T's own `cfn drop`; the caller is
+// responsible for that (if applicable). Factored out of emitDropInPlace
+// so emitDrops can re-use it to mirror Rust's "Drop::drop runs, then
+// fields auto-drop" sequencing.
+static void emitFieldDrops(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
+	pointeeTy = resolveGenericIfAny(gctx, pointeeTy);
+	const TypeKey &tk = gctx.ctx.getTypePool().get(pointeeTy);
+	const JamCodegenContext::StructInfo *sinfo = nullptr;
+	if (tk.kind == TypeKind::Struct || tk.kind == TypeKind::Named) {
+		std::string name =
+		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(tk.a));
+		sinfo = gctx.ctx.getStruct(name);
+	}
+	if (sinfo == nullptr) return;
+	for (size_t i = 0; i < sinfo->fields.size(); i++) {
+		TypeIdx fieldTy = sinfo->fields[i].second;
+		if (!typeNeedsDrop(gctx, fieldTy)) continue;
+		TypeIdx fieldPtrTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::PtrSingle, 0, 0, fieldTy, 0});
+		JirInst fieldAddr{};
+		fieldAddr.tag = JirTag::FieldAddr;
+		fieldAddr.a = ptrRef;
+		fieldAddr.b = static_cast<uint32_t>(i);
+		fieldAddr.ty = fieldPtrTy;
+		JirRef fieldPtr = emit(gctx, fieldAddr);
+		emitDropInPlace(gctx, fieldPtr, fieldTy);
+	}
+}
+
+static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
+	// Resolve a generic-call type to its concrete instantiation so the
+	// shape check + cfn-drop lookup operate on the right TypeIdx
+	// (Vec(u32) → Vec__u32 etc.). FieldAddr's lowering also needs the
+	// concrete struct in `pointeeTy` so the GEP indices match the LLVM
+	// layout.
+	pointeeTy = resolveGenericIfAny(gctx, pointeeTy);
+	// If the type has a custom drop fn (registered cfn drop OR an in-
+	// struct `fn drop` picked up via `instantiatedDrops_`), emit the
+	// call first. Then, regardless of whether the call was emitted,
+	// walk droppable fields — matches Rust's `drop_in_place::<T>`
+	// which always runs Drop::drop (if any) followed by field drops.
+	std::string dropLLVMName = lookupDropFnLLVMName(gctx, pointeeTy);
+	if (!dropLLVMName.empty()) {
+		StringIdx symId = gctx.ctx.getStringPool().intern(dropLLVMName);
+		JirInst drop{};
+		drop.tag = JirTag::DropBinding;
+		drop.a = ptrRef;
+		drop.b = symId;
+		drop.ty = kNoType;
+		emit(gctx, drop);
+	}
+	emitFieldDrops(gctx, ptrRef, pointeeTy);
+}
+
 // AstGen for `AtCall` — comptime intrinsic (`@sizeOf(T)` / `@alignOf(T)`).
 // Resolves to a constant at astgen time; the JIR never sees a call.
 static JirRef astgenAtCall(AstGenCtx &gctx, const AstNode &n) {
 	const std::string &name =
 	    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
+	// Expression-arg intrinsics (`@dropInPlace(ptr)`, `@emit*(...)`) carry
+	// `flags & 1` and use n.rhs as an ExtraIdx slice; the legacy type-arg
+	// path uses n.rhs as a TypeIdx. Dispatch here before reading n.rhs.
+	if ((n.flags & 1) != 0 && name == "dropInPlace") {
+		const NodeStore &ns = gctx.ctx.getNodeStore();
+		ExtraIdx argsExtra = static_cast<ExtraIdx>(n.rhs);
+		uint32_t argCount = ns.getExtra(argsExtra);
+		if (argCount != 1) {
+			failHere(gctx, "@dropInPlace takes exactly one pointer argument");
+		}
+		NodeIdx ptrIdx = static_cast<NodeIdx>(ns.getExtra(argsExtra + 1));
+		JirRef ptrRef = astgenExpr(gctx, ptrIdx, kNoType);
+		TypeIdx ptrTy = gctx.jfn.getInst(ptrRef).ty;
+		const TypeKey &pk = gctx.ctx.getTypePool().get(ptrTy);
+		if (pk.kind != TypeKind::PtrSingle && pk.kind != TypeKind::PtrMany) {
+			failHere(gctx, "@dropInPlace argument must be a pointer");
+		}
+		TypeIdx pointeeTy = static_cast<TypeIdx>(pk.a);
+		emitDropInPlace(gctx, ptrRef, pointeeTy);
+		return kNoJirRef;
+	}
 	TypeIdx tyArg = static_cast<TypeIdx>(n.rhs);
 	if (name == "isDarwin" || name == "isLinux" || name == "isWindows" ||
 	    name == "isUnix") {

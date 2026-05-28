@@ -51,7 +51,23 @@ pub fn Box(T: type) type {
         // Hooks the box into MVS auto-cleanup. The `cfn` variant (not a
         // plain `fn`) is what the drop registry recognizes — see Vec's
         // drop in std/collections for the same machinery.
+        //
+        // `@dropInPlace(self.ptr)` synthesizes T's drop sequence at this
+        // call site — fires T's own `cfn drop` if it has one, or walks
+        // T's fields and drops each that needs drop. Without this, a
+        // Box(Cue) where Cue holds Vec(T) fields would leak the inner
+        // Vec's backing storage on drop.
+        //
+        // TODO: ownership-marker syntax for owning pointer fields. Rust
+        // expresses this via `#[may_dangle]` + `PhantomData<T>` so the
+        // compiler auto-emits `drop_in_place::<T>` before `Box::drop`
+        // runs — the user-written body is then just `deallocate(...)`.
+        // jam doesn't have an `[[owns]]` field attribute (or equivalent)
+        // yet, so we call `@dropInPlace` explicitly here. Once the
+        // marker lands, this line goes away and the compiler injects
+        // it for any field annotated as owning its pointee.
         cfn drop(self: mut Self) {
+            @dropInPlace(self.ptr);
             free(self.ptr as *mut[] u8);
         }
     };

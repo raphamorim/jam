@@ -192,10 +192,13 @@ NodeIdx Parser::parsePrimary() {
 		StringIdx nameId = stringPool->intern(name);
 		consume(TOK_OPEN_PAREN, "Expected '(' after '@name'");
 		// Names starting with "emit" are the @-emit family; they take
-		// expression args. Everything else (sizeOf, alignOf) stays on
-		// the legacy type-arg path.
+		// expression args. `@dropInPlace(ptr)` is also expression-arg —
+		// the compiler reads the pointer's pointee type to synthesize
+		// the field-recursive drop sequence (Rust's drop_in_place).
+		// Everything else (sizeOf, alignOf) stays on the legacy type-arg path.
 		bool isEmitFamily = name.length() >= 4 && name.substr(0, 4) == "emit";
-		if (isEmitFamily) {
+		bool isExprIntrinsic = isEmitFamily || name == "dropInPlace";
+		if (isExprIntrinsic) {
 			std::vector<NodeIdx> args;
 			if (!check(TOK_CLOSE_PAREN)) {
 				do {
