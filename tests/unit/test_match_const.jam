@@ -1,0 +1,68 @@
+// Constant patterns in match: a bare identifier that names a module-level
+// `const` matches the scrutinee against the const's value (like a literal
+// arm), not a new binding. Mirrors Rust's const-pattern resolution.
+
+const { assert } = import("test");
+
+const A: u32 = 10;
+const B: u32 = 20;
+const C: u32 = 30;
+const D: u32 = 40;
+const E: u32 = 50;
+const F: u32 = 60;
+const G: u32 = 70;
+
+fn classify(x: u32) u32 {
+    match (x) {
+        A { return 1; }
+        B { return 2; }
+        C { return 3; }
+        _ { return 0; }
+    }
+}
+
+// const and literal arms in the same match.
+fn mixed(x: u32) u32 {
+    match (x) {
+        A { return 1; }
+        5 { return 5; }
+        _ { return 0; }
+    }
+}
+
+tfn matchConstPatterns() {
+    assert(classify(10), 1);
+    assert(classify(20), 2);
+    assert(classify(30), 3);
+    assert(classify(99), 0);
+}
+
+tfn matchMixedLiteralAndConst() {
+    assert(mixed(10), 1);
+    assert(mixed(5), 5);
+    assert(mixed(0), 0);
+}
+
+// All-const arms: the match lowers to a jump-table switch (collectSwitchCases
+// comptime-evaluates each const), and must give the same result as the
+// compare-chain it would otherwise use.
+fn grade(x: u32) u32 {
+    match (x) {
+        A { return 1; }
+        B { return 2; }
+        C { return 3; }
+        D { return 4; }
+        E { return 5; }
+        F { return 6; }
+        G { return 7; }
+        _ { return 0; }
+    }
+}
+
+tfn matchManyConstArmsSwitch() {
+    assert(grade(10), 1);
+    assert(grade(40), 4);
+    assert(grade(70), 7);
+    assert(grade(0), 0);
+    assert(grade(55), 0);
+}

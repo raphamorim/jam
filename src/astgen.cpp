@@ -3036,10 +3036,34 @@ static bool collectSwitchCases(const NodeStore &ns, JamCodegenContext &ctx,
 		return true;
 	}
 	case AstTag::PatEnumVariant: {
+		bool hasBindings = (p.flags & 1) != 0;
+		bool inferReceiver = (p.flags & 4) != 0;
+		// Constant pattern: a bare identifier (infer-receiver, no bindings)
+		// naming a module-level const. comptime-evaluate it to an integer and
+		// emit a switch case — the scalar-const -> SwitchInt path rustc takes
+		// via Const::try_eval_bits. Unfoldable / non-int consts return false
+		// and fall back to the per-arm compare chain (astgenPatternCompare).
+		if (!scrutIsEnum && inferReceiver && !hasBindings) {
+			const std::string &cname =
+			    ctx.getStringPool().get(static_cast<StringIdx>(p.rhs));
+			if (const auto *mc = ctx.getModuleConst(cname)) {
+				jam::ComptimeEvaluator ev(ns, ctx.getStringPool(),
+				                          ctx.getTypePool());
+				jam::ComptimeValue v =
+				    ev.eval(mc->initExpr, jam::ComptimeScope{});
+				if (v.isInt()) {
+					const TypeKey &sk = ctx.getTypePool().get(scrutTy);
+					bool signedCmp = sk.kind == TypeKind::Int && sk.b != 0;
+					out.push_back(
+					    SwitchCase{v.intVal.bits, signedCmp, armBlock});
+					return true;
+				}
+			}
+			return false;
+		}
 		if (!scrutIsEnum || einfo == nullptr) return false;
 		// Reject pattern shapes that need a binding block before the
 		// arm body — Switch can only jump straight to `armBlock`.
-		bool hasBindings = (p.flags & 1) != 0;
 		if (hasBindings) return false;
 		StringIdx variantNameId = static_cast<StringIdx>(p.rhs);
 		const std::string &variantName = ctx.getStringPool().get(variantNameId);
@@ -3190,6 +3214,21 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx, JirRef scrut,
 			einfo = gctx.ctx.getEnum(recvName);
 		}
 		if (einfo == nullptr) {
+			// Not an enum. A bare-identifier pattern (infer-receiver, no
+			// bindings) that names a module-level `const` is a CONSTANT
+			// pattern: compare the scrutinee against the const's value,
+			// exactly like a literal arm. Mirrors Rust, where an identifier
+			// pattern that resolves to a const is the const, not a binding.
+			if (inferReceiver && !hasBindings) {
+				const std::string &constName =
+				    gctx.ctx.getStringPool().get(variantNameId);
+				if (const auto *mc = gctx.ctx.getModuleConst(constName)) {
+					JirRef k = astgenExpr(gctx, mc->initExpr, scrutTy);
+					JirRef cmp = emitCmp(JirTag::ICmpEq, scrut, k);
+					emitCondBr(gctx, cmp, armBlock, nextBlock);
+					return;
+				}
+			}
 			failHere(gctx,
 			         "astgen: pattern receiver doesn't resolve to an enum");
 		}
