@@ -1,0 +1,63 @@
+// Vec(T) synthesizes element destructors on drop: each live element's
+// drop fires exactly once before the backing is freed (no leak, no
+// double-free). Mirrors test_drops' side-channel: a Counter bumps a
+// sink pointer on drop, observed cross-function after the Vec drops.
+//
+// TODO(move): these only push TEMPORARIES, which the compiler can move today.
+// Pushing a NAMED drop-bearing local:
+//     var b: Box(Counter) = Box(Counter).init(...); v.push(b);
+// so, still errors ("cannot move binding of drop-bearing type, drop+move
+// tracking is not yet implemented"). add that case once named-local move lands
+
+const { assert } = import("test");
+const { Vec } = import("std/collections");
+const { Box } = import("std/box");
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+// Build a Vec(Counter), push n elements (each moved in), then let it drop.
+// The synthesized element loop must fire each Counter drop once: sink += n.
+fn fillCountersAndDrop(sink: *mut u32, n: u32) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    var i: u32 = 0;
+    while (i < n) {
+        v.push(Counter { value: i, sink: sink });
+        i = i + 1;
+    }
+}
+
+// Vec(Box(Counter)): element drop must recurse Vec, Box, Counter.
+fn fillBoxedCountersAndDrop(sink: *mut u32, n: u32) {
+    var v: Vec(Box(Counter)) = Vec(Box(Counter)).empty();
+    var i: u32 = 0;
+    while (i < n) {
+        v.push(Box(Counter).init(Counter { value: i, sink: sink }));
+        i = i + 1;
+    }
+}
+
+tfn vecDropsEachElementOnce() {
+    var hits: u32 = 0;
+    fillCountersAndDrop(&hits, 3);
+    assert(hits, 3);
+}
+
+tfn vecBoxDropsTransitively() {
+    var hits: u32 = 0;
+    fillBoxedCountersAndDrop(&hits, 4);
+    assert(hits, 4);
+}
+
+tfn vecEmptyDropsNothing() {
+    var hits: u32 = 0;
+    fillCountersAndDrop(&hits, 0);
+    assert(hits, 0);
+}
