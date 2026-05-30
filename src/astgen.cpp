@@ -3813,6 +3813,154 @@ static void emitFieldDrops(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 	}
 }
 
+// If `containerTy` is a contiguous owning container — a struct exposing a
+// `cfn len(self)` count accessor and exactly one many-pointer data field —
+// synthesize its element destructors: loop `0..len()` and recursively
+// `emitDropInPlace` each element. Reuses the same JIR a `for` loop emits
+// (Alloca/Load/ICmpUlt/Add/Br/CondBr), `emitCall` for `len`, and the existing
+// `emitDropInPlace` recursion. Returns true if a loop was emitted.
+//
+// Runs BEFORE the container's own `cfn drop` (which frees the backing) so the
+// elements are destroyed while their storage is still live. POD element types
+// (typeNeedsDrop == false) emit nothing — the loop is skipped.
+static bool emitContainerElementDrops(AstGenCtx &gctx, JirRef ptrRef,
+                                      TypeIdx containerTy) {
+	const auto *sinfo = gctx.ctx.lookupStruct(containerTy);
+	if (sinfo == nullptr) return false;
+
+	// Opt-in marker: a `cfn len`. A plain `fn len` (or none) is not treated
+	// as a drop-synthesizable container — this prevents element-dropping a
+	// borrowing view that merely happens to expose a length + pointer.
+	const FunctionAST *lenFn = gctx.ctx.getFunctionAST(sinfo->name + ".len");
+	if (lenFn == nullptr || !lenFn->isCfn || lenFn->Args.empty()) return false;
+
+	// The single many-pointer field is the data base; its pointee is the
+	// element type. More than one many-pointer field is ambiguous.
+	int dataIdx = -1;
+	TypeIdx elemTy = kNoType;
+	for (size_t i = 0; i < sinfo->fields.size(); i++) {
+		const TypeKey &fk = gctx.ctx.getTypePool().get(sinfo->fields[i].second);
+		if (fk.kind == TypeKind::PtrMany) {
+			if (dataIdx >= 0) return false;
+			dataIdx = static_cast<int>(i);
+			elemTy = static_cast<TypeIdx>(fk.a);
+		}
+	}
+	if (dataIdx < 0 || !typeNeedsDrop(gctx, elemTy)) return false;
+
+	// count = self.len()  — receiver is the pointer-to-self we already hold.
+	jam::abi::ParamABI recvAbi =
+	    jam::abi::classifyParam(lenFn->Args[0].Mode, containerTy, gctx.ctx);
+	JirRef recvRef;
+	if (recvAbi.kind == jam::abi::ParamABI::Kind::ByPointer) {
+		recvRef = ptrRef;
+	} else {
+		JirInst ld{};
+		ld.tag = JirTag::Load;
+		ld.a = ptrRef;
+		ld.ty = containerTy;
+		recvRef = emit(gctx, ld);
+	}
+	std::vector<JirRef> lenArgs;
+	lenArgs.push_back(recvRef);
+	JirRef countRef = emitCall(gctx, lenFn, lenArgs);
+	TypeIdx countTy = gctx.jfn.getInst(countRef).ty;
+
+	// base = load self.<dataField>  → a `*mut[] Elem` value.
+	TypeIdx dataFieldTy = sinfo->fields[dataIdx].second;
+	TypeIdx dataAddrTy = gctx.ctx.getTypePool().intern(
+	    TypeKey{TypeKind::PtrSingle, 0, 0, dataFieldTy, 0});
+	JirInst fa{};
+	fa.tag = JirTag::FieldAddr;
+	fa.a = ptrRef;
+	fa.b = static_cast<uint32_t>(dataIdx);
+	fa.ty = dataAddrTy;
+	JirRef dataAddr = emit(gctx, fa);
+	JirInst ldb{};
+	ldb.tag = JirTag::Load;
+	ldb.a = dataAddr;
+	ldb.ty = dataFieldTy;
+	JirRef base = emit(gctx, ldb);
+
+	// i = 0
+	JirInst alloca{};
+	alloca.tag = JirTag::Alloca;
+	alloca.ty = countTy;
+	JirRef slot = emitAllocaHoisted(gctx, alloca);
+	JirInst zero{};
+	zero.tag = JirTag::Int;
+	zero.a = 0;
+	zero.ty = countTy;
+	JirRef zeroRef = emit(gctx, zero);
+	JirInst st0{};
+	st0.tag = JirTag::Store;
+	st0.a = slot;
+	st0.b = zeroRef;
+	emit(gctx, st0);
+
+	JirBlockRef condB = gctx.jfn.pushBlock("dropcond");
+	JirBlockRef bodyB = gctx.jfn.pushBlock("dropbody");
+	JirBlockRef exitB = gctx.jfn.pushBlock("dropexit");
+	emitBr(gctx, condB);
+
+	// cond: i < count
+	gctx.currentBlock = condB;
+	JirInst li{};
+	li.tag = JirTag::Load;
+	li.a = slot;
+	li.ty = countTy;
+	JirRef iVal = emit(gctx, li);
+	JirInst cmp{};
+	cmp.tag = JirTag::ICmpUlt;
+	cmp.a = iVal;
+	cmp.b = countRef;
+	cmp.ty = BuiltinType::Bool;
+	JirRef cmpRef = emit(gctx, cmp);
+	emitCondBr(gctx, cmpRef, bodyB, exitB);
+
+	// body: drop element i; i = i + 1
+	gctx.currentBlock = bodyB;
+	JirInst lib{};
+	lib.tag = JirTag::Load;
+	lib.a = slot;
+	lib.ty = countTy;
+	JirRef iBody = emit(gctx, lib);
+	TypeIdx elemPtrTy = gctx.ctx.getTypePool().intern(
+	    TypeKey{TypeKind::PtrMany, 0, 0, elemTy, 0});
+	JirInst ia{};
+	ia.tag = JirTag::IndexAddr;
+	ia.a = base;
+	ia.b = iBody;
+	ia.ty = elemPtrTy;
+	JirRef elemPtr = emit(gctx, ia);
+	emitDropInPlace(gctx, elemPtr, elemTy);
+	JirInst li2{};
+	li2.tag = JirTag::Load;
+	li2.a = slot;
+	li2.ty = countTy;
+	JirRef cur = emit(gctx, li2);
+	JirInst one{};
+	one.tag = JirTag::Int;
+	one.a = 1;
+	one.ty = countTy;
+	JirRef oneRef = emit(gctx, one);
+	JirInst inc{};
+	inc.tag = JirTag::Add;
+	inc.a = cur;
+	inc.b = oneRef;
+	inc.ty = countTy;
+	JirRef next = emit(gctx, inc);
+	JirInst st1{};
+	st1.tag = JirTag::Store;
+	st1.a = slot;
+	st1.b = next;
+	emit(gctx, st1);
+	emitBr(gctx, condB);
+
+	gctx.currentBlock = exitB;
+	return true;
+}
+
 static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 	// Resolve a generic-call type to its concrete instantiation so the
 	// shape check + cfn-drop lookup operate on the right TypeIdx
@@ -3820,6 +3968,10 @@ static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 	// concrete struct in `pointeeTy` so the GEP indices match the LLVM
 	// layout.
 	pointeeTy = resolveGenericIfAny(gctx, pointeeTy);
+	// Contiguous owning containers (a `cfn len` + a single data pointer)
+	// synthesize their element destructors here, BEFORE the container's own
+	// drop frees the backing — elements must die while their storage lives.
+	emitContainerElementDrops(gctx, ptrRef, pointeeTy);
 	// If the type has a custom drop fn (registered cfn drop OR an in-
 	// struct `fn drop` picked up via `instantiatedDrops_`), emit the
 	// call first. Then, regardless of whether the call was emitted,

@@ -65,7 +65,7 @@ pub fn Vec(T: type) type {
             return v;
         }
 
-        fn push(self: mut Self, value: T) {
+        fn push(self: mut Self, value: move T) {
             if (self.length == self.capacity) {
                 self.grow();
             }
@@ -81,7 +81,7 @@ pub fn Vec(T: type) type {
             return Option(T).Some(self.ptr[self.length]);
         }
 
-        fn len(self: Self) u32 { return self.length; }
+        cfn len(self: Self) u32 { return self.length; }
 
         fn get(self: Self, i: u32) Option(T) {
             if (i >= self.length) {
