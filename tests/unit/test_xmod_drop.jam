@@ -1,0 +1,15 @@
+// A struct whose `cfn drop` is defined in ANOTHER module must fire its drop
+// when dropped here. Regression for cross-module drop registration.
+const { assert } = import("test");
+const { XThing, makeXThing } = import("test_xmod_drop_helper");
+
+fn build(s: *mut u32) {
+    var t: XThing = makeXThing(s);
+    // t drops here -> XThing.drop (in the helper module) must run once.
+}
+
+tfn crossModuleDropFires() {
+    var hits: u32 = 0;
+    build(&hits);
+    assert(hits, 1);
+}

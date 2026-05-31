@@ -472,12 +472,11 @@ JamCodegenContext::getFunctionAST(const std::string &name) const {
 	// std/collections.jam (where Vec lives) regardless of whether the
 	// caller module independently imports it.
 	//
-	// Falls back to the flat global map for two cases the per-module
-	// table doesn't cover: (a) generic instantiations registered by
-	// mangled name (`Vec__u32.withCapacity` etc.) that live in the
-	// global map but not in any source module's pub-fn table; (b)
-	// names looked up outside any instantiation body (normal entry-
-	// module function bodies).
+	// The final global map below holds only NON-import entries: plain fns,
+	// struct methods, and generic instantiations registered by mangled name
+	// (`Vec__u32.withCapacity`). Import-handle flats (`handle.X`) live in the
+	// per-module `moduleImports_` tables instead, so an imported body can't
+	// reach the entry module's imports through this fallback.
 	if (!bodyModuleStack_.empty()) {
 		const std::string &defMod = bodyModuleStack_.back();
 		if (!defMod.empty()) {
@@ -486,6 +485,16 @@ JamCodegenContext::getFunctionAST(const std::string &name) const {
 				auto fIt = nsIt->second.functions.find(name);
 				if (fIt != nsIt->second.functions.end()) { return fIt->second; }
 			}
+		}
+	}
+	// Qualified handle calls (`std.fmt.print`, `fmt.print`) resolve against
+	// the CURRENT body's module imports -- the entry module / entry-defined
+	// generics use the "" key. A body never sees another file's imports.
+	{
+		auto mIt = moduleImports_.find(currentBodyModule());
+		if (mIt != moduleImports_.end()) {
+			auto qIt = mIt->second.qualFns.find(name);
+			if (qIt != mIt->second.qualFns.end()) return qIt->second;
 		}
 	}
 	auto it = functionAsts.find(name);
@@ -505,20 +514,20 @@ const std::string &JamCodegenContext::currentBodyModule() const {
 	return bodyModuleStack_.empty() ? kEmpty : bodyModuleStack_.back();
 }
 
-void JamCodegenContext::registerImportHandle(const std::string &handle,
-                                             const std::string &modulePath) {
-	importHandles_[handle].modulePath = modulePath;
-}
-
-void JamCodegenContext::registerPrivateName(const std::string &handle,
-                                            const std::string &name) {
-	importHandles_[handle].privateNames.insert(name);
-}
-
 const JamCodegenContext::ImportHandleInfo *
 JamCodegenContext::getImportHandle(const std::string &handle) const {
-	auto it = importHandles_.find(handle);
-	return (it == importHandles_.end()) ? nullptr : &it->second;
+	// Resolve against the CURRENT body's module imports only -- the entry
+	// module (and entry-defined generics) use the "" key; an imported body
+	// (e.g. Bus.drop in bus.jam, lowered under pushBodyModule("bus")) uses its
+	// own key. There is NO cross-module fallback: a handle absent from the
+	// declaring module's imports is an error, never resolved against the
+	// entry/root module's imports.
+	auto mIt = moduleImports_.find(currentBodyModule());
+	if (mIt != moduleImports_.end()) {
+		auto hIt = mIt->second.handles.find(handle);
+		if (hIt != mIt->second.handles.end()) return &hIt->second;
+	}
+	return nullptr;
 }
 
 void JamCodegenContext::registerModuleNamespace(ModuleNamespace ns) {

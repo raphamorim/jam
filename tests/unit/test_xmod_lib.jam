@@ -1,0 +1,7 @@
+// Tiny library imported BY test_xmod_drop_helper, but NOT by the test entry
+// module (test_xmod_drop). Lets the cross-module-drop test prove that the
+// helper's `cfn drop` body resolves its qualified imports against the helper's
+// own module -- not the entry module's imports.
+pub fn bumpBy(x: u32, n: u32) u32 {
+    return x + n;
+}

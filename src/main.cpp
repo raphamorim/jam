@@ -411,43 +411,54 @@ static int compileAndRun(const std::string &filename,
 	// Register every flat `handle.X` mapping for a given (handle name,
 	// resolved module). Shared by direct-import bindings and module-
 	// valued destructuring bindings (`const {fmt} = import("std");`).
+	// `owner` is the module whose imports these are -- and the scope key its
+	// bodies resolve against. "" is the entry module: its bodies compile with
+	// an empty bodyModuleStack_ (which maps to the "" key), and entry-defined
+	// generics carry an empty modulePath (same key). EVERY module -- entry
+	// included -- gets its OWN scope in moduleImports_, so a body resolves its
+	// qualified imports against its own module and never inherits another's.
+	// There is deliberately NO cross-module fallback (see getImportHandle): a
+	// qualified name absent from the declaring module's imports is an error,
+	// not a lookup in the entry/root module.
 	auto registerHandleFlats = [&](const std::string &handle,
 	                               const std::string &modulePath,
-	                               ModuleAST *importedModule) {
-		codegenCtx.registerImportHandle(handle, modulePath);
+	                               ModuleAST *importedModule,
+	                               const std::string &owner) {
+		codegenCtx.registerScopedHandle(owner, handle, modulePath);
+		auto regFn = [&](const std::string &key, const FunctionAST *fn) {
+			codegenCtx.registerScopedHandleFn(owner, key, fn);
+		};
+		auto regPriv = [&](const std::string &name) {
+			codegenCtx.registerScopedPrivateName(owner, handle, name);
+		};
 		auto aliasNamed = [&](const std::string &bare) {
 			TypeIdx target = codegenCtx.getTypePool().internNamed(
 			    codegenCtx.getStringPool().intern(bare));
-			codegenCtx.registerTypeAlias(handle + "." + bare, target);
+			codegenCtx.registerScopedTypeAlias(owner, handle + "." + bare,
+			                                   target);
 		};
 		for (auto &func : importedModule->Functions) {
-			if (func->isPub) {
-				codegenCtx.registerFunctionAST(handle + "." + func->Name,
-				                               func.get());
-			} else {
-				codegenCtx.registerPrivateName(handle, func->Name);
-			}
+			if (func->isPub) regFn(handle + "." + func->Name, func.get());
+			else regPriv(func->Name);
 		}
 		for (auto &s : importedModule->Structs) {
 			if (s->isPub) {
 				aliasNamed(s->Name);
 				for (auto &m : s->Methods) {
-					if (m->isPub) {
-						codegenCtx.registerFunctionAST(
-						    handle + "." + s->Name + "." + m->Name, m.get());
-					}
+					if (m->isPub)
+						regFn(handle + "." + s->Name + "." + m->Name, m.get());
 				}
 			} else {
-				codegenCtx.registerPrivateName(handle, s->Name);
+				regPriv(s->Name);
 			}
 		}
 		for (auto &e : importedModule->Enums) {
 			if (e->isPub) aliasNamed(e->Name);
-			else codegenCtx.registerPrivateName(handle, e->Name);
+			else regPriv(e->Name);
 		}
 		for (auto &u : importedModule->Unions) {
 			if (u->isPub) aliasNamed(u->Name);
-			else codegenCtx.registerPrivateName(handle, u->Name);
+			else regPriv(u->Name);
 		}
 	};
 
@@ -455,7 +466,7 @@ static int compileAndRun(const std::string &filename,
 		if (import->Path == "test") continue;
 		ModuleAST *importedModule = resolver.getOrLoadModule(import->Path);
 		if (!importedModule) continue;
-		registerHandleFlats(import->Name, import->Path, importedModule);
+		registerHandleFlats(import->Name, import->Path, importedModule, "");
 	}
 
 	// Destructured names that bind a re-exported module value — treat
@@ -477,7 +488,43 @@ static int compileAndRun(const std::string &filename,
 			auto resolved =
 			    resolveImportChain(re->Path, re->chain, resolveImportChain);
 			if (!resolved.second) continue;
-			registerHandleFlats(name, resolved.first, resolved.second);
+			registerHandleFlats(name, resolved.first, resolved.second, "");
+		}
+	}
+
+	// Per-module import bindings for every OTHER loaded module, scoped to that
+	// module's path. So when an imported pub/cfn body is compiled later (under
+	// pushBodyModule(modPath) in the imported-body pass), its qualified imports
+	// (`std.fmt.print`) resolve against ITS module's imports, not the entry
+	// module's -- a body resolves names against its own declaring module.
+	// Mirrors the two entry-module passes above, but walks each loaded module's
+	// own Imports/DestructuringImports.
+	for (const auto &[modPath, loadedModule] : resolver.getLoadedModules()) {
+		for (auto &imp : loadedModule->Imports) {
+			if (imp->Path == "test") continue;
+			ModuleAST *target = resolver.getOrLoadModule(imp->Path);
+			if (!target) continue;
+			registerHandleFlats(imp->Name, imp->Path, target, modPath);
+		}
+		for (auto &destImp : loadedModule->DestructuringImports) {
+			if (destImp->Path == "test") continue;
+			ModuleAST *src = resolver.getOrLoadModule(destImp->Path);
+			if (!src) continue;
+			for (const auto &name : destImp->Names) {
+				const ImportDeclAST *re = nullptr;
+				for (auto &imp : src->Imports) {
+					if (imp->isPub && imp->Name == name) {
+						re = imp.get();
+						break;
+					}
+				}
+				if (!re) continue;
+				auto resolved =
+				    resolveImportChain(re->Path, re->chain, resolveImportChain);
+				if (!resolved.second) continue;
+				registerHandleFlats(name, resolved.first, resolved.second,
+				                    modPath);
+			}
 		}
 	}
 
@@ -686,7 +733,12 @@ static int compileAndRun(const std::string &filename,
 	auto registerStructMethods = [&](ModuleAST *m, bool publicOnly) -> int {
 		for (auto &s : m->Structs) {
 			for (auto &meth : s->Methods) {
-				if (publicOnly && !meth->isPub) continue;
+				// `cfn` methods (drop / default / at / setAt / len) are
+				// compiler-synthesized hooks that may be invoked from OTHER
+				// modules (e.g. `drop` fires at a scope exit in the importing
+				// module), so they must be declared + codegen'd even when not
+				// `pub`. Plain non-pub methods stay module-private.
+				if (publicOnly && !meth->isPub && !meth->isCfn) continue;
 				// `cfn`-marked methods (drop / default / at / …) opt
 				// in to compiler-synthesized calls and must match the
 				// expected signature for their name. Plain `fn`
@@ -751,6 +803,14 @@ static int compileAndRun(const std::string &filename,
 	// bindings need their drop fn called at scope exit.
 	jam::drops::DropRegistry dropRegistry = jam::drops::buildDropRegistry(
 	    *module, codegenCtx.getTypePool(), codegenCtx.getStringPool());
+	// Fold imported modules' drops into the registry: a drop site in the main
+	// module must fire the destructor of a type defined and imported from
+	// another module (e.g. `Bus.drop` in bus.jam, dropped in main.jam).
+	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
+		jam::drops::addDropCandidates(dropRegistry, *importedModule,
+		                              codegenCtx.getTypePool(),
+		                              codegenCtx.getStringPool());
+	}
 	codegenCtx.setDropRegistry(&dropRegistry);
 
 	// Pass 1d: every function (free fns + struct methods + imported
@@ -805,6 +865,12 @@ static int compileAndRun(const std::string &filename,
 		// not the caller's. Same mechanism the generic-instantiation
 		// path uses — see JamCodegenContext::pushBodyModule.
 		codegenCtx.pushBodyModule(path);
+		// Attribute diagnostics from this module's bodies to ITS file, not the
+		// entry file. The global NodeStore already carries the correct line;
+		// only currentFile() (used by locOf) is entry-global, so an error in an
+		// imported body must restore the right filename here.
+		std::string prevFile = codegenCtx.currentFile();
+		codegenCtx.setCurrentFile(path + ".jam");
 		for (auto &func : importedModule->Functions) {
 			if (func->isGeneric()) continue;
 			if (func->isExtern) continue;
@@ -823,7 +889,9 @@ static int compileAndRun(const std::string &filename,
 		}
 		for (auto &s : importedModule->Structs) {
 			for (auto &m : s->Methods) {
-				if (!m->isPub) continue;
+				if (!m->isPub && !m->isCfn)
+					continue;  // cfn hooks (drop/...) are invocable
+					           // cross-module
 				try {
 					JirFunction jfn = astgenFunction(*m, codegenCtx);
 					jfn.name = mangledFunctionName(*m, codegenCtx.getTypePool(),
@@ -834,6 +902,7 @@ static int compileAndRun(const std::string &filename,
 				}
 			}
 		}
+		codegenCtx.setCurrentFile(prevFile);
 		codegenCtx.popBodyModule();
 	}
 

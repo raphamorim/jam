@@ -177,11 +177,17 @@ class CodegenErrorTests {
 		framework.addTest("FnRef - ptr as u32 (narrower than u64) is rejected",
 		                  testPtrAsNarrowIntRejected);
 		framework.addTest(
-		    "FnRef - u32 as *mut[] u8 (narrower than u64) is rejected",
-		    testNarrowIntAsPtrRejected);
+		    "FnRef - u32 as *mut[] u8 (int->ptr) zero-extends + inttoptr",
+		    testNarrowIntAsPtrZeroExtends);
 		framework.addTest(
 		    "FnRef - truly unknown variable still errors (no fn fallback)",
 		    testUnknownVariableStillErrors);
+		framework.addTest(
+		    "XMod - error in imported body blames the DEFINING file",
+		    testImportedBodyErrorBlamesDefiningFile);
+		framework.addTest(
+		    "XMod - imported body cannot see the entry module's imports",
+		    testImportedBodyCannotSeeEntryImports);
 	}
 
   private:
@@ -508,17 +514,24 @@ fn main() {
 		ASSERT_TRUE(stderrContains(r, "unsupported `as` cast"));
 	}
 
-	// Mirror of the above for the other direction: only u64 -> ptr
-	// is accepted (a u32 can't carry a full target pointer).
-	static void testNarrowIntAsPtrRejected() {
-		auto r = compileSource("narrow_int_as_ptr", R"(
+	// The OTHER direction is intentionally NOT symmetric: an int->ptr cast
+	// permits ANY integer width into a THIN pointer -- the int is an address,
+	// and narrower-than-pointer sources just widen to pointer width. (Only the
+	// reverse, ptr->int, is width-checked: u64 only.) So `u32 as *mut[] u8` is
+	// accepted and lowers to zext-to-i64 + inttoptr. `*mut[] u8` is a thin
+	// many-ptr, not a slice, so it is a legal target.
+	static void testNarrowIntAsPtrZeroExtends() {
+		auto r = compileSourceIR("narrow_int_as_ptr", R"(
+extern fn sink(p: *mut[] u8);
 fn main() {
     var n: u32 = 0xFF;
     var p: *mut[] u8 = n as *mut[] u8;
+    sink(p);
 }
 )");
-		ASSERT_TRUE(r.exitCode != 0);
-		ASSERT_TRUE(stderrContains(r, "unsupported `as` cast"));
+		ASSERT_TRUE(r.exitCode == 0);
+		ASSERT_TRUE(stderrContains(r, "inttoptr"));
+		ASSERT_TRUE(stderrContains(r, "zext"));
 	}
 
 	// Regression guard: the fn-name fallback in astgenVariable must
@@ -535,6 +548,73 @@ fn main() {
 		ASSERT_TRUE(r.exitCode != 0);
 		ASSERT_TRUE(stderrContains(r, "unknown variable"));
 		ASSERT_TRUE(stderrContains(r, "nonexistent_thing"));
+	}
+
+	// An error inside an IMPORTED module's body (here, a `cfn drop` in
+	// lib.jam) must be attributed to lib.jam — the file the code was
+	// WRITTEN in — not to main.jam, the entry file being compiled.
+	//
+	// The imported-body codegen pass runs with the entry file as the
+	// global currentFile(); the fix sets currentFile() to the defining
+	// module for that pass. The node's line is already correct (one global
+	// NodeStore), so the bug was a wrong FILENAME with a right line.
+	static void testImportedBodyErrorBlamesDefiningFile() {
+		auto r = compileWithLib("xmod_body_err",
+		                        // main.jam: just imports + uses the type so
+		                        // lib.jam's drop body gets compiled.
+		                        R"(
+const { makeBad } = import("lib");
+fn main() {
+    var b = makeBad();
+}
+)",
+		                        // lib.jam: the bad reference is on line 4.
+		                        R"(pub const Bad = struct {
+    x: u32,
+    cfn drop(self: mut Self) {
+        self.x = unknownNameXyz;
+    }
+};
+pub fn makeBad() Bad { return Bad { x: 0 }; }
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "unknown variable"));
+		// The whole point: the diagnostic names the DEFINING file...
+		ASSERT_TRUE(stderrContains(r, "lib.jam:4"));
+		// ...and never blames the entry file for this imported-body error.
+		ASSERT_TRUE(!stderrContains(r, "main.jam:"));
+	}
+
+	// Import-scope strictness: a body resolves qualified names against ITS OWN
+	// module's imports, never the entry module's. Here main.jam binds
+	// `p = import("lib")`, but lib.jam's drop body uses `p.ping()` without
+	// importing `p` itself. It must be rejected (not silently resolved against
+	// main's `p`), and the error must point at lib.jam.
+	static void testImportedBodyCannotSeeEntryImports() {
+		auto r = compileWithLib("xmod_no_entry_leak",
+		                        R"(
+const p = import("lib");
+const { makeThing } = import("lib");
+fn main() {
+    var n: u32 = 0;
+    var t: Thing = makeThing(&n);
+}
+)",
+		                        R"(pub fn ping() u32 { return 7; }
+pub const Thing = struct {
+    sink: *mut u32,
+    cfn drop(self: mut Self) {
+        var q: *mut u32 = self.sink;
+        q.* = p.ping();
+    }
+};
+pub fn makeThing(s: *mut u32) Thing { return Thing { sink: s }; }
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		// `p` is undeclared in lib.jam's namespace -> rejected, not leaked.
+		ASSERT_TRUE(stderrContains(r, "unknown module handle"));
+		ASSERT_TRUE(stderrContains(r, "lib.jam:"));
+		ASSERT_TRUE(!stderrContains(r, "main.jam:"));
 	}
 };
 

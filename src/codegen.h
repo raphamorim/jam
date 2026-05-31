@@ -288,13 +288,48 @@ class JamCodegenContext {
 		std::string modulePath;
 		std::unordered_set<std::string> privateNames;
 	};
-	void registerImportHandle(const std::string &handle,
-	                          const std::string &modulePath);
-	void registerPrivateName(const std::string &handle,
-	                         const std::string &name);
+	// Resolves `handle` against the CURRENT body module's imports (the ""
+	// scope for the entry module). No cross-module fallback -- see the .cpp.
 	const ImportHandleInfo *getImportHandle(const std::string &handle) const;
 	std::string formatNamespaceLookupError(const std::string &kind,
 	                                       const std::string &qualified) const;
+
+	// --- Per-declaring-module import bindings ---
+	// A function/method body compiled under pushBodyModule(M) -- e.g. an
+	// imported pub/cfn body like `Bus.drop` in bus.jam -- resolves its
+	// qualified imports (`std.fmt.print`) against M's OWN imports, never the
+	// importer's. Every module gets its own scope here, keyed by module path;
+	// the entry module uses the "" key (the key currentBodyModule() returns for
+	// an empty stack, and for entry-defined generics whose modulePath is ""),
+	// so a body never sees another file's imports. There is no cross-module
+	// fallback: a qualified name absent from the declaring module's imports is
+	// an error, not a lookup in the entry/root module.
+	//
+	// This is the qualified-import analogue of the BARE-name routing in
+	// getFunctionAST (see moduleNamespaces_).
+	struct ModuleImports {
+		std::unordered_map<std::string, ImportHandleInfo> handles;
+		std::unordered_map<std::string, const FunctionAST *> qualFns;
+		std::unordered_map<std::string, TypeIdx> typeAliases;
+	};
+	void registerScopedHandle(const std::string &owner,
+	                          const std::string &handle,
+	                          const std::string &modulePath) {
+		moduleImports_[owner].handles[handle].modulePath = modulePath;
+	}
+	void registerScopedPrivateName(const std::string &owner,
+	                               const std::string &handle,
+	                               const std::string &name) {
+		moduleImports_[owner].handles[handle].privateNames.insert(name);
+	}
+	void registerScopedHandleFn(const std::string &owner,
+	                            const std::string &key, const FunctionAST *fn) {
+		moduleImports_[owner].qualFns[key] = fn;
+	}
+	void registerScopedTypeAlias(const std::string &owner,
+	                             const std::string &key, TypeIdx target) {
+		moduleImports_[owner].typeAliases[key] = target;
+	}
 
 	// Per-loaded-module namespace. Indexes the module's `pub` members
 	// by source-level name so that member access on a Module value
@@ -302,10 +337,10 @@ class JamCodegenContext {
 	// or another Module value (re-exports).
 	//
 	// Populated when a module is resolved (Phase 2+). Distinct from
-	// `importHandles_`, which keys by the *binding-site* handle name
-	// (e.g. `fmt` from `const fmt = import("fmt");`); ModuleNamespace
-	// keys by the *resolved canonical path* (e.g. "fmt", "std/fmt") so
-	// re-exports and aliases all converge on one entry per file.
+	// `moduleImports_`, whose per-module `handles` key by the *binding-site*
+	// handle name (e.g. `fmt` from `const fmt = import("fmt");`);
+	// ModuleNamespace keys by the *resolved canonical path* (e.g. "fmt",
+	// "std/fmt") so re-exports and aliases all converge on one entry per file.
 	struct ModuleNamespace {
 		// Canonical resolved path (e.g. "fmt", "std/fmt"). Same string
 		// stored in TypeKind::Module's `a` field.
@@ -341,7 +376,12 @@ class JamCodegenContext {
 
   private:
 	std::unordered_map<std::string, const FunctionAST *> functionAsts;
-	std::unordered_map<std::string, ImportHandleInfo> importHandles_;
+	// Per-declaring-module import bindings, keyed by module path -- "" is the
+	// entry module (the key currentBodyModule() returns for an empty stack and
+	// for entry-defined generics). Consulted by getImportHandle /
+	// getFunctionAST / lookupTypeAlias with NO cross-module fallback for
+	// import-derived names. See ModuleImports.
+	std::unordered_map<std::string, ModuleImports> moduleImports_;
 	// Resolved canonical path -> namespace decl table. See ModuleNamespace.
 	std::unordered_map<std::string, ModuleNamespace> moduleNamespaces_;
 	// Stack of `modulePath` strings for the bodies currently being lowered.
@@ -449,6 +489,16 @@ class JamCodegenContext {
 		typeAliases_[name] = target;
 	}
 	TypeIdx lookupTypeAlias(const std::string &name) const {
+		// Import-handle aliases (`handle.Type`) resolve against the CURRENT
+		// body's module imports -- the entry module / entry-defined generics
+		// use the "" key. No cross-module fallback for these.
+		auto mIt = moduleImports_.find(currentBodyModule());
+		if (mIt != moduleImports_.end()) {
+			auto tIt = mIt->second.typeAliases.find(name);
+			if (tIt != mIt->second.typeAliases.end()) return tIt->second;
+		}
+		// Local `const Name = T` aliases live in the flat table (not import-
+		// derived), and stay reachable from any body.
 		auto it = typeAliases_.find(name);
 		if (it != typeAliases_.end()) return it->second;
 		return kNoType;

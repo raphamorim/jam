@@ -48,6 +48,13 @@ using DropRegistry = std::unordered_map<std::string, const FunctionAST *>;
 DropRegistry buildDropRegistry(const ModuleAST &module, const TypePool &types,
                                const StringPool &strings);
 
+// Add `module`'s drop fns to an existing registry. Used to fold imported
+// modules' drops in, so a drop site in one module fires the destructor of a
+// type defined (and imported) from another (e.g. `Bus.drop` in bus.jam,
+// dropped in main.jam).
+void addDropCandidates(DropRegistry &registry, const ModuleAST &module,
+                       const TypePool &types, const StringPool &strings);
+
 }  // namespace drops
 }  // namespace jam
 

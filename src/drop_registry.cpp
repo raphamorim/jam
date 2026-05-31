@@ -45,9 +45,8 @@ static void considerDropCandidate(const FunctionAST *fn, const TypePool &types,
 	registry[structName] = fn;
 }
 
-DropRegistry buildDropRegistry(const ModuleAST &module, const TypePool &types,
-                               const StringPool &strings) {
-	DropRegistry registry;
+void addDropCandidates(DropRegistry &registry, const ModuleAST &module,
+                       const TypePool &types, const StringPool &strings) {
 	// Top-level `fn drop(self: mut T)` declarations.
 	for (const auto &fn : module.Functions) {
 		considerDropCandidate(fn.get(), types, strings, registry);
@@ -62,6 +61,12 @@ DropRegistry buildDropRegistry(const ModuleAST &module, const TypePool &types,
 			considerDropCandidate(m.get(), types, strings, registry);
 		}
 	}
+}
+
+DropRegistry buildDropRegistry(const ModuleAST &module, const TypePool &types,
+                               const StringPool &strings) {
+	DropRegistry registry;
+	addDropCandidates(registry, module, types, strings);
 	return registry;
 }
 

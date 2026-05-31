@@ -1,0 +1,68 @@
+// Does a `cfn drop` body actually RUN its statements -- specifically a
+// function CALL with a side effect? That's the shape jamstation's Bus drop
+// uses (discClose(...) + a print). test_drops already proves a direct pointer
+// write inside drop runs; this isolates "drop body calls a function".
+
+const { assert } = import("test");
+
+fn bumpThrough(p: *mut u32) {
+    var q: *mut u32 = p;
+    q.* = q.* + 1;
+}
+
+const Thing = struct {
+    sink: *mut u32,
+    cfn drop(self: mut Self) {
+        bumpThrough(self.sink);
+    }
+};
+
+fn makeAndDrop(sink: *mut u32) {
+    var t: Thing = Thing { sink: sink };
+    // t drops at scope exit -> bumpThrough(self.sink) must run once.
+}
+
+const Two = struct {
+    sink: *mut u32,
+    cfn drop(self: mut Self) {
+        bumpThrough(self.sink);
+        bumpThrough(self.sink);
+    }
+};
+
+fn makeAndDropTwo(sink: *mut u32) {
+    var t: Two = Two { sink: sink };
+}
+
+tfn dropBodyRunsFunctionCall() {
+    var hits: u32 = 0;
+    makeAndDrop(&hits);
+    assert(hits, 1);
+}
+
+tfn dropBodyRunsAllStatements() {
+    var hits: u32 = 0;
+    makeAndDropTwo(&hits);
+    assert(hits, 2);
+}
+
+// The Bus scenario: a drop-bearing local passed by `let` borrow to functions
+// (repeatedly), then dropped at the caller's scope exit. The borrow must NOT
+// consume it -- the drop must still fire exactly ONCE at the end (not 0, not 2).
+fn borrowThing(t: Thing) u32 {
+    var p: *mut u32 = t.sink;
+    return p.*;
+}
+
+fn makeBorrowDrop(sink: *mut u32) {
+    var t: Thing = Thing { sink: sink };
+    var a: u32 = borrowThing(t);
+    var b: u32 = borrowThing(t);
+    // t drops here -> bumpThrough(sink) must run exactly once.
+}
+
+tfn dropFiresAfterLetBorrow() {
+    var hits: u32 = 0;
+    makeBorrowDrop(&hits);
+    assert(hits, 1);
+}

@@ -1,0 +1,19 @@
+// Helper module for test_xmod_drop: a drop-bearing struct defined HERE,
+// dropped in the importing test module. (No tfns -- it's a helper.)
+//
+// `lib` is imported HERE only. The entry test module does NOT import it, so
+// the `cfn drop` body below can only compile if its qualified call resolves
+// against THIS module's imports (the fix), not the entry module's.
+const lib = import("test_xmod_lib");
+
+pub const XThing = struct {
+    sink: *mut u32,
+    cfn drop(self: mut Self) {
+        var p: *mut u32 = self.sink;
+        p.* = lib.bumpBy(p.*, 1);
+    }
+};
+
+pub fn makeXThing(s: *mut u32) XThing {
+    return XThing { sink: s };
+}
