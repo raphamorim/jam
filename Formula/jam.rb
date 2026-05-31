@@ -15,10 +15,10 @@ class Jam < Formula
   head "https://github.com/raphamorim/jam.git", branch: "main"
 
   depends_on "cmake" => :build
-  depends_on "llvm@20"
+  depends_on "llvm@22"
 
   def install
-    llvm = Formula["llvm@20"]
+    llvm = Formula["llvm@22"]
     ENV.prepend_path "PATH", llvm.opt_bin
 
     system "cmake", "-S", ".", "-B", "build",

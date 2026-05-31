@@ -243,6 +243,18 @@ Result Analyzer::analyze(NodeIdx idx, NameMap state) {
 		if (r.terminated) return r;
 		return analyze(n.rhs, std::move(r.state));
 	}
+	case AstTag::Slice: {
+		// `base[start..end]` — walk the base, then the start/end bound
+		// expressions (held in the extra payload) for variable reads.
+		auto r = analyze(n.lhs, std::move(state));
+		if (r.terminated) return r;
+		ExtraIdx extra = n.rhs;
+		NodeIdx startIdx = static_cast<NodeIdx>(nodes_.getExtra(extra));
+		NodeIdx endIdx = static_cast<NodeIdx>(nodes_.getExtra(extra + 1));
+		r = analyze(startIdx, std::move(r.state));
+		if (r.terminated) return r;
+		return analyze(endIdx, std::move(r.state));
+	}
 	case AstTag::Deref:
 		// `p.*` — read the pointer. (Whether the pointee was initialized
 		// is a separate concern it does not track.)

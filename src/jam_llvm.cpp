@@ -120,7 +120,8 @@ JamModuleRef JamLLVMCreateModule(const char *name, JamContextRef ctx) {
 void JamLLVMDisposeModule(JamModuleRef mod) { delete UNWRAP_MODULE(mod); }
 
 void JamLLVMSetTargetTriple(JamModuleRef mod, const char *triple) {
-	UNWRAP_MODULE(mod)->setTargetTriple(triple);
+	// LLVM 21+ takes a Triple here (previously a string).
+	UNWRAP_MODULE(mod)->setTargetTriple(llvm::Triple(triple));
 }
 
 void JamLLVMSetDataLayout(JamModuleRef mod, JamTargetMachineRef tm) {
@@ -204,8 +205,9 @@ JamTypeRef JamLLVMVoidType(JamContextRef ctx) {
 }
 
 JamTypeRef JamLLVMPointerType(JamTypeRef elementType, unsigned addressSpace) {
-	return WRAP_TYPE(
-	    llvm::PointerType::get(UNWRAP_TYPE(elementType), addressSpace));
+	// Opaque pointers: the element type only supplies the LLVMContext now.
+	return WRAP_TYPE(llvm::PointerType::get(
+	    UNWRAP_TYPE(elementType)->getContext(), addressSpace));
 }
 
 JamTypeRef JamLLVMStructType(JamContextRef ctx, JamTypeRef *elementTypes,
@@ -1100,8 +1102,9 @@ JamLLVMCreateTargetMachine(const char *triple, const char *cpu,
                            const char *features, bool isRelocationPIC,
                            JamOptLevel optLevel, JamLTO lto) {
 	std::string error;
-	const llvm::Target *target =
-	    llvm::TargetRegistry::lookupTarget(triple, error);
+	// LLVM 21+ takes a Triple in TargetRegistry/TargetMachine (was a string).
+	llvm::Triple tt(triple);
+	const llvm::Target *target = llvm::TargetRegistry::lookupTarget(tt, error);
 	if (!target) { return nullptr; }
 
 	llvm::TargetOptions opt;
@@ -1143,8 +1146,9 @@ JamLLVMCreateTargetMachine(const char *triple, const char *cpu,
 		break;
 	}
 
+	// createTargetMachine also takes the Triple `tt` built above.
 	llvm::TargetMachine *tm = target->createTargetMachine(
-	    triple, cpu ? cpu : "generic", features ? features : "", opt, rm,
+	    tt, cpu ? cpu : "generic", features ? features : "", opt, rm,
 	    std::nullopt, cgOpt);
 	if (!tm) { return nullptr; }
 

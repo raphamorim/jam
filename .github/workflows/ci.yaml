@@ -22,22 +22,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM 20
+      - name: Install LLVM 22
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
             | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
           codename=$(lsb_release -cs)
-          echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-20 main" \
+          echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-22 main" \
             | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
-          sudo apt-get install -y llvm-20-dev libclang-20-dev clang-20 cmake
-          /usr/lib/llvm-20/bin/llvm-config --version
+          sudo apt-get install -y llvm-22-dev libclang-22-dev clang-22 cmake
+          /usr/lib/llvm-22/bin/llvm-config --version
 
       - name: Configure and build
         run: |
           mkdir -p build
           cd build
-          cmake .. -DCMAKE_PREFIX_PATH=/usr/lib/llvm-20
+          cmake .. -DCMAKE_PREFIX_PATH=/usr/lib/llvm-22
           cmake --build . -j $(nproc)
 
       - name: Run unit tests (debug, -C opt-level=0)
@@ -52,7 +52,7 @@ jobs:
         run: |
           ln -sf build/jam jam.out
           clang++ -c tests/cpp/test_codegen_errors.cpp -o codegen_error_tests.o \
-            `/usr/lib/llvm-20/bin/llvm-config --cxxflags` -fexceptions
+            `/usr/lib/llvm-22/bin/llvm-config --cxxflags` -fexceptions
           clang++ -o codegen_error_tests codegen_error_tests.o
           ./codegen_error_tests
 
@@ -68,22 +68,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM 20
+      - name: Install LLVM 22
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
             | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
           codename=$(lsb_release -cs)
-          echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-20 main" \
+          echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-22 main" \
             | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
-          sudo apt-get install -y llvm-20-dev libclang-20-dev clang-20 cmake
-          /usr/lib/llvm-20/bin/llvm-config --version
+          sudo apt-get install -y llvm-22-dev libclang-22-dev clang-22 cmake
+          /usr/lib/llvm-22/bin/llvm-config --version
 
       - name: Configure and build
         run: |
           mkdir -p build
           cd build
-          cmake .. -DCMAKE_PREFIX_PATH=/usr/lib/llvm-20
+          cmake .. -DCMAKE_PREFIX_PATH=/usr/lib/llvm-22
           cmake --build . -j $(nproc)
 
       - name: Run unit tests (debug, -C opt-level=0)
@@ -98,7 +98,7 @@ jobs:
         run: |
           ln -sf build/jam jam.out
           clang++ -c tests/cpp/test_codegen_errors.cpp -o codegen_error_tests.o \
-            `/usr/lib/llvm-20/bin/llvm-config --cxxflags` -fexceptions
+            `/usr/lib/llvm-22/bin/llvm-config --cxxflags` -fexceptions
           clang++ -o codegen_error_tests codegen_error_tests.o
           ./codegen_error_tests
 
@@ -114,10 +114,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM 20 via Homebrew
+      - name: Install LLVM 22 via Homebrew
         run: |
-          brew install llvm@20
-          LLVM_PREFIX="$(brew --prefix llvm@20)"
+          brew install llvm@22
+          LLVM_PREFIX="$(brew --prefix llvm@22)"
           echo "${LLVM_PREFIX}/bin" >> "$GITHUB_PATH"
           echo "LLVM_PREFIX=${LLVM_PREFIX}" >> "$GITHUB_ENV"
           "${LLVM_PREFIX}/bin/llvm-config" --version
