@@ -15,6 +15,7 @@
 #include "mangling.h"
 #include "target.h"
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -3444,6 +3445,16 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 				break;
 			}
 		}
+		// LLVM's SwitchInst requires unique case values; passing duplicates
+		// trips an assert in some builds and throws std::bad_alloc from
+		// SwitchLowering::buildJumpTable in LLVM 22 release builds. First-
+		// match-wins semantics: if value V appears in arm A and arm B (A<B),
+		// arm A's target must win, so we keep the earliest occurrence.
+		std::unordered_set<uint64_t> seen;
+		switchCases.erase(
+		    std::remove_if(switchCases.begin(), switchCases.end(),
+		                   [&](const SwitchCase &c) { return !seen.insert(c.value).second; }),
+		    switchCases.end());
 	}
 
 	if (tryingSwitch) {
