@@ -17,7 +17,9 @@
 // inactive branch is dead-code-eliminated — no `_NSGetArgv` reference
 // survives on a non-Darwin target, where that symbol doesn't exist:
 //   * Darwin: libSystem's _NSGetArgc / _NSGetArgv (live pointers).
-//   * other:  empty for now (Linux /proc/self/cmdline is a TODO).
+//   * Linux:  /proc/self/cmdline — argv joined by NULs. The buffer and
+//             argv table are malloc'd once and intentionally leaked,
+//             since they must outlive every `args()`/`next()` call.
 
 const { Option } = import("option");
 
@@ -26,6 +28,11 @@ const { Option } = import("option");
 pub extern fn strlen(s: *const[] u8) u64;
 pub extern fn _NSGetArgc() u64;   // C: int*    (Darwin / libSystem)
 pub extern fn _NSGetArgv() u64;   // C: char***
+pub extern fn fopen(path: *const[] u8, mode: *const[] u8) *mut[] u8;
+pub extern fn fread(buf: *mut[] u8, size: u64, n: u64, f: *mut[] u8) u64;
+pub extern fn fclose(f: *mut[] u8) i32;
+pub extern fn malloc(size: u64) *mut[] u8;
+pub extern fn free(ptr: *mut[] u8);
 
 // Terminate the process with status `code`, never returning. A noreturn
 // binding to libc exit(3) — the same model as Rust's
@@ -52,6 +59,69 @@ pub const Args = struct {
     n:     u32,
 };
 
+fn emptyArgs() Args {
+    var zero: u64 = 0;
+    var none: *mut[] u64 = zero as *mut[] u64;
+    return Args { table: none, index: 0, n: 0 };
+}
+
+// Parse /proc/self/cmdline into a (table, argc) pair. The kernel writes
+// the args joined by NULs (and usually ends with a final NUL too). We
+// read into a growable malloc'd buffer, count NULs to determine argc,
+// then allocate a u64 table of pointers — table[0] points at the start
+// of the buffer; each subsequent slot at the byte after the previous
+// NUL. Both buffer and table are leaked (process-lifetime).
+fn linuxArgs() Args {
+    var path: []u8 = "/proc/self/cmdline";
+    var mode: []u8 = "rb";
+    var f: *mut[] u8 = fopen(path.ptr, mode.ptr);
+    if ((f as u64) == 0) { return emptyArgs(); }
+
+    var cap: u64 = 4096;
+    var buf: *mut[] u8 = malloc(cap);
+    var total: u64 = 0;
+    loop {
+        var room: u64 = cap - total;
+        var dst: *mut[] u8 = (buf as u64 + total) as *mut[] u8;
+        var got: u64 = fread(dst, 1, room, f);
+        total = total + got;
+        if (got < room) { break; }
+        var newCap: u64 = cap * 2;
+        var newBuf: *mut[] u8 = malloc(newCap);
+        var j: u64 = 0;
+        while (j < total) { newBuf[j] = buf[j]; j = j + 1; }
+        free(buf);
+        buf = newBuf;
+        cap = newCap;
+    }
+    fclose(f);
+
+    if (total == 0) { return emptyArgs(); }
+    // Count NUL-terminated segments. If the kernel didn't emit a trailing
+    // NUL (rare), the final unterminated chunk still counts as one arg.
+    var argc: u32 = 0;
+    var k: u64 = 0;
+    while (k < total) {
+        if (buf[k] == 0) { argc = argc + 1; }
+        k = k + 1;
+    }
+    if (buf[total - 1] != 0) { argc = argc + 1; }
+    if (argc == 0) { return emptyArgs(); }
+
+    var table: *mut[] u64 = malloc((argc as u64) * 8) as *mut[] u64;
+    table[0] = buf as u64;
+    var slot: u32 = 1;
+    var p: u64 = 0;
+    while (p < total && slot < argc) {
+        if (buf[p] == 0) {
+            table[slot] = (buf as u64) + p + 1;
+            slot = slot + 1;
+        }
+        p = p + 1;
+    }
+    return Args { table: table, index: 0, n: argc };
+}
+
 pub fn args() Args {
     if (@isDarwin()) {
         // _NSGetArgc() -> int*   : deref for argc.
@@ -62,11 +132,10 @@ pub fn args() Args {
         var table:   *mut[] u64 = pp[0] as *mut[] u64;          // argv table
         return Args { table: table, index: 0, n: argc };
     }
-    // TODO(linux/other): build the table from /proc/self/cmdline. Until
-    // then, report no arguments. `table` is never read when `n` == 0.
-    var zero: u64 = 0;
-    var none: *mut[] u64 = zero as *mut[] u64;
-    return Args { table: none, index: 0, n: 0 };
+    if (@isLinux()) {
+        return linuxArgs();
+    }
+    return emptyArgs();
 }
 
 // Next argument as a []u8 (borrows argv's memory — valid for the process
