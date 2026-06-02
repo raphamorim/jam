@@ -26,6 +26,8 @@ class Jam < Formula
                     *std_cmake_args
     system "cmake", "--build", "build"
     system "cmake", "--install", "build"
+
+    (lib/"jam").install "std" unless (lib/"jam/std").exist?
   end
 
   test do
