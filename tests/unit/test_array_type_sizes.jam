@@ -1,0 +1,156 @@
+// note: Array sizes in type position written in every numeric base.
+// token must go through the full number-literal parser: a base-10-only
+// scan stops at the `x` in `[0x800]u8` and silently produces a
+// zero-length array, turning every store into stack corruption.
+//
+// Each test writes to the LAST index of the array so an under-sized
+// type would fail loudly rather than by luck.
+
+const { assert } = import("test");
+
+tfn hexSizeRoundTrip() {
+    var a: [0x10]u8 = [0; 0x10];
+    a[0x0F] = 7;
+    assert(a[0x0F], 7);
+    assert(a[0x0E], 0);
+}
+
+tfn binarySizeRoundTrip() {
+    var a: [0b1000]u8 = [0; 0b1000];
+    a[7] = 3;
+    assert(a[7], 3);
+    assert(a[0], 0);
+}
+
+tfn octalSizeRoundTrip() {
+    var a: [0o20]u8 = [0; 0o20];
+    a[15] = 9;
+    assert(a[15], 9);
+}
+
+tfn underscoreSizeRoundTrip() {
+    var a: [1_024]u8 = [0; 1_024];
+    a[1023] = 5;
+    assert(a[1023], 5);
+}
+
+const Block = struct {
+    cells: [0x800]u8,
+};
+
+tfn hexSizeStructField() {
+    // The original failing shape: a struct field typed with a hex array
+    // size, initialized with a repeat literal of the same hex count.
+    var b = Block{cells: [0; 0x800]};
+    b.cells[0x7FF] = 0x42;
+    assert(b.cells[0x7FF], 0x42);
+    assert(b.cells[0], 0);
+}
+
+tfn listLiteralAgainstHexSize() {
+    var a: [0x4]u8 = [1, 2, 3, 4];
+    assert(a[0], 1);
+    assert(a[3], 4);
+}
+
+tfn variableIndexLoop() {
+    // Runtime (non-constant) indices over a sized array: write through
+    // a loop-carried index, then accumulate. 1+2+3+4+5 = 15.
+    var a: [5]u32 = [0; 5];
+    var i: u32 = 0;
+    while (i < 5) {
+        a[i] = i + 1;
+        i = a[i];
+    }
+    var acc: u32 = 0;
+    i = 0;
+    while (i < 5) {
+        acc = acc + a[i];
+        i = i + 1;
+    }
+    assert(acc, 15);
+}
+
+tfn multiByteElements() {
+    // u16 elements: the element stride is wider than one byte, so an
+    // off-by-one in the size or stride shows up as aliased reads.
+    var hexMult: [0x4]u16 = [4096, 256, 16, 1];
+    assert(hexMult[0], 4096);
+    assert(hexMult[1], 256);
+    assert(hexMult[3], 1);
+}
+
+tfn nestedArraySizes() {
+    var m: [0x2][0x2]u8 = [[1, 2], [3, 4]];
+    assert(m[0][0], 1);
+    assert(m[0][1], 2);
+    assert(m[1][0], 3);
+    assert(m[1][1], 4);
+}
+
+const Point = struct {
+    x: u8,
+    y: u8,
+};
+
+tfn arrayOfStructs() {
+    var pts: [0x2]Point = [Point{x: 1, y: 2}, Point{x: 3, y: 4}];
+    assert(pts[0].x, 1);
+    assert(pts[1].y, 4);
+}
+
+tfn zeroLengthArray() {
+    // `[0]u8` is a legal (if degenerate) type; it must parse as an
+    // actual zero-length array and not corrupt anything around it.
+    var guard: u8 = 7;
+    var a: [0]u8 = [0; 0];
+    assert(guard, 7);
+}
+
+// Comptime array lengths: the size position accepts any expression
+// that folds against the module-const scope, not just literals. The
+// repeat-literal count folds the same way so both spellings agree.
+
+const SIZE = 0x10;
+const HALF = SIZE / 2;
+const DOUBLE = HALF * 2 * 2;
+
+tfn constSize() {
+    var a: [SIZE]u8 = [0; SIZE];
+    a[SIZE - 1] = 7;
+    assert(a[15], 7);
+}
+
+tfn constChainSize() {
+    // DOUBLE folds through two const references: 0x10/2*2*2 = 32.
+    var a: [DOUBLE]u8 = [0; DOUBLE];
+    a[31] = 3;
+    assert(a[31], 3);
+}
+
+tfn arithmeticSize() {
+    var a: [2 * 1024]u8 = [0; 2 * 1024];
+    a[2047] = 5;
+    assert(a[2047], 5);
+}
+
+const Buffer = struct {
+    cells: [SIZE]u8,
+};
+
+tfn constSizeStructField() {
+    var b = Buffer{cells: [0; SIZE]};
+    b.cells[SIZE - 1] = 0x42;
+    assert(b.cells[15], 0x42);
+    assert(b.cells[0], 0);
+}
+
+fn lastOf(buf: [SIZE]u8) u8 {
+    return buf[SIZE - 1];
+}
+
+tfn constSizeParam() {
+    var a: [SIZE]u8 = [0; SIZE];
+    a[15] = 9;
+    assert(lastOf(a), 9);
+}
