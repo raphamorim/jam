@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -16,6 +17,9 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 #include "analyzer.h"
 #include "ast.h"
@@ -528,25 +532,6 @@ static int compileAndRun(const std::string &filename,
 		}
 	}
 
-	// Single demand-driven body-fill pass: walk every Struct/Enum/
-	// Union decl in the DeclTable and ask the analyzer to materialise
-	// it. The per-kind `resolveTypeFields*` functions are re-entrant
-	// — when a struct's field references another struct/enum/union,
-	// the field walk's ensure*Body call fills that dependency
-	// transitively. The publicOnly filtering that the per-module
-	// fill*Bodies lambdas used to do isn't needed any more because
-	// `registerTopLevelDecls` already applied that filter when
-	// populating the DeclTable.
-	auto &dt = codegenCtx.declTable();
-	for (std::size_t i = 1; i < dt.all().size(); ++i) {
-		jam::DeclIndex idx = static_cast<jam::DeclIndex>(i);
-		const jam::Decl &dr = dt.get(idx);
-		if (dr.kind == jam::DeclKind::Struct ||
-		    dr.kind == jam::DeclKind::Enum || dr.kind == jam::DeclKind::Union) {
-			codegenCtx.analyzer().ensureDeclAnalyzed(idx);
-		}
-	}
-
 	// Register module-scope `const NAME[: T]? = expr;` bindings. These
 	// are inlined at use sites (see AstTag::Variable in ast.cpp), so we
 	// only need to teach the codegen context about them — no LLVM
@@ -663,6 +648,29 @@ static int compileAndRun(const std::string &filename,
 		registerConsts(importedModule.get());
 	}
 	registerConsts(module.get());
+
+	// Single demand-driven body-fill pass: walk every Struct/Enum/
+	// Union decl in the DeclTable and ask the analyzer to materialise
+	// it. The per-kind `resolveTypeFields*` functions are re-entrant
+	// — when a struct's field references another struct/enum/union,
+	// the field walk's ensure*Body call fills that dependency
+	// transitively. The publicOnly filtering that the per-module
+	// fill*Bodies lambdas used to do isn't needed any more because
+	// `registerTopLevelDecls` already applied that filter when
+	// populating the DeclTable.
+	//
+	// Runs AFTER module-const registration: a field typed `[SIZE]u8`
+	// comptime-folds SIZE against the const scope when getLLVMType
+	// resolves the deferred array length.
+	auto &dt = codegenCtx.declTable();
+	for (std::size_t i = 1; i < dt.all().size(); ++i) {
+		jam::DeclIndex idx = static_cast<jam::DeclIndex>(i);
+		const jam::Decl &dr = dt.get(idx);
+		if (dr.kind == jam::DeclKind::Struct ||
+		    dr.kind == jam::DeclKind::Enum || dr.kind == jam::DeclKind::Union) {
+			codegenCtx.analyzer().ensureDeclAnalyzed(idx);
+		}
+	}
 
 	// Two-pass codegen: declare every function's prototype first, then
 	// emit bodies. Without this, calling a function defined later in the
@@ -933,6 +941,9 @@ static int compileAndRun(const std::string &filename,
 			    if (k.kind == TypeKind::GenericCall) {
 				    TypeIdx r = cc->resolveGenericCall(t);
 				    if (r != kNoType) return r;
+			    }
+			    if (k.kind == TypeKind::ArrayExpr) {
+				    return cc->resolveArrayExpr(t);
 			    }
 			    return t;
 		    },
@@ -1235,6 +1246,22 @@ static int compileAndRun(const std::string &filename,
 #ifdef _WIN32
 		return exitCode;
 #else
+		if (exitCode == -1) {
+			std::cerr << "Failed to run " << outputName << std::endl;
+			return 1;
+		}
+		// A signal-killed child (segfault, abort, …) has no exit status;
+		// WEXITSTATUS on it reads garbage bits that decode to 0, which
+		// would report a crashed test binary as "passed" — and since the
+		// crash also loses the child's unflushed stdout, the failure
+		// would be completely silent. Follow the shell convention:
+		// 128 + signal number.
+		if (WIFSIGNALED(exitCode)) {
+			int sig = WTERMSIG(exitCode);
+			std::cerr << outputName << " terminated by signal " << sig << " ("
+			          << strsignal(sig) << ")" << std::endl;
+			return 128 + sig;
+		}
 		return WEXITSTATUS(exitCode);
 #endif
 	}

@@ -15,6 +15,7 @@
 #include "test_framework.h"
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -59,6 +60,31 @@ CompileResult compileSource(const std::string &name,
 
 bool stderrContains(const CompileResult &r, const std::string &substr) {
 	return r.stderr_.find(substr) != std::string::npos;
+}
+
+// `jam.out test` variant: compiles AND RUNS the file's tfn tests, so it
+// exercises the test-runner harness itself (exit-status decoding of the
+// spawned binary included). Runs from /tmp so the default output name
+// (`./output`) can't collide with the build tree's `output/` directory.
+CompileResult runTestMode(const std::string &name, const std::string &source) {
+	std::string path = "/tmp/" + name + ".jam";
+	{
+		std::ofstream out(path);
+		out << source;
+	}
+	std::string jamBin =
+	    (std::filesystem::current_path() / "output" / "jam.out").string();
+	std::string cmd = "cd /tmp && " + jamBin + " test " + name + ".jam 2>&1";
+
+	std::string output;
+	FILE *pipe = popen(cmd.c_str(), "r");
+	if (!pipe) { throw std::runtime_error("popen failed: " + cmd); }
+	char buf[256];
+	while (fgets(buf, sizeof(buf), pipe) != nullptr) output += buf;
+	int status = pclose(pipe);
+
+	int exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+	return {exitCode, std::move(output)};
 }
 
 // `--emit-ir` variant. Skips the link step (so it doesn't try to drop
@@ -188,6 +214,37 @@ class CodegenErrorTests {
 		framework.addTest(
 		    "XMod - imported body cannot see the entry module's imports",
 		    testImportedBodyCannotSeeEntryImports);
+		// Array sizes in type position + literal-length agreement.
+		framework.addTest(
+		    "Array - hex size in type position lowers to [2048 x i8]",
+		    testHexArraySizeLowersCorrectly);
+		framework.addTest("Array - repeat count != array length rejected",
+		                  testArrayRepeatCountMismatchRejected);
+		framework.addTest("Array - list literal longer than array rejected",
+		                  testArrayLitTooLongRejected);
+		framework.addTest("Array - list literal shorter than array rejected",
+		                  testArrayLitTooShortRejected);
+		framework.addTest("Array - float array size rejected",
+		                  testFloatArraySizeRejected);
+		framework.addTest("Array - array size beyond u32 rejected",
+		                  testHugeArraySizeRejected);
+		framework.addTest("Array - empty literal into sized array rejected",
+		                  testEmptyLitIntoSizedArrayRejected);
+		framework.addTest("Array - size literal grammar matches value position",
+		                  testArraySizeLiteralGrammarParity);
+		framework.addTest("Array - const size folds to [2048 x i8] in IR",
+		                  testConstArraySizeLowersCorrectly);
+		framework.addTest("Array - non-comptime size rejected",
+		                  testNonComptimeSizeRejected);
+		framework.addTest("Array - negative const size rejected",
+		                  testNegativeConstSizeRejected);
+		framework.addTest("Array - float const size rejected",
+		                  testFloatConstSizeRejected);
+		framework.addTest("Array - length mismatch via const size rejected",
+		                  testConstSizeMismatchRejected);
+		framework.addTest(
+		    "Harness - signal-killed test binary reported as failure",
+		    testSignalKilledBinaryReported);
 	}
 
   private:
@@ -615,6 +672,226 @@ pub fn makeThing(s: *mut u32) Thing { return Thing { sink: s }; }
 		ASSERT_TRUE(stderrContains(r, "unknown module handle"));
 		ASSERT_TRUE(stderrContains(r, "lib.jam:"));
 		ASSERT_TRUE(!stderrContains(r, "main.jam:"));
+	}
+
+	// `[0x800]u8` must intern a 2048-element array type. The size token
+	// goes through the full number-literal parser; a base-10-only scan
+	// (std::stoul) stops at the `x` and silently produces `[0]u8`, after
+	// which the repeat literal memsets 2048 bytes into a 0-byte slot.
+	static void testHexArraySizeLowersCorrectly() {
+		auto r = compileSourceIR("array_hex_size_ir", R"(
+const Block = struct {
+    cells: [0x800]u8,
+};
+fn main() {
+    var b = Block{cells: [0; 0x800]};
+    b.cells[0] = 1;
+}
+)");
+		ASSERT_TRUE(r.exitCode == 0);
+		ASSERT_TRUE(stderrContains(r, "[2048 x i8]"));
+		ASSERT_TRUE(!stderrContains(r, "[0 x i8]"));
+	}
+
+	// A repeat literal whose count disagrees with the destination array
+	// length must be a compile error — the memset/store lowering sizes
+	// from the count, so letting it through writes past the slot.
+	static void testArrayRepeatCountMismatchRejected() {
+		auto r = compileSource("array_repeat_mismatch", R"(
+fn main() {
+    const a: [4]u8 = [0; 0x800];
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    r, "array repeat count 2048 does not match array type length 4"));
+	}
+
+	static void testArrayLitTooLongRejected() {
+		auto r = compileSource("array_lit_too_long", R"(
+fn main() {
+    const a: [2]u8 = [1, 2, 3];
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    r, "array literal has 3 element(s) but the array type expects 2"));
+	}
+
+	static void testArrayLitTooShortRejected() {
+		auto r = compileSource("array_lit_too_short", R"(
+fn main() {
+    const a: [4]u8 = [1, 2];
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    r, "array literal has 2 element(s) but the array type expects 4"));
+	}
+
+	static void testFloatArraySizeRejected() {
+		auto r = compileSource("array_float_size", R"(
+fn main() {
+    var a: [1.5]u8 = [0; 1];
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(
+		    stderrContains(r, "array size must be a non-negative integer"));
+	}
+
+	static void testHugeArraySizeRejected() {
+		auto r = compileSource("array_huge_size", R"(
+fn main() {
+    var a: [0x1_0000_0000]u8 = [0; 1];
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "exceeds u32 range"));
+	}
+
+	// Zig errors `expected 8 array elements; found 0` here; jam's `[]`
+	// empty literal must hit the same wall instead of leaving the array
+	// uninitialized.
+	static void testEmptyLitIntoSizedArrayRejected() {
+		auto r = compileSource("array_empty_lit", R"(
+fn main() {
+    const a: [8]u8 = [];
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    r, "array literal has 0 element(s) but the array type expects 8"));
+	}
+
+	// The size token in `[N]T` inherits the FULL number-literal grammar,
+	// not just "digits the old std::stoul happened to eat": uppercase
+	// base prefixes, underscores glued to the prefix, and C-style
+	// leading zeros are rejected with the same diagnostics value
+	// position produces.
+	static void testArraySizeLiteralGrammarParity() {
+		auto upper = compileSource("array_size_upper_base", R"(
+fn main() {
+    var a: [0X800]u8 = [0; 2048];
+}
+)");
+		ASSERT_TRUE(upper.exitCode != 0);
+		ASSERT_TRUE(stderrContains(upper, "base prefix must be lowercase"));
+
+		auto glued = compileSource("array_size_underscore_after_base", R"(
+fn main() {
+    var a: [0x_800]u8 = [0; 2048];
+}
+)");
+		ASSERT_TRUE(glued.exitCode != 0);
+		ASSERT_TRUE(stderrContains(glued, "underscore not allowed"));
+
+		auto leading = compileSource("array_size_leading_zero", R"(
+fn main() {
+    var a: [07]u8 = [0; 7];
+}
+)");
+		ASSERT_TRUE(leading.exitCode != 0);
+		ASSERT_TRUE(stderrContains(leading, "leading zero is not allowed"));
+	}
+
+	// `[SIZE]u8` with a module const folds at type-resolution time and
+	// lowers identically to the literal spelling — the IR must carry
+	// the folded length. Mirrors how a comptime-known length resolves
+	// before lowering in the reference compiler.
+	static void testConstArraySizeLowersCorrectly() {
+		auto r = compileSourceIR("array_const_size_ir", R"(
+const SIZE = 0x800;
+const Block = struct {
+    cells: [SIZE]u8,
+};
+fn main() {
+    var b = Block{cells: [0; SIZE]};
+    b.cells[0] = 1;
+}
+)");
+		ASSERT_TRUE(r.exitCode == 0);
+		ASSERT_TRUE(stderrContains(r, "[2048 x i8]"));
+		ASSERT_TRUE(!stderrContains(r, "[0 x i8]"));
+	}
+
+	// Undefined names and runtime variables can't fold — both must be
+	// rejected with the comptime-known diagnostic, not silently sized.
+	static void testNonComptimeSizeRejected() {
+		auto undef = compileSource("array_size_undefined", R"(
+fn main() {
+    var a: [BOGUS]u8 = [0; 4];
+}
+)");
+		ASSERT_TRUE(undef.exitCode != 0);
+		ASSERT_TRUE(
+		    stderrContains(undef, "array length must be comptime-known"));
+
+		auto runtime = compileSource("array_size_runtime_var", R"(
+fn main() {
+    var n: u32 = 5;
+    var a: [n]u8 = [0; 5];
+}
+)");
+		ASSERT_TRUE(runtime.exitCode != 0);
+		ASSERT_TRUE(
+		    stderrContains(runtime, "array length must be comptime-known"));
+	}
+
+	static void testNegativeConstSizeRejected() {
+		auto r = compileSource("array_size_negative_const", R"(
+const NEG = 0 - 4;
+fn main() {
+    var a: [NEG]u8 = [0; 4];
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(
+		    stderrContains(r, "array size must be a non-negative integer"));
+	}
+
+	static void testFloatConstSizeRejected() {
+		auto r = compileSource("array_size_float_const", R"(
+const F = 1.5;
+fn main() {
+    var a: [F]u8 = [0; 1];
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(
+		    stderrContains(r, "array size must be a non-negative integer"));
+	}
+
+	// The folded length feeds the same literal-length checks as a
+	// written-out size: a 3-element literal into `[N]u8` with N = 4
+	// reports the mismatch with the RESOLVED length.
+	static void testConstSizeMismatchRejected() {
+		auto r = compileSource("array_size_const_mismatch", R"(
+const N = 4;
+fn main() {
+    const a: [N]u8 = [1, 2, 3];
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    r, "array literal has 3 element(s) but the array type expects 4"));
+	}
+
+	// A test binary killed by a signal has no exit status; decoding it
+	// with WEXITSTATUS alone reads 0 and reports the crashed run as
+	// "passed" — with the child's unflushed "testing ..." line lost, the
+	// failure would be completely invisible. The runner must surface the
+	// signal and return shell-convention 128+sig.
+	static void testSignalKilledBinaryReported() {
+		auto r = runTestMode("harness_signal_crash", R"(
+tfn crashByWildStore() {
+    var addr: u64 = 1;
+    var p: *mut[] u8 = addr as *mut[] u8;
+    p[0] = 9;
+}
+)");
+		ASSERT_TRUE(r.exitCode > 128);
+		ASSERT_TRUE(stderrContains(r, "terminated by signal"));
 	}
 };
 

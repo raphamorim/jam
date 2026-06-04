@@ -34,6 +34,13 @@ bool isByRef(TypeIdx ty, const JamCodegenContext &ctx) {
 		TypeIdx resolved = ctx.resolveGenericCall(ty);
 		return resolved != kNoType && resolved != ty && isByRef(resolved, ctx);
 	}
+	// Deferred-length arrays classify exactly like their resolved
+	// Array form (byref) — resolve so the recursion also validates
+	// the length expression on first ABI consultation.
+	case TypeKind::ArrayExpr: {
+		TypeIdx resolved = ctx.resolveArrayExpr(ty);
+		return resolved != kNoType && resolved != ty && isByRef(resolved, ctx);
+	}
 	// Scalars and pointer-shaped values: byval. The whole value
 	// rides in registers; SSA representation is the value itself.
 	case TypeKind::Bool:

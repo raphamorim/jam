@@ -147,6 +147,13 @@ JamTypeRef JamCodegenContext::getLLVMType(TypeIdx ty) const {
 		result = JamLLVMArrayType(elem, k.b);
 		break;
 	}
+	case TypeKind::ArrayExpr: {
+		// lazily fold the length expression to a canonical Array
+		// key, then recurse. The resolution is memoized in
+		// arrayExprResolutions_ (same shape as GenericCall below).
+		result = getLLVMType(resolveArrayExpr(ty));
+		break;
+	}
 	case TypeKind::Struct: {
 		const std::string &name = stringPool.get(static_cast<StringIdx>(k.a));
 		const auto *sinfo = getStruct(name);
@@ -663,6 +670,8 @@ uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
 		return 16;  // (ptr, len)
 	case TypeKind::Array:
 		return static_cast<uint64_t>(k.b) * typeSize(static_cast<TypeIdx>(k.a));
+	case TypeKind::ArrayExpr:
+		return typeSize(resolveArrayExpr(ty));
 	case TypeKind::Struct:
 	case TypeKind::Named: {
 		// a Named type may be a substitution-context
@@ -784,6 +793,8 @@ uint64_t JamCodegenContext::typeAlign(TypeIdx ty) const {
 		return 8;
 	case TypeKind::Array:
 		return typeAlign(static_cast<TypeIdx>(k.a));
+	case TypeKind::ArrayExpr:
+		return typeAlign(resolveArrayExpr(ty));
 	case TypeKind::Struct:
 	case TypeKind::Named: {
 		// substitution context wins. A Named type may
@@ -886,6 +897,12 @@ TypeIdx substituteType(TypeIdx ty,
 		return types.internArray(
 		    substituteType(static_cast<TypeIdx>(k.a), subst, types, strings),
 		    k.b);
+	case TypeKind::ArrayExpr:
+		// Substitute the element type; the length expression is
+		// type-free and rides along unchanged.
+		return types.internArrayExpr(
+		    substituteType(static_cast<TypeIdx>(k.a), subst, types, strings),
+		    static_cast<NodeIdx>(k.b));
 	case TypeKind::GenericCall: {
 		// Recurse into args: a generic call inside a generic body
 		// (e.g. `Box(Maybe(T))`) substitutes T in the inner call.
@@ -1076,6 +1093,59 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 	genericInstances_[idKey] = result;
 	genericResolutions_[effectiveTy] = result;
 	return result;
+}
+
+jam::ComptimeValue JamCodegenContext::foldComptimeExpr(NodeIdx expr) const {
+	// Fold with every module const in scope. Consts may reference each
+	// other (`const B = A * 2;`), so seed the scope to a fixpoint: each
+	// pass folds the consts whose dependencies folded in an earlier
+	// pass. Consts that never fold (runtime-only inits) simply stay
+	// unbound — an expression referencing one comes back None.
+	jam::ComptimeEvaluator ev(nodeStore, stringPool, typePool);
+	jam::ComptimeScope scope;
+	bool progress = true;
+	while (progress) {
+		progress = false;
+		for (const auto &kv : moduleConsts) {
+			if (scope.lookup(kv.first) != nullptr) continue;
+			jam::ComptimeValue v = ev.eval(kv.second.initExpr, scope);
+			if (!v.isNone()) {
+				scope.bind(kv.first, v);
+				progress = true;
+			}
+		}
+	}
+	return ev.eval(expr, scope);
+}
+
+TypeIdx JamCodegenContext::resolveArrayExpr(TypeIdx ty) const {
+	auto cached = arrayExprResolutions_.find(ty);
+	if (cached != arrayExprResolutions_.end()) return cached->second;
+
+	const TypeKey &k = typePool.get(ty);
+	jam::ComptimeValue len = foldComptimeExpr(static_cast<NodeIdx>(k.b));
+	if (len.isNone()) {
+		throw std::runtime_error("array length must be comptime-known");
+	}
+	if (!len.isInt() || (len.intVal.isSigned && len.asI64() < 0)) {
+		throw std::runtime_error("array size must be a non-negative integer");
+	}
+	uint64_t lenVal = len.asU64();
+	if (lenVal > UINT32_MAX) {
+		// A negative fold wraps to a huge unsigned value; report it as
+		// the sign error it is rather than a baffling range overflow.
+		if (static_cast<int64_t>(lenVal) < 0) {
+			throw std::runtime_error(
+			    "array size must be a non-negative integer");
+		}
+		throw std::runtime_error("array size " + std::to_string(lenVal) +
+		                         " exceeds u32 range");
+	}
+
+	TypeIdx resolved = typePool.internArray(static_cast<TypeIdx>(k.a),
+	                                        static_cast<uint32_t>(lenVal));
+	arrayExprResolutions_.emplace(ty, resolved);
+	return resolved;
 }
 
 // Instantiate a `struct {...}` expression appearing in a generic body's
@@ -1291,6 +1361,9 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 				    if (k.kind == TypeKind::GenericCall) {
 					    TypeIdx r = cc->resolveGenericCall(t);
 					    if (r != kNoType) return r;
+				    }
+				    if (k.kind == TypeKind::ArrayExpr) {
+					    return cc->resolveArrayExpr(t);
 				    }
 				    return t;
 			    },

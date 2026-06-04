@@ -158,6 +158,19 @@ static void appendErrorHere(AstGenCtx &gctx, std::string message) {
 	appendErrorNode(gctx, gctx.currentNode, std::move(message));
 }
 
+// Canonicalize a parser-deferred `[expr]T` (TypeKind::ArrayExpr) before
+// the type becomes astgen state — binding types, expected hints, field
+// reads. The codegen-side resolver throws when the length expression
+// doesn't comptime-fold; convert that into a per-decl diagnostic
+// anchored at the current node so sibling decls keep compiling.
+static TypeIdx resolveDeferredArrayTy(AstGenCtx &gctx, TypeIdx ty) {
+	if (ty == kNoType) return ty;
+	if (gctx.ctx.getTypePool().get(ty).kind != TypeKind::ArrayExpr) return ty;
+	try {
+		return gctx.ctx.resolveArrayExpr(ty);
+	} catch (const std::exception &e) { failHere(gctx, e.what()); }
+}
+
 // Forward-declared so the recovery helpers can build Poison; the
 // real definition follows below alongside `emitAllocaHoisted`.
 static JirRef emit(AstGenCtx &gctx, JirInst inst);
@@ -775,7 +788,11 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 		gctx.localTypes[name] = type;
 		if (!gctx.localScopes.empty()) { gctx.localScopes.back().insert(name); }
 	} else {
-		type = declared;
+		// Deferred `[expr]T` annotations canonicalize here so the
+		// binding's type — and everything downstream that switches on
+		// TypeKind::Array (index lowering, literal-length checks) —
+		// sees the resolved length.
+		type = resolveDeferredArrayTy(gctx, declared);
 		JirInst alloca{};
 		alloca.tag = JirTag::Alloca;
 		alloca.ty = type;
@@ -1231,7 +1248,8 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 			appendErrorHere(gctx, "unknown struct field `" + fieldName + "`");
 			continue;
 		}
-		TypeIdx expectedField = info->fields[idx].second;
+		TypeIdx expectedField =
+		    resolveDeferredArrayTy(gctx, info->fields[idx].second);
 		JirRef fieldVal = astgenExpr(gctx, exprIdx, expectedField);
 		// Struct-literal field capture is a MOVE for drop-bearing types:
 		// if the field's value came from a tracked local Variable, mark
@@ -1343,7 +1361,8 @@ static void astgenStructLitInto(AstGenCtx &gctx, const AstNode &n,
 			failHere(gctx, "astgen: struct literal missing field `" +
 			                   info->fields[i].first + "`");
 		}
-		TypeIdx expectedField = info->fields[i].second;
+		TypeIdx expectedField =
+		    resolveDeferredArrayTy(gctx, info->fields[i].second);
 		TypeIdx fieldPtrTy = gctx.ctx.getTypePool().intern(
 		    TypeKey{TypeKind::PtrSingle, 0, 0, expectedField, 0});
 		JirInst fieldAddr{};
@@ -1413,6 +1432,7 @@ static bool astgenExprIntoPtr(AstGenCtx &gctx, NodeIdx exprIdx,
 	case AstTag::ArrayLit: {
 		// Per-element write into destPtr. Element type comes from
 		// the surrounding context or from compiling the first elem.
+		expectedTy = resolveDeferredArrayTy(gctx, expectedTy);
 		TypeIdx elemTy = static_cast<TypeIdx>(n.lhs);
 		if (elemTy == kNoType && expectedTy != kNoType) {
 			const TypeKey &ek = gctx.ctx.getTypePool().get(expectedTy);
@@ -1423,6 +1443,17 @@ static bool astgenExprIntoPtr(AstGenCtx &gctx, NodeIdx exprIdx,
 		if (elemTy == kNoType) return false;
 		ExtraIdx elemsExtra = static_cast<ExtraIdx>(n.rhs);
 		uint32_t count = ns.getExtra(elemsExtra);
+		// Destination is a fixed-size array: the literal must supply
+		// exactly that many elements, or the per-element stores below
+		// would write past (or short of) the destination slot.
+		if (expectedTy != kNoType) {
+			const TypeKey &ek = gctx.ctx.getTypePool().get(expectedTy);
+			if (ek.kind == TypeKind::Array && ek.b != count) {
+				failHere(gctx, "array literal has " + std::to_string(count) +
+				                   " element(s) but the array type expects " +
+				                   std::to_string(ek.b));
+			}
+		}
 		TypeIdx u64Ty = BuiltinType::U64;
 		TypeIdx elemPtrTy = gctx.ctx.getTypePool().intern(
 		    TypeKey{TypeKind::PtrSingle, 0, 0, elemTy, 0});
@@ -1582,7 +1613,8 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 				                       info->name + "`",
 				                   kNoType);
 			}
-			TypeIdx fieldTy = info->fields[idx].second;
+			TypeIdx fieldTy =
+			    resolveDeferredArrayTy(gctx, info->fields[idx].second);
 			TypeIdx fieldPtrTy = gctx.ctx.getTypePool().intern(
 			    TypeKey{TypeKind::PtrSingle, 0, 0, fieldTy, 0});
 			JirInst fa{};
@@ -1670,7 +1702,7 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 	inst.tag = JirTag::FieldAccess;
 	inst.a = baseRef;
 	inst.b = static_cast<uint32_t>(idx);
-	inst.ty = info->fields[idx].second;
+	inst.ty = resolveDeferredArrayTy(gctx, info->fields[idx].second);
 	return emit(gctx, inst);
 }
 
@@ -1680,6 +1712,7 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 static JirRef astgenArrayLit(AstGenCtx &gctx, const AstNode &n,
                              TypeIdx expected) {
 	const NodeStore &ns = gctx.ctx.getNodeStore();
+	expected = resolveDeferredArrayTy(gctx, expected);
 	TypeIdx elemTy = static_cast<TypeIdx>(n.lhs);
 	if (elemTy == kNoType && expected != kNoType) {
 		const TypeKey &ek = gctx.ctx.getTypePool().get(expected);
@@ -1687,6 +1720,19 @@ static JirRef astgenArrayLit(AstGenCtx &gctx, const AstNode &n,
 	}
 	ExtraIdx elemsExtra = static_cast<ExtraIdx>(n.rhs);
 	uint32_t count = ns.getExtra(elemsExtra);
+
+	// When the destination type is a fixed-size array, the literal must
+	// supply exactly that many elements. Without this check the literal
+	// keeps its own length and the store writes past (or short of) the
+	// destination slot.
+	if (expected != kNoType) {
+		const TypeKey &ek = gctx.ctx.getTypePool().get(expected);
+		if (ek.kind == TypeKind::Array && ek.b != count) {
+			failHere(gctx, "array literal has " + std::to_string(count) +
+			                   " element(s) but the array type expects " +
+			                   std::to_string(ek.b));
+		}
+	}
 
 	std::vector<JirRef> elems;
 	elems.reserve(count);
@@ -1726,25 +1772,56 @@ static JirRef astgenArrayRepeat(AstGenCtx &gctx, const AstNode &n,
 	const NodeStore &ns = gctx.ctx.getNodeStore();
 	TypeIdx arrTy = static_cast<TypeIdx>(n.lhs);
 	if (arrTy == kNoType) arrTy = expected;
+	arrTy = resolveDeferredArrayTy(gctx, arrTy);
 	ExtraIdx extra = static_cast<ExtraIdx>(n.rhs);
 	NodeIdx valueIdx = static_cast<NodeIdx>(ns.getExtra(extra));
 	NodeIdx countIdx = static_cast<NodeIdx>(ns.getExtra(extra + 1));
 
+	// Literal counts read straight off the node; anything else
+	// (`[0; SIZE]`, `[0; 2 * 1024]`) comptime-folds against the
+	// module-const scope — mirroring the deferred `[expr]T` type
+	// position so both spellings stay in sync.
 	const AstNode &cn = ns.get(countIdx);
-	if (cn.tag != AstTag::NumberLit) {
-		failHere(
-		    gctx,
-		    "astgen: array-repeat count must be a constant integer literal");
+	uint64_t count = 0;
+	if (cn.tag == AstTag::NumberLit) {
+		count = static_cast<uint64_t>(cn.lhs) |
+		        (static_cast<uint64_t>(cn.rhs) << 32);
+	} else {
+		jam::ComptimeValue v = gctx.ctx.foldComptimeExpr(countIdx);
+		if (v.isNone()) {
+			failHere(gctx, "array-repeat count must be comptime-known");
+		}
+		if (!v.isInt() || (v.intVal.isSigned && v.asI64() < 0)) {
+			failHere(gctx, "array-repeat count must be a non-negative integer");
+		}
+		count = v.asU64();
 	}
-	uint64_t count =
-	    static_cast<uint64_t>(cn.lhs) | (static_cast<uint64_t>(cn.rhs) << 32);
+	if (count > UINT32_MAX) {
+		// A negative fold wraps to a huge unsigned value; report it as
+		// the sign error it is rather than a baffling range overflow.
+		if (static_cast<int64_t>(count) < 0) {
+			failHere(gctx, "array-repeat count must be a non-negative integer");
+		}
+		failHere(gctx, "array repeat count " + std::to_string(count) +
+		                   " exceeds u32 range");
+	}
 
 	// Resolve element type. From the array TypeKey if we have it; else
-	// from the first compile of the value.
+	// from the first compile of the value. When the destination is a
+	// fixed-size array, the repeat count must match its length exactly —
+	// the memset/store below sizes from the count, so a mismatch writes
+	// past (or short of) the destination slot.
 	TypeIdx elemTy = kNoType;
 	if (arrTy != kNoType) {
 		const TypeKey &k = gctx.ctx.getTypePool().get(arrTy);
-		if (k.kind == TypeKind::Array) elemTy = static_cast<TypeIdx>(k.a);
+		if (k.kind == TypeKind::Array) {
+			elemTy = static_cast<TypeIdx>(k.a);
+			if (k.b != count) {
+				failHere(gctx, "array repeat count " + std::to_string(count) +
+				                   " does not match array type length " +
+				                   std::to_string(k.b));
+			}
+		}
 	}
 	JirRef val = astgenExpr(gctx, valueIdx, elemTy);
 	if (elemTy == kNoType) elemTy = gctx.jfn.getInst(val).ty;
@@ -3453,7 +3530,9 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		std::unordered_set<uint64_t> seen;
 		switchCases.erase(
 		    std::remove_if(switchCases.begin(), switchCases.end(),
-		                   [&](const SwitchCase &c) { return !seen.insert(c.value).second; }),
+		                   [&](const SwitchCase &c) {
+			                   return !seen.insert(c.value).second;
+		                   }),
 		    switchCases.end());
 	}
 
@@ -4417,7 +4496,7 @@ static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
 		} else {
 			JirInst a{};
 			a.tag = JirTag::Alloca;
-			a.ty = fn->ReturnType;
+			a.ty = resolveDeferredArrayTy(gctx, fn->ReturnType);
 			sretSlot = emitAllocaHoisted(gctx, a);
 		}
 		allArgs.push_back(sretSlot);
@@ -4432,7 +4511,7 @@ static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
 	call.tag = JirTag::Call;
 	call.a = calleeId;
 	call.b = extra;
-	call.ty = fn->ReturnType;
+	call.ty = resolveDeferredArrayTy(gctx, fn->ReturnType);
 	JirRef callRef = emit(gctx, call);
 	// Calling a `noreturn` function diverges. Terminate the current
 	// block with Unreachable so downstream code is dead and the JIR
@@ -5768,7 +5847,7 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
 				failHere(gctx, "astgen: unknown field `" + memberName +
 				                   "` on `" + info->name + "`");
 			}
-			leafTy = info->fields[idx].second;
+			leafTy = resolveDeferredArrayTy(gctx, info->fields[idx].second);
 			TypeIdx ptrTy = gctx.ctx.getTypePool().intern(
 			    TypeKey{TypeKind::PtrSingle, 0, 0, leafTy, 0});
 			JirInst fa{};
@@ -6005,6 +6084,12 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 	// the function top level drops here at function exit.
 	pushDropScope(gctx);
 
+	// A deferred `[expr]T` return annotation canonicalizes before any
+	// return statement compares its value type against it. Runs before
+	// jirDeclarePrototype reads jfn.returnType, so the LLVM signature
+	// sees the resolved length too.
+	jfn.returnType = resolveDeferredArrayTy(gctx, jfn.returnType);
+
 	// Lower each parameter. The ABI classifier is the single source of
 	// truth — both the prototype emitter and the call-site argument
 	// lowering ask the same `classifyParam(mode, type)` question, so
@@ -6021,22 +6106,25 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 	//     pointer-to-pointee rather than a by-value Param.
 	for (size_t i = 0; i < fn.Args.size(); i++) {
 		const Param &p = fn.Args[i];
-		jam::abi::ParamABI pabi = jam::abi::classifyParam(p.Mode, p.Type, ctx);
+		// Deferred `[expr]T` param annotations canonicalize before the
+		// type is stamped on the Param inst / local binding.
+		TypeIdx pTy = resolveDeferredArrayTy(gctx, p.Type);
+		jam::abi::ParamABI pabi = jam::abi::classifyParam(p.Mode, pTy, ctx);
 		bool byPtr = pabi.kind == jam::abi::ParamABI::Kind::ByPointer;
 		JirInst paramInst{};
 		paramInst.tag = JirTag::Param;
 		paramInst.a = static_cast<uint32_t>(i);
-		paramInst.ty = p.Type;
+		paramInst.ty = pTy;
 		if (byPtr) paramInst.flags |= 1;
 		JirRef paramRef = emit(gctx, paramInst);
 
 		if (byPtr) {
 			gctx.locals[p.Name] = paramRef;
-			gctx.localTypes[p.Name] = p.Type;
+			gctx.localTypes[p.Name] = pTy;
 		} else {
 			JirInst alloca{};
 			alloca.tag = JirTag::Alloca;
-			alloca.ty = p.Type;
+			alloca.ty = pTy;
 			JirRef allocaRef = emitAllocaHoisted(gctx, alloca);
 			JirInst store{};
 			store.tag = JirTag::Store;
@@ -6044,7 +6132,7 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 			store.b = paramRef;
 			emit(gctx, store);
 			gctx.locals[p.Name] = allocaRef;
-			gctx.localTypes[p.Name] = p.Type;
+			gctx.localTypes[p.Name] = pTy;
 		}
 	}
 

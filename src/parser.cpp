@@ -8,6 +8,7 @@
 #include "parser.h"
 #include "jam_llvm.h"
 #include "number_literal.h"
+#include <cstdint>
 #include <cstring>
 #include <string>
 
@@ -687,11 +688,40 @@ TypeIdx Parser::parseType() {
 			return typePool->internSlice(parseType());
 		}
 		// `[N]T` — fixed-size array. No tag.
-		consume(TOK_NUMBER, "Expected size or `]` after `[`");
-		uint32_t len = static_cast<uint32_t>(
-		    std::stoul(std::string(previous().text(source_))));
+		//
+		// Literal fast path: a plain integer size (`[0x800]u8`) interns
+		// the Array key right here. The token runs through the same
+		// number-literal parser as value-position literals so hex /
+		// binary / octal / underscore forms resolve correctly —
+		// `std::stoul` would silently stop at the `x` and produce a
+		// zero-length array.
+		if (check(TOK_NUMBER) &&
+		    current + 1 < static_cast<int>(tokens.size()) &&
+		    tokens[current + 1].type == TOK_CLOSE_BRACKET) {
+			advance();
+			bool sizeNeg = false;
+			bool sizeFloat = false;
+			uint64_t sizeVal =
+			    parseNumLexeme(previous().text(source_), sizeNeg, sizeFloat);
+			if (sizeNeg || sizeFloat) {
+				parseError("array size must be a non-negative integer");
+			}
+			if (sizeVal > UINT32_MAX) {
+				parseError("array size `" +
+				           std::string(previous().text(source_)) +
+				           "` exceeds u32 range");
+			}
+			uint32_t len = static_cast<uint32_t>(sizeVal);
+			consume(TOK_CLOSE_BRACKET, "Expected `]` after array size");
+			return typePool->internArray(parseType(), len);
+		}
+		// Expression path: `[SIZE]u8`, `[2 * 1024]u8` — module consts
+		// aren't known yet, so park the expression node in a deferred
+		// ArrayExpr key; codegen comptime-folds it on first use
+		// (mirroring GenericCall resolution).
+		NodeIdx lenExpr = parseExpression();
 		consume(TOK_CLOSE_BRACKET, "Expected `]` after array size");
-		return typePool->internArray(parseType(), len);
+		return typePool->internArrayExpr(parseType(), lenExpr);
 	}
 	if (match(TOK_TYPE)) {
 		std::string_view s = previous().text(source_);

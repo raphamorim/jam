@@ -336,6 +336,14 @@ enum class TypeKind : uint8_t {
 	PtrMany,    // [*]T — ptrT.elem (indexable)
 	Slice,      // []T  — sliceT.elem  (lowered to {ptr, len} struct)
 	Array,      // [N]T — arrayT.elem, arrayT.len
+	// Parser-emitted "fixed-size array, length resolution deferred." The
+	// parser sees `[expr]T` where `expr` is not a plain integer literal
+	// (`[SIZE]u8`, `[2 * 1024]u8`) and can't evaluate it — module consts
+	// aren't registered until semantic time. The TypeKey carries the
+	// element TypeIdx in `a` and the length expression's NodeIdx in `b`.
+	// The codegen comptime-folds the expression lazily (mirroring
+	// GenericCall) and canonicalizes to a plain Array key.
+	ArrayExpr,  // arrayExprT.elem, arrayExprT.lenExpr (NodeIdx)
 	Struct,     // structT.name (StringIdx)
 	Enum,       // enumT.name (StringIdx); see EnumDeclAST for variants
 	Union,      // unionT.name (StringIdx); see UnionDeclAST for fields
@@ -392,6 +400,7 @@ struct TypeKey {
 	//   PtrSingle / PtrMany: a = elem TypeIdx
 	//   Slice:  a = elem TypeIdx
 	//   Array:  a = elem TypeIdx, b = length
+	//   ArrayExpr: a = elem TypeIdx, b = length expr NodeIdx
 	//   Struct: a = StringIdx (struct name)
 };
 
@@ -412,6 +421,7 @@ inline bool operator==(const TypeKey &x, const TypeKey &y) {
 	case TypeKind::Slice:
 		return x.a == y.a;
 	case TypeKind::Array:
+	case TypeKind::ArrayExpr:
 		return x.a == y.a && x.b == y.b;
 	case TypeKind::Struct:
 	case TypeKind::Enum:
@@ -544,6 +554,12 @@ class TypePool {
 	}
 	TypeIdx internArray(TypeIdx elem, uint32_t len) {
 		return intern(TypeKey{TypeKind::Array, 0, 0, elem, len});
+	}
+	// `[expr]T` with a non-literal length: the length expression's
+	// NodeIdx rides in `b` until codegen comptime-folds it (see
+	// JamCodegenContext::resolveArrayExpr).
+	TypeIdx internArrayExpr(TypeIdx elem, NodeIdx lenExpr) {
+		return intern(TypeKey{TypeKind::ArrayExpr, 0, 0, elem, lenExpr});
 	}
 	TypeIdx internStruct(StringIdx nameId) {
 		return intern(TypeKey{TypeKind::Struct, 0, 0, nameId, 0});

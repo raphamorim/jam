@@ -400,6 +400,12 @@ class JamCodegenContext {
 	// qualified `c.Vec(i32)` both resolve to the same Vec FunctionAST
 	// and produce a single Vec__i32 struct).
 	mutable std::unordered_map<TypeIdx, TypeIdx> genericResolutions_;
+
+	// `arrayExprResolutions_` memoizes deferred array lengths: every
+	// unique `TypeKind::ArrayExpr` TypeIdx maps to the canonical
+	// `TypeKind::Array` TypeIdx produced by comptime-folding its length
+	// expression. Same shape as genericResolutions_.
+	mutable std::unordered_map<TypeIdx, TypeIdx> arrayExprResolutions_;
 	struct GenericInstanceKey {
 		const FunctionAST *fn;
 		std::vector<TypeIdx> args;
@@ -470,6 +476,21 @@ class JamCodegenContext {
 	// function's body. Result is memoized — subsequent calls with the
 	// same TypeIdx hit the cache and return the same concrete TypeIdx.
 	TypeIdx resolveGenericCall(TypeIdx callTy) const;
+
+	// resolve a `TypeKind::ArrayExpr` TypeIdx (`[SIZE]u8`,
+	// `[2 * 1024]u8`) to a canonical `TypeKind::Array` by
+	// comptime-folding the length expression against the module-const
+	// scope. Throws with a precise message when the expression doesn't
+	// fold to a comptime-known non-negative integer that fits u32.
+	// Result is memoized in arrayExprResolutions_.
+	TypeIdx resolveArrayExpr(TypeIdx ty) const;
+
+	// Comptime-fold an arbitrary expression node against the
+	// module-const scope (consts may chain; the scope is seeded to a
+	// fixpoint). Returns a None value when the expression depends on
+	// anything not comptime-known. Shared by resolveArrayExpr and the
+	// array-repeat count fold in astgen.
+	jam::ComptimeValue foldComptimeExpr(NodeIdx expr) const;
 
 	// register the anonymous-struct table for the current
 	// module so the substitution engine can find struct expression
