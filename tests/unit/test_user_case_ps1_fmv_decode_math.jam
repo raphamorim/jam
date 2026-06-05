@@ -1,0 +1,55 @@
+// Exercises the exact language constructs the jamstation FMV decode path
+// relies on but the rest of the emulator (and the simple float tests) do
+// NOT: compound f64 YUV->RGB arithmetic with negative coefficients +
+// f64->i32 truncation, and i64 wide multiply/shift (>32-bit products).
+// If any of these is miscompiled, FMV decodes to garbage/black while
+// integer-only games (Crash) are unaffected.
+
+const { assert } = import("test");
+
+fn clampSByte(v: i32) i32 {
+    if (v < (0 - 128)) { return 0 - 128; }
+    if (v > 127) { return 127; }
+    return v;
+}
+
+// Replicates mdec.jam yuvToRgb for one pixel (unsigned output).
+fn yuvR(l: i32, rRaw: i32) i32 {
+    const rf: f64 = rRaw as f64;
+    const rFloat: f64 = 1.402 * rf;
+    var r: i32 = clampSByte(l + (rFloat as i32));
+    r = r ^ 0x80;
+    return r & 0xFF;
+}
+fn yuvG(l: i32, rRaw: i32, bRaw: i32) i32 {
+    const rf: f64 = rRaw as f64;
+    const bf: f64 = bRaw as f64;
+    const gFloat: f64 = (0.0 - 0.3437) * bf + (0.0 - 0.7143) * rf;
+    var g: i32 = clampSByte(l + (gFloat as i32));
+    g = g ^ 0x80;
+    return g & 0xFF;
+}
+
+tfn yuvKnownPixel() {
+    // Y=128, Cr=64: rFloat = 1.402*64 = 89.728 -> 89; r = clamp(217) = 127;
+    // ^0x80 = 255.
+    assert(yuvR(128, 64) as u32, 255);
+    // Cr=64, Cb=-32: gFloat = -0.3437*-32 + -0.7143*64 = 10.9984 - 45.7152
+    // = -34.7168 -> -34; g = clamp(94) = 94; ^0x80 = 222.
+    assert(yuvG(128, 64, 0 - 32) as u32, 222);
+}
+
+// i64 wide multiply (product > 2^32) + wide shift — the SPU volume mix and
+// the MDEC 44-bit clamp depend on i64 not silently truncating to 32 bits.
+fn i64MulShift(a: i64, b: i64, c: i64, sh: u32) i64 {
+    return (a * b * c) >> sh;
+}
+
+tfn i64WideArithmetic() {
+    // 1 << 43 = 0x0000_0800_0000_0000: low word 0, bits 43..32 -> 0x800 (2048).
+    var x: i64 = (1 as i64) << 43;
+    assert((x >> 32) as u32, 2048);
+    assert((x & 0xFFFFFFFF) as u32, 0);
+    // 1000*16384*32767 = 536_854_528_000 (>2^32); >>30 = 499 (floors below 500).
+    assert(i64MulShift(1000, 16384, 32767, 30) as u32, 499);
+}

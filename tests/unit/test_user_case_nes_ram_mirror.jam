@@ -1,0 +1,76 @@
+// NES CPU RAM: 2 KiB of physical memory mirrored across $0000-$1FFF.
+// https://problemkaputt.de/everynes.htm#memorymaps
+//
+// Every address in the 8 KiB window maps onto the same 2 KiB cells via
+// `address & RAM_MASK`, so $0000, $0800, $1000 and $1800 are four views
+// of cell 0. Also a regression test for comptime array sizes in type
+// position: `[RAM_PHYSICAL_END]u8` must fold the module const to a
+// 2048-byte array, and `[0; RAM_PHYSICAL_END]` must fold the repeat
+// count the same way.
+
+const { assert } = import("test");
+
+const RAM_PHYSICAL_START = 0x0000;
+const RAM_PHYSICAL_END = 0x0800;
+const RAM_MASK = RAM_PHYSICAL_END - 1;
+const RAM_BASE = RAM_PHYSICAL_START;
+
+pub const RAM = struct {
+    cells: [RAM_PHYSICAL_END]u8, // 2k
+
+    pub fn read(self: Self, address: u16) u8 {
+        return self.cells[(address - RAM_BASE) & RAM_MASK];
+    }
+
+    pub fn write(self: mut Self, address: u16, value: u8) {
+        self.cells[(address - RAM_BASE) & RAM_MASK] = value;
+    }
+};
+
+tfn freshRamReadsZero() {
+    var r = RAM{cells: [0; RAM_PHYSICAL_END]};
+    assert(r.read(0x0000), 0);
+    assert(r.read(0x07FF), 0);
+    assert(r.read(0x1FFF), 0);
+}
+
+tfn basicWriteAndRead() {
+    var r = RAM{cells: [0; 0x800]};
+    r.write(0x0000, 0x42);
+    assert(r.read(0x0000), 0x42);
+}
+
+tfn mirroredWriteAndRead() {
+    var r = RAM{cells: [0; 0x800]};
+    r.write(0x0800, 0x42);
+    // $0800 & $07FF = 0: the write lands in cell 0, so both the base
+    // address and the mirror observe the same value.
+    assert(r.read(0x0000), 0x42);
+    assert(r.read(0x0800), 0x42);
+}
+
+tfn allMirrorImagesAlias() {
+    var r = RAM{cells: [0; 0x800]};
+    r.write(0x0123, 0x5A);
+    assert(r.read(0x0923), 0x5A);
+    assert(r.read(0x1123), 0x5A);
+    assert(r.read(0x1923), 0x5A);
+}
+
+tfn mirrorWriteOverwritesBase() {
+    var r = RAM{cells: [0; 0x800]};
+    r.write(0x0000, 0x11);
+    r.write(0x1800, 0x22);
+    assert(r.read(0x0000), 0x22);
+}
+
+tfn maskBoundaryDistinctCells() {
+    var r = RAM{cells: [0; 0x800]};
+    // $07FF is the last physical cell; $0800 wraps to cell 0. They must
+    // stay independent — an off-by-one in the mask would collapse them.
+    r.write(0x07FF, 0x01);
+    r.write(0x0800, 0x02);
+    assert(r.read(0x07FF), 0x01);
+    assert(r.read(0x0000), 0x02);
+    assert(r.read(0x1FFF), 0x01);
+}
