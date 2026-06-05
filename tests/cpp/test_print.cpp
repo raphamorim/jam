@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -41,6 +42,25 @@ std::string readFile(const std::string &path) {
 	return ss.str();
 }
 
+// Locate the compiler binary across build layouts: JAM_BIN env, the
+// Makefile tree (./output/jam.out), or the CI symlink (./jam.out).
+// Mirrors the helper in test_codegen_errors.cpp.
+const std::string &jamBinary() {
+	static const std::string bin = [] {
+		if (const char *env = std::getenv("JAM_BIN")) {
+			return std::string(env);
+		}
+		if (std::filesystem::exists("output/jam.out")) {
+			return std::string("./output/jam.out");
+		}
+		if (std::filesystem::exists("jam.out")) {
+			return std::string("./jam.out");
+		}
+		return std::string("./output/jam.out");
+	}();
+	return bin;
+}
+
 // Compile `source` to a binary and run it. Captures the runtime
 // stdout/stderr separately via shell redirects so we can assert on
 // each independently.
@@ -56,7 +76,7 @@ RunResult compileAndRun(const std::string &name, const std::string &source) {
 		out << source;
 	}
 
-	std::string compileCmd = "./output/jam.out -o " + binPath + " " + srcPath +
+	std::string compileCmd = jamBinary() + " -o " + binPath + " " + srcPath +
 	                         " >" + compileLog + " 2>&1";
 	int compileStatus = std::system(compileCmd.c_str());
 	int compileExit =

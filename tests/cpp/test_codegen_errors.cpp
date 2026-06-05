@@ -28,6 +28,28 @@ struct CompileResult {
 	std::string stderr_;
 };
 
+// Locate the compiler binary across build layouts. The Makefile tree
+// puts it at ./output/jam.out; CI builds with CMake and symlinks
+// `ln -sf build/jam jam.out` in the repo root (see ci.yaml). A JAM_BIN
+// env var wins over both so a caller can point anywhere.
+const std::string &jamBinary() {
+	static const std::string bin = [] {
+		if (const char *env = std::getenv("JAM_BIN")) {
+			return std::string(env);
+		}
+		if (std::filesystem::exists("output/jam.out")) {
+			return std::string("./output/jam.out");
+		}
+		if (std::filesystem::exists("jam.out")) {
+			return std::string("./jam.out");
+		}
+		// Default to the Makefile layout; the popen failure surfaces
+		// the missing binary loudly either way.
+		return std::string("./output/jam.out");
+	}();
+	return bin;
+}
+
 // Run jam.out on a one-off source string. The binary must already be
 // built (the Makefile target depends on `build`). We invoke from the
 // project root so jam.out's relative paths resolve correctly.
@@ -45,7 +67,7 @@ CompileResult compileSource(const std::string &name,
 	// colliding with the build tree's `output/` directory when the
 	// tests run from the project root.
 	std::string outBin = "/tmp/" + name + ".bin";
-	std::string cmd = "./output/jam.out -o " + outBin + " " + path + " 2>&1";
+	std::string cmd = jamBinary() + " -o " + outBin + " " + path + " 2>&1";
 
 	std::string output;
 	FILE *pipe = popen(cmd.c_str(), "r");
@@ -72,8 +94,7 @@ CompileResult runTestMode(const std::string &name, const std::string &source) {
 		std::ofstream out(path);
 		out << source;
 	}
-	std::string jamBin =
-	    (std::filesystem::current_path() / "output" / "jam.out").string();
+	std::string jamBin = std::filesystem::absolute(jamBinary()).string();
 	std::string cmd = "cd /tmp && " + jamBin + " test " + name + ".jam 2>&1";
 
 	std::string output;
@@ -98,7 +119,7 @@ CompileResult compileSourceIR(const std::string &name,
 		std::ofstream out(path);
 		out << source;
 	}
-	std::string cmd = "./output/jam.out --emit-ir " + path + " 2>&1";
+	std::string cmd = jamBinary() + " --emit-ir " + path + " 2>&1";
 
 	std::string output;
 	FILE *pipe = popen(cmd.c_str(), "r");
@@ -130,8 +151,7 @@ CompileResult compileWithLib(const std::string &name,
 		out << mainSource;
 	}
 	std::string outBin = dir + "/main.bin";
-	std::string cmd =
-	    "./output/jam.out -o " + outBin + " " + mainPath + " 2>&1";
+	std::string cmd = jamBinary() + " -o " + outBin + " " + mainPath + " 2>&1";
 
 	std::string output;
 	FILE *pipe = popen(cmd.c_str(), "r");
