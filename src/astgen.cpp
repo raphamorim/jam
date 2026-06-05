@@ -571,18 +571,39 @@ static JirRef astgenNumberLit(AstGenCtx &gctx, const AstNode &n,
 	return emit(gctx, inst);
 }
 
-// AstGen for `StringLit`. The result type is a slice-of-u8 (`[]u8`);
-// the slice TypeKey is interned in the TypePool on first use so a
-// stable TypeIdx flows through the IR. The actual {ptr,len} struct
-// is materialised at jir-codegen time using the StringIdx in `a`.
-static JirRef astgenStringLit(AstGenCtx &gctx, const AstNode &n) {
+// AstGen for `StringLit`. The result type is normally a slice-of-u8
+// (`[]u8`); the slice TypeKey is interned in the TypePool on first use so
+// a stable TypeIdx flows through the IR. The actual {ptr,len} struct is
+// materialised at jir-codegen time using the StringIdx in `a`.
+//
+// Pointer decay: a string literal is a NUL-terminated `u8` array constant,
+// so when the use site expects a many-/single-item pointer to u8
+// (`*const[] u8`, `*mut[] u8`, `*const u8`) it lowers to the bare global
+// pointer instead of a fat slice. This mirrors Zig, where a literal's type
+// `*const [N:0]u8` coerces to `[*]const u8` / `[*c]const u8` (Sema.zig's
+// `src_array_ptr` array-pointer decay). It is what lets a literal be passed
+// straight to C FFI — `snprintf(.., "n=%d", ..)` — without an explicit
+// `.ptr`, while a runtime `[]u8` slice (which carries no static NUL
+// guarantee) still requires `.ptr`. The decay is keyed on the EXPECTED
+// type, so it fires uniformly for call args, `var` initialisers, and
+// `return` values; jir_codegen emits just the global address when the Str
+// inst's type is a pointer kind.
+static JirRef astgenStringLit(AstGenCtx &gctx, const AstNode &n,
+                              TypeIdx expected) {
 	StringIdx s = static_cast<StringIdx>(n.lhs);
-	TypeIdx sliceTy = gctx.ctx.getTypePool().intern(
+	TypeIdx resultTy = gctx.ctx.getTypePool().intern(
 	    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
+	if (expected != kNoType) {
+		const TypeKey &ek = gctx.ctx.getTypePool().get(expected);
+		if ((ek.kind == TypeKind::PtrMany || ek.kind == TypeKind::PtrSingle) &&
+		    ek.a == BuiltinType::U8) {
+			resultTy = expected;
+		}
+	}
 	JirInst inst{};
 	inst.tag = JirTag::Str;
 	inst.a = s;
-	inst.ty = sliceTy;
+	inst.ty = resultTy;
 	return emit(gctx, inst);
 }
 
@@ -4263,8 +4284,15 @@ static JirRef astgenAssertCall(AstGenCtx &gctx, const AstNode &n) {
 		}
 	}
 
+	// Float operands need an ordered float compare, not an integer one.
+	// `assert(f32, f32)` would otherwise build an ICmp on float values —
+	// invalid IR (it aborts an assertions-enabled LLVM). OEQ matches the
+	// `==` operator (see astgenBinaryOp) and IEEE semantics: NaN equals
+	// nothing, so `assert(nan, nan)` correctly fails.
+	const TypeKey &cmpTy = gctx.ctx.getTypePool().get(actualTy);
 	JirInst cmp{};
-	cmp.tag = JirTag::ICmpEq;
+	cmp.tag =
+	    (cmpTy.kind == TypeKind::Float) ? JirTag::FCmpOeq : JirTag::ICmpEq;
 	cmp.a = actualRef;
 	cmp.b = expectedRef;
 	cmp.ty = BuiltinType::Bool;
@@ -4405,7 +4433,23 @@ static std::string resolvePrefix(JamCodegenContext &ctx,
 static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 	jam::abi::ParamABI pabi = jam::abi::classifyParam(p.Mode, p.Type, gctx.ctx);
 	if (pabi.kind != jam::abi::ParamABI::Kind::ByPointer) {
-		return astgenExpr(gctx, argIdx, p.Type);
+		JirRef v = astgenExpr(gctx, argIdx, p.Type);
+		// A runtime slice does not implicitly decay to a pointer parameter;
+		// passing a {ptr,len} aggregate where the callee expects a bare
+		// pointer silently corrupts the ABI (e.g. desyncs C varargs).
+		// Require an explicit `.ptr`, matching Zig (a `[]T` slice has no
+		// static NUL guarantee, so it never coerces to `[*]T`). String
+		// literals decay in astgenStringLit, so they arrive here already
+		// typed as a pointer and skip this check.
+		const TypeKey &vk = gctx.ctx.getTypePool().get(gctx.jfn.getInst(v).ty);
+		const TypeKey &pk = gctx.ctx.getTypePool().get(p.Type);
+		if (vk.kind == TypeKind::Slice &&
+		    (pk.kind == TypeKind::PtrMany || pk.kind == TypeKind::PtrSingle)) {
+			failHere(gctx,
+			         "cannot pass a slice to pointer parameter `" + p.Name +
+			             "`; use `.ptr` to pass the slice's data pointer");
+		}
+		return v;
 	}
 	// ByPointer: feed an address. Lvalueable arg -> hand the existing
 	// storage ptr; non-lvalue rvalue -> spill to a fresh alloca. All
@@ -5929,7 +5973,7 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
 		result = astgenBoolLit(gctx, n);
 		break;
 	case AstTag::StringLit:
-		result = astgenStringLit(gctx, n);
+		result = astgenStringLit(gctx, n, expected);
 		break;
 	case AstTag::Return:
 		astgenReturn(gctx, n);

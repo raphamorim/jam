@@ -38,23 +38,34 @@ add_executable(jam
   src/target.cpp
 )
 
-llvm_map_components_to_libnames(llvm_libs
-  AllTargetsAsmParsers
-  AllTargetsCodeGens
-  AllTargetsDescs
-  AllTargetsDisassemblers
-  AllTargetsInfos
-  Core
-  ExecutionEngine
-  Interpreter
-  MC
-  MCJIT
-  OrcJIT
-  Passes
-  Support
-  native
-  nativecodegen
-)
+# Prefer the monolithic libLLVM shared library when the LLVM install was
+# built with it (Arch, Debian/Ubuntu, many distro packages). Such installs
+# usually omit the per-component static archives, so expanding the component
+# list below would emit unresolvable -lLLVMCore/-lLLVMSupport/... link flags.
+# This mirrors `llvm-config --libs` (used by the Makefile), which returns the
+# single -lLLVM-NN in shared mode. Fall back to the static component libs
+# only when no dylib is available.
+if(LLVM_LINK_LLVM_DYLIB)
+  set(llvm_libs LLVM)
+else()
+  llvm_map_components_to_libnames(llvm_libs
+    AllTargetsAsmParsers
+    AllTargetsCodeGens
+    AllTargetsDescs
+    AllTargetsDisassemblers
+    AllTargetsInfos
+    Core
+    ExecutionEngine
+    Interpreter
+    MC
+    MCJIT
+    OrcJIT
+    Passes
+    Support
+    native
+    nativecodegen
+  )
+endif()
 target_link_libraries(jam ${llvm_libs})
 include(GNUInstallDirs)
 

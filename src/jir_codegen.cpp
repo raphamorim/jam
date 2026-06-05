@@ -122,10 +122,19 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		JamLLVMSetGlobalConstant(strGlobal, true);
 		JamLLVMSetInitializer(strGlobal, strConst);
 
-		JamTypeRef sliceTy = lctx.ctx.getLLVMType(inst.ty);
 		JamTypeRef i8PtrTy = JamLLVMPointerType(lctx.ctx.getInt8Type(), 0);
 		JamValueRef strPtr = JamLLVMBuildBitCast(lctx.ctx.getBuilder(),
 		                                         strGlobal, i8PtrTy, "str_ptr");
+		// Pointer decay (see astgenStringLit): when the literal is used
+		// where a bare pointer is expected, the Str inst carries a pointer
+		// type — emit just the global address, not a {ptr,len} slice.
+		const TypeKey &strKind = lctx.ctx.getTypePool().get(inst.ty);
+		if (strKind.kind == TypeKind::PtrMany ||
+		    strKind.kind == TypeKind::PtrSingle) {
+			return strPtr;
+		}
+
+		JamTypeRef sliceTy = lctx.ctx.getLLVMType(inst.ty);
 		JamValueRef slice = JamLLVMGetUndef(sliceTy);
 		slice = JamLLVMBuildInsertValue(lctx.ctx.getBuilder(), slice, strPtr, 0,
 		                                "slice_ptr");
