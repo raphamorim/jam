@@ -64,9 +64,10 @@ class Analyzer {
 	Analyzer(const NodeStore &nodes, const StringPool &strings,
 	         const std::vector<Token> &tokens, const FunctionRegistry *registry,
 	         const drops::DropRegistry *drops, const TypePool *types,
-	         const EnumVariantMap *enums)
+	         const EnumVariantMap *enums, const AnalysisHooks *hooks)
 	    : nodes_(nodes), strings_(strings), tokens_(tokens),
-	      registry_(registry), drops_(drops), types_(types), enums_(enums) {}
+	      registry_(registry), drops_(drops), types_(types), enums_(enums),
+	      hooks_(hooks) {}
 
 	std::vector<Diagnostic> run(const FunctionAST &fn);
 
@@ -140,7 +141,19 @@ class Analyzer {
 	const drops::DropRegistry *drops_;
 	const TypePool *types_;
 	const EnumVariantMap *enums_;
+	const AnalysisHooks *hooks_;
 	std::vector<Diagnostic> diagnostics_;
+
+	// MATCH-MOVE oracle: does this type carry ownership (so matching it
+	// by value consumes the scrutinee)? Answered by codegen through the
+	// hook — the analyzer's own tables can't classify generic
+	// instantiations like Option(Counter).
+	bool typeOwnsDrops(TypeIdx ty) const {
+		if (hooks_ == nullptr || hooks_->typeNeedsDrop == nullptr) {
+			return false;
+		}
+		return hooks_->typeNeedsDrop(hooks_->ctx, ty);
+	}
 
 	// True when `enumName.variantName` names a known enum-variant
 	// constructor (concrete enums by name; generic enum factories by
@@ -671,6 +684,25 @@ Result Analyzer::analyzeMatch(NodeIdx idx, NameMap state) {
 	auto r = analyze(n.lhs, std::move(state));
 	if (r.terminated) return r;
 
+	// MATCH-MOVE: matching a drop-bearing enum by value CONSUMES the
+	// scrutinee — the match owns it (binding arms transfer payloads,
+	// non-binding arms drop the residual). The consume happens at the
+	// match's own depth, BEFORE the arms fork: every path through the
+	// match consumes, so it is unconditional. applyMoveToBinding also
+	// rejects consuming a borrowed (`let`/`mut` param) scrutinee.
+	{
+		const AstNode &scrutNode = nodes_.get(static_cast<NodeIdx>(n.lhs));
+		if (scrutNode.tag == AstTag::Variable) {
+			const std::string &sname =
+			    strings_.get(static_cast<StringIdx>(scrutNode.lhs));
+			auto vt = varTypes_.find(sname);
+			if (vt != varTypes_.end() && typeOwnsDrops(vt->second)) {
+				applyMoveToBinding(sname, static_cast<NodeIdx>(n.lhs),
+				                   r.state);
+			}
+		}
+	}
+
 	ExtraIdx extra = n.rhs;
 	uint32_t armCount = nodes_.getExtra(extra + 0);
 
@@ -885,7 +917,18 @@ void Analyzer::applyMoveToBinding(const std::string &name, NodeIdx anchor,
 	// locals and `move`-mode params (both in declDepth_); a `let`/`mut`
 	// param is borrowed — moving a drop-bearing value out of it would
 	// leave the caller and the new owner both dropping the payload.
-	if (lookupDropFor(name) != nullptr) {
+	// Two oracles: the drops registry (struct-name keyed), and the
+	// codegen hook for everything the registry can't see — enums whose
+	// payloads drop, arrays of drop-bearing elements, generic
+	// instantiations.
+	bool dropBearing = lookupDropFor(name) != nullptr;
+	if (!dropBearing) {
+		auto vt = varTypes_.find(name);
+		if (vt != varTypes_.end()) {
+			dropBearing = typeOwnsDrops(vt->second);
+		}
+	}
+	if (dropBearing) {
 		auto dd = declDepth_.find(name);
 		if (dd == declDepth_.end()) {
 			if (args_ != nullptr) {
@@ -1281,8 +1324,9 @@ std::vector<Diagnostic> analyze(const FunctionAST &fn, const NodeStore &nodes,
                                 const FunctionRegistry *registry,
                                 const drops::DropRegistry *drops,
                                 const TypePool *types,
-                                const EnumVariantMap *enums) {
-	Analyzer a(nodes, strings, tokens, registry, drops, types, enums);
+                                const EnumVariantMap *enums,
+                                const AnalysisHooks *hooks) {
+	Analyzer a(nodes, strings, tokens, registry, drops, types, enums, hooks);
 	return a.run(fn);
 }
 

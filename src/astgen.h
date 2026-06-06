@@ -51,4 +51,11 @@ JirFunction astgenMetadata(const FunctionAST &fn, JamCodegenContext &ctx);
 void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
                     JamCodegenContext &ctx);
 
+// True when `ty` carries ownership that must drop at scope exit: its
+// own `cfn drop`, drop-bearing struct fields (recursive), array
+// elements, or enum variant payloads. Exposed so the mode-aware
+// analysis can ask the same question codegen answers (match-move
+// consumes drop-bearing enum scrutinees in BOTH layers).
+bool typeNeedsDrop(JamCodegenContext &ctx, TypeIdx ty);
+
 #endif  // ASTGEN_H

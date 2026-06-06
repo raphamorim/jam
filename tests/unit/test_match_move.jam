@@ -1,0 +1,159 @@
+// MATCH-MOVE: matching a drop-bearing enum BY VALUE consumes the
+// scrutinee. Binding arms own the payload (drop-tracked, droppable at
+// arm exit or movable onward); non-binding arms (tag-only, wildcard)
+// drop the residual payload at entry via the tag-dispatched glue;
+// rvalue scrutinees (match (v.pop())) are owned by the match itself
+// — which closes the last temporary-enum leak. Plus: enum payload
+// deep-clone (clone counts pinned below). Rejections (use-after-
+// match, borrowed scrutinee, conditional match) are pinned in
+// tests/cpp/test_codegen_errors.cpp.
+
+const { assert } = import("test");
+const { Vec } = import("std/collections");
+
+const Counter = struct { value: u32, sink: *mut u32, };
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+
+fn consume(c: move Counter) {
+}
+
+fn rvalueMatch(sink: *mut u32) u32 {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 7, sink: sink });
+    match (v.pop()) {
+        Option(Counter).Some(c) { return c.value; }
+        _ { return 0; }
+    }
+}
+
+tfn rvalueMatchOwnsTheTemp() {
+    var hits: u32 = 0;
+    var got: u32 = rvalueMatch(&hits);
+    assert(got, 7);
+    assert(hits, 1);
+}
+
+fn wildcardResidual(sink: *mut u32) {
+    var m: Maybe = Maybe.Some(Counter { value: 1, sink: sink });
+    match (m) {
+        _ { }
+    }
+}
+
+tfn wildcardArmDropsResidualPayload() {
+    var hits: u32 = 0;
+    wildcardResidual(&hits);
+    assert(hits, 1);
+}
+
+fn tagOnlyResidual(sink: *mut u32) u32 {
+    var m: Maybe = Maybe.Some(Counter { value: 1, sink: sink });
+    match (m) {
+        Maybe.None { return 9; }
+        _ { return 1; }
+    }
+}
+
+tfn tagArmsDropResidualOnEveryPath() {
+    var hits: u32 = 0;
+    var r: u32 = tagOnlyResidual(&hits);
+    assert(r, 1);
+    assert(hits, 1);
+}
+
+fn bindingMovedOnward(sink: *mut u32) {
+    var m: Maybe = Maybe.Some(Counter { value: 2, sink: sink });
+    match (m) {
+        Maybe.Some(c) { consume(c); }
+        _ { }
+    }
+}
+
+tfn armBindingMovesOnward() {
+    var hits: u32 = 0;
+    bindingMovedOnward(&hits);
+    assert(hits, 1);
+}
+
+fn bindingDropsAtArmExit(sink: *mut u32) {
+    var m: Maybe = Maybe.Some(Counter { value: 3, sink: sink });
+    match (m) {
+        Maybe.Some(c) { var x: u32 = c.value; }
+        _ { }
+    }
+}
+
+tfn armBindingDropsAtArmExit() {
+    var hits: u32 = 0;
+    bindingDropsAtArmExit(&hits);
+    assert(hits, 1);
+}
+
+fn noneThroughBindingMatch(sink: *mut u32) {
+    var m: Maybe = Maybe.None();
+    match (m) {
+        Maybe.Some(c) { var x: u32 = c.value; }
+        _ { }
+    }
+    var c2: Counter = Counter { value: 1, sink: sink };
+}
+
+tfn noneVariantNothingExtra() {
+    var hits: u32 = 0;
+    noneThroughBindingMatch(&hits);
+    assert(hits, 1);
+}
+const Tracked = struct { value: u32, dropSink: *mut u32, cloneSink: *mut u32, };
+cfn drop(self: mut Tracked) {
+    var p: *mut u32 = self.dropSink;
+    p.* = p.* + 1;
+}
+cfn clone(self: Tracked) Tracked {
+    var p: *mut u32 = self.cloneSink;
+    p.* = p.* + 1;
+    return Tracked { value: self.value, dropSink: self.dropSink, cloneSink: self.cloneSink };
+}
+
+const MaybeT = enum {
+    None,
+    Some(Tracked),
+};
+
+fn cloneEnum(drops: *mut u32, clones: *mut u32) u32 {
+    var m: MaybeT = MaybeT.Some(Tracked { value: 6, dropSink: drops, cloneSink: clones });
+    var n: MaybeT = m.clone();
+    match (n) {
+        MaybeT.Some(t) { return t.value; }
+        _ { return 0; }
+    }
+}
+
+tfn enumCloneDeep() {
+    var drops: u32 = 0;
+    var clones: u32 = 0;
+    var got: u32 = cloneEnum(&drops, &clones);
+    assert(got, 6);
+    assert(clones, 1);
+    assert(drops, 2);
+}
+
+fn cloneNone(drops: *mut u32, clones: *mut u32) {
+    var m: MaybeT = MaybeT.None();
+    var n: MaybeT = m.clone();
+}
+
+tfn enumCloneNoneFree() {
+    var drops: u32 = 0;
+    var clones: u32 = 0;
+    cloneNone(&drops, &clones);
+    assert(clones, 0);
+    assert(drops, 0);
+}

@@ -1,0 +1,65 @@
+// Conditional generic methods: an instantiated method exists only for
+// the type arguments its body compiles AND analyzes for (except cfn
+// drop, which is unconditional). Vec(Counter): at/get/clone withdraw
+// (Counter is not cloneable), filled withdraws (its fill duplicates a
+// borrowed value) — while push/pop/setAt/drop stay available, so the
+// container itself keeps working. Calls to withdrawn methods replay
+// the reason (pinned in tests/cpp/test_codegen_errors.cpp).
+
+const { assert } = import("test");
+const { Vec } = import("std/collections");
+
+const Counter = struct { value: u32, sink: *mut u32, };
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+const Tracked = struct { value: u32, dropSink: *mut u32, cloneSink: *mut u32, };
+cfn drop(self: mut Tracked) {
+    var p: *mut u32 = self.dropSink;
+    p.* = p.* + 1;
+}
+cfn clone(self: Tracked) Tracked {
+    var p: *mut u32 = self.cloneSink;
+    p.* = p.* + 1;
+    return Tracked { value: self.value, dropSink: self.dropSink, cloneSink: self.cloneSink };
+}
+
+fn basicFlow(sink: *mut u32) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 1, sink: sink });
+    v[0] = Counter { value: 2, sink: sink };
+    var popped = v.pop();
+}
+
+tfn vecCounterCoreStillWorks() {
+    var hits: u32 = 0;
+    basicFlow(&hits);
+    assert(hits, 2);
+}
+
+fn getClones(drops: *mut u32, clones: *mut u32) u32 {
+    var v: Vec(Tracked) = Vec(Tracked).empty();
+    v.push(Tracked { value: 9, dropSink: drops, cloneSink: clones });
+    var got = v.get(0);
+    match (got) {
+        Option(Tracked).Some(t) { return t.value; }
+        _ { return 0; }
+    }
+}
+
+tfn getClonesForCloneableElems() {
+    var drops: u32 = 0;
+    var clones: u32 = 0;
+    var got: u32 = getClones(&drops, &clones);
+    assert(got, 9);
+    assert(clones, 1);
+    assert(drops, 2);
+}
+
+tfn indexReadOnPlainVecUnchanged() {
+    var v: Vec(u32) = Vec(u32).empty();
+    v.push(42);
+    assert(v[0], 42);
+}

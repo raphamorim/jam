@@ -87,7 +87,9 @@ pub fn Vec(T: type) type {
             if (i >= self.length) {
                 return Option(T).None();
             }
-            return Option(T).Some(self.ptr[i]);
+            // Clone out: the container keeps its element, the Option
+            // owns an independent copy (free for plain T).
+            return Option(T).Some(self.ptr[i].clone());
         }
 
         // `cfn at` / `cfn setAt` are the value-shaped hooks the
@@ -100,9 +102,15 @@ pub fn Vec(T: type) type {
         //
         // Bounds-checked reads remain on `get(i) -> Option(T)`.
         cfn at(self: Self, i: u32) T {
-            return self.ptr[i];
+            // Reads CLONE the element out: the container keeps its
+            // copy, the caller owns an independent one. For plain T
+            // clone is the value itself, so v[i] on Vec(u32) is the
+            // same raw read as before. For non-cloneable T this method
+            // withdraws (conditional methods) and v[i] reads report
+            // why at the call site.
+            return self.ptr[i].clone();
         }
-        cfn setAt(self: mut Self, i: u32, value: T) {
+        cfn setAt(self: mut Self, i: u32, value: move T) {
             // Overwriting a LIVE element drops the previous occupant
             // first (slots beyond length are uninitialized capacity —
             // dropping those would read garbage). @dropInPlace is a

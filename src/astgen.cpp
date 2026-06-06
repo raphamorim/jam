@@ -158,6 +158,22 @@ static void appendErrorHere(AstGenCtx &gctx, std::string message) {
 	appendErrorNode(gctx, gctx.currentNode, std::move(message));
 }
 
+// Forward decl (defined near the recovery helpers below).
+static JirRef recoverHere(AstGenCtx &gctx, std::string message, TypeIdx ty);
+
+// Method-miss reporting that understands CONDITIONAL methods: an
+// instantiated generic method withdrawn for these type arguments
+// replays the recorded reason instead of a bare "unknown method".
+static JirRef reportMethodMiss(AstGenCtx &gctx,
+                               const std::string &qualified) {
+	if (const std::string *why = gctx.ctx.getWithdrawnMethod(qualified)) {
+		failHere(gctx, "method `" + qualified +
+		                   "` is not available for this instantiation — " +
+		                   *why);
+	}
+	return recoverHere(gctx, "unknown method `" + qualified + "`", kNoType);
+}
+
 // Canonicalize a parser-deferred `[expr]T` (TypeKind::ArrayExpr) before
 // the type becomes astgen state — binding types, expected hints, field
 // reads. The codegen-side resolver throws when the length expression
@@ -339,7 +355,9 @@ static void emitDrops(AstGenCtx &gctx, const std::vector<DropTrack> &bindings);
 // `@dropInPlace(ptr)` intrinsic. Defined later; declared here so
 // emitDrops + astgenVarDecl can call them.
 static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy);
-static bool typeNeedsDrop(AstGenCtx &gctx, TypeIdx ty);
+bool typeNeedsDropInner(JamCodegenContext &ctx, TypeIdx ty);
+static void emitEnumPayloadDrops(AstGenCtx &gctx, JirRef ptrRef,
+                                 const JamCodegenContext::EnumInfo *einfo);
 static void rejectDropBearingFieldExtract(AstGenCtx &gctx, NodeIdx exprIdx,
                                           TypeIdx resultTy, const char *verb);
 static void rejectAddrOfOnModeArg(AstGenCtx &gctx, NodeIdx argIdx,
@@ -703,12 +721,12 @@ static void astgenReturn(AstGenCtx &gctx, const AstNode &n) {
 // `T.drop` or `m.T.drop`). Falls back to the codegen context's
 // instantiated-drops table so generic struct/enum instantiations
 // (Vec(i32), Holder(i32), ...) fire drops too.
-static std::string lookupDropFnLLVMName(AstGenCtx &gctx, TypeIdx ty) {
-	const TypeKey &k = gctx.ctx.getTypePool().get(ty);
+static std::string lookupDropFnLLVMName(JamCodegenContext &ctx, TypeIdx ty) {
+	const TypeKey &k = ctx.getTypePool().get(ty);
 	std::string typeName;
 	if (k.kind == TypeKind::Struct || k.kind == TypeKind::Named ||
 	    k.kind == TypeKind::Enum) {
-		typeName = gctx.ctx.getStringPool().get(static_cast<StringIdx>(k.a));
+		typeName = ctx.getStringPool().get(static_cast<StringIdx>(k.a));
 	} else {
 		return "";
 	}
@@ -719,30 +737,30 @@ static std::string lookupDropFnLLVMName(AstGenCtx &gctx, TypeIdx ty) {
 	// mangling change can't silently desync.
 	auto resolveName = [&](const std::string &name) -> std::string {
 		const FunctionAST *fn = nullptr;
-		const jam::drops::DropRegistry *reg = gctx.ctx.getDropRegistry();
+		const jam::drops::DropRegistry *reg = ctx.getDropRegistry();
 		if (reg != nullptr) {
 			auto it = reg->find(name);
 			if (it != reg->end()) fn = it->second;
 		}
-		if (fn == nullptr) fn = gctx.ctx.lookupDropFn(name);
+		if (fn == nullptr) fn = ctx.lookupDropFn(name);
 		if (fn == nullptr) return "";
-		return mangledFunctionName(*fn, gctx.ctx.getTypePool(),
-		                           gctx.ctx.getStringPool());
+		return mangledFunctionName(*fn, ctx.getTypePool(),
+		                           ctx.getStringPool());
 	};
 	std::string r = resolveName(typeName);
 	if (!r.empty()) return r;
-	TypeIdx aliasTarget = gctx.ctx.lookupTypeAlias(typeName);
+	TypeIdx aliasTarget = ctx.lookupTypeAlias(typeName);
 	if (aliasTarget != kNoType) {
-		const TypeKey &ak0 = gctx.ctx.getTypePool().get(aliasTarget);
+		const TypeKey &ak0 = ctx.getTypePool().get(aliasTarget);
 		if (ak0.kind == TypeKind::GenericCall) {
-			TypeIdx resolved = gctx.ctx.resolveGenericCall(aliasTarget);
+			TypeIdx resolved = ctx.resolveGenericCall(aliasTarget);
 			if (resolved != kNoType) aliasTarget = resolved;
 		}
-		const TypeKey &ak = gctx.ctx.getTypePool().get(aliasTarget);
+		const TypeKey &ak = ctx.getTypePool().get(aliasTarget);
 		if (ak.kind == TypeKind::Named || ak.kind == TypeKind::Struct ||
 		    ak.kind == TypeKind::Enum) {
 			std::string aliasName =
-			    gctx.ctx.getStringPool().get(static_cast<StringIdx>(ak.a));
+			    ctx.getStringPool().get(static_cast<StringIdx>(ak.a));
 			r = resolveName(aliasName);
 			if (!r.empty()) return r;
 		}
@@ -962,11 +980,11 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 	//     to walk the fields at the drop site. Matches Rust's
 	//     `needs_drop<T>()` which auto-drops a struct when any of its
 	//     fields does, even without an explicit Drop impl.
-	std::string dropName = lookupDropFnLLVMName(gctx, type);
+	std::string dropName = lookupDropFnLLVMName(gctx.ctx, type);
 	if (!dropName.empty()) {
 		if (gctx.dropScopes.empty()) pushDropScope(gctx);
 		gctx.dropScopes.back().push_back({name, allocaRef, type, dropName});
-	} else if (typeNeedsDrop(gctx, type)) {
+	} else if (typeNeedsDrop(gctx.ctx, type)) {
 		// Struct without its own `cfn drop` but with droppable fields
 		// (e.g. `Bus { dma: Vec(u32), ... }`). Track the binding so
 		// scope-exit invokes `emitDropInPlace(slot, type)` which walks
@@ -1163,6 +1181,11 @@ static void astgenAssign(AstGenCtx &gctx, const AstNode &n) {
 		if (sinfo != nullptr) {
 			const std::string qualified = sinfo->name + ".setAt";
 			const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
+			if (method == nullptr &&
+			    gctx.ctx.getWithdrawnMethod(qualified) != nullptr) {
+				reportMethodMiss(gctx, qualified);
+				return;
+			}
 			if (method != nullptr && method->isCfn &&
 			    method->Args.size() >= 3) {
 				// setAt's self must be mut/move (it mutates), so we
@@ -1204,7 +1227,7 @@ static void astgenAssign(AstGenCtx &gctx, const AstNode &n) {
 	// first, old value drops, new value stores. Reassign-after-MOVE is
 	// already rejected by init_analysis, so the destination here is
 	// never a moved-out slot.
-	if (leafTy != kNoType && typeNeedsDrop(gctx, leafTy) &&
+	if (leafTy != kNoType && typeNeedsDrop(gctx.ctx, leafTy) &&
 	    assignTargetIsValueWorld(gctx, targetIdx)) {
 		emitDropInPlace(gctx, ptrRef, leafTy);
 	}
@@ -1911,7 +1934,7 @@ static JirRef astgenArrayRepeat(AstGenCtx &gctx, const AstNode &n,
 	// drop-bearing element type that is N owners of one payload, every
 	// extra copy a future double-free. rustc requires `T: Copy` for
 	// `[x; N]`; jam rejects until explicit clone() lands.
-	if (typeNeedsDrop(gctx, elemTy)) {
+	if (typeNeedsDrop(gctx.ctx, elemTy)) {
 		failHere(gctx,
 		         "repeat literal would create " + std::to_string(count) +
 		             " owners of one drop-bearing value; initialize each "
@@ -2205,6 +2228,13 @@ static JirRef astgenIndex(AstGenCtx &gctx, const AstNode &n) {
 				JirRef atResult =
 				    emitStructCfnDispatch(gctx, sinfo, "at", recv, idxRef, {});
 				if (atResult != kNoJirRef) { return atResult; }
+				// `at` may be a WITHDRAWN conditional method for this
+				// instantiation (e.g. Vec(T) where T isn't cloneable):
+				// replay the reason instead of the generic index error.
+				if (gctx.ctx.getWithdrawnMethod(sinfo->name + ".at") !=
+				    nullptr) {
+					return reportMethodMiss(gctx, sinfo->name + ".at");
+				}
 			}
 		}
 	}
@@ -3607,6 +3637,40 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 	JirRef scrut = astgenExpr(gctx, scrutIdx, kNoType);
 	TypeIdx scrutTy = gctx.jfn.getInst(scrut).ty;
 
+	// MATCH-MOVE: matching a drop-bearing enum BY VALUE consumes the
+	// scrutinee (Rust semantics). The match becomes the owner: binding
+	// arms transfer the payload into drop-tracked bindings; arms that
+	// don't bind (tag-only, wildcard, no-match fallthrough) drop the
+	// residual payload at entry via the tag-dispatched glue. A bare
+	// local scrutinee's own scope-exit drop is suppressed; an rvalue
+	// scrutinee (`match (v.pop())`) is owned outright — which is what
+	// finally gives temporary enums a drop point.
+	const JamCodegenContext::EnumInfo *matchEinfo =
+	    gctx.ctx.lookupEnum(scrutTy);
+	// Gate must MATCH the analyzer's (typeNeedsDrop alone) — a
+	// payload-less enum with its own cfn drop also consumes, or the two
+	// layers disagree (analyzer says moved, codegen drops at scope
+	// exit → false use-after-move rejections).
+	bool matchOwns =
+	    matchEinfo != nullptr && typeNeedsDrop(gctx.ctx, scrutTy);
+	JirRef scrutOwned = kNoJirRef;
+	if (matchOwns) {
+		rejectDropBearingFieldExtract(gctx, scrutIdx, scrutTy, "consume");
+		consumeMovedVariable(gctx, scrutIdx);
+		// The residual-drop glue needs a stable POINTER to the owned
+		// enum storage; the scrutinee here is the loaded value. One
+		// spill, shared by every arm's residual path.
+		JirInst sa{};
+		sa.tag = JirTag::Alloca;
+		sa.ty = scrutTy;
+		scrutOwned = emitAllocaHoisted(gctx, sa);
+		JirInst sst{};
+		sst.tag = JirTag::Store;
+		sst.a = scrutOwned;
+		sst.b = scrut;
+		emit(gctx, sst);
+	}
+
 	// Build merge + arm blocks up-front so we can hand refs around.
 	JirBlockRef mergeB = gctx.jfn.pushBlock("matchend");
 	std::vector<JirBlockRef> armBlocks;
@@ -3712,9 +3776,13 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		// Default block branches to merge when no wildcard arm exists,
 		// matching the chained-CondBr semantics (non-exhaustive match
 		// falls through; expression-form match leaves the result slot
-		// at its default).
+		// at its default). An owned scrutinee still drops its payload
+		// on this path.
 		if (wildcardArmIdx < 0) {
 			gctx.currentBlock = defaultB;
+			if (matchOwns) {
+				emitDropInPlace(gctx, scrutOwned, scrutTy);
+			}
 			emitBr(gctx, mergeB);
 		}
 	} else {
@@ -3746,6 +3814,9 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		// the value after a non-exhaustive match is at fault.)
 		if (wildcardArmIdx < 0) {
 			gctx.currentBlock = defaultB;
+			if (matchOwns) {
+				emitDropInPlace(gctx, scrutOwned, scrutTy);
+			}
 			emitBr(gctx, mergeB);
 		}
 	}
@@ -3770,6 +3841,42 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 			gctx.localTypes[bind.name] = bind.type;
 		}
 		pushDropScope(gctx);
+
+		if (matchOwns) {
+			if (armBindings[i].empty()) {
+				// No bindings extracted the payload: this arm owns the
+				// residual. Full drop-in-place: the enum's own cfn drop
+				// (if any) plus the tag-dispatched payload glue.
+				emitDropInPlace(gctx, scrutOwned, scrutTy);
+			} else {
+				// Rust's E0509 analog: the payload cannot move out of
+				// an enum that has its OWN cfn drop — that drop expects
+				// the whole value intact, so extracting a field from
+				// under it would leave it running on a hollowed value.
+				if (!lookupDropFnLLVMName(gctx.ctx, scrutTy).empty()) {
+					failNode(gctx, arms[i].patIdx,
+					         "cannot bind the payload out of an enum "
+					         "that has its own `cfn drop` — the drop "
+					         "needs the whole value; clone the payload "
+					         "or restructure");
+				}
+				// Bindings took the payload — they become drop-tracked
+				// owners in the arm's scope (same dual-flavor
+				// registration var-decls use).
+				for (const ArmBinding &bind : armBindings[i]) {
+					std::string dn =
+					    lookupDropFnLLVMName(gctx.ctx, bind.type);
+					if (!dn.empty()) {
+						gctx.dropScopes.back().push_back(
+						    {bind.name, bind.slot, bind.type, dn});
+					} else if (typeNeedsDrop(gctx.ctx, bind.type)) {
+						gctx.dropScopes.back().push_back(
+						    {bind.name, bind.slot, bind.type,
+						     std::string()});
+					}
+				}
+			}
+		}
 
 		const ArmSpec &a = arms[i];
 		bool armDiverged = false;
@@ -3969,7 +4076,7 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n,
 	// callee's FunctionAST via the same registry path.
 	const FunctionAST *fn = gctx.ctx.getFunctionAST(qualified);
 	if (fn == nullptr) {
-		return recoverHere(gctx, "unknown method `" + qualified + "`", kNoType);
+		return reportMethodMiss(gctx, qualified);
 	}
 	std::vector<JirRef> argRefs;
 	argRefs.reserve(argCount);
@@ -4001,21 +4108,21 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n,
 // where a substituted field type lands as `Named("BumperI32")` and the
 // drop-fn lookup has to chase the alias to reach `Bumper__i32` whose
 // drop is registered.
-static TypeIdx resolveGenericIfAny(AstGenCtx &gctx, TypeIdx ty) {
-	const auto &types = gctx.ctx.getTypePool();
-	const auto &strings = gctx.ctx.getStringPool();
+static TypeIdx resolveGenericIfAny(JamCodegenContext &ctx, TypeIdx ty) {
+	const auto &types = ctx.getTypePool();
+	const auto &strings = ctx.getStringPool();
 	constexpr int kMaxHops = 8;
 	for (int i = 0; i < kMaxHops; i++) {
 		const TypeKey &tk = types.get(ty);
 		if (tk.kind == TypeKind::GenericCall) {
-			TypeIdx r = gctx.ctx.resolveGenericCall(ty);
+			TypeIdx r = ctx.resolveGenericCall(ty);
 			if (r == kNoType || r == ty) break;
 			ty = r;
 			continue;
 		}
 		if (tk.kind == TypeKind::Named) {
 			const std::string &name = strings.get(static_cast<StringIdx>(tk.a));
-			TypeIdx alias = gctx.ctx.lookupTypeAlias(name);
+			TypeIdx alias = ctx.lookupTypeAlias(name);
 			if (alias != kNoType && alias != ty) {
 				ty = alias;
 				continue;
@@ -4034,25 +4141,25 @@ static TypeIdx resolveGenericIfAny(AstGenCtx &gctx, TypeIdx ty) {
 // treated as primitives (Rust's same answer: a raw pointer doesn't
 // auto-drop its pointee; if the user wants that, they own a Box/Vec
 // whose own `cfn drop` handles deallocation).
-static bool typeNeedsDrop(AstGenCtx &gctx, TypeIdx ty) {
-	ty = resolveGenericIfAny(gctx, ty);
-	if (!lookupDropFnLLVMName(gctx, ty).empty()) return true;
-	const TypeKey &tk = gctx.ctx.getTypePool().get(ty);
+bool typeNeedsDropInner(JamCodegenContext &ctx, TypeIdx ty) {
+	ty = resolveGenericIfAny(ctx, ty);
+	if (!lookupDropFnLLVMName(ctx, ty).empty()) return true;
+	const TypeKey &tk = ctx.getTypePool().get(ty);
 	// A fixed-size array owns its elements: it needs drop iff the
 	// element type does. (Deferred `[expr]T` sizes resolve first so
 	// field types annotated with const lengths classify correctly.)
 	if (tk.kind == TypeKind::ArrayExpr) {
-		return typeNeedsDrop(gctx, gctx.ctx.resolveArrayExpr(ty));
+		return typeNeedsDrop(ctx, ctx.resolveArrayExpr(ty));
 	}
 	if (tk.kind == TypeKind::Array) {
-		return typeNeedsDrop(gctx, static_cast<TypeIdx>(tk.a));
+		return typeNeedsDrop(ctx, static_cast<TypeIdx>(tk.a));
 	}
 	// A payloaded enum owns whichever variant payload is live: it needs
 	// drop iff ANY variant carries a payload type that does.
-	if (const auto *einfo = gctx.ctx.lookupEnum(ty)) {
+	if (const auto *einfo = ctx.lookupEnum(ty)) {
 		for (const auto &v : einfo->variants) {
 			for (TypeIdx pt : v.payloadTypes) {
-				if (typeNeedsDrop(gctx, pt)) return true;
+				if (typeNeedsDrop(ctx, pt)) return true;
 			}
 		}
 		return false;
@@ -4061,11 +4168,11 @@ static bool typeNeedsDrop(AstGenCtx &gctx, TypeIdx ty) {
 		return false;
 	}
 	const std::string &name =
-	    gctx.ctx.getStringPool().get(static_cast<StringIdx>(tk.a));
-	const auto *sinfo = gctx.ctx.getStruct(name);
+	    ctx.getStringPool().get(static_cast<StringIdx>(tk.a));
+	const auto *sinfo = ctx.getStruct(name);
 	if (sinfo == nullptr) return false;
 	for (const auto &f : sinfo->fields) {
-		if (typeNeedsDrop(gctx, f.second)) return true;
+		if (typeNeedsDrop(ctx, f.second)) return true;
 	}
 	return false;
 }
@@ -4107,7 +4214,7 @@ static bool assignTargetIsValueWorld(AstGenCtx &gctx, NodeIdx targetIdx) {
 	if (it == gctx.localTypes.end()) return false;
 	TypeIdx curTy = it->second;
 	for (auto rit = steps.rbegin(); rit != steps.rend(); ++rit) {
-		curTy = resolveGenericIfAny(gctx, curTy);
+		curTy = resolveGenericIfAny(gctx.ctx, curTy);
 		const TypeKey &k = gctx.ctx.getTypePool().get(curTy);
 		if ((*rit)->tag == AstTag::Index) {
 			if (k.kind != TypeKind::Array) return false;
@@ -4145,7 +4252,7 @@ static bool assignTargetIsValueWorld(AstGenCtx &gctx, NodeIdx targetIdx) {
 // so emitDrops can re-use it to mirror Rust's "Drop::drop runs, then
 // fields auto-drop" sequencing.
 static void emitFieldDrops(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
-	pointeeTy = resolveGenericIfAny(gctx, pointeeTy);
+	pointeeTy = resolveGenericIfAny(gctx.ctx, pointeeTy);
 	const TypeKey &tk = gctx.ctx.getTypePool().get(pointeeTy);
 	const JamCodegenContext::StructInfo *sinfo = nullptr;
 	if (tk.kind == TypeKind::Struct || tk.kind == TypeKind::Named) {
@@ -4156,7 +4263,7 @@ static void emitFieldDrops(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 	if (sinfo == nullptr) return;
 	for (size_t i = 0; i < sinfo->fields.size(); i++) {
 		TypeIdx fieldTy = sinfo->fields[i].second;
-		if (!typeNeedsDrop(gctx, fieldTy)) continue;
+		if (!typeNeedsDrop(gctx.ctx, fieldTy)) continue;
 		TypeIdx fieldPtrTy = gctx.ctx.getTypePool().intern(
 		    TypeKey{TypeKind::PtrSingle, 0, 0, fieldTy, 0});
 		JirInst fieldAddr{};
@@ -4202,7 +4309,7 @@ static bool emitContainerElementDrops(AstGenCtx &gctx, JirRef ptrRef,
 			elemTy = static_cast<TypeIdx>(fk.a);
 		}
 	}
-	if (dataIdx < 0 || !typeNeedsDrop(gctx, elemTy)) return false;
+	if (dataIdx < 0 || !typeNeedsDrop(gctx.ctx, elemTy)) return false;
 
 	// count = self.len()  — receiver is the pointer-to-self we already hold.
 	jam::abi::ParamABI recvAbi =
@@ -4439,7 +4546,7 @@ static void emitEnumPayloadDrops(AstGenCtx &gctx, JirRef ptrRef,
 	for (const auto &v : einfo->variants) {
 		bool anyDrop = false;
 		for (TypeIdx pt : v.payloadTypes) {
-			if (typeNeedsDrop(gctx, pt)) {
+			if (typeNeedsDrop(gctx.ctx, pt)) {
 				anyDrop = true;
 				break;
 			}
@@ -4473,7 +4580,7 @@ static void emitEnumPayloadDrops(AstGenCtx &gctx, JirRef ptrRef,
 			uint64_t s = gctx.ctx.typeSize(pt);
 			uint64_t a = gctx.ctx.typeAlign(pt);
 			off = (off + a - 1) / a * a;
-			if (typeNeedsDrop(gctx, pt)) {
+			if (typeNeedsDrop(gctx.ctx, pt)) {
 				JirInst offC{};
 				offC.tag = JirTag::Int;
 				offC.a = static_cast<uint32_t>(off);
@@ -4507,7 +4614,7 @@ static void emitEnumPayloadDrops(AstGenCtx &gctx, JirRef ptrRef,
 // conformance with explicit .copy()).
 static void emitCloneInto(AstGenCtx &gctx, JirRef srcPtr, JirRef destPtr,
                           TypeIdx ty) {
-	ty = resolveGenericIfAny(gctx, ty);
+	ty = resolveGenericIfAny(gctx.ctx, ty);
 	{
 		const TypeKey &k0 = gctx.ctx.getTypePool().get(ty);
 		if (k0.kind == TypeKind::ArrayExpr) {
@@ -4516,7 +4623,7 @@ static void emitCloneInto(AstGenCtx &gctx, JirRef srcPtr, JirRef destPtr,
 	}
 
 	// Plain data: bitwise copy is a true value copy.
-	if (!typeNeedsDrop(gctx, ty)) {
+	if (!typeNeedsDrop(gctx.ctx, ty)) {
 		JirInst ld{};
 		ld.tag = JirTag::Load;
 		ld.a = srcPtr;
@@ -4561,14 +4668,106 @@ static void emitCloneInto(AstGenCtx &gctx, JirRef srcPtr, JirRef destPtr,
 		return;
 	}
 
-	// Enums: payload clone glue needs tag dispatch — fenced until the
-	// match-move milestone (the payloads only just learned to DROP).
+	// Enums: bitwise-copy the whole value (tag + payload bytes), then
+	// re-clone the live variant's droppable payload fields over the
+	// raw copy — tag-dispatched at the SAME byte offsets construction
+	// and the drop glue use. Non-droppable payload variants are
+	// already correct from the bitwise copy.
 	if (const auto *einfo = gctx.ctx.lookupEnum(ty)) {
-		if (einfo->hasPayloadVariant) {
-			failHere(gctx, "enums with payloads are not yet cloneable");
+		JirInst ld{};
+		ld.tag = JirTag::Load;
+		ld.a = srcPtr;
+		ld.ty = ty;
+		JirRef whole = emit(gctx, ld);
+		JirInst st{};
+		st.tag = JirTag::Store;
+		st.a = destPtr;
+		st.b = whole;
+		emit(gctx, st);
+		if (!einfo->hasPayloadVariant) return;
+
+		TypeIdx u8PtrTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::PtrSingle, 0, 0, BuiltinType::U8, 0});
+		JirInst tagFA{};
+		tagFA.tag = JirTag::FieldAddr;
+		tagFA.a = srcPtr;
+		tagFA.b = 0;
+		tagFA.ty = u8PtrTy;
+		JirRef tagPtr = emit(gctx, tagFA);
+		JirInst tagLd{};
+		tagLd.tag = JirTag::Load;
+		tagLd.a = tagPtr;
+		tagLd.ty = BuiltinType::U8;
+		JirRef tagVal = emit(gctx, tagLd);
+
+		for (const auto &v : einfo->variants) {
+			bool anyDrop = false;
+			for (TypeIdx pt : v.payloadTypes) {
+				if (typeNeedsDrop(gctx.ctx, pt)) {
+					anyDrop = true;
+					break;
+				}
+			}
+			if (!anyDrop) continue;
+
+			JirBlockRef cloneB = gctx.jfn.pushBlock("eclone");
+			JirBlockRef contB = gctx.jfn.pushBlock("eclonecont");
+			JirInst disc{};
+			disc.tag = JirTag::Int;
+			disc.a = static_cast<uint32_t>(v.discriminant);
+			disc.ty = BuiltinType::U8;
+			JirRef discRef = emit(gctx, disc);
+			JirInst cmp{};
+			cmp.tag = JirTag::ICmpEq;
+			cmp.a = tagVal;
+			cmp.b = discRef;
+			cmp.ty = BuiltinType::Bool;
+			JirRef cmpRef = emit(gctx, cmp);
+			emitCondBr(gctx, cmpRef, cloneB, contB);
+
+			gctx.currentBlock = cloneB;
+			JirInst sPayFA{};
+			sPayFA.tag = JirTag::FieldAddr;
+			sPayFA.a = srcPtr;
+			sPayFA.b = 1;
+			sPayFA.ty = u8PtrTy;
+			JirRef sPay = emit(gctx, sPayFA);
+			JirInst dPayFA{};
+			dPayFA.tag = JirTag::FieldAddr;
+			dPayFA.a = destPtr;
+			dPayFA.b = 1;
+			dPayFA.ty = u8PtrTy;
+			JirRef dPay = emit(gctx, dPayFA);
+			uint64_t off = 0;
+			for (TypeIdx pt : v.payloadTypes) {
+				uint64_t sz = gctx.ctx.typeSize(pt);
+				uint64_t al = gctx.ctx.typeAlign(pt);
+				off = (off + al - 1) / al * al;
+				if (typeNeedsDrop(gctx.ctx, pt)) {
+					JirInst offC{};
+					offC.tag = JirTag::Int;
+					offC.a = static_cast<uint32_t>(off);
+					offC.ty = BuiltinType::U64;
+					JirRef offRef = emit(gctx, offC);
+					JirInst sGep{};
+					sGep.tag = JirTag::IndexAddr;
+					sGep.a = sPay;
+					sGep.b = offRef;
+					sGep.ty = u8PtrTy;
+					JirRef sF = emit(gctx, sGep);
+					JirInst dGep{};
+					dGep.tag = JirTag::IndexAddr;
+					dGep.a = dPay;
+					dGep.b = offRef;
+					dGep.ty = u8PtrTy;
+					JirRef dF = emit(gctx, dGep);
+					emitCloneInto(gctx, sF, dF, pt);
+				}
+				off += sz;
+			}
+			emitBr(gctx, contB);
+			gctx.currentBlock = contB;
 		}
-		// payload-less enums are plain data; unreachable (needsDrop
-		// false), but keep the shape total.
 		return;
 	}
 
@@ -4602,7 +4801,7 @@ static void emitCloneInto(AstGenCtx &gctx, JirRef srcPtr, JirRef destPtr,
 	}
 
 	// Error tier: owns a resource (its own cfn drop), no clone recipe.
-	if (!lookupDropFnLLVMName(gctx, ty).empty()) {
+	if (!lookupDropFnLLVMName(gctx.ctx, ty).empty()) {
 		failHere(gctx, "`" + sinfo->name +
 		                   "` owns resources (it has `cfn drop`); define "
 		                   "`cfn clone(self: Self) Self` to make it "
@@ -4612,7 +4811,7 @@ static void emitCloneInto(AstGenCtx &gctx, JirRef srcPtr, JirRef destPtr,
 	// Tier 2: field-wise structural clone.
 	for (size_t i = 0; i < sinfo->fields.size(); i++) {
 		TypeIdx fieldTy =
-		    resolveGenericIfAny(gctx, sinfo->fields[i].second);
+		    resolveGenericIfAny(gctx.ctx, sinfo->fields[i].second);
 		TypeIdx fieldPtrTy = gctx.ctx.getTypePool().intern(
 		    TypeKey{TypeKind::PtrSingle, 0, 0, fieldTy, 0});
 		JirInst sfa{};
@@ -4639,7 +4838,7 @@ static void emitCloneInto(AstGenCtx &gctx, JirRef srcPtr, JirRef destPtr,
 // emitCloneInto.
 static JirRef tryLowerBuiltinClone(AstGenCtx &gctx, JirRef recvLvaluePtr,
                                    JirRef recvVal, TypeIdx recvTy) {
-	recvTy = resolveGenericIfAny(gctx, recvTy);
+	recvTy = resolveGenericIfAny(gctx.ctx, recvTy);
 	{
 		const TypeKey &k0 = gctx.ctx.getTypePool().get(recvTy);
 		if (k0.kind == TypeKind::ArrayExpr) {
@@ -4663,7 +4862,7 @@ static JirRef tryLowerBuiltinClone(AstGenCtx &gctx, JirRef recvLvaluePtr,
 	}
 
 	// Tier 1: plain data — clone IS the value.
-	if (!typeNeedsDrop(gctx, recvTy)) {
+	if (!typeNeedsDrop(gctx.ctx, recvTy)) {
 		if (recvVal != kNoJirRef) return recvVal;
 		JirInst ld{};
 		ld.tag = JirTag::Load;
@@ -4700,7 +4899,7 @@ static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 	// (Vec(u32) → Vec__u32 etc.). FieldAddr's lowering also needs the
 	// concrete struct in `pointeeTy` so the GEP indices match the LLVM
 	// layout.
-	pointeeTy = resolveGenericIfAny(gctx, pointeeTy);
+	pointeeTy = resolveGenericIfAny(gctx.ctx, pointeeTy);
 	// Fixed-size arrays own their elements: drop each one that needs
 	// it. Arrays have no cfn drop and no fields of their own, so this
 	// is the whole story for them.
@@ -4712,7 +4911,7 @@ static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 		}
 		const TypeKey &rk = gctx.ctx.getTypePool().get(arrTy);
 		if (rk.kind == TypeKind::Array) {
-			if (typeNeedsDrop(gctx, static_cast<TypeIdx>(rk.a))) {
+			if (typeNeedsDrop(gctx.ctx, static_cast<TypeIdx>(rk.a))) {
 				emitArrayElementDrops(gctx, ptrRef, arrTy);
 			}
 			return;
@@ -4727,7 +4926,7 @@ static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 	// call first. Then, regardless of whether the call was emitted,
 	// walk droppable fields — matches Rust's `drop_in_place::<T>`
 	// which always runs Drop::drop (if any) followed by field drops.
-	std::string dropLLVMName = lookupDropFnLLVMName(gctx, pointeeTy);
+	std::string dropLLVMName = lookupDropFnLLVMName(gctx.ctx, pointeeTy);
 	if (!dropLLVMName.empty()) {
 		StringIdx symId = gctx.ctx.getStringPool().intern(dropLLVMName);
 		JirInst drop{};
@@ -5155,7 +5354,7 @@ static bool isDropBearingFieldExtract(AstGenCtx &gctx, NodeIdx exprIdx,
 			// Only locals/params — `Color.Red` and module paths also
 			// parse as MemberAccess on a Variable root.
 			if (gctx.locals.find(root) == gctx.locals.end()) return false;
-			return typeNeedsDrop(gctx, resultTy);
+			return typeNeedsDrop(gctx.ctx, resultTy);
 		}
 		return false;  // Index / Deref / call in the path: pointer world
 	}
@@ -6012,8 +6211,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 		std::string qualified = recvName + "." + methodName;
 		const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
 		if (method == nullptr) {
-			return recoverHere(gctx, "unknown method `" + qualified + "`",
-			                   kNoType);
+			return reportMethodMiss(gctx, qualified);
 		}
 		ParamMode mode =
 		    method->Args.empty() ? ParamMode::Let : method->Args[0].Mode;
@@ -6349,6 +6547,13 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 					std::string qualified = sinfo->name + "." + methodName;
 					const FunctionAST *method =
 					    gctx.ctx.getFunctionAST(qualified);
+					// A withdrawn conditional method replays its
+					// reason here rather than falling through to the
+					// module-handle fallback's confusing error.
+					if (method == nullptr &&
+					    gctx.ctx.getWithdrawnMethod(qualified) != nullptr) {
+						return reportMethodMiss(gctx, qualified);
+					}
 					if (method != nullptr && !method->Args.empty()) {
 						// Dispatch on the full ABI — a `let self:
 						// Self` where Self is byref arrives ByPointer,
@@ -6666,6 +6871,14 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
 			    lk.kind == TypeKind::PtrMany) {
 				elemTy = static_cast<TypeIdx>(lk.a);
 			} else {
+				// A struct base usually means the `v[i]` sugar's `at`
+				// was withdrawn for this instantiation — replay why.
+				if (const auto *sb = gctx.ctx.lookupStruct(baseTy)) {
+					if (gctx.ctx.getWithdrawnMethod(sb->name + ".at") !=
+					    nullptr) {
+						return reportMethodMiss(gctx, sb->name + ".at");
+					}
+				}
 				failHere(gctx,
 				         "astgen: lvalue index on non-array/slice/ptr-many");
 			}
@@ -6839,6 +7052,13 @@ static JirRef astgenExpr(AstGenCtx &gctx, NodeIdx node, TypeIdx expected,
 
 }  // namespace
 
+// Global bridge for the header-declared symbol: the implementation
+// lives in this file's anonymous namespace alongside the rest of the
+// drop machinery.
+bool typeNeedsDrop(JamCodegenContext &ctx, TypeIdx ty) {
+	return typeNeedsDropInner(ctx, ty);
+}
+
 JirFunction astgenMetadata(const FunctionAST &fn, JamCodegenContext &ctx) {
 	(void)ctx;
 	JirFunction jfn;
@@ -6941,11 +7161,11 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 		// before any body local, so emitDrops' reverse walk drops
 		// locals first, params last.
 		if (p.Mode == ParamMode::Move) {
-			std::string dropName = lookupDropFnLLVMName(gctx, pTy);
+			std::string dropName = lookupDropFnLLVMName(gctx.ctx, pTy);
 			if (!dropName.empty()) {
 				gctx.dropScopes.back().push_back(
 				    {p.Name, slotRef, pTy, dropName});
-			} else if (typeNeedsDrop(gctx, pTy)) {
+			} else if (typeNeedsDrop(gctx.ctx, pTy)) {
 				gctx.dropScopes.back().push_back(
 				    {p.Name, slotRef, pTy, std::string()});
 			}

@@ -13,6 +13,7 @@
 #include "decl.h"
 #include "diagnostics.h"
 #include "drop_registry.h"
+#include "init_analysis.h"
 #include "jam_llvm.h"
 #include <map>
 #include <memory>
@@ -192,6 +193,42 @@ class JamCodegenContext {
 		return cloneRegistry_;
 	}
 
+	// Borrowed views of the mode-aware analysis tables, so generic
+	// instantiation can run init_analysis on each method CLONE right
+	// after its body astgens (conditional methods: a clone whose body
+	// fails astgen OR analysis for these type args is withdrawn, and
+	// the reason replays at any call site).
+	void setAnalysisTables(const jam::init_analysis::FunctionRegistry *fns,
+	                       const jam::init_analysis::EnumVariantMap *enums) {
+		analysisFns_ = fns;
+		analysisEnums_ = enums;
+	}
+	const jam::init_analysis::FunctionRegistry *analysisFns() const {
+		return analysisFns_;
+	}
+	const jam::init_analysis::EnumVariantMap *analysisEnums() const {
+		return analysisEnums_;
+	}
+	void setAnalysisHooks(const jam::init_analysis::AnalysisHooks *h) {
+		analysisHooks_ = h;
+	}
+	const jam::init_analysis::AnalysisHooks *analysisHooks() const {
+		return analysisHooks_;
+	}
+
+	// Withdrawn instantiated methods: qualified name
+	// ("Vec__Counter.withCapacity") -> human-readable reason. A call to
+	// a withdrawn method reports "not available for this instantiation"
+	// with the recorded reason instead of a bare "unknown method".
+	void recordWithdrawnMethod(const std::string &name,
+	                           std::string reason) const {
+		withdrawnMethods_[name] = std::move(reason);
+	}
+	const std::string *getWithdrawnMethod(const std::string &name) const {
+		auto it = withdrawnMethods_.find(name);
+		return it == withdrawnMethods_.end() ? nullptr : &it->second;
+	}
+
 	// Global diagnostics collector. Every pass that detects an error
 	// (parser, astgen, init_analysis, jir_verify, generic-instantiation
 	// codegen) pushes here instead of throwing or printing inline; the
@@ -256,6 +293,10 @@ class JamCodegenContext {
 	// drop tracking itself lives in the per-function `AstGenCtx`.
 	const jam::drops::DropRegistry *dropRegistry = nullptr;
 	const jam::drops::CloneRegistry *cloneRegistry_ = nullptr;
+	const jam::init_analysis::FunctionRegistry *analysisFns_ = nullptr;
+	const jam::init_analysis::EnumVariantMap *analysisEnums_ = nullptr;
+	const jam::init_analysis::AnalysisHooks *analysisHooks_ = nullptr;
+	mutable std::unordered_map<std::string, std::string> withdrawnMethods_;
 
 	// Global diagnostics — mutable so const accessors (`diagnostics()`)
 	// can hand out a writable reference. Every push is a side-effect

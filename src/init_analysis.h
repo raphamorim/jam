@@ -71,6 +71,18 @@ using FunctionRegistry = std::unordered_map<std::string, const FunctionAST *>;
 using EnumVariantMap =
     std::unordered_map<std::string, std::unordered_set<std::string>>;
 
+// Callbacks into the codegen context for questions the analyzer can't
+// answer from its own tables (generic instantiation state lives there).
+// typeNeedsDrop powers MATCH-MOVE: matching a drop-bearing enum by
+// value consumes the scrutinee, and the analyzer must agree with
+// codegen about which types that applies to (including generic
+// instantiations like Option(Counter) that the static tables can't
+// classify).
+struct AnalysisHooks {
+	void *ctx = nullptr;
+	bool (*typeNeedsDrop)(void *ctx, TypeIdx ty) = nullptr;
+};
+
 // Run the definite-init analysis on a function body. Returns an empty
 // vector on success; on failure, the vector contains every detected
 // uninit-read with location info.
@@ -98,7 +110,8 @@ std::vector<Diagnostic> analyze(const FunctionAST &fn, const NodeStore &nodes,
                                 const FunctionRegistry *registry = nullptr,
                                 const drops::DropRegistry *drops = nullptr,
                                 const TypePool *types = nullptr,
-                                const EnumVariantMap *enums = nullptr);
+                                const EnumVariantMap *enums = nullptr,
+                                const AnalysisHooks *hooks = nullptr);
 
 }  // namespace init_analysis
 }  // namespace jam

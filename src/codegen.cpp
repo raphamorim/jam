@@ -1342,32 +1342,69 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 			// resolve against that module's namespace. RAII via
 			// try/catch: pop on every exit path.
 			mutCtx.pushBodyModule(definingModulePath_);
-			// `cfn clone` instantiates CONDITIONALLY: a container's
-			// clone exists iff the element type is cloneable (Rust's
-			// `impl<T: Clone> Clone for Vec<T>`). A failed clone body
-			// withdraws its diagnostics and the method is simply not
-			// provided — a later `.clone()` call on this instantiation
-			// reports owns-resources at the call site instead.
+			// CONDITIONAL METHODS: every instantiated method except
+			// `cfn drop` exists only for the type arguments its body
+			// compiles AND analyzes for (Rust's `impl<T: Clone> Clone
+			// for Vec<T>` shape, generalized). A failed body withdraws
+			// its diagnostics, records the reason, and the method is
+			// simply not provided — calling it reports "not available
+			// for this instantiation: <reason>" at the call site.
+			// `cfn drop` stays unconditional: silently withdrawing a
+			// destructor would change ownership semantics.
 			bool conditional =
-			    im.clonePtr->isCfn &&
-			    im.clonePtr->Name.size() >= 6 &&
-			    im.clonePtr->Name.rfind(".clone") ==
-			        im.clonePtr->Name.size() - 6;
+			    !(im.clonePtr->Name.size() >= 5 &&
+			      im.clonePtr->Name.rfind(".drop") ==
+			          im.clonePtr->Name.size() - 5);
 			std::size_t diagMark = mutCtx.diagnostics().size();
+			auto withdraw = [&](const std::string &reason) {
+				mutCtx.diagnostics().truncateTo(diagMark);
+				mutCtx.unregisterFunctionAST(im.clonePtr->Name);
+				mutCtx.recordWithdrawnMethod(im.clonePtr->Name, reason);
+			};
 			try {
 				astgenBodyInto(im.passOneJir, *im.clonePtr, mutCtx);
 			} catch (const AstGenAnalysisFail &) {
 				mutCtx.popBodyModule();
 				clearCurrentSubst();
 				if (conditional) {
-					mutCtx.diagnostics().truncateTo(diagMark);
-					mutCtx.unregisterFunctionAST(im.clonePtr->Name);
+					std::string reason = "does not compile for these "
+					                     "type arguments";
+					const auto &all = mutCtx.diagnostics().all();
+					if (all.size() > diagMark) {
+						reason = all[diagMark].message;
+					}
+					withdraw(reason);
 					continue;
 				}
 				// diagnostic already pushed; trace was attached via
 				// the helper. Continue with the next method so the
 				// user sees every error in this instantiation.
 				continue;
+			}
+			// Body compiled — now run the mode-aware analysis on the
+			// CLONE (substituted param types/modes), so std generic
+			// bodies obey the same move/ownership rules user code does.
+			// Failures withdraw the method the same way.
+			if (mutCtx.analysisFns() != nullptr) {
+				static const std::vector<Token> kNoTokens;
+				auto adiags = jam::init_analysis::analyze(
+				    *im.clonePtr, nodeStore, stringPool, kNoTokens,
+				    mutCtx.analysisFns(), mutCtx.getDropRegistry(),
+				    &typePool, mutCtx.analysisEnums(),
+				    mutCtx.analysisHooks());
+				if (!adiags.empty()) {
+					mutCtx.popBodyModule();
+					clearCurrentSubst();
+					if (conditional) {
+						withdraw(adiags[0].message);
+						continue;
+					}
+					for (auto &d : adiags) {
+						jam::SrcLoc loc{currentFile_, d.line};
+						mutCtx.diagnostics().error(loc, d.message);
+					}
+					continue;
+				}
 			}
 			mutCtx.popBodyModule();
 			auto diags = verifyJirFunction(

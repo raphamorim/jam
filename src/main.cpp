@@ -672,6 +672,95 @@ static int compileAndRun(const std::string &filename,
 		}
 	}
 
+	// Mode-aware analysis tables, built BEFORE any body astgen runs:
+	// generic instantiation analyzes each method clone as it
+	// materializes (conditional methods), so the function registry and
+	// enum-variant table must already exist when the first user body
+	// triggers an instantiation.
+	jam::init_analysis::FunctionRegistry fnRegistry;
+	for (auto &fn : module->Functions) { fnRegistry[fn->Name] = fn.get(); }
+	for (auto &s : module->Structs) {
+		for (auto &m : s->Methods) {
+			fnRegistry[s->Name + "." + m->Name] = m.get();
+		}
+	}
+	for (const auto &kv : resolver.getLoadedModules()) {
+		for (auto &fn : kv.second->Functions) {
+			// Non-pub fns register too: the analysis covers imported
+			// BODIES, and a pub fn's body calls its module's private
+			// helpers — their modes must resolve or moves through them
+			// go unseen. Flat-by-name; private-helper collisions across
+			// modules resolve last-wins.
+			fnRegistry[fn->Name] = fn.get();
+		}
+	}
+	// Methods of generic struct-returning functions register under
+	// "GenericName.method" — modes don't depend on T.
+	auto registerAnonMethods = [&](const ModuleAST *m) {
+		const NodeStore &nsr = codegenCtx.getNodeStore();
+		for (const auto &fn : m->Functions) {
+			if (!fn->isGeneric()) continue;
+			for (NodeIdx stmt : fn->Body) {
+				const AstNode &rn = nsr.get(stmt);
+				if (rn.tag != AstTag::Return) continue;
+				if (rn.lhs == kNoNode) break;
+				const AstNode &value = nsr.get(static_cast<NodeIdx>(rn.lhs));
+				if (value.tag != AstTag::StructExpr) break;
+				uint32_t anonIdx = value.lhs;
+				if (anonIdx >= sharedAnonStructs.size()) break;
+				const StructDeclAST *anon = sharedAnonStructs[anonIdx].get();
+				for (const auto &mth : anon->Methods) {
+					fnRegistry[fn->Name + "." + mth->Name] = mth.get();
+				}
+				break;
+			}
+		}
+	};
+	registerAnonMethods(module.get());
+	for (const auto &kv : resolver.getLoadedModules()) {
+		registerAnonMethods(kv.second.get());
+	}
+	// Enum-variant table: concrete enums by name, generic enum
+	// factories under the factory fn's name.
+	jam::init_analysis::EnumVariantMap enumVariants;
+	auto registerEnumVariants = [&](const ModuleAST *m) {
+		for (const auto &e : m->Enums) {
+			auto &set = enumVariants[e->Name];
+			for (const auto &v : e->Variants) { set.insert(v.Name); }
+		}
+		const NodeStore &nsr = codegenCtx.getNodeStore();
+		for (const auto &fn : m->Functions) {
+			if (!fn->isGeneric()) continue;
+			for (NodeIdx stmt : fn->Body) {
+				const AstNode &rn = nsr.get(stmt);
+				if (rn.tag != AstTag::Return) continue;
+				if (rn.lhs == kNoNode) break;
+				const AstNode &value = nsr.get(static_cast<NodeIdx>(rn.lhs));
+				if (value.tag != AstTag::EnumExpr) break;
+				uint32_t anonIdx = value.lhs;
+				if (anonIdx >= sharedAnonEnums.size()) break;
+				auto &set = enumVariants[fn->Name];
+				for (const auto &v : sharedAnonEnums[anonIdx]->Variants) {
+					set.insert(v.Name);
+				}
+				break;
+			}
+		}
+	};
+	registerEnumVariants(module.get());
+	for (const auto &kv : resolver.getLoadedModules()) {
+		registerEnumVariants(kv.second.get());
+	}
+	codegenCtx.setAnalysisTables(&fnRegistry, &enumVariants);
+	// Match-move oracle: the analyzer asks codegen whether a scrutinee
+	// type owns drops (generic instantiations included).
+	jam::init_analysis::AnalysisHooks analysisHooks;
+	analysisHooks.ctx = &codegenCtx;
+	analysisHooks.typeNeedsDrop = +[](void *c, TypeIdx t) -> bool {
+		return typeNeedsDrop(*static_cast<JamCodegenContext *>(c), t);
+	};
+	codegenCtx.setAnalysisHooks(&analysisHooks);
+
 	// Two-pass codegen: declare every function's prototype first, then
 	// emit bodies. Without this, calling a function defined later in the
 	// file (or another module) would fail with "Unknown function". The
@@ -979,93 +1068,9 @@ static int compileAndRun(const std::string &filename,
 	// before any body is codegen'd. The drop registry was built
 	// earlier (before pass 1d) so the JIR astgen could read it.
 	{
-		jam::init_analysis::FunctionRegistry fnRegistry;
-		for (auto &fn : module->Functions) { fnRegistry[fn->Name] = fn.get(); }
-		for (auto &s : module->Structs) {
-			for (auto &m : s->Methods) {
-				fnRegistry[s->Name + "." + m->Name] = m.get();
-			}
-		}
-		for (const auto &kv : resolver.getLoadedModules()) {
-			for (auto &fn : kv.second->Functions) {
-				// Non-pub fns register too: the analysis sweep now
-				// covers imported BODIES, and a pub fn's body calls its
-				// module's private helpers — their modes must resolve
-				// or moves through them go unseen. Flat-by-name, so a
-				// private-helper name collision across modules resolves
-				// last-wins (acceptable: modes rarely differ for
-				// same-named helpers; a per-module registry is the
-				// precise fix if it ever bites).
-				fnRegistry[fn->Name] = fn.get();
-			}
-		}
-		// Methods of generic struct-returning functions (`pub fn Vec(T:
-		// type) type { return struct { fn push(value: move T) ... }; }`)
-		// register under "GenericName.method". Parameter MODES don't
-		// depend on T, so the un-instantiated FunctionAST is enough for
-		// the mode-aware callsite analysis to see `v.push(c)` as a move.
-		auto registerAnonMethods = [&](const ModuleAST *m) {
-			const NodeStore &nsr = codegenCtx.getNodeStore();
-			for (const auto &fn : m->Functions) {
-				if (!fn->isGeneric()) continue;
-				for (NodeIdx stmt : fn->Body) {
-					const AstNode &rn = nsr.get(stmt);
-					if (rn.tag != AstTag::Return) continue;
-					if (rn.lhs == kNoNode) break;
-					const AstNode &value =
-					    nsr.get(static_cast<NodeIdx>(rn.lhs));
-					if (value.tag != AstTag::StructExpr) break;
-					uint32_t anonIdx = value.lhs;
-					if (anonIdx >= sharedAnonStructs.size()) break;
-					const StructDeclAST *anon =
-					    sharedAnonStructs[anonIdx].get();
-					for (const auto &mth : anon->Methods) {
-						fnRegistry[fn->Name + "." + mth->Name] = mth.get();
-					}
-					break;
-				}
-			}
-		};
-		registerAnonMethods(module.get());
-		for (const auto &kv : resolver.getLoadedModules()) {
-			registerAnonMethods(kv.second.get());
-		}
-
-		// Enum-variant table: concrete enums by name, plus generic
-		// enum factories (`pub fn Option(T: type) type { return enum
-		// {...}; }`) under the factory fn's name. Lets the analyzer
-		// treat `Maybe.Some(c)` / `Option(T).Some(c)` payload args as
-		// the moves they are.
-		jam::init_analysis::EnumVariantMap enumVariants;
-		auto registerEnumVariants = [&](const ModuleAST *m) {
-			for (const auto &e : m->Enums) {
-				auto &set = enumVariants[e->Name];
-				for (const auto &v : e->Variants) { set.insert(v.Name); }
-			}
-			const NodeStore &nsr = codegenCtx.getNodeStore();
-			for (const auto &fn : m->Functions) {
-				if (!fn->isGeneric()) continue;
-				for (NodeIdx stmt : fn->Body) {
-					const AstNode &rn = nsr.get(stmt);
-					if (rn.tag != AstTag::Return) continue;
-					if (rn.lhs == kNoNode) break;
-					const AstNode &value =
-					    nsr.get(static_cast<NodeIdx>(rn.lhs));
-					if (value.tag != AstTag::EnumExpr) break;
-					uint32_t anonIdx = value.lhs;
-					if (anonIdx >= sharedAnonEnums.size()) break;
-					auto &set = enumVariants[fn->Name];
-					for (const auto &v : sharedAnonEnums[anonIdx]->Variants) {
-						set.insert(v.Name);
-					}
-					break;
-				}
-			}
-		};
-		registerEnumVariants(module.get());
-		for (const auto &kv : resolver.getLoadedModules()) {
-			registerEnumVariants(kv.second.get());
-		}
+		// fnRegistry / enumVariants were built before the body passes
+		// (see setAnalysisTables above) — instantiation-time analysis
+		// and this whole-module sweep share the same tables.
 
 		auto runAnalysisIn = [&](FunctionAST *function,
 		                         const std::string &file) {
@@ -1073,7 +1078,7 @@ static int compileAndRun(const std::string &filename,
 			auto diags = jam::init_analysis::analyze(
 			    *function, codegenCtx.getNodeStore(),
 			    codegenCtx.getStringPool(), tokens, &fnRegistry, &dropRegistry,
-			    &codegenCtx.getTypePool(), &enumVariants);
+			    &codegenCtx.getTypePool(), &enumVariants, &analysisHooks);
 			// Funnel each init-analysis diagnostic into the unified
 			// `jam::Diagnostics` channel so they share the same
 			// formatting / ordering as astgen errors.

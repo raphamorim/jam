@@ -754,7 +754,7 @@ fn distance(a: Point, b: Point) f64 {
     return sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
 }
 
-// Exclusive read-write, caller passes `&binding`.
+// Exclusive read-write, declared at the signature only.
 fn scale(p: mut Point, factor: f64) {
     p.x = p.x * factor;
     p.y = p.y * factor;
@@ -766,16 +766,21 @@ fn storeIn(buf: move []u8, db: mut Database) {
 }
 ```
 
-At the call site, a `mut` parameter is passed with `&` to make the borrow explicit:
+Call sites are sigil-free for every mode — the signature's mode declaration does all
+the work, and the argument is always a plain expression:
 
 ```jam
 var p: Point = { x: 3.0, y: 4.0 };
-scale(&p, 2.0);                  // mut borrow, explicit &
-distance(p, otherPoint);          // read-only, no sigil
+scale(p, 2.0);                   // mut access, no sigil
+distance(p, otherPoint);         // read-only, no sigil
 ```
 
-`move` parameters take a plain expression, the binding is dead in the caller after the
-call.
+There is no reference type in jam, so `&` is not a borrow operator: it is address-of,
+producing a `*mut T` / `*const T` pointer value, and is only meaningful where the
+parameter's *type* is a pointer (FFI, sink out-params). Writing `&x` for a mode
+parameter is a compile error.
+
+After a `move` call the binding is dead in the caller; reading it is a compile error.
 
 ## Exclusivity {#mvs-exclusivity}
 
@@ -793,7 +798,7 @@ fn modify(x: mut u32, y: u32) u32 {
 
 fn caller() u32 {
     var n: u32 = 5;
-    return modify(&n, n);   // error: conflicting borrows of `n`
+    return modify(n, n);   // error: conflicting borrows of `n`
 }
 ```
 
@@ -822,3 +827,36 @@ fn readFile(path: []u8) i32 {
 
 A value *moved* into another function (via the `move` mode) becomes uninitialized in
 the caller, so the drop fires at the new owner's scope exit, never twice.
+
+A `move` parameter is owned by the callee: it drops when the function exits, unless
+the body moves it onward — into a container slot, a struct-literal field, another
+`move` call, or a `return`. Binding a bare drop-bearing value to a new name
+(`var owned = c;`) or storing it (`arr[i] = c;`) is likewise a move, never a copy.
+Assigning over a live drop-bearing value (`c = newCounter();`, `h.field = x;`,
+`v[i] = x;`) drops the previous occupant before the store, so overwriting never
+leaks.
+Moving a drop-bearing value out of a `let`/`mut` parameter is rejected — those are
+borrowed, not owned; declare the parameter `move` to take ownership.
+
+Matching a drop-bearing enum by value consumes the scrutinee: arm bindings take
+ownership of the payload (they drop at the arm's end unless moved onward), arms
+that don't bind drop the residual payload on entry, and a temporary scrutinee
+(`match (v.pop())`) is owned by the match itself. Matching a `let`/`mut`
+parameter's enum is rejected — borrowed values can't be consumed; clone the
+scrutinee or take it by `move`.
+
+When both values are genuinely needed, clone explicitly: `x.clone()` is a deep
+copy. Plain data clones for free (it is the value), structs without their own
+`drop` clone field-wise, arrays clone element-wise, and a type that owns
+resources (has `cfn drop`) must define `cfn clone(self: Self) Self` to say how
+its resource duplicates — the compiler can clone structure, never resources.
+Container clones are conditional: `Vec(T).clone()` exists exactly when `T` is
+cloneable. There are no implicit clones.
+
+Drops stay static — jam never inserts runtime drop flags. Two restrictions on
+drop-bearing bindings keep that possible: a move must be unconditional relative to the
+binding's declaration (moving inside an `if` arm, loop body, or `match` arm that does
+not also contain the declaration is rejected with "move it on all control-flow paths
+or none"), and a moved binding cannot be re-assigned — bind a new name instead. Where
+Rust would insert a runtime drop flag for a conditionally-moved value, jam rejects the
+program, the same static resolution Swift's noncopyable types use.

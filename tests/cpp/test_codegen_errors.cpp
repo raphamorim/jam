@@ -303,6 +303,13 @@ class CodegenErrorTests {
 		    testConditionalContainerClone);
 		framework.addTest("Clone - payloaded enum clone fenced",
 		                  testEnumCloneFenced);
+		framework.addTest(
+		    "Conditional - withdrawn method replays reason at call site",
+		    testWithdrawnMethodReplays);
+		framework.addTest("MatchMove - rejections (use-after/borrowed/cond)",
+		                  testMatchMoveRejections);
+		framework.addTest("MatchMove - own-cfn-drop enum edge (E0509 analog)",
+		                  testMatchMoveOwnDropEnum);
 	}
 
   private:
@@ -1279,6 +1286,10 @@ fn main() {}
 		ASSERT_TRUE(stderrContains(r, "owns resources"));
 	}
 
+	// Enum payload clone recurses into the payload's clone tier: a
+	// non-cloneable payload (own cfn drop, no cfn clone) reports
+	// owns-resources at the clone site. (Cloneable payloads deep-clone
+	// — pinned in tests/unit/test_match_move.jam.)
 	static void testEnumCloneFenced() {
 		auto r = compileSource("clone_enum_fenced", movePrelude() + R"(
 const Maybe = enum {
@@ -1292,8 +1303,154 @@ fn bad(sink: *mut u32) {
 fn main() {}
 )");
 		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "owns resources"));
+		ASSERT_TRUE(stderrContains(r, "define `cfn clone"));
+	}
+
+	// Conditional generic methods: a method whose body fails astgen or
+	// the mode-aware analysis for these type args is WITHDRAWN; calling
+	// it replays the recorded reason. Three flavors: the `v[i]` sugar's
+	// `at` (astgen withdrawal: element not cloneable), `get` (same),
+	// and `filled` (ANALYSIS withdrawal: the fill duplicates a borrowed
+	// drop-bearing value).
+	static void testWithdrawnMethodReplays() {
+		std::string prelude = std::string(R"(
+const { Vec } = import("std/collections");
+)") + movePrelude();
+		auto idx = compileSource("cond_at_replay", prelude + R"(
+fn bad(sink: *mut u32) u32 {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 1, sink: sink });
+    return v[0].value;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(idx.exitCode != 0);
 		ASSERT_TRUE(stderrContains(
-		    r, "enums with payloads are not yet cloneable"));
+		    idx, "`Vec__Counter.at` is not available for this instantiation"));
+		ASSERT_TRUE(stderrContains(idx, "owns resources"));
+
+		auto filled = compileSource("cond_filled_replay", prelude + R"(
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    var v: Vec(Counter) = Vec(Counter).filled(c, 3);
+}
+fn main() {}
+)");
+		ASSERT_TRUE(filled.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    filled,
+		    "`Vec__Counter.filled` is not available for this instantiation"));
+		ASSERT_TRUE(stderrContains(filled, "borrowed, not owned"));
+
+		auto get = compileSource("cond_get_replay", prelude + R"(
+fn bad(sink: *mut u32) u32 {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 1, sink: sink });
+    var got = v.get(0);
+    return 0;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(get.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    get,
+		    "`Vec__Counter.get` is not available for this instantiation"));
+	}
+
+	// MATCH-MOVE rejections: matching a drop-bearing enum consumes the
+	// scrutinee, so re-matching is use-after-move, a borrowed (let
+	// param) scrutinee can't be consumed, and a conditional match of an
+	// outer binding violates the depth rule.
+	static void testMatchMoveRejections() {
+		std::string en = movePrelude() + R"(
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+)";
+		auto twice = compileSource("matchmove_twice", en + R"(
+fn bad(sink: *mut u32) u32 {
+    var m: Maybe = Maybe.Some(Counter { value: 1, sink: sink });
+    match (m) { _ { } }
+    match (m) { _ { return 1; } }
+    return 0;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(twice.exitCode != 0);
+		ASSERT_TRUE(stderrContains(twice, "use of moved binding `m`"));
+
+		auto borrowed = compileSource("matchmove_borrowed", en + R"(
+fn bad(m: Maybe) u32 {
+    match (m) { _ { return 1; } }
+    return 0;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(borrowed.exitCode != 0);
+		ASSERT_TRUE(stderrContains(borrowed, "borrowed, not owned"));
+
+		auto cond = compileSource("matchmove_cond", en + R"(
+fn bad(sink: *mut u32, doIt: bool) {
+    var m: Maybe = Maybe.Some(Counter { value: 1, sink: sink });
+    if (doIt) {
+        match (m) { _ { } }
+    }
+}
+fn main() {}
+)");
+		ASSERT_TRUE(cond.exitCode != 0);
+		ASSERT_TRUE(stderrContains(cond, "move it on all control-flow paths"));
+	}
+
+	// Enums with their OWN cfn drop: match-consume applies even when
+	// payload-less (the analyzer/codegen gates must agree — found by
+	// the rustc-comparison fleet), and binding the payload out from
+	// under the enum's own drop is rejected (Rust's E0509).
+	static void testMatchMoveOwnDropEnum() {
+		auto twice = compileSource("matchmove_owndrop_twice", R"(
+extern fn puts(s: *const[] u8) i32;
+const Token = enum {
+    Red,
+    Blue,
+};
+cfn drop(self: mut Token) {
+    puts("D");
+}
+fn bad() u32 {
+    var t: Token = Token.Red();
+    match (t) { _ { } }
+    match (t) { _ { return 1; } }
+    return 0;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(twice.exitCode != 0);
+		ASSERT_TRUE(stderrContains(twice, "use of moved binding `t`"));
+
+		auto bind = compileSource("matchmove_owndrop_bind", R"(
+extern fn puts(s: *const[] u8) i32;
+const Wrapped = enum {
+    None,
+    Some(u32),
+};
+cfn drop(self: mut Wrapped) {
+    puts("D");
+}
+fn bad() u32 {
+    var w: Wrapped = Wrapped.Some(5);
+    match (w) {
+        Wrapped.Some(x) { return x; }
+        _ { return 0; }
+    }
+}
+fn main() {}
+)");
+		ASSERT_TRUE(bind.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    bind, "cannot bind the payload out of an enum that has its "
+		          "own `cfn drop`"));
 	}
 
 	// Call sites are sigil-free for parameter modes; `&` is address-of
