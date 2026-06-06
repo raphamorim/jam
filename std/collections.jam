@@ -103,7 +103,28 @@ pub fn Vec(T: type) type {
             return self.ptr[i];
         }
         cfn setAt(self: mut Self, i: u32, value: T) {
+            // Overwriting a LIVE element drops the previous occupant
+            // first (slots beyond length are uninitialized capacity —
+            // dropping those would read garbage). @dropInPlace is a
+            // no-op for non-drop T, so this costs nothing for plain
+            // element types.
+            if (i < self.length) {
+                @dropInPlace(&self.ptr[i]);
+            }
             self.ptr[i] = value;
+        }
+
+        // Deep copy: a fresh backing buffer with a clone of every
+        // element. `.clone()` on the element is the value itself for
+        // plain T, so Vec(u32).clone() is a straight buffer copy.
+        cfn clone(self: Self) Self {
+            var out: Vec(T) = Vec(T).empty();
+            var i: u32 = 0;
+            while (i < self.length) {
+                out.push(self.ptr[i].clone());
+                i = i + 1;
+            }
+            return out;
         }
 
         // Reset length to zero without releasing the buffer. Lets

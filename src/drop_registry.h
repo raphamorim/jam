@@ -55,6 +55,17 @@ DropRegistry buildDropRegistry(const ModuleAST &module, const TypePool &types,
 void addDropCandidates(DropRegistry &registry, const ModuleAST &module,
                        const TypePool &types, const StringPool &strings);
 
+// Map of struct name -> user-defined `cfn clone(self: T) T`. The clone
+// counterpart of DropRegistry: a type with its own cfn drop must
+// provide a cfn clone to be cloneable (the compiler can clone structure
+// but not resources — see CLONE_PLAN.md). Top-level form mirrors the
+// top-level drop form; in-struct clones also register here so lookup is
+// uniform.
+using CloneRegistry = std::unordered_map<std::string, const FunctionAST *>;
+
+void addCloneCandidates(CloneRegistry &registry, const ModuleAST &module,
+                        const TypePool &types, const StringPool &strings);
+
 }  // namespace drops
 }  // namespace jam
 

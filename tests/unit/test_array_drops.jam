@@ -1,0 +1,123 @@
+// Fixed-size arrays OWN their elements: every drop-bearing element
+// drops exactly once when the array goes out of scope; bare named
+// locals MOVE into array literals (sources suppressed, use-after
+// rejected); repeat literals of drop-bearing values are rejected
+// outright (N owners of one payload). Regression: arrays previously
+// leaked every element.
+
+const { assert } = import("test");
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+const Pair = struct {
+    slots: [2]Counter,
+};
+
+fn arrayOfTemporaries(sink: *mut u32) {
+    var arr: [3]Counter = [
+        Counter { value: 1, sink: sink },
+        Counter { value: 2, sink: sink },
+        Counter { value: 3, sink: sink },
+    ];
+}
+
+tfn arrayElementsDropAtScopeExit() {
+    var hits: u32 = 0;
+    arrayOfTemporaries(&hits);
+    assert(hits, 3);
+}
+
+fn arrayOfNamedLocals(sink: *mut u32) {
+    var c1: Counter = Counter { value: 1, sink: sink };
+    var c2: Counter = Counter { value: 2, sink: sink };
+    var arr: [2]Counter = [c1, c2];
+}
+
+tfn namedLocalsMoveIntoArray() {
+    var hits: u32 = 0;
+    arrayOfNamedLocals(&hits);
+    // sources suppressed, exactly the 2 elements drop
+    assert(hits, 2);
+}
+
+fn arrayInStructField(sink: *mut u32) {
+    var p: Pair = Pair { slots: [
+        Counter { value: 1, sink: sink },
+        Counter { value: 2, sink: sink },
+    ] };
+}
+
+tfn structFieldArrayDropsTransitively() {
+    var hits: u32 = 0;
+    arrayInStructField(&hits);
+    assert(hits, 2);
+}
+
+fn overwriteThenExit(sink: *mut u32) {
+    var arr: [2]Counter = [
+        Counter { value: 1, sink: sink },
+        Counter { value: 2, sink: sink },
+    ];
+    arr[0] = Counter { value: 9, sink: sink };
+}
+
+tfn elementOverwritePlusScopeExit() {
+    var hits: u32 = 0;
+    overwriteThenExit(&hits);
+    // old arr[0] drops at the overwrite; both live elements drop at exit
+    assert(hits, 3);
+}
+
+fn nestedArrays(sink: *mut u32) {
+    var m: [2][1]Counter = [
+        [Counter { value: 1, sink: sink }],
+        [Counter { value: 2, sink: sink }],
+    ];
+}
+
+tfn nestedArrayElementsDrop() {
+    var hits: u32 = 0;
+    nestedArrays(&hits);
+    assert(hits, 2);
+}
+
+fn moveWholeArray(sink: *mut u32) {
+    var arr: [2]Counter = [
+        Counter { value: 1, sink: sink },
+        Counter { value: 2, sink: sink },
+    ];
+    var owned: [2]Counter = arr;
+}
+
+tfn wholeArrayMovesNotCopies() {
+    var hits: u32 = 0;
+    moveWholeArray(&hits);
+    assert(hits, 2);
+}
+
+// An array moved into a move param transfers whole-array ownership:
+// the callee drops the elements at exit, the caller is suppressed.
+fn consumeArr(arr: move [2]Counter) {
+}
+
+fn makeAndMoveArr(sink: *mut u32) {
+    var arr: [2]Counter = [
+        Counter { value: 1, sink: sink },
+        Counter { value: 2, sink: sink },
+    ];
+    consumeArr(arr);
+}
+
+tfn arrayMoveParamDropsInCallee() {
+    var hits: u32 = 0;
+    makeAndMoveArr(&hits);
+    assert(hits, 2);
+}

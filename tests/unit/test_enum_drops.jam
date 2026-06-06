@@ -1,0 +1,98 @@
+// Payloaded enums OWN the live variant payload: tag-dispatched drop
+// glue runs the payload drop exactly once when the enum goes out of
+// scope; bare drop-bearing locals MOVE into variant constructors
+// (use-after and conditional captures rejected). Headline regression:
+// Vec(T).pop() returned the element through Option(T) which never
+// dropped it — push 1, pop 1 used to leak (0 drops), now exactly 1.
+
+const { assert } = import("test");
+const { Vec } = import("std/collections");
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+
+fn holdSomeTemp(sink: *mut u32) {
+    var m: Maybe = Maybe.Some(Counter { value: 1, sink: sink });
+}
+
+tfn enumPayloadDropsAtScopeExit() {
+    var hits: u32 = 0;
+    holdSomeTemp(&hits);
+    assert(hits, 1);
+}
+
+fn holdSomeNamed(sink: *mut u32) {
+    var c: Counter = Counter { value: 2, sink: sink };
+    var m: Maybe = Maybe.Some(c);
+}
+
+tfn namedLocalMovesIntoEnum() {
+    var hits: u32 = 0;
+    holdSomeNamed(&hits);
+    assert(hits, 1);
+}
+
+fn holdNone(sink: *mut u32) {
+    var m: Maybe = Maybe.None();
+    var c: Counter = Counter { value: 3, sink: sink };
+}
+
+tfn noneVariantDropsNothingExtra() {
+    var hits: u32 = 0;
+    holdNone(&hits);
+    assert(hits, 1);
+}
+
+fn pushPopAll(sink: *mut u32) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 1, sink: sink });
+    var popped = v.pop();
+}
+
+tfn poppedElementDropsThroughOption() {
+    var hits: u32 = 0;
+    pushPopAll(&hits);
+    assert(hits, 1);
+}
+
+fn pushTwoPopOne(sink: *mut u32) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 1, sink: sink });
+    v.push(Counter { value: 2, sink: sink });
+    var popped = v.pop();
+}
+
+tfn pushTwoPopOneDropsBoth() {
+    var hits: u32 = 0;
+    pushTwoPopOne(&hits);
+    assert(hits, 2);
+}
+
+fn popMatchRead(sink: *mut u32) u32 {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 7, sink: sink });
+    var popped = v.pop();
+    match (popped) {
+        Option(Counter).Some(c) { return c.value; }
+        _ { return 0; }
+    }
+}
+
+tfn popMatchReadDropsOnce() {
+    var hits: u32 = 0;
+    var got: u32 = popMatchRead(&hits);
+    assert(got, 7);
+    assert(hits, 1);
+}

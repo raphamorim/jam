@@ -184,6 +184,14 @@ class JamCodegenContext {
 		return dropRegistry;
 	}
 
+	// Clone counterpart (CLONE_PLAN.md): struct name -> user cfn clone.
+	void setCloneRegistry(const jam::drops::CloneRegistry *r) {
+		cloneRegistry_ = r;
+	}
+	const jam::drops::CloneRegistry *getCloneRegistry() const {
+		return cloneRegistry_;
+	}
+
 	// Global diagnostics collector. Every pass that detects an error
 	// (parser, astgen, init_analysis, jir_verify, generic-instantiation
 	// codegen) pushes here instead of throwing or printing inline; the
@@ -247,6 +255,7 @@ class JamCodegenContext {
 	// lowered). AstGen consults this to wire drop calls at scope exit;
 	// drop tracking itself lives in the per-function `AstGenCtx`.
 	const jam::drops::DropRegistry *dropRegistry = nullptr;
+	const jam::drops::CloneRegistry *cloneRegistry_ = nullptr;
 
 	// Global diagnostics — mutable so const accessors (`diagnostics()`)
 	// can hand out a writable reference. Every push is a side-effect
@@ -269,6 +278,11 @@ class JamCodegenContext {
 	// declaration; lifetime tied to the parsed module.
   public:
 	void registerFunctionAST(const std::string &name, const FunctionAST *fn);
+	// Withdraw a registration (conditional `cfn clone` instantiation:
+	// a clone whose body doesn't compile for this T is not provided).
+	void unregisterFunctionAST(const std::string &name) {
+		functionAsts.erase(name);
+	}
 	const FunctionAST *getFunctionAST(const std::string &name) const;
 
 	// Push/pop the module path whose body is currently being lowered.

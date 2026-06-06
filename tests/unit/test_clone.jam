@@ -1,0 +1,140 @@
+// Explicit deep copy: x.clone() (see CLONE_PLAN.md). Three tiers
+// mirroring drop: plain data = the value itself; structs without
+// their own cfn drop = synthesized field-wise glue (arrays clone
+// element-wise); types with cfn drop must provide cfn clone
+// (resources cannot be duplicated structurally). Container clones
+// are CONDITIONAL: Vec(T)/Box(T) clone exists iff T is cloneable.
+// Each test asserts exact clone AND drop counts via two sinks.
+
+const { assert } = import("test");
+const { Vec } = import("std/collections");
+const { Box } = import("std/box");
+
+// A resource type that IS cloneable: drop bumps dropSink, clone bumps
+// cloneSink and produces an independent value.
+const Tracked = struct {
+    value: u32,
+    dropSink: *mut u32,
+    cloneSink: *mut u32,
+};
+
+cfn drop(self: mut Tracked) {
+    var p: *mut u32 = self.dropSink;
+    p.* = p.* + 1;
+}
+
+cfn clone(self: Tracked) Tracked {
+    var p: *mut u32 = self.cloneSink;
+    p.* = p.* + 1;
+    return Tracked { value: self.value, dropSink: self.dropSink, cloneSink: self.cloneSink };
+}
+
+const Holder = struct {
+    t: Tracked,
+    n: u32,
+};
+
+tfn tier1PlainClone() {
+    var x: u32 = 41;
+    var y: u32 = x.clone();
+    assert(y, 41);
+}
+
+fn tier3Direct(drops: *mut u32, clones: *mut u32) {
+    var t: Tracked = Tracked { value: 1, dropSink: drops, cloneSink: clones };
+    var u: Tracked = t.clone();
+}
+
+tfn tier3CfnClone() {
+    var drops: u32 = 0;
+    var clones: u32 = 0;
+    tier3Direct(&drops, &clones);
+    assert(clones, 1);
+    assert(drops, 2);
+}
+
+fn tier2Structural(drops: *mut u32, clones: *mut u32) {
+    var h: Holder = Holder { t: Tracked { value: 5, dropSink: drops, cloneSink: clones }, n: 9 };
+    var g: Holder = h.clone();
+    assert(g.n, 9);
+    assert(g.t.value, 5);
+}
+
+tfn tier2FieldwiseGlue() {
+    var drops: u32 = 0;
+    var clones: u32 = 0;
+    tier2Structural(&drops, &clones);
+    assert(clones, 1);
+    assert(drops, 2);
+}
+
+fn arrayElementwise(drops: *mut u32, clones: *mut u32) {
+    var arr: [2]Tracked = [
+        Tracked { value: 1, dropSink: drops, cloneSink: clones },
+        Tracked { value: 2, dropSink: drops, cloneSink: clones },
+    ];
+    var copy: [2]Tracked = arr.clone();
+    assert(copy[1].value, 2);
+}
+
+tfn arrayCloneElementwise() {
+    var drops: u32 = 0;
+    var clones: u32 = 0;
+    arrayElementwise(&drops, &clones);
+    assert(clones, 2);
+    assert(drops, 4);
+}
+
+fn vecDeep(drops: *mut u32, clones: *mut u32) {
+    var v: Vec(Tracked) = Vec(Tracked).empty();
+    v.push(Tracked { value: 7, dropSink: drops, cloneSink: clones });
+    var w: Vec(Tracked) = v.clone();
+    assert(w.len(), 1);
+}
+
+tfn vecCloneDeep() {
+    var drops: u32 = 0;
+    var clones: u32 = 0;
+    vecDeep(&drops, &clones);
+    assert(clones, 1);
+    assert(drops, 2);
+}
+
+fn boxDeep(drops: *mut u32, clones: *mut u32) {
+    var b: Box(Tracked) = Box(Tracked).init(Tracked { value: 3, dropSink: drops, cloneSink: clones });
+    var c: Box(Tracked) = b.clone();
+    assert(c.get().value, 3);
+}
+
+tfn boxCloneDeep() {
+    var drops: u32 = 0;
+    var clones: u32 = 0;
+    boxDeep(&drops, &clones);
+    assert(clones, 1);
+    assert(drops, 2);
+}
+
+tfn vecPlainElemsClone() {
+    var v: Vec(u32) = Vec(u32).empty();
+    v.push(10);
+    v.push(20);
+    var w: Vec(u32) = v.clone();
+    v.push(30);
+    assert(w.len(), 2);
+    assert(v.len(), 3);
+}
+
+fn cloneBeforeMove(drops: *mut u32, clones: *mut u32) {
+    var t: Tracked = Tracked { value: 4, dropSink: drops, cloneSink: clones };
+    var keep: Tracked = t.clone();
+    var b: Box(Tracked) = Box(Tracked).init(t);
+    assert(keep.value, 4);
+}
+
+tfn cloneEscapesTheMove() {
+    var drops: u32 = 0;
+    var clones: u32 = 0;
+    cloneBeforeMove(&drops, &clones);
+    assert(clones, 1);
+    assert(drops, 2);
+}

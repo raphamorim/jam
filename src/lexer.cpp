@@ -52,6 +52,16 @@ void Lexer::skipWhitespace() {
 				while (peek() != '\n' && !isAtEnd()) advance();
 				break;
 			}
+			// `/*` is NOT a comment — jam has only `//` line comments
+			// (same deliberate choice as Zig: greppable, no nesting
+			// rules). Without this check the `/` lexes as divide and the
+			// parser reports a baffling "Expected primary expression".
+			if (peekNext() == '*') {
+				throw std::runtime_error(
+				    "jam has no block comments; use `//` line comments "
+				    "(line " +
+				    std::to_string(line) + ")");
+			}
 			return;
 		default:
 			return;

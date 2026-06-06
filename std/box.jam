@@ -23,10 +23,11 @@ pub fn Box(T: type) type {
     return struct {
         ptr: *mut[] T,
 
-        // Allocate sizeof(T) bytes on the heap and initialize the slot
-        // with `v`. Panics on OOM (matches Vec.empty's libc-aborts-on-NULL
-        // contract — a pluggable allocator can return an error later).
-        fn init(v: T) Self {
+        // Allocate sizeof(T) bytes on the heap and take ownership of
+        // `v`, moving it into the slot. Panics on OOM (matches
+        // Vec.empty's libc-aborts-on-NULL contract — a pluggable
+        // allocator can return an error later).
+        fn init(v: move T) Self {
             const bytes: u64 = @sizeOf(T);
             var raw: *mut[] u8 = malloc(bytes);
             var t: *mut[] T = raw as *mut[] T;
@@ -34,11 +35,20 @@ pub fn Box(T: type) type {
             return Self { ptr: t };
         }
 
+        // Deep copy: a fresh heap slot owning a clone of the value.
+        cfn clone(self: Self) Self {
+            return Box(T).init(self.ptr[0].clone());
+        }
+
         // Read the contained value by copy.
         pub fn get(self: Self) T { return self.ptr[0]; }
 
-        // Overwrite the contained value.
-        pub fn set(self: mut Self, v: T) { self.ptr[0] = v; }
+        // Overwrite the contained value: the previous occupant drops,
+        // the new value moves in.
+        pub fn set(self: mut Self, v: move T) {
+            @dropInPlace(self.ptr);
+            self.ptr[0] = v;
+        }
 
         // Typed pointer borrow — for code that wants to mutate via the
         // pointer (e.g. an FFI fn taking `*mut SDL_AudioSpec`). The Box

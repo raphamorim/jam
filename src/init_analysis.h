@@ -62,6 +62,15 @@ struct Diagnostic {
 // every call site (caller's bindings are unchanged).
 using FunctionRegistry = std::unordered_map<std::string, const FunctionAST *>;
 
+// Enum name -> its variant names. Lets the analyzer recognize variant
+// CONSTRUCTION (`Maybe.Some(c)`, `Option(T).Some(c)`) as an
+// ownership-transferring position: a bare drop-bearing payload arg is a
+// MOVE (codegen consumes its drop track), so the same use-after-move and
+// conditional-move rules must apply. Generic enum factories register
+// under the factory fn's name ("Option" -> variants of its anon enum).
+using EnumVariantMap =
+    std::unordered_map<std::string, std::unordered_set<std::string>>;
+
 // Run the definite-init analysis on a function body. Returns an empty
 // vector on success; on failure, the vector contains every detected
 // uninit-read with location info.
@@ -88,7 +97,8 @@ std::vector<Diagnostic> analyze(const FunctionAST &fn, const NodeStore &nodes,
                                 const std::vector<Token> &tokens,
                                 const FunctionRegistry *registry = nullptr,
                                 const drops::DropRegistry *drops = nullptr,
-                                const TypePool *types = nullptr);
+                                const TypePool *types = nullptr,
+                                const EnumVariantMap *enums = nullptr);
 
 }  // namespace init_analysis
 }  // namespace jam

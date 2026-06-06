@@ -821,6 +821,19 @@ static int compileAndRun(const std::string &filename,
 	}
 	codegenCtx.setDropRegistry(&dropRegistry);
 
+	// Clone counterpart: `cfn clone(self: T) T` per type, top-level and
+	// in-struct forms (CLONE_PLAN.md).
+	jam::drops::CloneRegistry cloneRegistry;
+	jam::drops::addCloneCandidates(cloneRegistry, *module,
+	                               codegenCtx.getTypePool(),
+	                               codegenCtx.getStringPool());
+	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
+		jam::drops::addCloneCandidates(cloneRegistry, *importedModule,
+		                               codegenCtx.getTypePool(),
+		                               codegenCtx.getStringPool());
+	}
+	codegenCtx.setCloneRegistry(&cloneRegistry);
+
 	// Pass 1d: every function (free fns + struct methods + imported
 	// pub fns) is registered. Run AstGen on each so call sites inside
 	// their bodies can resolve every callee — including
@@ -975,7 +988,15 @@ static int compileAndRun(const std::string &filename,
 		}
 		for (const auto &kv : resolver.getLoadedModules()) {
 			for (auto &fn : kv.second->Functions) {
-				if (fn->isPub) { fnRegistry[fn->Name] = fn.get(); }
+				// Non-pub fns register too: the analysis sweep now
+				// covers imported BODIES, and a pub fn's body calls its
+				// module's private helpers — their modes must resolve
+				// or moves through them go unseen. Flat-by-name, so a
+				// private-helper name collision across modules resolves
+				// last-wins (acceptable: modes rarely differ for
+				// same-named helpers; a per-module registry is the
+				// precise fix if it ever bites).
+				fnRegistry[fn->Name] = fn.get();
 			}
 		}
 		// Methods of generic struct-returning functions (`pub fn Vec(T:
@@ -1010,19 +1031,59 @@ static int compileAndRun(const std::string &filename,
 			registerAnonMethods(kv.second.get());
 		}
 
-		auto runAnalysis = [&](FunctionAST *function) {
+		// Enum-variant table: concrete enums by name, plus generic
+		// enum factories (`pub fn Option(T: type) type { return enum
+		// {...}; }`) under the factory fn's name. Lets the analyzer
+		// treat `Maybe.Some(c)` / `Option(T).Some(c)` payload args as
+		// the moves they are.
+		jam::init_analysis::EnumVariantMap enumVariants;
+		auto registerEnumVariants = [&](const ModuleAST *m) {
+			for (const auto &e : m->Enums) {
+				auto &set = enumVariants[e->Name];
+				for (const auto &v : e->Variants) { set.insert(v.Name); }
+			}
+			const NodeStore &nsr = codegenCtx.getNodeStore();
+			for (const auto &fn : m->Functions) {
+				if (!fn->isGeneric()) continue;
+				for (NodeIdx stmt : fn->Body) {
+					const AstNode &rn = nsr.get(stmt);
+					if (rn.tag != AstTag::Return) continue;
+					if (rn.lhs == kNoNode) break;
+					const AstNode &value =
+					    nsr.get(static_cast<NodeIdx>(rn.lhs));
+					if (value.tag != AstTag::EnumExpr) break;
+					uint32_t anonIdx = value.lhs;
+					if (anonIdx >= sharedAnonEnums.size()) break;
+					auto &set = enumVariants[fn->Name];
+					for (const auto &v : sharedAnonEnums[anonIdx]->Variants) {
+						set.insert(v.Name);
+					}
+					break;
+				}
+			}
+		};
+		registerEnumVariants(module.get());
+		for (const auto &kv : resolver.getLoadedModules()) {
+			registerEnumVariants(kv.second.get());
+		}
+
+		auto runAnalysisIn = [&](FunctionAST *function,
+		                         const std::string &file) {
 			if (function->isExtern) return;
 			auto diags = jam::init_analysis::analyze(
 			    *function, codegenCtx.getNodeStore(),
 			    codegenCtx.getStringPool(), tokens, &fnRegistry, &dropRegistry,
-			    &codegenCtx.getTypePool());
+			    &codegenCtx.getTypePool(), &enumVariants);
 			// Funnel each init-analysis diagnostic into the unified
 			// `jam::Diagnostics` channel so they share the same
 			// formatting / ordering as astgen errors.
 			for (auto &d : diags) {
-				jam::SrcLoc loc{filename, d.line};
+				jam::SrcLoc loc{file, d.line};
 				codegenCtx.diagnostics().error(loc, d.message);
 			}
+		};
+		auto runAnalysis = [&](FunctionAST *function) {
+			runAnalysisIn(function, filename);
 		};
 		// Run init / drop analysis on every non-generic main-module
 		// function and struct method. The pipeline registered all of
@@ -1037,6 +1098,26 @@ static int compileAndRun(const std::string &filename,
 		}
 		for (auto &s : module->Structs) {
 			for (auto &m : s->Methods) runAnalysis(m.get());
+		}
+		// Imported modules get the same sweep, with diagnostics
+		// attributed to the DEFINING file (NodeStore's per-node line
+		// table is parse-time-stamped, so lines are already correct).
+		// Generic factory bodies stay skipped here, same as the entry
+		// module — their CLONES are the analyzable artifacts, and
+		// analyzing clones is blocked on std APIs that duplicate
+		// drop-bearing values by design (withCapacity's fill, get/at
+		// copies); see TODO.md #12.
+		for (const auto &kv : resolver.getLoadedModules()) {
+			std::string importedFile = kv.first + ".jam";
+			for (auto &fn : kv.second->Functions) {
+				if (fn->isGeneric()) continue;
+				runAnalysisIn(fn.get(), importedFile);
+			}
+			for (auto &s : kv.second->Structs) {
+				for (auto &m : s->Methods) {
+					runAnalysisIn(m.get(), importedFile);
+				}
+			}
 		}
 		if (codegenCtx.diagnostics().hasErrors()) {
 			progress.error();

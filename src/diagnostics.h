@@ -114,6 +114,16 @@ class Diagnostics {
 	std::size_t errorCount() const;
 	const std::vector<Diagnostic> &all() const { return diags_; }
 
+	// Roll back to a previously observed size. Used by conditional
+	// instantiation (`cfn clone` on a generic container instantiates
+	// only when the element type is cloneable — a failed attempt's
+	// diagnostics are withdrawn and the method is simply not provided,
+	// Rust's `impl<T: Clone> Clone for Vec<T>` shape).
+	std::size_t size() const { return diags_.size(); }
+	void truncateTo(std::size_t n) {
+		if (n < diags_.size()) diags_.resize(n);
+	}
+
 	// Format the report:
 	//     file:line: error: message
 	//         note: ...

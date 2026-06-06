@@ -344,6 +344,7 @@ static void rejectDropBearingFieldExtract(AstGenCtx &gctx, NodeIdx exprIdx,
                                           TypeIdx resultTy, const char *verb);
 static void rejectAddrOfOnModeArg(AstGenCtx &gctx, NodeIdx argIdx,
                                   const Param &p);
+static bool assignTargetIsValueWorld(AstGenCtx &gctx, NodeIdx targetIdx);
 static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
                        const std::vector<JirRef> &argRefs,
                        JirRef destPtr = kNoJirRef);
@@ -1195,6 +1196,18 @@ static void astgenAssign(AstGenCtx &gctx, const AstNode &n) {
 	TypeIdx leafTy = kNoType;
 	JirRef ptrRef = astgenLvalue(gctx, targetIdx, leafTy);
 	JirRef valRef = astgenExpr(gctx, valueIdx, leafTy);
+	// Overwrite drop: storing over a live drop-bearing VALUE-world
+	// destination (whole local, struct field, fixed-array element)
+	// drops the old value first — rustc's assignment semantics.
+	// Pointer-world destinations stay raw stores (see
+	// assignTargetIsValueWorld). Order matches Rust: RHS evaluates
+	// first, old value drops, new value stores. Reassign-after-MOVE is
+	// already rejected by init_analysis, so the destination here is
+	// never a moved-out slot.
+	if (leafTy != kNoType && typeNeedsDrop(gctx, leafTy) &&
+	    assignTargetIsValueWorld(gctx, targetIdx)) {
+		emitDropInPlace(gctx, ptrRef, leafTy);
+	}
 	JirInst store{};
 	store.tag = JirTag::Store;
 	store.a = ptrRef;
@@ -1533,6 +1546,11 @@ static bool astgenExprIntoPtr(AstGenCtx &gctx, NodeIdx exprIdx,
 				st.b = ev;
 				emit(gctx, st);
 			}
+			// Array elements own their values: a bare drop-bearing
+			// local moves in (mirrors the value-path ArrayLit and
+			// struct-literal capture).
+			rejectDropBearingFieldExtract(gctx, eIdx, elemTy, "capture");
+			consumeMovedVariable(gctx, eIdx);
 		}
 		return true;
 	}
@@ -1793,6 +1811,12 @@ static JirRef astgenArrayLit(AstGenCtx &gctx, const AstNode &n,
 	for (uint32_t i = 0; i < count; i++) {
 		NodeIdx e = static_cast<NodeIdx>(ns.getExtra(elemsExtra + 1 + i));
 		elems.push_back(astgenExpr(gctx, e, elemTy));
+		// A bare drop-bearing local used as an array element is a MOVE
+		// — the array owns it now (same rule as struct-literal field
+		// capture). Field extraction has no per-field suppression and
+		// is rejected.
+		rejectDropBearingFieldExtract(gctx, e, elemTy, "capture");
+		consumeMovedVariable(gctx, e);
 	}
 	if (elemTy == kNoType && !elems.empty()) {
 		elemTy = gctx.jfn.getInst(elems[0]).ty;
@@ -1882,6 +1906,16 @@ static JirRef astgenArrayRepeat(AstGenCtx &gctx, const AstNode &n,
 	if (arrTy == kNoType) {
 		arrTy = gctx.ctx.getTypePool().intern(TypeKey{
 		    TypeKind::Array, 0, 0, elemTy, static_cast<uint32_t>(count)});
+	}
+	// A repeat literal duplicates ONE value into N slots — for a
+	// drop-bearing element type that is N owners of one payload, every
+	// extra copy a future double-free. rustc requires `T: Copy` for
+	// `[x; N]`; jam rejects until explicit clone() lands.
+	if (typeNeedsDrop(gctx, elemTy)) {
+		failHere(gctx,
+		         "repeat literal would create " + std::to_string(count) +
+		             " owners of one drop-bearing value; initialize each "
+		             "element explicitly");
 	}
 
 	// Zig-style fill: a constant byte fill (especially `[0; N]`)
@@ -2874,7 +2908,22 @@ static void astgenFor(AstGenCtx &gctx, const AstNode &n) {
 	uint32_t bodyCount = ns.getExtra(extra + 3);
 	const std::string &varName = gctx.ctx.getStringPool().get(varNameId);
 
-	JirRef startRef = astgenExpr(gctx, startIdx, kNoType);
+	// Peek a bare-Variable end bound's declared type and use it as the
+	// start expression's hint: `for i in 0:n` adopts n's exact type
+	// (width AND signedness) for the induction var. Complex end
+	// expressions fall back to the start's own type plus the width
+	// reconciliation at the comparison below.
+	TypeIdx startHint = kNoType;
+	{
+		const AstNode &en = ns.get(endIdx);
+		if (en.tag == AstTag::Variable) {
+			const std::string &endName =
+			    gctx.ctx.getStringPool().get(static_cast<StringIdx>(en.lhs));
+			auto it = gctx.localTypes.find(endName);
+			if (it != gctx.localTypes.end()) { startHint = it->second; }
+		}
+	}
+	JirRef startRef = astgenExpr(gctx, startIdx, startHint);
 	TypeIdx idxTy = gctx.jfn.getInst(startRef).ty;
 
 	// Allocate the loop-var slot and store the start value.
@@ -2906,6 +2955,33 @@ static void astgenFor(AstGenCtx &gctx, const AstNode &n) {
 	// Pick signed-or-unsigned comparison from the induction var's type.
 	const TypeKey &ik = gctx.ctx.getTypePool().get(idxTy);
 	bool isSigned = ik.kind == TypeKind::Int && ik.b != 0;
+	// `for i in 0:n` with a VARIABLE bound: the induction var's type
+	// comes from the start expression while a non-literal end keeps its
+	// own width (the expected-type hint only narrows literals). Widen
+	// the narrower side so the comparison is well-typed — same shape as
+	// astgenAssertCall's width reconciliation.
+	TypeIdx endTy = gctx.jfn.getInst(endRef).ty;
+	if (endTy != idxTy) {
+		const TypeKey &ek = gctx.ctx.getTypePool().get(endTy);
+		if (ik.kind == TypeKind::Int && ek.kind == TypeKind::Int &&
+		    ik.b == ek.b) {
+			JirInst ext{};
+			ext.tag = isSigned ? JirTag::SExt : JirTag::ZExt;
+			if (ik.a > ek.a) {
+				ext.a = endRef;
+				ext.ty = idxTy;
+				endRef = emit(gctx, ext);
+			} else {
+				ext.a = loadIdx;
+				ext.ty = endTy;
+				loadIdx = emit(gctx, ext);
+			}
+		} else {
+			failHere(gctx,
+			         "for-range bounds have mismatched types; cast one "
+			         "side with `as` so both bounds agree");
+		}
+	}
 	JirInst cmp{};
 	cmp.tag = isSigned ? JirTag::ICmpSlt : JirTag::ICmpUlt;
 	cmp.a = loadIdx;
@@ -3858,6 +3934,11 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n,
 				payStore.a = payPtr;
 				payStore.b = payloadVal;
 				emit(gctx, payStore);
+				// Enum payload capture is a MOVE: the enum owns the
+				// value now (its tag-dispatched drop glue runs it).
+				rejectDropBearingFieldExtract(gctx, argIdx0, fieldTy,
+				                              "capture");
+				consumeMovedVariable(gctx, argIdx0);
 			}
 
 			JirInst load{};
@@ -3957,6 +4038,25 @@ static bool typeNeedsDrop(AstGenCtx &gctx, TypeIdx ty) {
 	ty = resolveGenericIfAny(gctx, ty);
 	if (!lookupDropFnLLVMName(gctx, ty).empty()) return true;
 	const TypeKey &tk = gctx.ctx.getTypePool().get(ty);
+	// A fixed-size array owns its elements: it needs drop iff the
+	// element type does. (Deferred `[expr]T` sizes resolve first so
+	// field types annotated with const lengths classify correctly.)
+	if (tk.kind == TypeKind::ArrayExpr) {
+		return typeNeedsDrop(gctx, gctx.ctx.resolveArrayExpr(ty));
+	}
+	if (tk.kind == TypeKind::Array) {
+		return typeNeedsDrop(gctx, static_cast<TypeIdx>(tk.a));
+	}
+	// A payloaded enum owns whichever variant payload is live: it needs
+	// drop iff ANY variant carries a payload type that does.
+	if (const auto *einfo = gctx.ctx.lookupEnum(ty)) {
+		for (const auto &v : einfo->variants) {
+			for (TypeIdx pt : v.payloadTypes) {
+				if (typeNeedsDrop(gctx, pt)) return true;
+			}
+		}
+		return false;
+	}
 	if (tk.kind != TypeKind::Struct && tk.kind != TypeKind::Named) {
 		return false;
 	}
@@ -3968,6 +4068,66 @@ static bool typeNeedsDrop(AstGenCtx &gctx, TypeIdx ty) {
 		if (typeNeedsDrop(gctx, f.second)) return true;
 	}
 	return false;
+}
+
+// True when an assignment target is an lvalue path rooted at a
+// local/param where every step stays in the VALUE world: struct/union
+// fields and fixed-array elements. Pointer-typed segments (`p.*`,
+// `self.ptr[i]`, slice indexing) are raw memory — Vec.push writes
+// uninitialized capacity slots through them, so auto-dropping the
+// "old" bytes there would drop garbage (the same reason Rust assigns
+// through `ptr::write` in container internals). Value-world
+// destinations are definitely initialized (every jam binding
+// initializes at declaration), so dropping the overwritten value is
+// always sound.
+static bool assignTargetIsValueWorld(AstGenCtx &gctx, NodeIdx targetIdx) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	// Collect the projection steps leaf->root, then type-check them
+	// root->leaf so each Index can be classified Array-vs-pointer.
+	std::vector<const AstNode *> steps;
+	NodeIdx cur = targetIdx;
+	const AstNode *root = nullptr;
+	while (cur != kNoNode) {
+		const AstNode &nd = ns.get(cur);
+		if (nd.tag == AstTag::Variable) {
+			root = &nd;
+			break;
+		}
+		if (nd.tag == AstTag::MemberAccess || nd.tag == AstTag::Index) {
+			steps.push_back(&nd);
+			cur = static_cast<NodeIdx>(nd.lhs);
+			continue;
+		}
+		return false;  // Deref or any other shape: pointer world
+	}
+	if (root == nullptr) return false;
+	const std::string &rootName =
+	    gctx.ctx.getStringPool().get(static_cast<StringIdx>(root->lhs));
+	auto it = gctx.localTypes.find(rootName);
+	if (it == gctx.localTypes.end()) return false;
+	TypeIdx curTy = it->second;
+	for (auto rit = steps.rbegin(); rit != steps.rend(); ++rit) {
+		curTy = resolveGenericIfAny(gctx, curTy);
+		const TypeKey &k = gctx.ctx.getTypePool().get(curTy);
+		if ((*rit)->tag == AstTag::Index) {
+			if (k.kind != TypeKind::Array) return false;
+			curTy = static_cast<TypeIdx>(k.a);
+			continue;
+		}
+		// MemberAccess: resolve the field's type through the struct
+		// registry; unions and anything unresolvable bail conservative.
+		if (k.kind != TypeKind::Struct && k.kind != TypeKind::Named) {
+			return false;
+		}
+		const auto *sinfo = gctx.ctx.lookupStruct(curTy);
+		if (sinfo == nullptr) return false;
+		const std::string &member = gctx.ctx.getStringPool().get(
+		    static_cast<StringIdx>((*rit)->rhs));
+		int fidx = gctx.ctx.getFieldIndex(sinfo->name, member);
+		if (fidx < 0) return false;
+		curTy = sinfo->fields[static_cast<size_t>(fidx)].second;
+	}
+	return true;
 }
 
 // Synthesize a Rust-style `drop_in_place::<T>(*T)` call sequence at `ptrRef`
@@ -4157,6 +4317,383 @@ static bool emitContainerElementDrops(AstGenCtx &gctx, JirRef ptrRef,
 	return true;
 }
 
+// Per-element drop loop for a fixed-size array at `ptrRef`. Same loop
+// shape as emitContainerElementDrops, but the count is the compile-time
+// array length and the base is the array storage itself. Elements drop
+// in index order (0..N).
+static void emitArrayElementDrops(AstGenCtx &gctx, JirRef ptrRef,
+                                  TypeIdx arrTy) {
+	const TypeKey &ak = gctx.ctx.getTypePool().get(arrTy);
+	TypeIdx elemTy = static_cast<TypeIdx>(ak.a);
+	uint32_t count = ak.b;
+	if (count == 0) return;
+
+	TypeIdx countTy = BuiltinType::U64;
+	JirInst countI{};
+	countI.tag = JirTag::Int;
+	countI.a = count;
+	countI.ty = countTy;
+	JirRef countRef = emit(gctx, countI);
+
+	// i = 0
+	JirInst alloca{};
+	alloca.tag = JirTag::Alloca;
+	alloca.ty = countTy;
+	JirRef slot = emitAllocaHoisted(gctx, alloca);
+	JirInst zero{};
+	zero.tag = JirTag::Int;
+	zero.a = 0;
+	zero.ty = countTy;
+	JirRef zeroRef = emit(gctx, zero);
+	JirInst st0{};
+	st0.tag = JirTag::Store;
+	st0.a = slot;
+	st0.b = zeroRef;
+	emit(gctx, st0);
+
+	JirBlockRef condB = gctx.jfn.pushBlock("adropcond");
+	JirBlockRef bodyB = gctx.jfn.pushBlock("adropbody");
+	JirBlockRef exitB = gctx.jfn.pushBlock("adropexit");
+	emitBr(gctx, condB);
+
+	gctx.currentBlock = condB;
+	JirInst li{};
+	li.tag = JirTag::Load;
+	li.a = slot;
+	li.ty = countTy;
+	JirRef iVal = emit(gctx, li);
+	JirInst cmp{};
+	cmp.tag = JirTag::ICmpUlt;
+	cmp.a = iVal;
+	cmp.b = countRef;
+	cmp.ty = BuiltinType::Bool;
+	JirRef cmpRef = emit(gctx, cmp);
+	emitCondBr(gctx, cmpRef, bodyB, exitB);
+
+	gctx.currentBlock = bodyB;
+	JirInst lib{};
+	lib.tag = JirTag::Load;
+	lib.a = slot;
+	lib.ty = countTy;
+	JirRef iBody = emit(gctx, lib);
+	TypeIdx elemPtrTy = gctx.ctx.getTypePool().intern(
+	    TypeKey{TypeKind::PtrSingle, 0, 0, elemTy, 0});
+	JirInst ia{};
+	ia.tag = JirTag::IndexAddr;
+	ia.a = ptrRef;
+	ia.b = iBody;
+	ia.ty = elemPtrTy;
+	JirRef elemPtr = emit(gctx, ia);
+	emitDropInPlace(gctx, elemPtr, elemTy);
+	JirInst li2{};
+	li2.tag = JirTag::Load;
+	li2.a = slot;
+	li2.ty = countTy;
+	JirRef cur = emit(gctx, li2);
+	JirInst one{};
+	one.tag = JirTag::Int;
+	one.a = 1;
+	one.ty = countTy;
+	JirRef oneRef = emit(gctx, one);
+	JirInst inc{};
+	inc.tag = JirTag::Add;
+	inc.a = cur;
+	inc.b = oneRef;
+	inc.ty = countTy;
+	JirRef next = emit(gctx, inc);
+	JirInst st1{};
+	st1.tag = JirTag::Store;
+	st1.a = slot;
+	st1.b = next;
+	emit(gctx, st1);
+	emitBr(gctx, condB);
+
+	gctx.currentBlock = exitB;
+}
+
+// Tag-dispatched payload drops for a payloaded enum at `ptrRef`. Loads
+// the discriminant (struct field 0) and, for each variant whose payload
+// needs dropping, branches to a block that drops each payload field at
+// its byte offset within the payload area (field 1) — the SAME
+// offset computation the variant constructors use (align each field to
+// its own alignment, advance by its size), so construction and
+// destruction can never disagree about where a payload lives.
+static void emitEnumPayloadDrops(AstGenCtx &gctx, JirRef ptrRef,
+                                 const JamCodegenContext::EnumInfo *einfo) {
+	TypeIdx u8PtrTy = gctx.ctx.getTypePool().intern(
+	    TypeKey{TypeKind::PtrSingle, 0, 0, BuiltinType::U8, 0});
+
+	// tag = load (u8*)&self.field0
+	JirInst tagFA{};
+	tagFA.tag = JirTag::FieldAddr;
+	tagFA.a = ptrRef;
+	tagFA.b = 0;
+	tagFA.ty = u8PtrTy;
+	JirRef tagPtr = emit(gctx, tagFA);
+	JirInst tagLd{};
+	tagLd.tag = JirTag::Load;
+	tagLd.a = tagPtr;
+	tagLd.ty = BuiltinType::U8;
+	JirRef tagVal = emit(gctx, tagLd);
+
+	for (const auto &v : einfo->variants) {
+		bool anyDrop = false;
+		for (TypeIdx pt : v.payloadTypes) {
+			if (typeNeedsDrop(gctx, pt)) {
+				anyDrop = true;
+				break;
+			}
+		}
+		if (!anyDrop) continue;
+
+		JirBlockRef dropB = gctx.jfn.pushBlock("edrop");
+		JirBlockRef contB = gctx.jfn.pushBlock("edropcont");
+		JirInst disc{};
+		disc.tag = JirTag::Int;
+		disc.a = static_cast<uint32_t>(v.discriminant);
+		disc.ty = BuiltinType::U8;
+		JirRef discRef = emit(gctx, disc);
+		JirInst cmp{};
+		cmp.tag = JirTag::ICmpEq;
+		cmp.a = tagVal;
+		cmp.b = discRef;
+		cmp.ty = BuiltinType::Bool;
+		JirRef cmpRef = emit(gctx, cmp);
+		emitCondBr(gctx, cmpRef, dropB, contB);
+
+		gctx.currentBlock = dropB;
+		JirInst payFA{};
+		payFA.tag = JirTag::FieldAddr;
+		payFA.a = ptrRef;
+		payFA.b = 1;
+		payFA.ty = u8PtrTy;
+		JirRef payArea = emit(gctx, payFA);
+		uint64_t off = 0;
+		for (TypeIdx pt : v.payloadTypes) {
+			uint64_t s = gctx.ctx.typeSize(pt);
+			uint64_t a = gctx.ctx.typeAlign(pt);
+			off = (off + a - 1) / a * a;
+			if (typeNeedsDrop(gctx, pt)) {
+				JirInst offC{};
+				offC.tag = JirTag::Int;
+				offC.a = static_cast<uint32_t>(off);
+				offC.ty = BuiltinType::U64;
+				JirRef offRef = emit(gctx, offC);
+				JirInst gep{};
+				gep.tag = JirTag::IndexAddr;
+				gep.a = payArea;
+				gep.b = offRef;
+				gep.ty = u8PtrTy;  // *u8 -> byte stride
+				JirRef fieldPtr = emit(gctx, gep);
+				emitDropInPlace(gctx, fieldPtr, pt);
+			}
+			off += s;
+		}
+		emitBr(gctx, contB);
+		gctx.currentBlock = contB;
+	}
+}
+
+// Deep-copy the value at `srcPtr` into `destPtr` (see CLONE_PLAN.md).
+// Three tiers, mirroring the drop tiers:
+//   - plain data (no drops anywhere): whole-value load+store.
+//   - type with its OWN `cfn clone`: call it, store the result.
+//   - struct with drop-bearing fields but no own cfn drop: recurse per
+//     field; fixed-size arrays clone element-wise.
+// A type with its own `cfn drop` but NO `cfn clone` is an error — the
+// compiler can clone structure but cannot guess how to duplicate a
+// resource (dup the fd? malloc+memcpy?). Same conclusion as Rust
+// (derive(Clone) is useless past owned resources) and Hylo (`Copyable`
+// conformance with explicit .copy()).
+static void emitCloneInto(AstGenCtx &gctx, JirRef srcPtr, JirRef destPtr,
+                          TypeIdx ty) {
+	ty = resolveGenericIfAny(gctx, ty);
+	{
+		const TypeKey &k0 = gctx.ctx.getTypePool().get(ty);
+		if (k0.kind == TypeKind::ArrayExpr) {
+			ty = gctx.ctx.resolveArrayExpr(ty);
+		}
+	}
+
+	// Plain data: bitwise copy is a true value copy.
+	if (!typeNeedsDrop(gctx, ty)) {
+		JirInst ld{};
+		ld.tag = JirTag::Load;
+		ld.a = srcPtr;
+		ld.ty = ty;
+		JirRef v = emit(gctx, ld);
+		JirInst st{};
+		st.tag = JirTag::Store;
+		st.a = destPtr;
+		st.b = v;
+		emit(gctx, st);
+		return;
+	}
+
+	const TypeKey &k = gctx.ctx.getTypePool().get(ty);
+
+	// Fixed-size array: clone element-wise (same loop shape as
+	// emitArrayElementDrops, with paired src/dest element pointers).
+	if (k.kind == TypeKind::Array) {
+		TypeIdx elemTy = static_cast<TypeIdx>(k.a);
+		TypeIdx elemPtrTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::PtrSingle, 0, 0, elemTy, 0});
+		for (uint32_t i = 0; i < k.b; i++) {
+			JirInst idxI{};
+			idxI.tag = JirTag::Int;
+			idxI.a = i;
+			idxI.ty = BuiltinType::U64;
+			JirRef idxRef = emit(gctx, idxI);
+			JirInst sa{};
+			sa.tag = JirTag::IndexAddr;
+			sa.a = srcPtr;
+			sa.b = idxRef;
+			sa.ty = elemPtrTy;
+			JirRef se = emit(gctx, sa);
+			JirInst da{};
+			da.tag = JirTag::IndexAddr;
+			da.a = destPtr;
+			da.b = idxRef;
+			da.ty = elemPtrTy;
+			JirRef de = emit(gctx, da);
+			emitCloneInto(gctx, se, de, elemTy);
+		}
+		return;
+	}
+
+	// Enums: payload clone glue needs tag dispatch — fenced until the
+	// match-move milestone (the payloads only just learned to DROP).
+	if (const auto *einfo = gctx.ctx.lookupEnum(ty)) {
+		if (einfo->hasPayloadVariant) {
+			failHere(gctx, "enums with payloads are not yet cloneable");
+		}
+		// payload-less enums are plain data; unreachable (needsDrop
+		// false), but keep the shape total.
+		return;
+	}
+
+	const auto *sinfo = gctx.ctx.lookupStruct(ty);
+	if (sinfo == nullptr) {
+		failHere(gctx, "cannot clone this type — no structural clone "
+		               "is available for it");
+	}
+
+	// Tier 3: the type's own cfn clone — in-struct form registers as
+	// "Name.clone"; the top-level `cfn clone(self: T) T` form lives in
+	// the CloneRegistry (mirror of how drop is found).
+	const FunctionAST *cloneFn =
+	    gctx.ctx.getFunctionAST(sinfo->name + ".clone");
+	if (cloneFn == nullptr) {
+		if (const auto *cr = gctx.ctx.getCloneRegistry()) {
+			auto it = cr->find(sinfo->name);
+			if (it != cr->end()) cloneFn = it->second;
+		}
+	}
+	if (cloneFn != nullptr) {
+		std::vector<JirRef> args;
+		args.push_back(srcPtr);  // let-mode self on a byref aggregate
+		JirRef result = emitCall(gctx, cloneFn, args);
+		JirInst st{};
+		st.tag = JirTag::Store;
+		st.a = destPtr;
+		st.b = result;
+		emit(gctx, st);
+		return;
+	}
+
+	// Error tier: owns a resource (its own cfn drop), no clone recipe.
+	if (!lookupDropFnLLVMName(gctx, ty).empty()) {
+		failHere(gctx, "`" + sinfo->name +
+		                   "` owns resources (it has `cfn drop`); define "
+		                   "`cfn clone(self: Self) Self` to make it "
+		                   "cloneable");
+	}
+
+	// Tier 2: field-wise structural clone.
+	for (size_t i = 0; i < sinfo->fields.size(); i++) {
+		TypeIdx fieldTy =
+		    resolveGenericIfAny(gctx, sinfo->fields[i].second);
+		TypeIdx fieldPtrTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::PtrSingle, 0, 0, fieldTy, 0});
+		JirInst sfa{};
+		sfa.tag = JirTag::FieldAddr;
+		sfa.a = srcPtr;
+		sfa.b = static_cast<uint32_t>(i);
+		sfa.ty = fieldPtrTy;
+		JirRef sf = emit(gctx, sfa);
+		JirInst dfa{};
+		dfa.tag = JirTag::FieldAddr;
+		dfa.a = destPtr;
+		dfa.b = static_cast<uint32_t>(i);
+		dfa.ty = fieldPtrTy;
+		JirRef df = emit(gctx, dfa);
+		emitCloneInto(gctx, sf, df, fieldTy);
+	}
+}
+
+// Built-in `recv.clone()` lowering for receivers WITHOUT a user cfn
+// clone. Returns kNoJirRef when a user clone method exists (the caller
+// proceeds with ordinary method dispatch — tier 3). Otherwise lowers
+// tier 1 (plain data: the value itself) or tier 2 (structural glue into
+// a fresh slot), or rejects (owns-resources / fenced types) inside
+// emitCloneInto.
+static JirRef tryLowerBuiltinClone(AstGenCtx &gctx, JirRef recvLvaluePtr,
+                                   JirRef recvVal, TypeIdx recvTy) {
+	recvTy = resolveGenericIfAny(gctx, recvTy);
+	{
+		const TypeKey &k0 = gctx.ctx.getTypePool().get(recvTy);
+		if (k0.kind == TypeKind::ArrayExpr) {
+			recvTy = gctx.ctx.resolveArrayExpr(recvTy);
+		}
+	}
+
+	// An in-struct user cfn clone wins — ordinary dispatch handles it.
+	// (Top-level cfn clones aren't dispatchable as "Name.clone" method
+	// calls, so those route through emitCloneInto's registry lookup.)
+	if (const auto *sinfo = gctx.ctx.lookupStruct(recvTy)) {
+		if (gctx.ctx.getFunctionAST(sinfo->name + ".clone") != nullptr) {
+			return kNoJirRef;
+		}
+		// Top-level form: lower as glue (emitCloneInto calls it).
+		if (const auto *cr = gctx.ctx.getCloneRegistry()) {
+			if (cr->find(sinfo->name) != cr->end()) {
+				// fall through to the glue path below
+			}
+		}
+	}
+
+	// Tier 1: plain data — clone IS the value.
+	if (!typeNeedsDrop(gctx, recvTy)) {
+		if (recvVal != kNoJirRef) return recvVal;
+		JirInst ld{};
+		ld.tag = JirTag::Load;
+		ld.a = recvLvaluePtr;
+		ld.ty = recvTy;
+		return emit(gctx, ld);
+	}
+
+	// Tier 2 / error tiers: glue into a fresh slot. Need a stable
+	// source pointer; spill a value-form receiver first.
+	JirRef srcPtr = recvLvaluePtr;
+	if (srcPtr == kNoJirRef) {
+		JirInst sp{};
+		sp.tag = JirTag::Alloca;
+		sp.ty = recvTy;
+		srcPtr = emitAllocaHoisted(gctx, sp);
+		JirInst st{};
+		st.tag = JirTag::Store;
+		st.a = srcPtr;
+		st.b = recvVal;
+		emit(gctx, st);
+	}
+	JirInst da{};
+	da.tag = JirTag::Alloca;
+	da.ty = recvTy;
+	JirRef destPtr = emitAllocaHoisted(gctx, da);
+	emitCloneInto(gctx, srcPtr, destPtr, recvTy);
+	return destPtr;
+}
+
 static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 	// Resolve a generic-call type to its concrete instantiation so the
 	// shape check + cfn-drop lookup operate on the right TypeIdx
@@ -4164,6 +4701,23 @@ static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 	// concrete struct in `pointeeTy` so the GEP indices match the LLVM
 	// layout.
 	pointeeTy = resolveGenericIfAny(gctx, pointeeTy);
+	// Fixed-size arrays own their elements: drop each one that needs
+	// it. Arrays have no cfn drop and no fields of their own, so this
+	// is the whole story for them.
+	{
+		const TypeKey &pk = gctx.ctx.getTypePool().get(pointeeTy);
+		TypeIdx arrTy = pointeeTy;
+		if (pk.kind == TypeKind::ArrayExpr) {
+			arrTy = gctx.ctx.resolveArrayExpr(pointeeTy);
+		}
+		const TypeKey &rk = gctx.ctx.getTypePool().get(arrTy);
+		if (rk.kind == TypeKind::Array) {
+			if (typeNeedsDrop(gctx, static_cast<TypeIdx>(rk.a))) {
+				emitArrayElementDrops(gctx, ptrRef, arrTy);
+			}
+			return;
+		}
+	}
 	// Contiguous owning containers (a `cfn len` + a single data pointer)
 	// synthesize their element destructors here, BEFORE the container's own
 	// drop frees the backing — elements must die while their storage lives.
@@ -4184,6 +4738,14 @@ static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 		emit(gctx, drop);
 	}
 	emitFieldDrops(gctx, ptrRef, pointeeTy);
+	// Payloaded enums own the live variant's payload: tag-dispatched
+	// payload drops run after any user drop (mirroring the
+	// Drop::drop-then-fields order structs get).
+	if (const auto *einfo = gctx.ctx.lookupEnum(pointeeTy)) {
+		if (einfo->hasPayloadVariant) {
+			emitEnumPayloadDrops(gctx, ptrRef, einfo);
+		}
+	}
 }
 
 // AstGen for `AtCall` — comptime intrinsic (`@sizeOf(T)` / `@alignOf(T)`).
@@ -4607,8 +5169,8 @@ static void rejectDropBearingFieldExtract(AstGenCtx &gctx, NodeIdx exprIdx,
 	         std::string("cannot ") + verb +
 	             " a drop-bearing field out of its aggregate — ownership "
 	             "is tracked per whole binding, so the field and the "
-	             "aggregate's drop would both run; move the whole value "
-	             "or restructure");
+	             "aggregate's drop would both run; clone the field out "
+	             "(`.clone()`) or move the whole value");
 }
 
 // Callsites are sigil-free for parameter modes: `mut` / `move` access
@@ -5425,6 +5987,17 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 			}
 		}
 
+		// Built-in `recv.clone()` — explicit deep copy (CLONE_PLAN.md).
+		// Works on EVERY type: plain data is the value itself, structs
+		// without their own cfn clone get structural glue, arrays clone
+		// element-wise. A user cfn clone returns kNoJirRef here and
+		// dispatches as an ordinary method below.
+		if (methodName == "clone" && argCount == 0) {
+			JirRef cloned =
+			    tryLowerBuiltinClone(gctx, recvLvaluePtr, recvVal, recvTy);
+			if (cloned != kNoJirRef) return cloned;
+		}
+
 		// Resolve to a struct name (generic instantiation happens here
 		// as a side effect of lookupStruct).
 		std::string recvName;
@@ -5659,6 +6232,12 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 							NodeIdx argIdxN = static_cast<NodeIdx>(
 							    ns.getExtra(argsExtra + 1 + i));
 							JirRef payVal = astgenExpr(gctx, argIdxN, fieldTy);
+							// Enum payload capture is a MOVE — the enum
+							// owns the value (see the TypeMethodCall
+							// constructor for the same rule).
+							rejectDropBearingFieldExtract(
+							    gctx, argIdxN, fieldTy, "capture");
+							consumeMovedVariable(gctx, argIdxN);
 							JirInst gepInst{};
 							gepInst.tag = JirTag::IndexAddr;
 							gepInst.a = payAreaPtr;
@@ -5721,6 +6300,16 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 			if (it != gctx.locals.end()) {
 				std::string instName = prefix;
 				TypeIdx instTy = gctx.localTypes[instName];
+				// Built-in `local.clone()` — explicit deep copy
+				// (CLONE_PLAN.md). Handles plain data (the value
+				// itself), structural glue, and element-wise arrays; a
+				// user cfn clone returns kNoJirRef and dispatches as an
+				// ordinary method below.
+				if (methodName == "clone" && argCount == 0) {
+					JirRef cloned = tryLowerBuiltinClone(
+					    gctx, it->second, kNoJirRef, instTy);
+					if (cloned != kNoJirRef) return cloned;
+				}
 				// Built-in array methods: `arr.asPtr()` / `arr.asMutPtr()`
 				// return the array's storage base as a `PtrMany(elem)`.
 				// Mirrors Rust's `[T; N]::as_ptr` / `as_mut_ptr`. See the

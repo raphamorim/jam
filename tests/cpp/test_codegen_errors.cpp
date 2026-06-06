@@ -285,6 +285,24 @@ class CodegenErrorTests {
 		                  testAddrOfOnModeArgRejected);
 		framework.addTest("Move - drop-bearing field extraction rejected",
 		                  testFieldExtractRejected);
+		framework.addTest("Move - drop-bearing repeat literal rejected",
+		                  testDropBearingRepeatRejected);
+		framework.addTest("Move - double capture in array literal rejected",
+		                  testDoubleArrayCaptureRejected);
+		framework.addTest("Move - use after enum payload capture rejected",
+		                  testUseAfterEnumCaptureRejected);
+		framework.addTest("Move - conditional enum payload capture rejected",
+		                  testConditionalEnumCaptureRejected);
+		framework.addTest(
+		    "Move - imported-module body analyzed, blames defining file",
+		    testImportedBodyMoveAnalyzed);
+		framework.addTest("Clone - owns-resources without cfn clone rejected",
+		                  testCloneOwnsResourcesRejected);
+		framework.addTest(
+		    "Clone - container clone conditional on element cloneability",
+		    testConditionalContainerClone);
+		framework.addTest("Clone - payloaded enum clone fenced",
+		                  testEnumCloneFenced);
 	}
 
   private:
@@ -1120,6 +1138,162 @@ fn ok(sink: *mut u32) {
 fn main() {}
 )");
 		ASSERT_TRUE(whole.exitCode == 0);
+	}
+
+	// `[c; N]` duplicates one value into N slots — N owners of one
+	// payload for drop-bearing types. rustc requires `T: Copy`; jam
+	// rejects.
+	static void testDropBearingRepeatRejected() {
+		auto r = compileSource("array_repeat_dropbearing", movePrelude() + R"(
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    var arr: [2]Counter = [c; 2];
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    r, "owners of one drop-bearing value"));
+	}
+
+	// `[c, c]` — the first element moves c, the second is use-after-move.
+	static void testDoubleArrayCaptureRejected() {
+		auto r = compileSource("array_double_capture", movePrelude() + R"(
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    var arr: [2]Counter = [c, c];
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "use of moved binding `c`"));
+	}
+
+	// Enum payload construction is a MOVE of bare drop-bearing args:
+	// the enum's tag-dispatched glue owns the drop.
+	static void testUseAfterEnumCaptureRejected() {
+		auto r = compileSource("enum_use_after_capture", movePrelude() + R"(
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+fn bad(sink: *mut u32) u32 {
+    var c: Counter = Counter { value: 1, sink: sink };
+    var m: Maybe = Maybe.Some(c);
+    return c.value;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "use of moved binding `c`"));
+	}
+
+	static void testConditionalEnumCaptureRejected() {
+		auto r = compileSource("enum_cond_capture", movePrelude() + R"(
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+fn bad(sink: *mut u32, doIt: bool) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    if (doIt) {
+        var m: Maybe = Maybe.Some(c);
+    }
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "move it on all"));
+	}
+
+	// The mode-aware callsite analysis covers IMPORTED module bodies
+	// (including their calls to private same-module helpers), with
+	// diagnostics attributed to the defining file. Regression: std
+	// generic bodies escaping analysis is how Box.init's double-drop
+	// shipped.
+	static void testImportedBodyMoveAnalyzed() {
+		auto r = compileWithLib("move_imported_body",
+		                        R"(
+const { badHelper } = import("lib");
+fn main() {
+    var hits: u32 = 0;
+    badHelper(&hits);
+}
+)",
+		                        R"(pub const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+}
+
+pub fn badHelper(sink: *mut u32) u32 {
+    var c: Counter = Counter { value: 1, sink: sink };
+    consume(c);
+    return c.value;
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "use of moved binding `c`"));
+		ASSERT_TRUE(stderrContains(r, "lib.jam:"));
+	}
+
+	// clone(): a type with its own cfn drop but no cfn clone cannot be
+	// cloned — the compiler can clone structure, not resources.
+	static void testCloneOwnsResourcesRejected() {
+		auto r = compileSource("clone_owns_resources", movePrelude() + R"(
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    var d: Counter = c.clone();
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "owns resources"));
+		ASSERT_TRUE(stderrContains(r, "define `cfn clone"));
+	}
+
+	// Vec(T)'s clone instantiates CONDITIONALLY (Rust's
+	// `impl<T: Clone> Clone for Vec<T>`): Vec(Counter) itself works,
+	// but calling .clone() on it reports owns-resources at the call
+	// site, naming the instantiation.
+	static void testConditionalContainerClone() {
+		auto r = compileSource("clone_vec_conditional", R"(
+const { Vec } = import("std/collections");
+)" + movePrelude() + R"(
+fn bad(sink: *mut u32) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 1, sink: sink });
+    var w: Vec(Counter) = v.clone();
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "Vec__Counter"));
+		ASSERT_TRUE(stderrContains(r, "owns resources"));
+	}
+
+	static void testEnumCloneFenced() {
+		auto r = compileSource("clone_enum_fenced", movePrelude() + R"(
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+fn bad(sink: *mut u32) {
+    var m: Maybe = Maybe.Some(Counter { value: 1, sink: sink });
+    var n: Maybe = m.clone();
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    r, "enums with payloads are not yet cloneable"));
 	}
 
 	// Call sites are sigil-free for parameter modes; `&` is address-of

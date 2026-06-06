@@ -70,5 +70,39 @@ DropRegistry buildDropRegistry(const ModuleAST &module, const TypePool &types,
 	return registry;
 }
 
+// Clone counterpart of considerDropCandidate: `cfn clone(self: T) T`
+// (let-mode self — cloning borrows the original). The self param's
+// type names the struct the clone belongs to.
+static void considerCloneCandidate(const FunctionAST *fn,
+                                   const TypePool &types,
+                                   const StringPool &strings,
+                                   CloneRegistry &registry) {
+	if (!fn->isCfn) return;
+	if (fn->Name != "clone") return;
+	if (fn->Args.size() != 1) return;
+	const Param &p = fn->Args[0];
+	if (p.Name != "self") return;
+	if (p.Mode != ParamMode::Let) return;
+
+	const TypeKey &key = types.get(p.Type);
+	if (key.kind != TypeKind::Struct && key.kind != TypeKind::Named) { return; }
+	StringIdx nameIdx = static_cast<StringIdx>(key.a);
+	if (nameIdx == kNoString) return;
+	const std::string &structName = strings.get(nameIdx);
+	registry[structName] = fn;
+}
+
+void addCloneCandidates(CloneRegistry &registry, const ModuleAST &module,
+                        const TypePool &types, const StringPool &strings) {
+	for (const auto &fn : module.Functions) {
+		considerCloneCandidate(fn.get(), types, strings, registry);
+	}
+	for (const auto &s : module.Structs) {
+		for (const auto &m : s->Methods) {
+			considerCloneCandidate(m.get(), types, strings, registry);
+		}
+	}
+}
+
 }  // namespace drops
 }  // namespace jam

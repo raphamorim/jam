@@ -1,0 +1,62 @@
+// For-range bounds with VARIABLE upper bounds of every width and
+// signedness. The induction var adopts a bare-Variable bound's exact
+// type (the start literal coerces to it); mismatched widths from
+// complex bounds reconcile by widening at the comparison. Regression:
+// `for i in 0:n` with a u32 `n` used to fail jir-verify with an
+// ICmpUlt operand type mismatch.
+
+const { assert } = import("test");
+
+tfn u32VariableBound() {
+    var n: u32 = 4;
+    var sum: u32 = 0;
+    for i in 0:n {
+        sum = sum + i;
+    }
+    assert(sum, 6);
+}
+
+tfn i32VariableBound() {
+    var n: i32 = 5;
+    var sum: i32 = 0;
+    for i in 0:n {
+        sum = sum + i;
+    }
+    assert(sum, 10);
+}
+
+tfn u8VariableBound() {
+    var n: u8 = 3;
+    var count: u32 = 0;
+    for i in 0:n {
+        count = count + 1;
+    }
+    assert(count, 3);
+}
+
+tfn u64VariableBound() {
+    var n: u64 = 6;
+    var sum: u64 = 0;
+    for i in 0:n {
+        sum = sum + i;
+    }
+    assert(sum as u32, 15);
+}
+
+tfn literalBoundsStillWork() {
+    var sum: u32 = 0;
+    for i in 0:16 {
+        sum = sum + 1;
+    }
+    assert(sum, 16);
+}
+
+tfn variableBothBounds() {
+    var lo: u32 = 2;
+    var hi: u32 = 5;
+    var sum: u32 = 0;
+    for i in lo:hi {
+        sum = sum + i;
+    }
+    assert(sum, 9);
+}

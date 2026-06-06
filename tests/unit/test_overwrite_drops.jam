@@ -1,0 +1,88 @@
+// Overwrite drops: storing over a live drop-bearing VALUE-world
+// destination (whole local, struct field, container element via setAt,
+// Box.set) drops the previous occupant first — assignment semantics
+// matching what rustc does. Pointer-world stores (Vec.push into fresh
+// capacity) stay raw: no drops of uninitialized slots, pinned by the
+// push/grow test.
+
+const { assert } = import("test");
+const { Vec } = import("std/collections");
+const { Box } = import("std/box");
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+const Holder = struct {
+    c: Counter,
+};
+
+fn reassignLocal(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    c = Counter { value: 2, sink: sink };
+}
+
+tfn wholeLocalReassignDropsOld() {
+    var hits: u32 = 0;
+    reassignLocal(&hits);
+    // old dropped at the overwrite + new dropped at scope exit
+    assert(hits, 2);
+}
+
+fn overwriteField(sink: *mut u32) {
+    var h: Holder = Holder { c: Counter { value: 1, sink: sink } };
+    h.c = Counter { value: 2, sink: sink };
+}
+
+tfn fieldOverwriteDropsOld() {
+    var hits: u32 = 0;
+    overwriteField(&hits);
+    assert(hits, 2);
+}
+
+fn overwriteVecElem(sink: *mut u32) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 1, sink: sink });
+    v[0] = Counter { value: 2, sink: sink };
+}
+
+tfn vecElemOverwriteDropsOld() {
+    var hits: u32 = 0;
+    overwriteVecElem(&hits);
+    // old elem dropped at setAt + new elem dropped with the Vec
+    assert(hits, 2);
+}
+
+fn boxSet(sink: *mut u32) {
+    var b: Box(Counter) = Box(Counter).init(Counter { value: 1, sink: sink });
+    b.set(Counter { value: 2, sink: sink });
+}
+
+tfn boxSetDropsOld() {
+    var hits: u32 = 0;
+    boxSet(&hits);
+    assert(hits, 2);
+}
+
+fn pushGrowFlow(sink: *mut u32, n: u32) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    var i: u32 = 0;
+    while (i < n) {
+        v.push(Counter { value: i, sink: sink });
+        i = i + 1;
+    }
+}
+
+tfn pushIntoFreshSlotsNeverDropsGarbage() {
+    var hits: u32 = 0;
+    pushGrowFlow(&hits, 20);
+    // exactly the 20 elements drop with the Vec; growth re-slotting
+    // must not fire extra drops or read garbage
+    assert(hits, 20);
+}

@@ -63,9 +63,10 @@ class Analyzer {
   public:
 	Analyzer(const NodeStore &nodes, const StringPool &strings,
 	         const std::vector<Token> &tokens, const FunctionRegistry *registry,
-	         const drops::DropRegistry *drops, const TypePool *types)
+	         const drops::DropRegistry *drops, const TypePool *types,
+	         const EnumVariantMap *enums)
 	    : nodes_(nodes), strings_(strings), tokens_(tokens),
-	      registry_(registry), drops_(drops), types_(types) {}
+	      registry_(registry), drops_(drops), types_(types), enums_(enums) {}
 
 	std::vector<Diagnostic> run(const FunctionAST &fn);
 
@@ -138,7 +139,36 @@ class Analyzer {
 	const FunctionRegistry *registry_;
 	const drops::DropRegistry *drops_;
 	const TypePool *types_;
+	const EnumVariantMap *enums_;
 	std::vector<Diagnostic> diagnostics_;
+
+	// True when `enumName.variantName` names a known enum-variant
+	// constructor (concrete enums by name; generic enum factories by
+	// the factory fn's name).
+	bool isEnumVariantCtor(const std::string &enumName,
+	                       const std::string &variantName) const {
+		if (enums_ == nullptr) return false;
+		auto it = enums_->find(enumName);
+		if (it == enums_->end()) return false;
+		return it->second.count(variantName) != 0;
+	}
+
+	// Apply the enum-payload capture rule to a constructor's args: a
+	// bare drop-bearing payload arg MOVES into the enum.
+	void applyEnumPayloadMoves(ExtraIdx argsBase, uint32_t argCount,
+	                           NameMap &state) {
+		for (uint32_t i = 0; i < argCount; i++) {
+			NodeIdx argIdx =
+			    static_cast<NodeIdx>(nodes_.getExtra(argsBase + i));
+			const AstNode &an = nodes_.get(argIdx);
+			if (an.tag != AstTag::Variable) continue;
+			const std::string &src =
+			    strings_.get(static_cast<StringIdx>(an.lhs));
+			if (lookupDropFor(src) != nullptr) {
+				applyMoveToBinding(src, argIdx, state);
+			}
+		}
+	}
 
 	// Pointer to the current function's parameter list. Set in run(),
 	// Cleared on exit. Lifetime bounded by the run() activation that set it.
@@ -261,8 +291,11 @@ Result Analyzer::analyze(NodeIdx idx, NameMap state) {
 		// Receiver is a TypeIdx — no binding state involved. Walk the
 		// method's value-arg list (stored after [methodName, argCount]
 		// in the extra payload) so any variable reads inside the args
-		// are checked.
+		// are checked. When the receiver is an ENUM and the "method"
+		// is a variant, this is payload construction: bare drop-bearing
+		// args MOVE into the enum.
 		ExtraIdx extra = n.rhs;
+		StringIdx methodId = static_cast<StringIdx>(nodes_.getExtra(extra));
 		uint32_t argCount = nodes_.getExtra(extra + 1);
 		Result r{std::move(state), false};
 		for (uint32_t i = 0; i < argCount; i++) {
@@ -270,6 +303,20 @@ Result Analyzer::analyze(NodeIdx idx, NameMap state) {
 			    static_cast<NodeIdx>(nodes_.getExtra(extra + 2 + i));
 			r = analyze(argIdx, std::move(r.state));
 			if (r.terminated) return r;
+		}
+		if (types_ != nullptr && enums_ != nullptr) {
+			TypeIdx recvTy = static_cast<TypeIdx>(n.lhs);
+			const TypeKey &k = types_->get(recvTy);
+			std::string recvName;
+			if (k.kind == TypeKind::Named || k.kind == TypeKind::Enum ||
+			    k.kind == TypeKind::GenericCall) {
+				recvName = strings_.get(static_cast<StringIdx>(k.a));
+			}
+			const std::string &method = strings_.get(methodId);
+			if (!recvName.empty() && isEnumVariantCtor(recvName, method)) {
+				applyEnumPayloadMoves(static_cast<ExtraIdx>(extra + 2),
+				                      argCount, r.state);
+			}
 		}
 		return r;
 	}
@@ -317,7 +364,10 @@ Result Analyzer::analyze(NodeIdx idx, NameMap state) {
 		return analyzeStructLit(idx, std::move(state));
 	case AstTag::ArrayLit: {
 		// Walk every element expression so any variable reads inside the
-		// array literal are checked against the init state.
+		// array literal are checked against the init state. A bare
+		// drop-bearing local used as an element is a MOVE (the array
+		// owns it — codegen consumes the source's drop track), so the
+		// same conditional-move / use-after-move rules apply.
 		ExtraIdx extra = n.rhs;
 		uint32_t count = nodes_.getExtra(extra);
 		Result r{std::move(state), false};
@@ -326,6 +376,14 @@ Result Analyzer::analyze(NodeIdx idx, NameMap state) {
 			    static_cast<NodeIdx>(nodes_.getExtra(extra + 1 + i));
 			r = analyze(elemIdx, std::move(r.state));
 			if (r.terminated) return r;
+			const AstNode &elemNode = nodes_.get(elemIdx);
+			if (elemNode.tag == AstTag::Variable) {
+				const std::string &src = strings_.get(
+				    static_cast<StringIdx>(elemNode.lhs));
+				if (lookupDropFor(src) != nullptr) {
+					applyMoveToBinding(src, elemIdx, r.state);
+				}
+			}
 		}
 		return r;
 	}
@@ -679,6 +737,9 @@ Result Analyzer::analyzeCall(NodeIdx idx, NameMap state) {
 	// Instance-method callees carry an implicit `self` in Args[0];
 	// source-level args start at Args[1].
 	uint32_t argModeOffset = 0;
+	// `Enum.Variant(payload)` constructors: payload args are
+	// ownership-transferring captures (handled after the arg walk).
+	bool isVariantCtor = false;
 	if ((n.flags & 1) == 0) {
 		StringIdx calleeIdx = n.lhs;
 		const std::string &calleeName = strings_.get(calleeIdx);
@@ -697,6 +758,7 @@ Result Analyzer::analyzeCall(NodeIdx idx, NameMap state) {
 			if (dot != std::string::npos && calleeName.rfind('.') == dot) {
 				std::string recv = calleeName.substr(0, dot);
 				std::string method = calleeName.substr(dot + 1);
+				if (isEnumVariantCtor(recv, method)) { isVariantCtor = true; }
 				auto vt = varTypes_.find(recv);
 				if (vt != varTypes_.end()) {
 					const TypeKey &k = types_->get(vt->second);
@@ -804,6 +866,14 @@ Result Analyzer::analyzeCall(NodeIdx idx, NameMap state) {
 				applyMoveToBinding(name, info.argIdx, r.state);
 			}
 		}
+	}
+
+	// Enum-variant construction: every bare drop-bearing payload arg
+	// MOVES into the enum (codegen consumes its drop track; the enum's
+	// tag-dispatched glue runs the drop).
+	if (isVariantCtor) {
+		applyEnumPayloadMoves(static_cast<ExtraIdx>(extra + 1), argCount,
+		                      r.state);
 	}
 	return r;
 }
@@ -1029,7 +1099,10 @@ void Analyzer::checkVariableRead(NodeIdx idx, const NameMap &state) {
 	case InitState::Uninit:
 		if (movedBindings_.count(name) != 0) {
 			emitError("use of moved binding `" + name +
-			              "` — its value was moved out here or earlier",
+			              "` — its value was moved out here or earlier; "
+			              "if both values are needed, clone before moving "
+			              "(`" +
+			              name + ".clone()`)",
 			          idx, name);
 		} else {
 			emitError("use of uninitialized binding `" + name + "`", idx,
@@ -1166,9 +1239,12 @@ void Analyzer::checkScopeEscape(NodeIdx exprIdx) {
 
 int Analyzer::lineOf(NodeIdx idx) const {
 	if (idx == kNoNode) return 0;
-	const AstNode &n = nodes_.get(idx);
-	if (n.mainToken >= tokens_.size()) return 0;
-	return tokens_[n.mainToken].line;
+	// NodeStore's parallel lines_ array is stamped at PARSE time with
+	// each module's own token stream, so it is correct for imported
+	// modules too — mapping mainToken through the entry module's token
+	// vector would mis-attribute (or zero out) lines for any node that
+	// wasn't parsed from the entry file.
+	return nodes_.getLine(idx);
 }
 
 void Analyzer::emitError(std::string message, NodeIdx anchor,
@@ -1204,8 +1280,9 @@ std::vector<Diagnostic> analyze(const FunctionAST &fn, const NodeStore &nodes,
                                 const std::vector<Token> &tokens,
                                 const FunctionRegistry *registry,
                                 const drops::DropRegistry *drops,
-                                const TypePool *types) {
-	Analyzer a(nodes, strings, tokens, registry, drops, types);
+                                const TypePool *types,
+                                const EnumVariantMap *enums) {
+	Analyzer a(nodes, strings, tokens, registry, drops, types, enums);
 	return a.run(fn);
 }
 
