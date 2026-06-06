@@ -41,15 +41,15 @@ fn computeFromMut(x: mut u32) u32 {
 
 tfn doubleByValueOK() {
     var n: u32 = 5;
-    assert(doubleByValue(&n), 10);
+    assert(doubleByValue(n), 10);
 }
 
 tfn pickFieldAOK() {
     var p: Pair = Pair { a: 9, b: 0 };
-    assert(pickFieldA(&p), 10);
+    assert(pickFieldA(p), 10);
 }
 
 tfn computeFromMutOK() {
     var n: u32 = 7;
-    assert(computeFromMut(&n), 108);
+    assert(computeFromMut(n), 108);
 }

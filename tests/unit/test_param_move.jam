@@ -1,0 +1,129 @@
+// Move tracking for drop-bearing locals: a named local moved into a
+// `move` parameter transfers ownership to the callee, which OWNS the
+// param — it drops at callee exit unless the body moves it onward (a
+// store, a struct-literal capture, a further move call, a return). The
+// caller-side scope-exit drop is suppressed; the value drops exactly
+// once at its final owner. The init analysis enforces the rules that
+// keep the flag-free suppression sound: moves must be unconditional
+// relative to the binding's declaration, no re-initialization, any
+// later read is a use-after-move error, and a drop-bearing value
+// cannot be moved out of a borrowed (let/mut) parameter (rejections
+// covered in tests/cpp/test_codegen_errors.cpp).
+
+const { assert } = import("test");
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+// Empty body: the move param itself is the owner; it drops here.
+fn consume(c: move Counter) {
+}
+
+fn makeAndMove(sink: *mut u32) {
+    var c: Counter = Counter { value: 7, sink: sink };
+    consume(c);
+}
+
+tfn namedLocalMoveDropsOnce() {
+    var hits: u32 = 0;
+    makeAndMove(&hits);
+    // One drop: the `c` param at consume's exit. A double-drop (no
+    // caller suppression) gives 2; a leak (no callee ownership) gives 0.
+    assert(hits, 1);
+}
+
+// `var owned = c;` of a bare drop-bearing binding is a MOVE, not a
+// copy: the new binding owns the value, the source is dead.
+fn rebindThenDrop(sink: *mut u32) {
+    var c: Counter = Counter { value: 2, sink: sink };
+    var owned: Counter = c;
+}
+
+tfn varInitMovesNotCopies() {
+    var hits: u32 = 0;
+    rebindThenDrop(&hits);
+    assert(hits, 1);
+}
+
+// A move param moved onward into another move call: the final owner
+// drops it, exactly once.
+fn relay(c: move Counter) {
+    consume(c);
+}
+
+tfn movedOnwardDropsOnceAtFinalOwner() {
+    var hits: u32 = 0;
+    var c: Counter = Counter { value: 1, sink: &hits };
+    relay(c);
+    assert(hits, 1);
+}
+
+// Returning a move param transfers ownership back to the caller: no
+// drop fires inside the callee, the caller's binding owns the value.
+fn passThrough(c: move Counter) Counter {
+    return c;
+}
+
+tfn returnMoveOfParamTransfersBack() {
+    var hits: u32 = 0;
+    var c: Counter = Counter { value: 3, sink: &hits };
+    var back: Counter = passThrough(c);
+    assert(hits, 0);
+    assert(back.value, 3);
+}
+
+// Declaring AND moving inside the same conditional arm is fine: the
+// move is unconditional relative to the binding's own scope.
+fn moveInsideOwnArm(sink: *mut u32, doIt: bool) {
+    if (doIt) {
+        var c: Counter = Counter { value: 1, sink: sink };
+        consume(c);
+    }
+}
+
+tfn declAndMoveInSameArm() {
+    var hits: u32 = 0;
+    moveInsideOwnArm(&hits, true);
+    assert(hits, 1);
+    moveInsideOwnArm(&hits, false);
+    assert(hits, 1);
+}
+
+// An early return BEFORE the move drops the still-owned value; the
+// move path transfers it instead. Each path drops exactly once.
+fn earlyReturnThenMove(sink: *mut u32, bail: bool) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    if (bail) {
+        return;
+    }
+    consume(c);
+}
+
+tfn earlyReturnPathDropsMovePathTransfers() {
+    var hits: u32 = 0;
+    earlyReturnThenMove(&hits, true);
+    assert(hits, 1);
+    earlyReturnThenMove(&hits, false);
+    assert(hits, 2);
+}
+
+// Two independent locals moved back-to-back: each transfers once.
+fn moveTwoLocals(sink: *mut u32) {
+    var a: Counter = Counter { value: 1, sink: sink };
+    var b: Counter = Counter { value: 2, sink: sink };
+    consume(a);
+    consume(b);
+}
+
+tfn sequentialMovesEachDropOnce() {
+    var hits: u32 = 0;
+    moveTwoLocals(&hits);
+    assert(hits, 2);
+}

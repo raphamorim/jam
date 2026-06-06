@@ -21,7 +21,7 @@ fn fillFromExtern(buf: mut [16]u8) i32 {
 
 tfn fillFromExternOK() {
     var buf: [16]u8 = [0; 16];
-    var n: i32 = fillFromExtern(&buf);
+    var n: i32 = fillFromExtern(buf);
     // snprintf wrote "n=42" (4 chars) into the buffer.
     assert(n, 4);
     assert(buf[0], 110);  // 'n'
@@ -71,7 +71,7 @@ fn fillField(b: mut Bag) i32 {
 
 tfn fillFieldOK() {
     var b: Bag = Bag { one: 0, two: 0, three: 0, four: 0 };
-    var n: i32 = fillField(&b);
+    var n: i32 = fillField(b);
     assert(n, 2);
     assert(b.one, 104);  // 'h'
     assert(b.two, 105);  // 'i'
@@ -93,7 +93,7 @@ fn multimode(prefix: u32, target: mut [8]u8, out: mut u32) i32 {
 tfn multimodeOK() {
     var buf: [8]u8 = [0; 8];
     var written: u32 = 0;
-    var n: i32 = multimode(7, &buf, &written);
+    var n: i32 = multimode(7, buf, written);
     assert(n, 3);                // "p=7" is 3 chars
     assert(written as u32, 3);   // strlen of "p=7" is 3
     assert(buf[0], 112);         // 'p'

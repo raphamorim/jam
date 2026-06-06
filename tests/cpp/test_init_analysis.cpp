@@ -92,7 +92,7 @@ fn caller() u32 {
 }
 )");
 	ASSERT_EQ(static_cast<size_t>(1), r.diagnostics.size());
-	ASSERT_CONTAINS(r.diagnostics[0].message, "uninitialized");
+	ASSERT_CONTAINS(r.diagnostics[0].message, "moved");
 	ASSERT_EQ(std::string("x"), r.diagnostics[0].varName);
 }
 
@@ -107,7 +107,7 @@ fn caller() u32 {
 }
 )");
 	ASSERT_EQ(static_cast<size_t>(1), r.diagnostics.size());
-	ASSERT_CONTAINS(r.diagnostics[0].message, "uninitialized");
+	ASSERT_CONTAINS(r.diagnostics[0].message, "moved");
 	ASSERT_EQ(std::string("x"), r.diagnostics[0].varName);
 }
 
@@ -226,17 +226,17 @@ fn doubleIt(x: mut u32) u32 {
 	ASSERT_EQ(static_cast<size_t>(0), r.diagnostics.size());
 }
 
-// Drop registry interaction: `move` on a drop-bearing binding is the
-// hazard the analyzer prevents (without move-aware drop tracking the
-// codegen would auto-fire drop on a moved-out slot — double-free).
+// Drop registry interaction: an UNCONDITIONAL `move` of a drop-bearing
+// binding is supported (codegen suppresses the caller-side scope-exit
+// drop); a CONDITIONAL move is rejected — rustc would insert a runtime
+// drop flag there, jam keeps drops static and rejects, Swift-style.
 
-void testMoveOnDropBearingRejected() {
+void testMoveOnDropBearingAccepted() {
 	// A type with a user-defined `cfn drop(self: mut T)` is "drop-
 	// bearing" — `cfn` is the explicit opt-in that hands the
 	// destructor call to the compiler's auto-fire path (see
-	// drop_registry.cpp's `considerDropCandidate`). The analyzer
-	// rejects `move` on a drop-bearing binding so the codegen can't
-	// emit drop on a moved-out slot.
+	// drop_registry.cpp's `considerDropCandidate`). Moving it
+	// unconditionally at its own declaration depth is clean.
 	auto r = analyzeSource(R"(
 const File = struct {
     fd: i32,
@@ -255,7 +255,33 @@ fn caller() i32 {
     return consume(f);
 }
 )");
-	ASSERT_TRUE(diagsContain(r.diagnostics, "drop-bearing type"));
+	ASSERT_EQ(static_cast<size_t>(0), r.diagnostics.size());
+}
+
+void testConditionalMoveOnDropBearingRejected() {
+	// Moving inside an if-arm of a binding declared outside is a
+	// maybe-move: the flag-free drop suppression can't express it.
+	auto r = analyzeSource(R"(
+const File = struct {
+    fd: i32,
+};
+
+cfn drop(self: mut File) {
+    self.fd = 0;
+}
+
+fn consume(f: move File) i32 {
+    return f.fd;
+}
+
+fn caller(doIt: bool) {
+    var f: File = File { fd: 7 };
+    if (doIt) {
+        consume(f);
+    }
+}
+)");
+	ASSERT_TRUE(diagsContain(r.diagnostics, "all control-flow paths"));
 	ASSERT_TRUE(diagsAbout(r.diagnostics, "f"));
 }
 
@@ -357,8 +383,11 @@ class InitAnalysisTests {
 		                  testReturnMutParamByValueOK);
 
 		// Drop registry interaction
-		framework.addTest("InitAnalysis - move on drop-bearing rejected",
-		                  testMoveOnDropBearingRejected);
+		framework.addTest("InitAnalysis - unconditional move on drop-bearing OK",
+		                  testMoveOnDropBearingAccepted);
+		framework.addTest(
+		    "InitAnalysis - conditional move on drop-bearing rejected",
+		    testConditionalMoveOnDropBearingRejected);
 		framework.addTest("InitAnalysis - let on drop-bearing OK",
 		                  testLetOnDropBearingOK);
 		framework.addTest("InitAnalysis - mut on drop-bearing OK",

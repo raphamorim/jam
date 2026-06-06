@@ -3,11 +3,9 @@
 // double-free). Mirrors test_drops' side-channel: a Counter bumps a
 // sink pointer on drop, observed cross-function after the Vec drops.
 //
-// TODO(move): these only push TEMPORARIES, which the compiler can move today.
-// Pushing a NAMED drop-bearing local:
-//     var b: Box(Counter) = Box(Counter).init(...); v.push(b);
-// so, still errors ("cannot move binding of drop-bearing type, drop+move
-// tracking is not yet implemented"). add that case once named-local move lands
+// Covers both TEMPORARIES pushed directly and NAMED drop-bearing
+// locals moved in via `push(value: move T)` — the local's scope-exit
+// drop is suppressed and the element drops exactly once with the Vec.
 
 const { assert } = import("test");
 const { Vec } = import("std/collections");
@@ -60,4 +58,47 @@ tfn vecEmptyDropsNothing() {
     var hits: u32 = 0;
     fillCountersAndDrop(&hits, 0);
     assert(hits, 0);
+}
+
+// Named drop-bearing locals move into the Vec: ownership transfers to
+// the container, the local's own scope-exit drop is suppressed, and the
+// synthesized element loop drops it exactly once.
+fn fillNamedCounterAndDrop(sink: *mut u32) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    var c: Counter = Counter { value: 1, sink: sink };
+    v.push(c);
+}
+
+fn fillNamedBoxAndDrop(sink: *mut u32) {
+    var v: Vec(Box(Counter)) = Vec(Box(Counter)).empty();
+    var b: Box(Counter) = Box(Counter).init(Counter { value: 5, sink: sink });
+    v.push(b);
+}
+
+tfn vecNamedLocalPushDropsOnce() {
+    var hits: u32 = 0;
+    fillNamedCounterAndDrop(&hits);
+    assert(hits, 1);
+}
+
+tfn vecNamedBoxPushDropsOnce() {
+    var hits: u32 = 0;
+    fillNamedBoxAndDrop(&hits);
+    assert(hits, 1);
+}
+
+// Box.init takes `v: move T`: a NAMED local moves into the heap slot
+// through the `Type.method(args)` call form. Exactly one drop — the
+// caller's scope drop is suppressed and Box.drop frees the single
+// owner. (Regression: this path double-dropped when Box.init was
+// let-mode and the TypeMethodCall arg loop was mode-blind.)
+fn boxNamedCounterAndDrop(sink: *mut u32) {
+    var c: Counter = Counter { value: 5, sink: sink };
+    var b: Box(Counter) = Box(Counter).init(c);
+}
+
+tfn boxInitNamedLocalDropsOnce() {
+    var hits: u32 = 0;
+    boxNamedCounterAndDrop(&hits);
+    assert(hits, 1);
 }

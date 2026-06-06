@@ -38,6 +38,7 @@
 #include "init_analysis.h"
 #include "ast.h"
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
 
 namespace jam {
@@ -87,6 +88,23 @@ class Analyzer {
 	void emitError(std::string message, NodeIdx anchor, std::string varName);
 	int lineOf(NodeIdx idx) const;
 
+	// Apply the caller-side effect of moving `name` out of its binding
+	// (a `move`-mode call argument or a struct-literal field capture):
+	// the binding becomes Uninit, and — for drop-bearing types — the
+	// move is validated against the rules that keep codegen's
+	// lexical/permanent drop suppression sound:
+	//
+	//   1. The move must happen at the same conditional depth as the
+	//      declaration. rustc resolves a conditionally-moved binding by
+	//      inserting a runtime drop flag (DropStyle::Conditional in
+	//      elaborate_drops.rs); jam follows Swift (SE-0390) instead and
+	//      rejects, keeping codegen flag-free.
+	//   2. The binding must not be re-initialized afterwards (enforced
+	//      in analyzeAssignTarget) — the codegen suppression is
+	//      permanent, so a re-init's eventual drop would never fire.
+	void applyMoveToBinding(const std::string &name, NodeIdx anchor,
+	                        NameMap &state);
+
 	// Walk an argument expression (`x`, `&x`, `&p.x`, `&arr[i]`, `p.*`)
 	// down to the leftmost Variable AST node, and return that node's name
 	// StringIdx. Returns kNoString if the expression's base isn't a
@@ -131,6 +149,28 @@ class Analyzer {
 	// Reset per function in run().
 	std::unordered_map<std::string, TypeIdx> varTypes_;
 
+	// Conditional nesting depth: 0 in the function body, +1 inside each
+	// if-arm / loop body / match arm. A drop-bearing binding may only be
+	// moved at the depth it was declared at — a move under a deeper
+	// conditional is a maybe-move, which codegen's flag-free suppression
+	// can't express ("move it on all paths or none").
+	int condDepth_ = 0;
+
+	// Conditional depth at declaration, per `var` local. Parameters are
+	// not entered here — that absence also distinguishes locals from
+	// params where the rules differ.
+	std::unordered_map<std::string, int> declDepth_;
+
+	// Every binding moved anywhere in this function (any type) — used to
+	// phrase read-errors as "use of moved binding" rather than the
+	// misleading "uninitialized".
+	std::unordered_set<std::string> movedBindings_;
+
+	// Drop-bearing bindings that were definitely moved. At a drop point,
+	// Uninit + membership here means the scope-exit drop was suppressed
+	// by codegen — fine. Re-initializing a member is rejected.
+	std::unordered_set<std::string> movedDropBearing_;
+
 	// Look up the drop function for `bindingName` if its type is a struct
 	// declared with `fn drop(self: mut StructName)`. Returns nullptr when
 	// no drop is registered, when the binding's type is unknown, or when
@@ -143,16 +183,22 @@ class Analyzer {
 std::vector<Diagnostic> Analyzer::run(const FunctionAST &fn) {
 	args_ = &fn.Args;
 	varTypes_.clear();
+	declDepth_.clear();
+	movedBindings_.clear();
+	movedDropBearing_.clear();
+	condDepth_ = 0;
 
 	NameMap state;
 	// parameter entry state depends on the declared mode.
 	//   Let / Mut / Move -> Init (caller's binding is valid)
-	// `move` does not change anything for the callee's view of its own
-	// parameter — the moved-from-ness applies to the *caller's* binding
-	// after the call.
+	// A `move` parameter is OWNED by the callee — it participates in
+	// the move/drop rules like a depth-0 local (it drops at exit unless
+	// moved onward). `let`/`mut` params are borrowed: they never drop
+	// here and moving a drop-bearing value out of them is rejected.
 	for (const Param &p : fn.Args) {
 		state[p.Name] = InitState::Init;
 		varTypes_[p.Name] = p.Type;
+		if (p.Mode == ParamMode::Move) { declDepth_[p.Name] = 0; }
 	}
 
 	Result r{std::move(state), false};
@@ -340,6 +386,11 @@ Result Analyzer::analyzeVarDecl(NodeIdx idx, NameMap state) {
 	NodeIdx initIdx = nodes_.getExtra(extra + 2);
 	const std::string &name = strings_.get(nameIdx);
 	varTypes_[name] = typeIdx;
+	declDepth_[name] = condDepth_;
+	// Re-declaration (shadowing in an inner block) starts a fresh
+	// binding: clear any moved-ness recorded for the old one.
+	movedBindings_.erase(name);
+	movedDropBearing_.erase(name);
 
 	if (initIdx == kNoNode) {
 		// Should not happen — Jam syntactically requires an initializer
@@ -350,6 +401,19 @@ Result Analyzer::analyzeVarDecl(NodeIdx idx, NameMap state) {
 
 	auto r = analyze(initIdx, std::move(state));
 	if (r.terminated) return r;
+
+	// `var owned = c;` with a bare drop-bearing `c` MOVES it — the new
+	// binding owns the value (codegen consumes the source's drop
+	// track). Plain copies of non-drop values are untouched.
+	const AstNode &initNode = nodes_.get(initIdx);
+	if (initNode.tag == AstTag::Variable) {
+		const std::string &src =
+		    strings_.get(static_cast<StringIdx>(initNode.lhs));
+		if (lookupDropFor(src) != nullptr) {
+			applyMoveToBinding(src, initIdx, r.state);
+		}
+	}
+
 	r.state[name] = InitState::Init;
 	return r;
 }
@@ -360,6 +424,19 @@ Result Analyzer::analyzeAssign(NodeIdx idx, NameMap state) {
 	// store new). Sub-expressions of the RHS may read other bindings.
 	auto r = analyze(n.rhs, std::move(state));
 	if (r.terminated) return r;
+
+	// A bare drop-bearing RHS is MOVED into the store destination
+	// (`self.ptr[i] = value`, `s.field = c`) — the destination owns it
+	// now; codegen consumes the source's drop track.
+	const AstNode &rhsNode = nodes_.get(n.rhs);
+	if (rhsNode.tag == AstTag::Variable) {
+		const std::string &src =
+		    strings_.get(static_cast<StringIdx>(rhsNode.lhs));
+		if (lookupDropFor(src) != nullptr) {
+			applyMoveToBinding(src, n.rhs, r.state);
+		}
+	}
+
 	return analyzeAssignTarget(n.lhs, std::move(r.state));
 }
 
@@ -378,6 +455,16 @@ Result Analyzer::analyzeAssignTarget(NodeIdx idx, NameMap state) {
 	case AstTag::Variable: {
 		StringIdx nameIdx = n.lhs;
 		const std::string &name = strings_.get(nameIdx);
+		// A moved-out drop-bearing binding cannot be re-initialized:
+		// codegen's drop suppression is permanent, so the new value's
+		// scope-exit drop would never fire (a leak). Rust re-arms the
+		// drop via its runtime flag; jam asks for a fresh binding.
+		if (movedDropBearing_.count(name) != 0) {
+			emitError("cannot assign to `" + name +
+			              "` after it was moved — its scope-exit drop was "
+			              "suppressed by the move; bind a new name instead",
+			          idx, name);
+		}
 		state[name] = InitState::Init;
 		return Result{std::move(state), false};
 	}
@@ -416,6 +503,10 @@ Result Analyzer::analyzeIf(NodeIdx idx, NameMap state) {
 	NameMap stateBeforeBranch = r.state;  // copy for the else path
 
 	// Then-branch: walks under thenR, reusing r.state to avoid an extra copy.
+	// Arm bodies run at +1 conditional depth — a drop-bearing move inside
+	// an arm of a binding declared outside is a maybe-move (rejected in
+	// applyMoveToBinding).
+	condDepth_++;
 	Result thenR{std::move(r.state), false};
 	for (uint32_t i = 0; i < thenCount; i++) {
 		if (thenR.terminated) break;
@@ -430,6 +521,7 @@ Result Analyzer::analyzeIf(NodeIdx idx, NameMap state) {
 		NodeIdx s = nodes_.getExtra(extra + 2 + thenCount + i);
 		elseR = analyze(s, std::move(elseR.state));
 	}
+	condDepth_--;
 
 	// Merge.
 	if (thenR.terminated && elseR.terminated) return Result{NameMap{}, true};
@@ -449,12 +541,16 @@ Result Analyzer::analyzeWhile(NodeIdx idx, NameMap state) {
 
 	ExtraIdx extra = n.rhs;
 	uint32_t bodyCount = nodes_.getExtra(extra);
+	// Loop bodies run at +1 conditional depth: they execute zero or more
+	// times, so a move inside of an outer binding is always a maybe-move.
+	condDepth_++;
 	Result bodyR{std::move(r.state), false};
 	for (uint32_t i = 0; i < bodyCount; i++) {
 		if (bodyR.terminated) break;
 		NodeIdx s = nodes_.getExtra(extra + 1 + i);
 		bodyR = analyze(s, std::move(bodyR.state));
 	}
+	condDepth_--;
 
 	// Loop body executes zero or more times. The post-loop state is the
 	// merge of "body never ran" (stateBefore) with "body ran at least once"
@@ -483,12 +579,15 @@ Result Analyzer::analyzeFor(NodeIdx idx, NameMap state) {
 	const std::string &varName = strings_.get(varIdx);
 	r.state[varName] = InitState::Init;
 
+	// Loop bodies run at +1 conditional depth (zero-or-more iterations).
+	condDepth_++;
 	Result bodyR{std::move(r.state), false};
 	for (uint32_t i = 0; i < bodyCount; i++) {
 		if (bodyR.terminated) break;
 		NodeIdx s = nodes_.getExtra(extra + 4 + i);
 		bodyR = analyze(s, std::move(bodyR.state));
 	}
+	condDepth_--;
 
 	// For-over-range: it assumes the body executes at least once. This
 	// matches existing Jam idioms (e.g., `for i in 0:N { arr[i] = ... }`
@@ -530,12 +629,15 @@ Result Analyzer::analyzeMatch(NodeIdx idx, NameMap state) {
 		uint32_t armBodyCount = nodes_.getExtra(extra + cursor);
 		cursor++;
 
+		// Match arms run at +1 conditional depth, same as if-arms.
+		condDepth_++;
 		Result armR{stateBefore, false};
 		for (uint32_t i = 0; i < armBodyCount; i++) {
 			if (armR.terminated) break;
 			NodeIdx s = nodes_.getExtra(extra + cursor + i);
 			armR = analyze(s, std::move(armR.state));
 		}
+		condDepth_--;
 		cursor += armBodyCount;
 
 		if (mergedR.terminated && armR.terminated) {
@@ -574,12 +676,43 @@ Result Analyzer::analyzeCall(NodeIdx idx, NameMap state) {
 	// Call: d.lhs = StringIdx (callee), d.rhs = ExtraIdx -> [argCount, args...]
 	const AstNode &n = nodes_.get(idx);
 	const FunctionAST *callee = nullptr;
+	// Instance-method callees carry an implicit `self` in Args[0];
+	// source-level args start at Args[1].
+	uint32_t argModeOffset = 0;
 	if ((n.flags & 1) == 0) {
 		StringIdx calleeIdx = n.lhs;
 		const std::string &calleeName = strings_.get(calleeIdx);
 		if (registry_) {
 			auto it = registry_->find(calleeName);
 			if (it != registry_->end()) callee = it->second;
+		}
+		// `recv.method(args)` — resolve through the receiver's static
+		// type so the callee's parameter MODES are visible: `v.push(c)`
+		// must see `value: move T` or the move tracking is blind to
+		// method calls. The registry holds "TypeName.method" for
+		// concrete structs and "GenericName.method" for methods of
+		// generic struct-returning functions (registered in main.cpp).
+		if (!callee && registry_ && types_) {
+			auto dot = calleeName.find('.');
+			if (dot != std::string::npos && calleeName.rfind('.') == dot) {
+				std::string recv = calleeName.substr(0, dot);
+				std::string method = calleeName.substr(dot + 1);
+				auto vt = varTypes_.find(recv);
+				if (vt != varTypes_.end()) {
+					const TypeKey &k = types_->get(vt->second);
+					if (k.kind == TypeKind::Struct ||
+					    k.kind == TypeKind::Named ||
+					    k.kind == TypeKind::GenericCall) {
+						const std::string &typeName =
+						    strings_.get(static_cast<StringIdx>(k.a));
+						auto mit = registry_->find(typeName + "." + method);
+						if (mit != registry_->end()) {
+							callee = mit->second;
+							argModeOffset = 1;
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -600,7 +733,9 @@ Result Analyzer::analyzeCall(NodeIdx idx, NameMap state) {
 	for (uint32_t i = 0; i < argCount; i++) {
 		NodeIdx argIdx = nodes_.getExtra(extra + 1 + i);
 		ParamMode mode = ParamMode::Let;
-		if (callee && i < callee->Args.size()) { mode = callee->Args[i].Mode; }
+		if (callee && i + argModeOffset < callee->Args.size()) {
+			mode = callee->Args[i + argModeOffset].Mode;
+		}
 		argInfos.push_back({argIdx, mode, extractPath(argIdx)});
 	}
 
@@ -639,31 +774,76 @@ Result Analyzer::analyzeCall(NodeIdx idx, NameMap state) {
 		r = analyze(info.argIdx, std::move(r.state));
 		if (r.terminated) return r;
 
+		// `&`-rooted args skip the read-check (taking an address is not
+		// a read), but borrowing a MOVED binding must still be rejected:
+		// a callee could write through the pointer and "re-initialize"
+		// storage whose scope-exit drop was already suppressed — the new
+		// value would leak. Mirrors rustc's "borrow of moved value"
+		// (E0382); rustc's dataflow even re-gens maybe_init on &mut
+		// borrows (initialized.rs, #90752) — jam rejects instead.
+		if (nodes_.get(info.argIdx).tag == AstTag::AddressOf &&
+		    info.path.base != kNoString) {
+			const std::string &bname = strings_.get(info.path.base);
+			auto st = r.state.find(bname);
+			if (movedBindings_.count(bname) != 0 && st != r.state.end() &&
+			    st->second != InitState::Init) {
+				emitError("cannot borrow `" + bname +
+				              "` after it was moved — a write through the "
+				              "borrow would re-initialize storage whose "
+				              "drop was suppressed; bind a new name instead",
+				          info.argIdx, bname);
+			}
+		}
+
 		// Post-call mode effect on the caller's binding.
 		//   move      — caller's binding moves into the callee; becomes Uninit.
 		//   let / mut — no caller-side state change.
 		if (info.mode == ParamMode::Move) {
 			if (info.path.base != kNoString) {
 				const std::string &name = strings_.get(info.path.base);
-
-				// reject `move` on a drop-bearing binding
-				// until move-aware drop tracking lands. Without
-				// it, codegen would emit drop on the moved-out slot at
-				// scope exit — a double-free.
-				if (lookupDropFor(name) != nullptr) {
-					emitError("cannot `move` binding `" + name +
-					              "` of drop-bearing type — drop+move "
-					              "tracking is not yet implemented; "
-					              "consider passing as `mut` or `let` "
-					              "instead",
-					          info.argIdx, name);
-				}
-
-				r.state[name] = InitState::Uninit;
+				applyMoveToBinding(name, info.argIdx, r.state);
 			}
 		}
 	}
 	return r;
+}
+
+void Analyzer::applyMoveToBinding(const std::string &name, NodeIdx anchor,
+                                  NameMap &state) {
+	// Drop-bearing bindings get the extra validation that keeps
+	// codegen's lexical drop suppression sound. "Owned" bindings are
+	// locals and `move`-mode params (both in declDepth_); a `let`/`mut`
+	// param is borrowed — moving a drop-bearing value out of it would
+	// leave the caller and the new owner both dropping the payload.
+	if (lookupDropFor(name) != nullptr) {
+		auto dd = declDepth_.find(name);
+		if (dd == declDepth_.end()) {
+			if (args_ != nullptr) {
+				for (const Param &p : *args_) {
+					if (p.Name != name) continue;
+					emitError(
+					    "cannot move drop-bearing `" + name + "` out of a `" +
+					        (p.Mode == ParamMode::Mut ? "mut" : "let") +
+					        "` parameter — it is borrowed, not owned; "
+					        "declare the parameter `move` to take ownership",
+					    anchor, name);
+					break;
+				}
+			}
+			// Unknown/global name: fall through, just record the state.
+		} else if (dd->second != condDepth_) {
+			emitError(
+			    "cannot move `" + name +
+			        "` here: the move is conditional relative to its "
+			        "declaration, so its drop cannot run unconditionally — "
+			        "move it on all control-flow paths or none",
+			    anchor, name);
+		} else {
+			movedDropBearing_.insert(name);
+		}
+	}
+	movedBindings_.insert(name);
+	state[name] = InitState::Uninit;
 }
 
 StringIdx Analyzer::findBasePathBinding(NodeIdx argIdx) const {
@@ -807,6 +987,22 @@ Result Analyzer::analyzeStructLit(NodeIdx idx, NameMap state) {
 		if (r.terminated) return r;
 		NodeIdx exprIdx = nodes_.getExtra(extra + 1 + 2 * i + 1);
 		r = analyze(exprIdx, std::move(r.state));
+
+		// A bare drop-bearing binding used as a field initializer is a
+		// MOVE: codegen's consumeMovedVariable suppresses its scope-exit
+		// drop (the struct owns the value now). Mirror that here so the
+		// same conditional-move and use-after-move rules apply — without
+		// this, `if (c) { var b = Box { x: counter }; }` silently leaks
+		// `counter` on the no-capture path. applyMoveToBinding also
+		// rejects capturing out of a borrowed (`let`/`mut`) parameter.
+		const AstNode &fieldExpr = nodes_.get(exprIdx);
+		if (fieldExpr.tag == AstTag::Variable) {
+			const std::string &fname =
+			    strings_.get(static_cast<StringIdx>(fieldExpr.lhs));
+			if (lookupDropFor(fname) != nullptr) {
+				applyMoveToBinding(fname, exprIdx, r.state);
+			}
+		}
 	}
 	return r;
 }
@@ -831,13 +1027,26 @@ void Analyzer::checkVariableRead(NodeIdx idx, const NameMap &state) {
 	case InitState::Unknown:
 		return;  // OK
 	case InitState::Uninit:
-		emitError("use of uninitialized binding `" + name + "`", idx, name);
+		if (movedBindings_.count(name) != 0) {
+			emitError("use of moved binding `" + name +
+			              "` — its value was moved out here or earlier",
+			          idx, name);
+		} else {
+			emitError("use of uninitialized binding `" + name + "`", idx,
+			          name);
+		}
 		return;
 	case InitState::MaybeInit:
-		emitError(
-		    "binding `" + name +
-		        "` may not be initialized on every path that reaches here",
-		    idx, name);
+		if (movedBindings_.count(name) != 0) {
+			emitError("binding `" + name +
+			              "` may have been moved on a path that reaches here",
+			          idx, name);
+		} else {
+			emitError(
+			    "binding `" + name +
+			        "` may not be initialized on every path that reaches here",
+			    idx, name);
+		}
 		return;
 	}
 }
@@ -857,19 +1066,20 @@ void Analyzer::checkDropBearingLocalsInit(const NameMap &state,
 	if (!drops_ || !types_) return;
 	for (const auto &sv : state) {
 		const std::string &name = sv.first;
-		// Skip parameters — drops for owning-mode params would belong to
-		// the caller's binding, not the callee. Today's codegen only
-		// drops `var` locals.
-		bool isParam = false;
+		// `let`/`mut` parameters are borrowed — the caller owns the
+		// value and its drop; the callee never drops them. `move`
+		// parameters are owned by the callee and DO drop at exit, so
+		// they go through the same classification as locals.
+		bool isBorrowedParam = false;
 		if (args_) {
 			for (const Param &p : *args_) {
 				if (p.Name == name) {
-					isParam = true;
+					isBorrowedParam = (p.Mode != ParamMode::Move);
 					break;
 				}
 			}
 		}
-		if (isParam) continue;
+		if (isBorrowedParam) continue;
 
 		auto vt = varTypes_.find(name);
 		if (vt == varTypes_.end()) continue;
@@ -883,11 +1093,26 @@ void Analyzer::checkDropBearingLocalsInit(const NameMap &state,
 		InitState s = sv.second;
 		if (s == InitState::Init) continue;
 
+		// Classification mirrors rustc's drop_style over the
+		// (maybe_init, maybe_uninit) pair — Uninit here is rustc's Dead:
+		// the binding was definitely moved on every path reaching this
+		// exit, codegen suppressed its drop, nothing runs. OK.
+		if (s == InitState::Uninit && movedDropBearing_.count(name) != 0) {
+			continue;
+		}
+
 		std::string msg =
 		    "drop-bearing binding `" + name + "` of type `" + structName + "` ";
 		if (s == InitState::Uninit) {
 			msg += "must be initialized before this exit; drop runs on it "
 			       "and would otherwise read uninit memory";
+		} else if (movedBindings_.count(name) != 0) {
+			// rustc's Conditional: maybe-init AND maybe-uninit. rustc
+			// would insert a runtime drop flag; jam rejects (Swift
+			// SE-0390 style) to keep codegen flag-free.
+			msg += "is moved on some control-flow paths but not others; "
+			       "its drop cannot run conditionally — move it on all "
+			       "paths or none";
 		} else {
 			msg += "may not be initialized on every path that reaches this "
 			       "exit; drop runs on it on every path";

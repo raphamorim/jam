@@ -265,6 +265,26 @@ class CodegenErrorTests {
 		framework.addTest(
 		    "Harness - signal-killed test binary reported as failure",
 		    testSignalKilledBinaryReported);
+		// Move tracking for drop-bearing locals (Swift-style static
+		// resolution: ambiguous moves are rejected, no runtime flags).
+		framework.addTest("Move - use after move rejected",
+		                  testUseAfterMoveRejected);
+		framework.addTest("Move - conditional move rejected",
+		                  testConditionalMoveRejected);
+		framework.addTest("Move - reassign after move rejected",
+		                  testReassignAfterMoveRejected);
+		framework.addTest("Move - move inside loop rejected",
+		                  testLoopMoveRejected);
+		framework.addTest("Move - conditional method-call move rejected",
+		                  testConditionalMethodMoveRejected);
+		framework.addTest("Move - use after method-call move rejected",
+		                  testUseAfterMethodMoveRejected);
+		framework.addTest("Move - move out of borrowed param rejected",
+		                  testMoveOutOfBorrowedParamRejected);
+		framework.addTest("Modes - `&` on a mode argument rejected",
+		                  testAddrOfOnModeArgRejected);
+		framework.addTest("Move - drop-bearing field extraction rejected",
+		                  testFieldExtractRejected);
 	}
 
   private:
@@ -912,6 +932,212 @@ tfn crashByWildStore() {
 )");
 		ASSERT_TRUE(r.exitCode > 128);
 		ASSERT_TRUE(stderrContains(r, "terminated by signal"));
+	}
+
+	// Shared prelude for the move-tracking rejections: a drop-bearing
+	// Counter and a `move`-mode consumer.
+	static std::string movePrelude() {
+		return R"(
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+)";
+	}
+
+	static void testUseAfterMoveRejected() {
+		auto r = compileSource("move_use_after", movePrelude() + R"(
+fn bad(sink: *mut u32) u32 {
+    var c: Counter = Counter { value: 1, sink: sink };
+    consume(c);
+    return c.value;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "use of moved binding `c`"));
+	}
+
+	// rustc would insert a runtime drop flag here (DropStyle::
+	// Conditional); jam rejects, Swift SE-0390 style, keeping codegen
+	// flag-free.
+	static void testConditionalMoveRejected() {
+		auto r = compileSource("move_conditional", movePrelude() + R"(
+fn bad(sink: *mut u32, doIt: bool) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    if (doIt) {
+        consume(c);
+    }
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "move it on all control-flow paths"));
+	}
+
+	static void testReassignAfterMoveRejected() {
+		auto r = compileSource("move_reassign", movePrelude() + R"(
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    consume(c);
+    c = Counter { value: 2, sink: sink };
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    r, "cannot assign to `c` after it was moved"));
+	}
+
+	// A loop body runs zero or more times, so a move inside of an outer
+	// binding is always a maybe-move.
+	static void testLoopMoveRejected() {
+		auto r = compileSource("move_in_loop", movePrelude() + R"(
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    var i: u32 = 0;
+    while (i < 3) {
+        consume(c);
+        i = i + 1;
+    }
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "move it on all control-flow paths"));
+	}
+
+	// Method-call moves (`v.push(c)` with `push(value: move T)`) follow
+	// the same rules — the analysis resolves the callee through the
+	// receiver's static type.
+	static void testConditionalMethodMoveRejected() {
+		auto r = compileSource("move_cond_push", R"(
+const { Vec } = import("std/collections");
+)" + movePrelude() + R"(
+fn bad(sink: *mut u32, doIt: bool) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    var c: Counter = Counter { value: 1, sink: sink };
+    if (doIt) {
+        v.push(c);
+    }
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "move it on all control-flow paths"));
+	}
+
+	static void testUseAfterMethodMoveRejected() {
+		auto r = compileSource("move_use_after_push", R"(
+const { Vec } = import("std/collections");
+)" + movePrelude() + R"(
+fn bad(sink: *mut u32) u32 {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    var c: Counter = Counter { value: 1, sink: sink };
+    v.push(c);
+    return c.value;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "use of moved binding `c`"));
+	}
+
+	// A `let`/`mut` parameter is borrowed, not owned: moving a
+	// drop-bearing value out of it (here via a var-init move) would
+	// leave the caller and the new owner both dropping the payload.
+	static void testMoveOutOfBorrowedParamRejected() {
+		auto r = compileSource("move_steal_from_let", movePrelude() + R"(
+fn steal(c: Counter) {
+    var mine: Counter = c;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "borrowed, not owned"));
+		ASSERT_TRUE(stderrContains(r, "declare the parameter `move`"));
+	}
+
+	// Ownership is tracked per whole binding: extracting a drop-bearing
+	// value out of a pure field path duplicates ownership (the field
+	// copy and the aggregate's drop glue both drop the payload).
+	// rustc models per-field move paths; jam rejects in every
+	// ownership-transferring position.
+	static void testFieldExtractRejected() {
+		std::string holder = movePrelude() + R"(
+const Holder = struct {
+    c: Counter,
+};
+)";
+		auto moveArg = compileSource("field_extract_move", holder + R"(
+fn bad(sink: *mut u32) {
+    var h: Holder = Holder { c: Counter { value: 1, sink: sink } };
+    consume(h.c);
+}
+fn main() {}
+)");
+		ASSERT_TRUE(moveArg.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    moveArg, "cannot move a drop-bearing field out of its aggregate"));
+
+		auto ret = compileSource("field_extract_return", holder + R"(
+fn takeOut(h: move Holder) Counter {
+    return h.c;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(ret.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    ret, "cannot return a drop-bearing field out of its aggregate"));
+
+		auto varInit = compileSource("field_extract_varinit", holder + R"(
+fn bad(sink: *mut u32) {
+    var h: Holder = Holder { c: Counter { value: 1, sink: sink } };
+    var x: Counter = h.c;
+}
+fn main() {}
+)");
+		ASSERT_TRUE(varInit.exitCode != 0);
+		ASSERT_TRUE(stderrContains(
+		    varInit, "cannot copy a drop-bearing field out of its aggregate"));
+
+		// Whole-binding moves stay legal — the rule only bites paths.
+		auto whole = compileSource("field_extract_whole_ok", holder + R"(
+fn consumeHolder(h: move Holder) {}
+fn ok(sink: *mut u32) {
+    var h: Holder = Holder { c: Counter { value: 1, sink: sink } };
+    consumeHolder(h);
+}
+fn main() {}
+)");
+		ASSERT_TRUE(whole.exitCode == 0);
+	}
+
+	// Call sites are sigil-free for parameter modes; `&` is address-of
+	// (a pointer value) and only valid where the parameter's TYPE is a
+	// pointer. `&x` on a mode parameter is rejected with guidance.
+	static void testAddrOfOnModeArgRejected() {
+		auto r = compileSource("addrof_on_mode_arg", R"(
+fn bump(x: mut u32) {
+    x = x + 1;
+}
+fn main() {
+    var n: u32 = 1;
+    bump(&n);
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "`&` makes a pointer"));
+		ASSERT_TRUE(stderrContains(r, "pass it plainly"));
 	}
 };
 

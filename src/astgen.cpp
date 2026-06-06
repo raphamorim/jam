@@ -340,6 +340,10 @@ static void emitDrops(AstGenCtx &gctx, const std::vector<DropTrack> &bindings);
 // emitDrops + astgenVarDecl can call them.
 static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy);
 static bool typeNeedsDrop(AstGenCtx &gctx, TypeIdx ty);
+static void rejectDropBearingFieldExtract(AstGenCtx &gctx, NodeIdx exprIdx,
+                                          TypeIdx resultTy, const char *verb);
+static void rejectAddrOfOnModeArg(AstGenCtx &gctx, NodeIdx argIdx,
+                                  const Param &p);
 static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
                        const std::vector<JirRef> &argRefs,
                        JirRef destPtr = kNoJirRef);
@@ -656,6 +660,10 @@ static void astgenReturn(AstGenCtx &gctx, const AstNode &n) {
 		// temp alloca, no trailing memcpy. Byval returns still flow
 		// the value through and let Ret's standard store handle it.
 		TypeIdx retTy = gctx.jfn.returnType;
+		// `return h.c` copies the field while the aggregate's drop glue
+		// still owns it — the caller's copy and the glue would both
+		// drop the payload. Reject (pure field paths only).
+		rejectDropBearingFieldExtract(gctx, valIdx, retTy, "return");
 		bool sretFn = retTy != kNoType &&
 		              jam::abi::classifyReturn(retTy, gctx.ctx).kind ==
 		                  jam::abi::ReturnABI::Kind::Indirect;
@@ -934,6 +942,14 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 		emit(gctx, store);
 	}
 
+	// `var owned = c;` with a bare drop-bearing `c` is a MOVE: the new
+	// binding owns the value, the source's scope-exit drop is
+	// suppressed. Without this, both bindings drop the same payload.
+	// `var x = h.c` (field extraction) has no per-field suppression to
+	// offer — reject it instead.
+	rejectDropBearingFieldExtract(gctx, initIdx, type, "copy");
+	consumeMovedVariable(gctx, initIdx);
+
 	// If this binding's type owns heap, track it on the top of the
 	// drop-scope stack so scope-exit (or the function-end Return)
 	// fires the cleanup. Two flavors share the same DropTrack slot:
@@ -1165,6 +1181,11 @@ static void astgenAssign(AstGenCtx &gctx, const AstNode &n) {
 				JirRef valRef = astgenExpr(gctx, valueIdx, valParamTy);
 				emitStructCfnDispatch(gctx, sinfo, "setAt", recv, idxRef,
 				                      {valRef});
+				// A bare drop-bearing local/`move`-param stored into a
+				// container element is MOVED — the element owns it now.
+				rejectDropBearingFieldExtract(gctx, valueIdx, valParamTy,
+				                              "copy");
+				consumeMovedVariable(gctx, valueIdx);
 				return;
 			}
 		}
@@ -1179,6 +1200,15 @@ static void astgenAssign(AstGenCtx &gctx, const AstNode &n) {
 	store.a = ptrRef;
 	store.b = valRef;
 	emit(gctx, store);
+	// A bare drop-bearing local/`move`-param on the RHS is MOVED into
+	// the destination — the destination owns it now (`self.ptr[i] =
+	// value` in Vec.push transfers the pushed element; without this the
+	// move param's own drop would double-free it). Plain copies of
+	// non-drop values are untouched: consumeMovedVariable only affects
+	// tracked drop-bearing bindings. Field extraction on the RHS
+	// (`x = h.c`) has no per-field suppression — reject.
+	rejectDropBearingFieldExtract(gctx, valueIdx, leafTy, "copy");
+	consumeMovedVariable(gctx, valueIdx);
 }
 
 // AstGen for `StructLit`. The struct value is built as an SSA aggregate
@@ -1271,6 +1301,7 @@ static JirRef astgenStructLit(AstGenCtx &gctx, const AstNode &n,
 		}
 		TypeIdx expectedField =
 		    resolveDeferredArrayTy(gctx, info->fields[idx].second);
+		rejectDropBearingFieldExtract(gctx, exprIdx, expectedField, "capture");
 		JirRef fieldVal = astgenExpr(gctx, exprIdx, expectedField);
 		// Struct-literal field capture is a MOVE for drop-bearing types:
 		// if the field's value came from a tracked local Variable, mark
@@ -1384,6 +1415,8 @@ static void astgenStructLitInto(AstGenCtx &gctx, const AstNode &n,
 		}
 		TypeIdx expectedField =
 		    resolveDeferredArrayTy(gctx, info->fields[i].second);
+		rejectDropBearingFieldExtract(gctx, exprByIdx[i], expectedField,
+		                              "capture");
 		TypeIdx fieldPtrTy = gctx.ctx.getTypePool().intern(
 		    TypeKey{TypeKind::PtrSingle, 0, 0, expectedField, 0});
 		JirInst fieldAddr{};
@@ -3862,7 +3895,20 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n,
 	for (uint32_t i = 0; i < argCount; i++) {
 		NodeIdx argIdx = static_cast<NodeIdx>(ns.getExtra(callExtra + 1 + i));
 		TypeIdx expectArg = (i < fn->Args.size()) ? fn->Args[i].Type : kNoType;
+		if (i < fn->Args.size()) {
+			rejectAddrOfOnModeArg(gctx, argIdx, fn->Args[i]);
+			if (fn->Args[i].Mode == ParamMode::Move) {
+				rejectDropBearingFieldExtract(gctx, argIdx, expectArg,
+				                              "move");
+			}
+		}
 		argRefs.push_back(astgenExpr(gctx, argIdx, expectArg));
+		// `move`-mode arg through the `Type.method(args)` form
+		// (`Box(Counter).init(c)`): ownership transfers to the callee —
+		// suppress the caller-side scope-exit drop, same as lowerArg.
+		if (i < fn->Args.size() && fn->Args[i].Mode == ParamMode::Move) {
+			consumeMovedVariable(gctx, argIdx);
+		}
 	}
 	return emitCall(gctx, fn, argRefs, destPtr);
 }
@@ -4430,7 +4476,7 @@ static std::string resolvePrefix(JamCodegenContext &ctx,
 // temp alloca). For `let` / `const`, pass the value with the
 // param's TypeIdx as the expected hint so literals settle at the
 // right width.
-static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
+static JirRef lowerArgInner(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 	jam::abi::ParamABI pabi = jam::abi::classifyParam(p.Mode, p.Type, gctx.ctx);
 	if (pabi.kind != jam::abi::ParamABI::Kind::ByPointer) {
 		JirRef v = astgenExpr(gctx, argIdx, p.Type);
@@ -4513,6 +4559,92 @@ static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 	store.b = val;
 	emit(gctx, store);
 	return ptr;
+}
+
+// Ownership is tracked per WHOLE binding. Extracting a drop-bearing
+// value out of a pure field path (`h.c`, `o.inner.c`) duplicates
+// ownership: the extracted value and the aggregate's drop glue would
+// both drop the same payload (double-free), or — for a moved-out field
+// — the parent's glue re-drops what the callee already consumed.
+// rustc models this with per-field move paths (rustc_mir_dataflow/
+// move_paths); jam keeps whole-binding granularity and REJECTS,
+// matching its reject-don't-flag philosophy.
+//
+// Scope: pure MemberAccess chains rooted at a local binding. Paths
+// that index through raw pointers (`self.ptr[i]`) are the pointer
+// world and stay unchecked; whole-array element extraction is covered
+// by the (separate, pending) array-ownership work.
+static bool isDropBearingFieldExtract(AstGenCtx &gctx, NodeIdx exprIdx,
+                                      TypeIdx resultTy) {
+	if (resultTy == kNoType) return false;
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	const AstNode &top = ns.get(exprIdx);
+	if (top.tag != AstTag::MemberAccess) return false;
+	NodeIdx cur = exprIdx;
+	while (cur != kNoNode) {
+		const AstNode &n = ns.get(cur);
+		if (n.tag == AstTag::MemberAccess) {
+			cur = static_cast<NodeIdx>(n.lhs);
+			continue;
+		}
+		if (n.tag == AstTag::Variable) {
+			const std::string &root =
+			    gctx.ctx.getStringPool().get(static_cast<StringIdx>(n.lhs));
+			// Only locals/params — `Color.Red` and module paths also
+			// parse as MemberAccess on a Variable root.
+			if (gctx.locals.find(root) == gctx.locals.end()) return false;
+			return typeNeedsDrop(gctx, resultTy);
+		}
+		return false;  // Index / Deref / call in the path: pointer world
+	}
+	return false;
+}
+
+static void rejectDropBearingFieldExtract(AstGenCtx &gctx, NodeIdx exprIdx,
+                                          TypeIdx resultTy, const char *verb) {
+	if (!isDropBearingFieldExtract(gctx, exprIdx, resultTy)) return;
+	failNode(gctx, exprIdx,
+	         std::string("cannot ") + verb +
+	             " a drop-bearing field out of its aggregate — ownership "
+	             "is tracked per whole binding, so the field and the "
+	             "aggregate's drop would both run; move the whole value "
+	             "or restructure");
+}
+
+// Callsites are sigil-free for parameter modes: `mut` / `move` access
+// is declared at the signature, and the argument is a plain expression
+// (`scale(p, 2.0)`, `consume(c)`). There is no reference type in jam —
+// `&` is address-of, producing a `*mut T` / `*const T` pointer VALUE,
+// and is only meaningful where the parameter's type is a pointer
+// (FFI, sink out-params). An `&` on a mode argument is rejected here
+// so the pointer world and the mode world stay disjoint.
+static void rejectAddrOfOnModeArg(AstGenCtx &gctx, NodeIdx argIdx,
+                                  const Param &p) {
+	const AstNode &argNode = gctx.ctx.getNodeStore().get(argIdx);
+	if (argNode.tag != AstTag::AddressOf) return;
+	const TypeKey &k = gctx.ctx.getTypePool().get(p.Type);
+	if (k.kind == TypeKind::PtrSingle || k.kind == TypeKind::PtrMany) return;
+	failNode(gctx, argIdx,
+	         "`&` makes a pointer, but parameter `" + p.Name +
+	             "` takes its argument by mode — pass it plainly (the "
+	             "signature's `mut`/`move` already grants access)");
+}
+
+static JirRef lowerArg(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
+	rejectAddrOfOnModeArg(gctx, argIdx, p);
+	if (p.Mode == ParamMode::Move) {
+		rejectDropBearingFieldExtract(gctx, argIdx, p.Type, "move");
+	}
+	JirRef r = lowerArgInner(gctx, argIdx, p);
+	// A `move`-mode argument transfers ownership into the callee: the
+	// value's new owner runs the drop. Suppress the caller-side
+	// scope-exit drop when the arg is a bare tracked drop-bearing local
+	// — the same mechanism struct-literal field capture uses.
+	// init_analysis guarantees the move is unconditional relative to
+	// the binding's declaration and that the binding is never
+	// re-initialized, so the permanent removal is sound.
+	if (p.Mode == ParamMode::Move) { consumeMovedVariable(gctx, argIdx); }
+	return r;
 }
 
 static JirRef emitCall(AstGenCtx &gctx, const FunctionAST *fn,
@@ -5357,10 +5489,25 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 		for (uint32_t i = 0; i < argCount; i++) {
 			NodeIdx argIdx =
 			    static_cast<NodeIdx>(ns.getExtra(argsExtra + 1 + i));
+			if (1 + i < method->Args.size()) {
+				rejectAddrOfOnModeArg(gctx, argIdx, method->Args[1 + i]);
+			}
 			TypeIdx expectArg = (1 + i < method->Args.size())
 			                        ? method->Args[1 + i].Type
 			                        : kNoType;
+			if (1 + i < method->Args.size() &&
+			    method->Args[1 + i].Mode == ParamMode::Move) {
+				rejectDropBearingFieldExtract(gctx, argIdx, expectArg,
+				                              "move");
+			}
 			argRefs.push_back(astgenExpr(gctx, argIdx, expectArg));
+			// A `move`-mode method argument (`v.push(local)`) transfers
+			// ownership to the callee — suppress the caller-side
+			// scope-exit drop, same as lowerArg does for free fns.
+			if (1 + i < method->Args.size() &&
+			    method->Args[1 + i].Mode == ParamMode::Move) {
+				consumeMovedVariable(gctx, argIdx);
+			}
 		}
 		return emitCall(gctx, method, argRefs, destPtr);
 	}
@@ -5645,11 +5792,27 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 						for (uint32_t i = 0; i < argCount; i++) {
 							NodeIdx argIdx = static_cast<NodeIdx>(
 							    ns.getExtra(argsExtra + 1 + i));
+							if (1 + i < method->Args.size()) {
+								rejectAddrOfOnModeArg(gctx, argIdx,
+								                      method->Args[1 + i]);
+								if (method->Args[1 + i].Mode ==
+								    ParamMode::Move) {
+									rejectDropBearingFieldExtract(
+									    gctx, argIdx,
+									    method->Args[1 + i].Type, "move");
+								}
+							}
 							TypeIdx expectArg = (1 + i < method->Args.size())
 							                        ? method->Args[1 + i].Type
 							                        : kNoType;
 							argRefs.push_back(
 							    astgenExpr(gctx, argIdx, expectArg));
+							// `move`-mode method arg: ownership moves to
+							// the callee; suppress the caller-side drop.
+							if (1 + i < method->Args.size() &&
+							    method->Args[1 + i].Mode == ParamMode::Move) {
+								consumeMovedVariable(gctx, argIdx);
+							}
 						}
 						return emitCall(gctx, method, argRefs, destPtr);
 					}
@@ -6162,6 +6325,7 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 		if (byPtr) paramInst.flags |= 1;
 		JirRef paramRef = emit(gctx, paramInst);
 
+		JirRef slotRef = paramRef;
 		if (byPtr) {
 			gctx.locals[p.Name] = paramRef;
 			gctx.localTypes[p.Name] = pTy;
@@ -6177,6 +6341,25 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 			emit(gctx, store);
 			gctx.locals[p.Name] = allocaRef;
 			gctx.localTypes[p.Name] = pTy;
+			slotRef = allocaRef;
+		}
+
+		// A `move` parameter is OWNED by the callee: it drops at
+		// function exit unless the body moves it onward (a store, a
+		// struct-literal capture, a further `move` call, a return) —
+		// each of those sites consumes the track. `let`/`mut` params
+		// stay caller-owned and never drop here. Params register
+		// before any body local, so emitDrops' reverse walk drops
+		// locals first, params last.
+		if (p.Mode == ParamMode::Move) {
+			std::string dropName = lookupDropFnLLVMName(gctx, pTy);
+			if (!dropName.empty()) {
+				gctx.dropScopes.back().push_back(
+				    {p.Name, slotRef, pTy, dropName});
+			} else if (typeNeedsDrop(gctx, pTy)) {
+				gctx.dropScopes.back().push_back(
+				    {p.Name, slotRef, pTy, std::string()});
+			}
 		}
 	}
 

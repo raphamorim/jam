@@ -58,7 +58,7 @@ fn doubleIt(x: mut u32) u32 {
 
 fn mutCaller() u32 {
     var n: u32 = 7;
-    var doubled: u32 = doubleIt(&n);
+    var doubled: u32 = doubleIt(n);
     // Post P9, n is now 14 in the caller (the function mutated it
     // through the pointer). read(n) sees the new value.
     var stillUsable: u32 = read(n);
@@ -93,7 +93,7 @@ tfn letCallerOK() {
 }
 
 tfn mutCallerOK() {
-    // doubleIt(&n) mutates caller's n: 7 → 14. Returns 14.
+    // doubleIt(n) mutates caller's n: 7 → 14. Returns 14.
     // read(n) sees the new value, returns n + 1 = 15.
     // Total: 14 + 15 = 29.
     assert(mutCaller(), 29);

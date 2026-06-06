@@ -46,14 +46,14 @@ tfn callerObservesInlineDrop() {
     assert(hits, 1);
 }
 
-// Manual `Counter.drop(&c)` call while c is still in scope. The auto-drop
+// Manual `Counter.drop(c)` call while c is still in scope. The auto-drop
 // at function exit also fires, so the sink gets bumped twice. This is a
 // known footgun (manual + auto = double drop) — flagged in
 // docs/STRUCT_METHODS.md as a v1.1 polish item. The test pins down
 // today's behavior so a future fix is intentional, not accidental.
 fn callsDropManually(sink: *mut u32) u32 {
     var c: Counter = Counter { value: 9, sink: sink };
-    Counter.drop(&c);
+    Counter.drop(c);
     // sink == 1 here (manual drop ran)
     return c.value;
 }

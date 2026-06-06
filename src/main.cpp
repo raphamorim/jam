@@ -978,6 +978,37 @@ static int compileAndRun(const std::string &filename,
 				if (fn->isPub) { fnRegistry[fn->Name] = fn.get(); }
 			}
 		}
+		// Methods of generic struct-returning functions (`pub fn Vec(T:
+		// type) type { return struct { fn push(value: move T) ... }; }`)
+		// register under "GenericName.method". Parameter MODES don't
+		// depend on T, so the un-instantiated FunctionAST is enough for
+		// the mode-aware callsite analysis to see `v.push(c)` as a move.
+		auto registerAnonMethods = [&](const ModuleAST *m) {
+			const NodeStore &nsr = codegenCtx.getNodeStore();
+			for (const auto &fn : m->Functions) {
+				if (!fn->isGeneric()) continue;
+				for (NodeIdx stmt : fn->Body) {
+					const AstNode &rn = nsr.get(stmt);
+					if (rn.tag != AstTag::Return) continue;
+					if (rn.lhs == kNoNode) break;
+					const AstNode &value =
+					    nsr.get(static_cast<NodeIdx>(rn.lhs));
+					if (value.tag != AstTag::StructExpr) break;
+					uint32_t anonIdx = value.lhs;
+					if (anonIdx >= sharedAnonStructs.size()) break;
+					const StructDeclAST *anon =
+					    sharedAnonStructs[anonIdx].get();
+					for (const auto &mth : anon->Methods) {
+						fnRegistry[fn->Name + "." + mth->Name] = mth.get();
+					}
+					break;
+				}
+			}
+		};
+		registerAnonMethods(module.get());
+		for (const auto &kv : resolver.getLoadedModules()) {
+			registerAnonMethods(kv.second.get());
+		}
 
 		auto runAnalysis = [&](FunctionAST *function) {
 			if (function->isExtern) return;

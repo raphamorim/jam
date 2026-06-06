@@ -126,7 +126,7 @@ void testUseAfterMoveHasLine() {
 	                       "}\n");
 	ASSERT_TRUE(r.exitCode != 0);
 	ASSERT_TRUE(stderrContains(r, ":5: error:"));
-	ASSERT_TRUE(stderrContains(r, "uninitialized binding"));
+	ASSERT_TRUE(stderrContains(r, "use of moved binding"));
 }
 
 // Multi-error reporting

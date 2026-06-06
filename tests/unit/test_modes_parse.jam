@@ -57,7 +57,7 @@ tfn readDefaultParses() {
 
 tfn modifyMutParses() {
     var n: u32 = 10;
-    assert(modifyMut(&n), 11);
+    assert(modifyMut(n), 11);
 }
 
 tfn moveValueParses() {
@@ -68,7 +68,7 @@ tfn moveValueParses() {
 tfn mixedModesParses() {
     var b: u32 = 2;
     var c: u32 = 3;
-    assert(mixedModes(1, &b, c), 7);
+    assert(mixedModes(1, b, c), 7);
 }
 
 tfn modifyMutPtrParses() {
