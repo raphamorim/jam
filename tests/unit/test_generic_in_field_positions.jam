@@ -1,0 +1,68 @@
+// Regression test for "Unknown generic: Vec" when a generic type
+// appears in a struct FIELD or enum VARIANT PAYLOAD position (issue
+// report, 2026-06). Root cause: the eager import pass iterated
+// getLoadedModules() (an unordered_map), so whether `Vec`'s defining
+// module had been registered before the field's GenericCall resolved
+// was hash-order dependent — the failure was flaky by construction.
+// Fixed by the demand-driven fallback in resolveGenericCall (resolve
+// from the decl table on reference). These tests pin the reported
+// shapes exactly so the lazy path keeps covering them.
+
+const { assert } = import("test");
+const { Vec } = import("std/collections");
+const { Option } = import("std/option");
+
+const Backpack = struct {
+    items: Vec(u64),
+};
+
+tfn vecInStructField() {
+    var b: Backpack = Backpack { items: Vec(u64).empty() };
+    b.items.push(40);
+    b.items.push(2);
+    assert(b.items.len(), 2);
+}
+
+const Item = enum {
+    Single(u64),
+    Many(Vec(u64)),
+};
+
+// `move` — Item carries a drop-bearing payload (Vec), and matching by
+// value consumes the scrutinee, so the function must own it.
+fn describe(it: move Item) u64 {
+    match (it) {
+        Item.Single(x) { return x; }
+        Item.Many(xs) { return xs.len() as u64; }
+    }
+    return 0;
+}
+
+tfn vecInEnumVariantPayload() {
+    assert(describe(Item.Single(7)) as u32, 7);
+    var v: Vec(u64) = Vec(u64).empty();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    assert(describe(Item.Many(v)) as u32, 3);
+}
+
+// Nested generic in a field — Option(Vec(u64)) — the deeper shape of
+// the same resolution path.
+const MaybePack = struct {
+    items: Option(Vec(u64)),
+};
+
+tfn nestedGenericInStructField() {
+    // The field POSITION resolving is the regression target; matching
+    // a drop-bearing field directly is (correctly) rejected by the
+    // ownership rules, so the match runs on a whole local instead.
+    var m: MaybePack = MaybePack { items: Option(Vec(u64)).None() };
+    var direct: Option(Vec(u64)) = Option(Vec(u64)).None();
+    var found: u32 = 0;
+    match (direct) {
+        Option(Vec(u64)).Some(v) { found = 1; }
+        _ { found = 2; }
+    }
+    assert(found, 2);
+}
