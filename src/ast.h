@@ -26,16 +26,6 @@ class JamCodegenContext;
 //                      stays initialized after the call.
 // Move               — consume ownership; caller's binding becomes
 //                      uninitialized after the call.
-// Undefined          — write-to-uninit destination; param is uninitialized
-//                      at entry, function must initialize before any return,
-//                      caller's binding becomes initialized after the call.
-//
-// See docs/MVS.md §2 for the full specification. Modes are static-only;
-// the calling convention is unchanged at the LLVM IR level (see §7).
-// ParamMode lives in its own header (`param_mode.h`) so other
-// translation units — notably JIR — can carry per-param modes
-// without dragging in the rest of ast.h. Re-exported here for
-// source-compat with existing #include "ast.h" users.
 
 // One function parameter. Mode defaults to Let when not annotated at the
 // declaration site (the common case for read-only parameters).
@@ -265,8 +255,6 @@ class ImportDeclAST {
 	    : Name(std::move(Name)), Path(std::move(Path)) {}
 };
 
-// const { f1, f2 } = import("mod");
-//
 // `chain` captures trailing `.seg.seg` access on the RHS — e.g.
 // `const {print} = import("std").fmt;` parses with `Path="std"` and
 // `chain=["fmt"]`. Resolution walks pub-import re-exports in each
@@ -299,13 +287,6 @@ class ModuleAST {
 	// engine in reads from here to instantiate the struct with
 	// concrete type arguments.
 	std::vector<std::unique_ptr<StructDeclAST>> AnonStructs;
-
-	// Mirror of AnonStructs for `enum { ... }` expressions. Each entry
-	// is a regular EnumDeclAST with a synthetic name
-	// (`__anon_enum_<N>`); the EnumExpr AST node carries the index in
-	// its d.lhs slot. Variant payload types may reference generic
-	// parameters (e.g. `Some(T)`); the substitution engine resolves
-	// them at each instantiation site (`Option(i32)` -> `Some(i32)`).
 	std::vector<std::unique_ptr<EnumDeclAST>> AnonEnums;
 
 	ModuleAST() = default;
