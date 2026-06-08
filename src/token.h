@@ -12,15 +12,9 @@
 #include <string>
 #include <string_view>
 
-// Token types
 enum TokenType {
 	TOK_EOF = 0,
 	TOK_FN,
-	// `cfn` declares a method whose calls are synthesized by the
-	// compiler instead of being typed by the user. The shape on disk
-	// is identical to a regular function (same args / body / return);
-	// the difference is opt-in for the compiler hooks (`drop`, `at`,
-	// `default`). A `fn drop(self)` without `cfn` is just a method.
 	TOK_CFN,
 	TOK_IDENTIFIER,
 	TOK_COLON,
@@ -53,24 +47,23 @@ enum TokenType {
 	TOK_CLOSE_BRACKET,
 	TOK_STRING_LITERAL,
 	TOK_WHILE,
-	TOK_LOOP,  // `loop { ... }` — infinite loop, syntactically noreturn unless
-	           // body breaks
+	TOK_LOOP,
 	TOK_FOR,
 	TOK_BREAK,
 	TOK_CONTINUE,
 	TOK_IN,
-	TOK_EXTERN,     // extern keyword (import C function)
-	TOK_EXPORT,     // export keyword (C ABI export)
-	TOK_PUB,        // pub keyword (visible across Jam modules)
-	TOK_IMPORT,     // import keyword
-	TOK_DOT,        // . for member access
-	TOK_AND,        // && (logical AND, short-circuit)
-	TOK_OR,         // || (logical OR, short-circuit)
-	TOK_NOT,        // ! (logical NOT)
-	TOK_TFN,        // tfn keyword (test function)
-	TOK_STRUCT,     // struct keyword
-	TOK_UNION,      // union keyword (untagged; FFI-shaped)
-	TOK_ENUM,       // enum keyword (tagged sum type; payload-less)
+	TOK_EXTERN,
+	TOK_EXPORT,
+	TOK_PUB,
+	TOK_IMPORT,
+	TOK_DOT,
+	TOK_AND,
+	TOK_OR,
+	TOK_NOT,
+	TOK_TFN,
+	TOK_STRUCT,
+	TOK_UNION,
+	TOK_ENUM,
 	TOK_STAR,       // * (pointer prefix; multiplication)
 	TOK_SLASH,      // / (division)
 	TOK_PERCENT,    // % (modulo)
@@ -80,23 +73,15 @@ enum TokenType {
 	TOK_TILDE,      // ~ (bitwise NOT)
 	TOK_LSHIFT,     // << (left shift)
 	TOK_RSHIFT,     // >> (right shift)
-	TOK_MOVE,       // move keyword (parameter mode: consume ownership)
+	TOK_MOVE,
 	TOK_ELLIPSIS,   // ... (variadic marker in extern fn parameters)
-	TOK_MATCH,      // match keyword
+	TOK_MATCH,
 	TOK_DOTDOT,     // .. (exclusive range / slice)
 	TOK_DOTDOT_EQ,  // ..= (inclusive range in match patterns)
-	TOK_AS,         // as keyword (explicit type cast)
-	TOK_AT,         // @ — prefix for comptime-function invocations:
-	                //   `@sizeOf(T)`, `@alignOf(T)`, user-defined cfns
-	TOK_COMP,       // comp keyword — comp param marker (`fn f(comp n: u32)
-	                //   ...`); also wraps an expression that must fold at
-	                //   compile time (`comp const X = 1 + 1;`). Source-
-	                //   level keyword for the broader "compile-time
-	                //   evaluation" mechanism implemented in src/comptime.h.
-	TOK_INLINE,     // inline keyword — prefix for `inline while` (loop
-	                //   unrolling at compile time, mirrors Zig's
-	                //   `inline while`). Required by std.fmt's format-
-	                //   string parser.
+	TOK_AS,
+	TOK_AT,         // @
+	TOK_COMP,
+	TOK_INLINE,
 };
 
 // Token structure.

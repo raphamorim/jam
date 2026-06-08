@@ -868,9 +868,29 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		}
 
 		const char *resultName = (inst.ty == kNoType) ? "" : "call.indirect";
-		return JamLLVMBuildIndirectCall(
+		JamValueRef callResult = JamLLVMBuildIndirectCall(
 		    lctx.ctx.getBuilder(), llvmFnTy, calleeVal, args.data(),
 		    static_cast<unsigned>(args.size()), resultName);
+		// A byref aggregate return arrives as an SSA aggregate VALUE: the
+		// indirect-call signature returns it by value (getLLVMType →
+		// struct type), so LLVM applies the platform C ABI — arm64 HFAs
+		// (NSPoint/NSSize/NSRect, CGRect) come back in v0–v3, ≤16-byte
+		// structs (NSRange) in x0/x1. jam's byref model expects the
+		// call's JirRef to be a POINTER to the aggregate, so spill the
+		// value to a slot and hand back the pointer; downstream
+		// Load/Store/FieldAccess then treat it like any other byref
+		// value. (Symmetric to the by-value aggregate ARG load above —
+		// together they make `[view frame]` / `[win frame]` and other
+		// struct-returning Cocoa methods work through the msgSend pun.)
+		if (inst.ty != kNoType && jam::abi::isByRef(inst.ty, lctx.ctx)) {
+			JamTypeRef aggTy = lctx.ctx.getLLVMType(inst.ty);
+			uint64_t align = lctx.ctx.typeAlign(inst.ty);
+			JamValueRef slot = JamLLVMBuildAlloca(lctx.ctx.getBuilder(), aggTy,
+			                                      align, "ret.byval");
+			JamLLVMBuildStore(lctx.ctx.getBuilder(), callResult, slot);
+			return slot;
+		}
+		return callResult;
 	}
 	// Control
 	case JirTag::Br: {

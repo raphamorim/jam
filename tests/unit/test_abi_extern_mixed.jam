@@ -1,19 +1,8 @@
 const { assert } = import("test");
 
-// MVS P9.8: extern fns follow the C ABI literally — mode-aware ABI
-// rules don't apply at the FFI boundary. These tests confirm that
-// (a) Jam functions using P9 modes can call extern fns with primitive
-// and pointer arguments, (b) extern fns retain their C-ABI shape
-// regardless of what the surrounding Jam code is doing, and (c) all
-// the existing extern patterns (snprintf, printf, etc.) continue to
-// compose cleanly with the new ABI.
-
 extern fn snprintf(buf: *mut[] u8, size: u64, fmt: *const[] u8, ...) i32;
 extern fn strlen(s: *const[] u8) u64;
 
-// Jam-defined helper using a `mut` parameter that internally calls an
-// extern fn. The mut param is pointer-passed under P9.3; the extern
-// call uses pointer args via Jam-source `&` syntax — no auto-address.
 fn fillFromExtern(buf: mut [16]u8) i32 {
     var written: i32 = snprintf(&buf[0], 16, "n=%d", 42);
     return written;

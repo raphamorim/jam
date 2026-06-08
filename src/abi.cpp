@@ -13,7 +13,10 @@ namespace jam {
 namespace abi {
 
 bool isByRef(TypeIdx ty, const JamCodegenContext &ctx) {
-	if (ty == kNoType) return false;
+    if (ty == kNoType) {
+        return false;
+    }
+
 	const TypeKey &k = ctx.getTypePool().get(ty);
 	switch (k.kind) {
 	// Source-only / comptime-only — never lowered to runtime memory,
