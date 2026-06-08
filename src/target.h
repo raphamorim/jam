@@ -13,13 +13,9 @@
 
 namespace jam {
 
-// CPU Architectures
 enum class Arch { X86_64, AArch64, ARM, RISCV64, Unknown };
-
-// Operating Systems
 enum class OS { Linux, MacOS, Windows, FreeBSD, Unknown };
 
-// ABIs (Application Binary Interface)
 enum class ABI {
 	None,   // No specific ABI (e.g., macOS)
 	GNU,    // GNU C library
@@ -29,7 +25,8 @@ enum class ABI {
 	Unknown
 };
 
-// Target triple information
+// target triplet is basically a pattern in gnu build system
+// it's : name of the CPU family/model then the vendor and the OS name
 struct Target {
 	Arch arch;
 	OS os;
@@ -44,23 +41,18 @@ struct Target {
 	// Create target from host system
 	static Target getHostTarget();
 
-	// Convert to LLVM triple string
 	std::string toLLVMTriple() const;
-
-	// Get human-readable name
 	std::string getName() const;
 
-	// Target characteristics
 	bool requiresLibC() const;
 	bool requiresPIC() const;
 	bool requiresPIE() const;
 	bool canDynamicLink() const;
-	bool usesCabi() const;  // Whether this target uses C ABI
+	bool usesCabi() const;
 
-	// ABI-specific queries
 	const char *getLibCName() const;
-	int getPointerSize() const;       // in bytes
-	int getPointerAlignment() const;  // in bytes
+	int getPointerSize() const;
+	int getPointerAlignment() const;
 
 	// Calling convention
 	enum class CallingConvention {
@@ -73,31 +65,6 @@ struct Target {
 	CallingConvention getDefaultCC() const;
 };
 
-// Common target configurations
-namespace targets {
-inline Target x86_64_linux_gnu() {
-	return Target(Arch::X86_64, OS::Linux, ABI::GNU);
 }
-inline Target x86_64_linux_musl() {
-	return Target(Arch::X86_64, OS::Linux, ABI::Musl);
-}
-inline Target x86_64_macos() {
-	return Target(Arch::X86_64, OS::MacOS, ABI::None);
-}
-inline Target x86_64_windows_gnu() {
-	return Target(Arch::X86_64, OS::Windows, ABI::MinGW);
-}
-inline Target x86_64_windows_msvc() {
-	return Target(Arch::X86_64, OS::Windows, ABI::MSVC);
-}
-inline Target aarch64_linux_gnu() {
-	return Target(Arch::AArch64, OS::Linux, ABI::GNU);
-}
-inline Target aarch64_macos() {
-	return Target(Arch::AArch64, OS::MacOS, ABI::None);
-}
-}  // namespace targets
 
-}  // namespace jam
-
-#endif  // TARGET_H
+#endif
