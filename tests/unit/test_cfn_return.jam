@@ -1,0 +1,120 @@
+// `cfn` value returns + cfn→cfn calls (Stage 3 of COMPTIME_PLAN.md).
+// A compile-time function with a declared return type folds its body
+// at the call site and materializes the returned value as a constant.
+// cfn bodies may call other cfns (bounded by depth / total-call caps).
+
+const { assert } = import("test");
+
+// Simple value-returning cfn, used in expression position.
+cfn add1(x: u64) u64 {
+    return x + 1;
+}
+
+tfn cfnReturnsValue() {
+    var r: u64 = add1(41);
+    assert(r, 42);
+}
+
+// Return value narrows to the consumer's width like a literal.
+cfn pick() u32 {
+    return 7;
+}
+
+tfn cfnReturnNarrows() {
+    var a: u8 = pick() as u8;
+    var b: u32 = pick();
+    assert(a as u32 + b, 14);
+}
+
+// cfn calling another cfn.
+cfn base() u64 { return 10; }
+cfn doubled() u64 { return base() * 2; }
+cfn plusTwo() u64 { return doubled() + 2; }
+
+tfn cfnCallsCfn() {
+    var r: u64 = plusTwo();
+    assert(r, 22);
+}
+
+// Recursion: factorial.
+cfn fact(n: u64) u64 {
+    comp if (n == 0) {
+        return 1;
+    } else {
+        return n * fact(n - 1);
+    }
+    return 0;
+}
+
+tfn cfnRecursion() {
+    var r: u64 = fact(5);
+    assert(r, 120);
+}
+
+// Recursion with a runtime-looking branch folded at comptime: fib.
+cfn fib(n: u64) u64 {
+    comp if (n < 2) {
+        return n;
+    } else {
+        return fib(n - 1) + fib(n - 2);
+    }
+    return 0;
+}
+
+tfn cfnFib() {
+    var r: u64 = fib(10);
+    assert(r, 55);
+}
+
+// cfn body uses a comptime while-loop to accumulate.
+cfn sumTo(n: u64) u64 {
+    var total: u64 = 0;
+    var i: u64 = 0;
+    while (i < n) {
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+tfn cfnLoop() {
+    var r: u64 = sumTo(100);
+    assert(r, 4950);
+}
+
+// cfn in an array-length position — folds through resolveArrayExpr.
+cfn bufLen(extra: u64) u64 {
+    return 16 + extra;
+}
+
+fn arrayLenFromCfn() u64 {
+    var buf: [bufLen(8)]u8 = [0; bufLen(8)];
+    var n: u64 = 0;
+    for i in 0:24 {
+        buf[i] = 1;
+        n = n + 1;
+    }
+    return n;
+}
+
+tfn cfnDrivesArrayLength() {
+    assert(arrayLenFromCfn(), 24);
+}
+
+// cfn argument is itself a comptime expression (module const + arith).
+comp const SEED = 6;
+
+cfn square(x: u64) u64 {
+    return x * x;
+}
+
+tfn cfnArgIsComptimeExpr() {
+    var r: u64 = square(SEED + 1);
+    assert(r, 49);
+}
+
+// cfn feeding a cfn argument (nested calls in arg position).
+tfn cfnNestedArgCall() {
+    var r: u64 = add1(square(5));
+    assert(r, 26);
+}

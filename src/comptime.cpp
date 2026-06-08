@@ -8,6 +8,7 @@
 #include "comptime.h"
 
 #include "jam_llvm.h"
+#include "target.h"
 
 namespace jam {
 
@@ -148,6 +149,8 @@ ComptimeValue ComptimeEvaluator::eval(NodeIdx expr,
 		return evalMemberAccess(n, scope);
 	case AstTag::AtCall:
 		return evalAtCall(n, scope);
+	case AstTag::Call:
+		return evalCall(n, scope);
 	default:
 		// Operator / construct we don't fold yet. Returning None keeps
 		// optional-fold callers (peephole constant folding) silent;
@@ -156,13 +159,63 @@ ComptimeValue ComptimeEvaluator::eval(NodeIdx expr,
 	}
 }
 
+ComptimeValue ComptimeEvaluator::evalCall(const AstNode &n,
+                                          const ComptimeScope &scope) const {
+	// Only direct calls fold (flags bit 0 set = indirect method call on
+	// a runtime value — never comptime). Direct form: lhs = callee
+	// StringIdx, rhs = ExtraIdx -> [argCount, arg0, ...].
+	if ((n.flags & 1) != 0) return ComptimeValue::makeNone();
+	if (resolver_ == nullptr) return ComptimeValue::makeNone();
+
+	const std::string &name = strings_.get(static_cast<StringIdx>(n.lhs));
+	ExtraIdx extra = static_cast<ExtraIdx>(n.rhs);
+	uint32_t argCount = nodes_.getExtra(extra);
+	std::vector<ComptimeValue> argVals;
+	argVals.reserve(argCount);
+	for (uint32_t i = 0; i < argCount; i++) {
+		NodeIdx argIdx = static_cast<NodeIdx>(nodes_.getExtra(extra + 1 + i));
+		ComptimeValue v = eval(argIdx, scope);
+		if (v.isNone()) {
+			if (diags_ != nullptr) {
+				diags_->error(loc_, "argument #" + std::to_string(i) +
+				                        " to comptime call `" + name +
+				                        "` is not a compile-time constant");
+			}
+			return ComptimeValue::makeNone();
+		}
+		argVals.push_back(std::move(v));
+	}
+
+	Diagnostics dummy;
+	Diagnostics &d = diags_ != nullptr ? *diags_ : dummy;
+	return resolver_->resolveCall(name, argVals, d, loc_);
+}
+
 ComptimeValue ComptimeEvaluator::evalAtCall(const AstNode &n,
                                             const ComptimeScope &scope) const {
-	// Type-arg single form (`@sizeOf(T)` / `@alignOf(T)`) doesn't
-	// belong here — those produce a value the regular astgen path
-	// turns into a JIR Int. From inside a cfn body, those still
-	// return None (caller can do its own dispatch if it wants).
-	if ((n.flags & 1) == 0) { return ComptimeValue::makeNone(); }
+	// No-arg / type-arg intrinsics (flags bit 0 clear). The target-OS
+	// predicates fold to a comptime bool here so `comp if (@isDarwin())`
+	// works — they're pure queries of the (host) target, the same
+	// source astgenAtCall reads. `@sizeOf` / `@alignOf` need the
+	// codegen context's layout tables, which this evaluator doesn't
+	// hold; they stay None here and fold via astgen (Stage 5 adds a
+	// hook to share them). `@os()` returns a string and isn't used for
+	// branching, so it's astgen-only too.
+	if ((n.flags & 1) == 0) {
+		const std::string &iname = strings_.get(static_cast<StringIdx>(n.lhs));
+		if (iname == "isDarwin" || iname == "isLinux" || iname == "isWindows" ||
+		    iname == "isUnix") {
+			jam::OS os = jam::Target::getHostTarget().os;
+			bool v = (iname == "isDarwin")  ? (os == jam::OS::MacOS)
+			         : (iname == "isLinux") ? (os == jam::OS::Linux)
+			         : (iname == "isWindows")
+			             ? (os == jam::OS::Windows)
+			             : (os == jam::OS::MacOS || os == jam::OS::Linux ||
+			                os == jam::OS::FreeBSD);  // isUnix
+			return ComptimeValue::makeBool(v);
+		}
+		return ComptimeValue::makeNone();
+	}
 
 	// Expr-arg multi-form: rhs = ExtraIdx -> [argCount, arg0, ...].
 	ExtraIdx extra = static_cast<ExtraIdx>(n.rhs);

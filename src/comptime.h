@@ -151,6 +151,26 @@ class CompEmitter {
 	                                Diagnostics &diags, SrcLoc loc) = 0;
 };
 
+// Resolves a comptime call `name(args)` to a value. The evaluator hits
+// a direct `Call` node while folding a cfn body (or an array-length /
+// comp-const initializer); it evaluates each argument, then forwards
+// the name + values here. The concrete implementation (codegen-side)
+// looks the callee up, confirms it is a compile-time function, and
+// interprets its body in a fresh scope — that is how one `cfn` calls
+// another (and how a cfn appears in a `[N]u8` length position).
+//
+// Returns None when `name` is not a comptime-evaluable function (the
+// caller surfaces the diagnostic) or when the callee body fails to
+// fold (a diagnostic was already pushed). Implementations are
+// responsible for their own recursion-depth / total-call caps.
+class CompCallResolver {
+  public:
+	virtual ~CompCallResolver() = default;
+	virtual ComptimeValue resolveCall(const std::string &name,
+	                                  const std::vector<ComptimeValue> &args,
+	                                  Diagnostics &diags, SrcLoc loc) = 0;
+};
+
 // Folds AST expression nodes to compile-time values. Failure modes
 // (depends on runtime value, unsupported operator, type mismatch) all
 // surface as ComptimeValue::None — the evaluator never throws. Callers
@@ -217,11 +237,20 @@ class ComptimeEvaluator {
 		loc_ = {};
 	}
 
+	// Install / clear the call resolver. Independent of the emitter:
+	// the array-length / comp-const fold path installs a resolver with
+	// no emitter, while a cfn body installs both. When a resolver is
+	// set, direct `Call` nodes fold through it (cfn -> cfn); otherwise
+	// a Call folds to None.
+	void setCallResolver(CompCallResolver *r) const { resolver_ = r; }
+	void clearCallResolver() const { resolver_ = nullptr; }
+
   private:
 	const NodeStore &nodes_;
 	const StringPool &strings_;
 	const TypePool &types_;
 	mutable CompEmitter *emitter_ = nullptr;
+	mutable CompCallResolver *resolver_ = nullptr;
 	mutable Diagnostics *diags_ = nullptr;
 	mutable SrcLoc loc_;
 
@@ -232,6 +261,12 @@ class ComptimeEvaluator {
 	// (the @-emit family produces side effects, not values).
 	ComptimeValue evalAtCall(const AstNode &n,
 	                         const ComptimeScope &scope) const;
+
+	// Eval a direct `Call` node (cfn -> cfn). Evaluates each argument
+	// in `scope`, then forwards name + values to the installed
+	// resolver. None when no resolver is set, the callee isn't
+	// comptime-evaluable, or an argument fails to fold.
+	ComptimeValue evalCall(const AstNode &n, const ComptimeScope &scope) const;
 
 	// Per-tag handlers. Each returns None on failure; callers compose.
 	ComptimeValue evalNumberLit(const AstNode &n) const;

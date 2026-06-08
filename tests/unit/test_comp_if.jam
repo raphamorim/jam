@@ -1,0 +1,181 @@
+// `comp if` — compile-time branch elision (Stage 2 of
+// COMPTIME_PLAN.md). The condition folds during astgen and ONLY the
+// taken arm lowers; the dead arm is never typechecked, never reaches
+// JIR, and its symbols are never referenced. init_analysis observes
+// the same elision through the verdict table, so move/drop accounting
+// matches the emitted code.
+
+const { assert } = import("test");
+const { Option } = import("std").option;
+
+comp const FEATURE = true;
+comp const LEVEL = 3;
+
+// The dead arm references a function that does not exist anywhere.
+// A runtime `if (false)` would still typecheck (and fail to compile);
+// `comp if` must never look at it.
+fn gatedCall() u64 {
+    comp if (FEATURE) {
+        return 1;
+    } else {
+        return thisFunctionDoesNotExist();
+    }
+    return 99;
+}
+
+tfn deadArmNeverTypechecks() {
+    assert(gatedCall(), 1);
+}
+
+// else-arm taken.
+fn elseTaken() u64 {
+    comp if (LEVEL > 100) {
+        return missingSymbolHereToo();
+    } else {
+        return 2;
+    }
+    return 99;
+}
+
+tfn elseArmTaken() {
+    assert(elseTaken(), 2);
+}
+
+// Platform intrinsics fold inside comp-if conditions — the
+// conditional-compilation story. Exactly one arm survives per target.
+fn osGated() u64 {
+    comp if (@isDarwin()) {
+        return 10;
+    } else {
+        comp if (@isLinux()) { return 20; } else { return 30; }
+    }
+    return 0;
+}
+
+tfn osGatedPicksOneArm() {
+    const v: u64 = osGated();
+    const darwin: u64 = 10;
+    const linux: u64 = 20;
+    const other: u64 = 30;
+    assert(((v == darwin) || (v == linux) || (v == other)) as u8, 1);
+    if (@isDarwin()) { assert(v, 10); }
+    if (@isLinux()) { assert(v, 20); }
+}
+
+// comp if over comp bindings, including a comp var mutated earlier
+// in the function.
+fn compIfOverCompVar() u64 {
+    comp var threshold = 1;
+    threshold = threshold + 4;
+    comp if (threshold == 5) {
+        return 50;
+    } else {
+        return 60;
+    }
+    return 0;
+}
+
+tfn compIfSeesCompVarMutation() {
+    assert(compIfOverCompVar(), 50);
+}
+
+// Taken-arm statements run at the SAME runtime depth as the
+// surrounding code: a comp var declared outside is assignable inside.
+fn compIfArmIsUnconditional() u64 {
+    comp var x = 1;
+    comp if (FEATURE) {
+        x = x + 1;
+    } else {
+        x = x + 100;
+    }
+    return x;
+}
+
+tfn compIfArmSameDepth() {
+    assert(compIfArmIsUnconditional(), 2);
+}
+
+// Locals declared inside a taken arm stay arm-scoped; drops fire at
+// arm exit exactly like a bare block.
+const DropProbe = struct {
+    sink: *mut u32,
+    cfn drop(self: mut DropProbe) {
+        var p: *mut u32 = self.sink;
+        p.* = p.* + 1;
+    }
+};
+
+fn armScopedDrop(sink: *mut u32) u64 {
+    comp if (FEATURE) {
+        var d: DropProbe = DropProbe { sink: sink };
+        // d drops at arm exit.
+    } else {
+        var notLowered: DropProbe = DropProbe { sink: sink };
+    }
+    return 1;
+}
+
+tfn compIfArmDropsFire() {
+    var counter: u32 = 0;
+    var p: *mut u32 = &counter;
+    armScopedDrop(p);
+    assert(counter, 1);
+}
+
+// Move OUT of a taken comp-if arm is unconditional — init_analysis
+// must accept it (a runtime if-arm would reject the same shape with
+// "move it on all control-flow paths or none").
+fn consumeProbe(d: move DropProbe) u64 {
+    return 1;
+}
+
+fn moveInsideTakenArm(sink: *mut u32) u64 {
+    var d: DropProbe = DropProbe { sink: sink };
+    comp if (FEATURE) {
+        return consumeProbe(d);
+    } else {
+        return 0;
+    }
+    return 0;
+}
+
+tfn moveInsideTakenArmIsUnconditional() {
+    var counter: u32 = 0;
+    var p: *mut u32 = &counter;
+    assert(moveInsideTakenArm(p), 1);
+    // consumeProbe owned `d` and dropped it at its exit.
+    assert(counter, 1);
+}
+
+// comp if interacts with match/Option as ordinary inline statements.
+fn compIfInsideMatch(o: Option(u64)) u64 {
+    match (o) {
+        Option(u64).Some(v) {
+            comp if (LEVEL == 3) { return v * 2; } else { return v; }
+        }
+        Option(u64).None { return 0; }
+    }
+    return 0;
+}
+
+tfn compIfInsideMatchArm() {
+    assert(compIfInsideMatch(Option(u64).Some(21)), 42);
+}
+
+// Nested comp ifs with else-if chaining.
+fn nestedChain() u64 {
+    comp if (LEVEL == 1) {
+        return 1;
+    } else comp if (LEVEL == 2) {
+        return 2;
+    } else comp if (LEVEL == 3) {
+        return 3;
+    } else {
+        return 4;
+    }
+    return 0;
+}
+
+tfn compElseIfChain() {
+    assert(nestedChain(), 3);
+}

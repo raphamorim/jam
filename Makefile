@@ -189,7 +189,7 @@ test-comptime: build
 	@echo ""
 	@echo "Building and running Comptime C++ tests..."
 	@clang++ -c ./tests/cpp/test_comptime.cpp -o $(OUT)/test_comptime.o `$(LLVM_CONFIG) --cxxflags` -fexceptions $(OPTFLAGS)
-	@clang++ -o $(OUT)/comptime_tests $(OUT)/test_comptime.o $(OUT)/comptime.o $(OUT)/diagnostics.o $(OUT)/jam_llvm.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
+	@clang++ -o $(OUT)/comptime_tests $(OUT)/test_comptime.o $(OUT)/comptime.o $(OUT)/diagnostics.o $(OUT)/jam_llvm.o $(OUT)/target.o `$(LLVM_CONFIG) --ldflags --libs --libfiles --system-libs`
 	@$(OUT)/comptime_tests
 
 test-print: build

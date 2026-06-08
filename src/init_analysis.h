@@ -81,6 +81,13 @@ using EnumVariantMap =
 struct AnalysisHooks {
 	void *ctx = nullptr;
 	bool (*typeNeedsDrop)(void *ctx, TypeIdx ty) = nullptr;
+	// `comp if` verdict recorded by astgen for (fnAst, IfNode). The
+	// analyzer must observe the same dead-arm elision astgen performed:
+	// only the taken arm exists, and its statements run at the SAME
+	// conditional depth as the surrounding code. Returns 1 (then arm),
+	// 0 (else arm), or -1 (no verdict — e.g. astgen bailed on this fn;
+	// the analyzer falls back to conservative both-arm analysis).
+	int (*compIfVerdict)(void *ctx, const void *fnAst, NodeIdx node) = nullptr;
 };
 
 // Run the definite-init analysis on a function body. Returns an empty

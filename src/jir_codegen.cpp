@@ -846,7 +846,25 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		args.reserve(argCount);
 		for (uint32_t i = 0; i < argCount; i++) {
 			JirRef ar = static_cast<JirRef>(lctx.jfn.getExtra(extra + 1 + i));
-			args.push_back(emitInst(lctx, ar));
+			JamValueRef av = emitInst(lctx, ar);
+			// The indirect-call LLVM signature carries aggregates BY
+			// VALUE (getLLVMType returns the struct/array type, not a
+			// pointer), so LLVM applies the platform C ABI — e.g. on
+			// arm64 a 2-/4-double struct (NSPoint / NSSize / NSRect,
+			// CGPoint / CGRect) is a homogeneous-float aggregate passed
+			// in v0–v3. But a byref aggregate is a POINTER in jam's SSA
+			// model, so load the value to match the by-value signature;
+			// without this the pointer lands in an integer register and
+			// the callee reads garbage from the FP registers (the bug
+			// behind blank Cocoa windows: the content NSRect arrived as
+			// {0,0,garbage,garbage}). Scalars / pointers pass as-is.
+			if (i < paramTys.size() &&
+			    jam::abi::isByRef(paramTys[i], lctx.ctx)) {
+				JamTypeRef aggTy = lctx.ctx.getLLVMType(paramTys[i]);
+				av = JamLLVMBuildLoad(lctx.ctx.getBuilder(), aggTy, av,
+				                      "arg.byval");
+			}
+			args.push_back(av);
 		}
 
 		const char *resultName = (inst.ty == kNoType) ? "" : "call.indirect";

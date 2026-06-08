@@ -715,11 +715,15 @@ TypeIdx Parser::parseType() {
 			consume(TOK_CLOSE_BRACKET, "Expected `]` after array size");
 			return typePool->internArray(parseType(), len);
 		}
-		// Expression path: `[SIZE]u8`, `[2 * 1024]u8` — module consts
-		// aren't known yet, so park the expression node in a deferred
-		// ArrayExpr key; codegen comptime-folds it on first use
-		// (mirroring GenericCall resolution).
-		NodeIdx lenExpr = parseExpression();
+		// Expression path: `[SIZE]u8`, `[2 * 1024]u8`, `[bufLen(8)]u8`
+		// — module consts / cfn results aren't known yet, so park the
+		// expression node in a deferred ArrayExpr key; codegen
+		// comptime-folds it on first use (mirroring GenericCall
+		// resolution). Parse with `parseLogicalOr` (a pure expression
+		// grammar), NOT `parseExpression` — the latter applies
+		// statement rules and would demand a `;` after a call length
+		// like `bufLen(8)`.
+		NodeIdx lenExpr = parseLogicalOr();
 		consume(TOK_CLOSE_BRACKET, "Expected `]` after array size");
 		return typePool->internArrayExpr(parseType(), lenExpr);
 	}
@@ -1948,7 +1952,7 @@ std::unique_ptr<ModuleAST> Parser::parse() {
 		if (check(TOK_PUB)) {
 			int pubSaved = current;
 			advance();
-			bool nextIsConst = check(TOK_CONST);
+			bool nextIsConst = check(TOK_CONST) || check(TOK_COMP);
 			current = pubSaved;
 			if (nextIsConst) {
 				advance();  // consume `pub`; const branch below handles the
@@ -1962,6 +1966,23 @@ std::unique_ptr<ModuleAST> Parser::parse() {
 					parseError("`pub` is not allowed on destructuring imports");
 				}
 			}
+		}
+
+		// `comp const NAME[: T]? = expr;` at module scope — a constant
+		// whose initializer must fold at compile time. Registration
+		// validates the fold eagerly (see main.cpp); the binding is
+		// otherwise an ordinary module const, inlined per use.
+		if (check(TOK_COMP)) {
+			advance();
+			if (!check(TOK_CONST)) {
+				parseError("`comp` at module scope must be followed by "
+				           "`const`");
+			}
+			auto c = parseConstDecl();
+			c->isPub = isPub;
+			c->isComp = true;
+			module->Consts.push_back(std::move(c));
+			continue;
 		}
 
 		if (check(TOK_CONST)) {

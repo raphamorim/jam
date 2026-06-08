@@ -232,6 +232,11 @@ class ConstDeclAST {
 	// context's type-alias table.
 	TypeIdx AliasedType = kNoType;
 	bool isPub = false;
+	// `comp const NAME = expr;` — the initializer is required to fold
+	// at compile time. Registration eagerly validates the fold (a
+	// plain const with a non-foldable init only errors when a comp
+	// position consumes it; a comp const errors at the declaration).
+	bool isComp = false;
 
 	ConstDeclAST(std::string Name, TypeIdx DeclaredType, NodeIdx InitExpr)
 	    : Name(std::move(Name)), DeclaredType(DeclaredType),

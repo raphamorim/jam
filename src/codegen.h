@@ -155,13 +155,50 @@ class JamCodegenContext {
 	// when omitted). At each Variable use site we re-codegen the init
 	// expression in place — effectively a per-use inline expansion that
 	// the optimizer collapses just like a literal.
+	//
+	// `isComp` marks a `comp const`: its initializer is REQUIRED to
+	// fold at compile time, validated eagerly after registration (see
+	// validateCompConsts) instead of lazily at first comp-position use.
+	// `file` records the declaring module's path so the eager
+	// validation can anchor its diagnostic.
 	struct ModuleConstInfo {
 		NodeIdx initExpr;
 		TypeIdx declaredType;
+		bool isComp = false;
+		std::string file;
 	};
 	void registerModuleConst(const std::string &name, NodeIdx init,
-	                         TypeIdx declared);
+	                         TypeIdx declared, bool isComp = false,
+	                         std::string file = std::string());
 	const ModuleConstInfo *getModuleConst(const std::string &name) const;
+
+	// Eager `comp const` validation: every registered module const
+	// marked isComp must fold against the module-const fixpoint scope.
+	// Pushes one diagnostic per non-folding comp const. Runs once,
+	// after every module's consts are registered and before function
+	// bodies lower.
+	void validateCompConsts();
+
+	// Seed `scope` with every foldable module const (fixpoint, so
+	// consts may reference each other) plus any active comp-param
+	// substitutions (which shadow same-named module consts — matching
+	// astgen's Variable resolution order). Shared by foldComptimeExpr
+	// and astgen's per-function comp-binding scope.
+	void seedComptimeScope(jam::ComptimeScope &scope) const;
+
+	// `comp if` verdicts recorded during astgen, consulted by
+	// init_analysis so both passes agree on which arm of a `comp if`
+	// exists. Keyed by (FunctionAST*, IfNode NodeIdx) — generic clones
+	// own distinct FunctionAST objects, so per-instantiation verdicts
+	// can't collide on shared body node indices.
+	void recordCompIfVerdict(const void *fnAst, NodeIdx node, bool taken) {
+		compIfVerdicts_[{fnAst, node}] = taken;
+	}
+	const bool *lookupCompIfVerdict(const void *fnAst, NodeIdx node) const {
+		auto it = compIfVerdicts_.find({fnAst, node});
+		if (it == compIfVerdicts_.end()) return nullptr;
+		return &it->second;
+	}
 
 	// drop emission state.
 	//
@@ -282,6 +319,9 @@ class JamCodegenContext {
 	std::map<std::string, UnionInfo> unions;
 	mutable std::map<std::string, EnumInfo> enums;
 	std::map<std::string, ModuleConstInfo> moduleConsts;
+	// (FunctionAST*, IfNode NodeIdx) -> comp-if condition verdict. See
+	// recordCompIfVerdict / lookupCompIfVerdict above.
+	std::map<std::pair<const void *, NodeIdx>, bool> compIfVerdicts_;
 	mutable TypePool typePool;
 	mutable StringPool stringPool;
 	mutable NodeStore nodeStore;
@@ -647,6 +687,37 @@ class JamCodegenContext {
 	    const AstNode &exprNode, const std::string &calleeName,
 	    const std::vector<TypeIdx> &args,
 	    const std::unordered_map<std::string, TypeIdx> &subst) const;
+};
+
+// Resolves comptime `Call` nodes (cfn -> cfn) for a ComptimeEvaluator.
+// Looks the callee up in the codegen context, confirms it is a
+// compile-time function, binds the (already-evaluated) arguments into a
+// fresh scope, and interprets the body on the same evaluator. Used both
+// by `foldComptimeExpr` (so a cfn can appear in a `[N]u8` length or a
+// comp-const initializer) and by the cfn-call dispatcher in astgen.
+//
+// Two caps keep a malformed program from hanging the compiler: a
+// recursion-depth cap (stack depth) and a total-call cap (cumulative
+// work, so exponential fan-out like naive fib(40) is bounded too).
+class CompCallResolverImpl : public jam::CompCallResolver {
+  public:
+	CompCallResolverImpl(const JamCodegenContext &ctx,
+	                     jam::ComptimeEvaluator &ev)
+	    : ctx_(ctx), ev_(ev) {}
+
+	jam::ComptimeValue resolveCall(const std::string &name,
+	                               const std::vector<jam::ComptimeValue> &args,
+	                               jam::Diagnostics &diags,
+	                               jam::SrcLoc loc) override;
+
+	static constexpr uint32_t kMaxDepth = 256;
+	static constexpr uint32_t kMaxTotalCalls = 1'000'000;
+
+  private:
+	const JamCodegenContext &ctx_;
+	jam::ComptimeEvaluator &ev_;
+	uint32_t depth_ = 0;
+	uint32_t totalCalls_ = 0;
 };
 
 #endif  // CODEGEN_H

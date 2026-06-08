@@ -168,7 +168,191 @@ CompileResult compileWithLib(const std::string &name,
 
 class CodegenErrorTests {
   public:
+	// ─── comptime (COMPTIME_PLAN.md Stages 1–2) ──────────────────────
+
+	// A `comp const` whose initializer depends on a runtime value is
+	// rejected eagerly at the declaration.
+	static void testCompConstRuntimeInitRejected() {
+		auto r = compileSource("comp_const_runtime", R"(
+fn rt() u64 { return 5; }
+comp const BAD = rt();
+fn main() {}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "comp const `BAD`"));
+		ASSERT_TRUE(stderrContains(r, "compile-time"));
+	}
+
+	// A function-local `comp` binding whose initializer isn't foldable
+	// is rejected at the declaration.
+	static void testCompLocalRuntimeInitRejected() {
+		auto r = compileSource("comp_local_runtime", R"(
+fn rt() u64 { return 5; }
+fn main() {
+    comp const x = rt();
+    var y: u64 = x;
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "comp initializer of `x`"));
+	}
+
+	// Reassigning a `comp const` is rejected.
+	static void testCompConstReassignRejected() {
+		auto r = compileSource("comp_const_reassign", R"(
+fn main() {
+    comp const x = 1;
+    x = 2;
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "cannot assign to comp const `x`"));
+	}
+
+	// Mutating a `comp var` from inside runtime conditional control
+	// flow is rejected — a comp value can't depend on a runtime branch.
+	static void testCompVarRuntimeCondAssignRejected() {
+		auto r = compileSource("comp_var_rt_cond", R"(
+fn flag() bool { return true; }
+fn main() {
+    comp var x = 1;
+    if (flag()) {
+        x = 2;
+    }
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "comp binding `x`"));
+		ASSERT_TRUE(stderrContains(r, "runtime"));
+	}
+
+	// A `comp var` value that overflows its established int width is
+	// rejected at the assignment.
+	static void testCompVarOverflowRejected() {
+		auto r = compileSource("comp_var_overflow", R"(
+fn main() {
+    comp var x: u8 = 1;
+    x = 300;
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "does not fit"));
+	}
+
+	// `comp if` with a non-comptime condition is rejected.
+	static void testCompIfRuntimeCondRejected() {
+		auto r = compileSource("comp_if_runtime", R"(
+fn flag() bool { return true; }
+fn main() {
+    comp if (flag()) {
+        var x: u64 = 1;
+    } else {
+        var y: u64 = 2;
+    }
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "comp if"));
+		ASSERT_TRUE(stderrContains(r, "compile-time"));
+	}
+
+	// A symbol referenced ONLY in the TAKEN arm of a comp-if is a real
+	// reference and must still resolve (the elision only spares the
+	// dead arm).
+	static void testCompIfTakenArmStillChecked() {
+		auto r = compileSource("comp_if_taken_checked", R"(
+fn main() {
+    comp if (true) {
+        var x: u64 = doesNotExist();
+    } else {
+        var y: u64 = 0;
+    }
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "doesNotExist"));
+	}
+
+	// A value-returning cfn whose body doesn't `return` a value is
+	// rejected at the call site.
+	static void testCfnMissingReturnRejected() {
+		auto r = compileSource("cfn_missing_return", R"(
+cfn noReturn(x: u64) u64 {
+    var y: u64 = x + 1;
+}
+fn main() {
+    var z: u64 = noReturn(5);
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "noReturn"));
+	}
+
+	// Infinite cfn recursion is caught by the depth cap.
+	static void testCfnInfiniteRecursionRejected() {
+		auto r = compileSource("cfn_infinite", R"(
+cfn forever(n: u64) u64 {
+    return forever(n + 1);
+}
+fn main() {
+    var z: u64 = forever(0);
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "depth cap"));
+	}
+
+	// Calling a plain (runtime) fn from comptime is rejected.
+	static void testCfnCallsRuntimeFnRejected() {
+		auto r = compileSource("cfn_calls_runtime", R"(
+fn runtimeFn(x: u64) u64 { return x * 2; }
+cfn wrap(x: u64) u64 {
+    return runtimeFn(x);
+}
+fn main() {
+    var z: u64 = wrap(5);
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "runtime function"));
+	}
+
+	// A cfn arg that isn't comptime-known is rejected.
+	static void testCfnRuntimeArgRejected() {
+		auto r = compileSource("cfn_runtime_arg", R"(
+cfn dbl(x: u64) u64 { return x * 2; }
+fn main() {
+    var n: u64 = 3;
+    var z: u64 = dbl(n);
+}
+)");
+		ASSERT_TRUE(r.exitCode != 0);
+		ASSERT_TRUE(stderrContains(r, "compile-time constant"));
+	}
+
 	static void registerAllTests(TestFramework &framework) {
+		framework.addTest("Comptime - cfn missing return rejected",
+		                  testCfnMissingReturnRejected);
+		framework.addTest("Comptime - cfn infinite recursion rejected",
+		                  testCfnInfiniteRecursionRejected);
+		framework.addTest("Comptime - cfn calls runtime fn rejected",
+		                  testCfnCallsRuntimeFnRejected);
+		framework.addTest("Comptime - cfn runtime arg rejected",
+		                  testCfnRuntimeArgRejected);
+		framework.addTest("Comptime - comp const runtime init rejected",
+		                  testCompConstRuntimeInitRejected);
+		framework.addTest("Comptime - comp local runtime init rejected",
+		                  testCompLocalRuntimeInitRejected);
+		framework.addTest("Comptime - comp const reassign rejected",
+		                  testCompConstReassignRejected);
+		framework.addTest("Comptime - comp var runtime-cond assign rejected",
+		                  testCompVarRuntimeCondAssignRejected);
+		framework.addTest("Comptime - comp var overflow rejected",
+		                  testCompVarOverflowRejected);
+		framework.addTest("Comptime - comp if runtime cond rejected",
+		                  testCompIfRuntimeCondRejected);
+		framework.addTest("Comptime - comp if taken arm still checked",
+		                  testCompIfTakenArmStillChecked);
 		framework.addTest("Codegen - Maybe(T) where T lacks default()",
 		                  testMaybeOfTypeWithoutDefault);
 		// Three rejected-method validation tests removed: the compiler
@@ -1019,8 +1203,8 @@ fn bad(sink: *mut u32) {
 fn main() {}
 )");
 		ASSERT_TRUE(r.exitCode != 0);
-		ASSERT_TRUE(stderrContains(
-		    r, "cannot assign to `c` after it was moved"));
+		ASSERT_TRUE(
+		    stderrContains(r, "cannot assign to `c` after it was moved"));
 	}
 
 	// A loop body runs zero or more times, so a move inside of an outer
@@ -1159,8 +1343,7 @@ fn bad(sink: *mut u32) {
 fn main() {}
 )");
 		ASSERT_TRUE(r.exitCode != 0);
-		ASSERT_TRUE(stderrContains(
-		    r, "owners of one drop-bearing value"));
+		ASSERT_TRUE(stderrContains(r, "owners of one drop-bearing value"));
 	}
 
 	// `[c, c]` — the first element moves c, the second is use-after-move.
@@ -1354,8 +1537,7 @@ fn main() {}
 )");
 		ASSERT_TRUE(get.exitCode != 0);
 		ASSERT_TRUE(stderrContains(
-		    get,
-		    "`Vec__Counter.get` is not available for this instantiation"));
+		    get, "`Vec__Counter.get` is not available for this instantiation"));
 	}
 
 	// MATCH-MOVE rejections: matching a drop-bearing enum consumes the

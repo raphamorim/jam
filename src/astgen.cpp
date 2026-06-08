@@ -16,6 +16,7 @@
 #include "target.h"
 
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -81,6 +82,32 @@ struct AstGenCtx {
 	// every entry so error helpers without an explicit NodeIdx in
 	// scope (`failHere` and friends) can still emit a SrcLoc.
 	NodeIdx currentNode = 0;
+	// Comp-binding scope chain (`comp const` / `comp var`): one frame
+	// per lexical scope, parallel to `localScopes` — pushDropScope /
+	// popDropScope keep the three stacks aligned. Frame 0 (the function
+	// root) is seeded by astgenBodyInto with the module-const fixpoint
+	// and any active comp-param substitutions, so comp initializers and
+	// `comp if` conditions can reference both.
+	std::vector<std::unique_ptr<jam::ComptimeScope>> compScopes;
+	// Per-frame metadata for comp bindings declared in that frame:
+	// the runtime-conditional depth at declaration (assignments from
+	// deeper runtime control flow are rejected — a comp value cannot
+	// depend on a runtime branch) and constness (`comp const` rejects
+	// reassignment).
+	struct CompBindingInfo {
+		uint32_t declDepth;
+		bool isConst;
+	};
+	std::vector<std::unordered_map<std::string, CompBindingInfo>> compBindInfo;
+	// Depth of runtime conditional control flow (if / while / for /
+	// match arm bodies). `comp if` arms do NOT count: their statements
+	// lower inline and execute unconditionally.
+	uint32_t runtimeCondDepth = 0;
+	// FunctionAST being lowered — keys the comp-if verdict table so
+	// init_analysis observes the same arm elision astgen performed
+	// (generic clones own distinct FunctionAST objects, so shared body
+	// NodeIdx values can't collide across instantiations).
+	const FunctionAST *fnAst = nullptr;
 };
 
 // `AstGenAnalysisFail` is declared in astgen.h so main.cpp and
@@ -164,8 +191,7 @@ static JirRef recoverHere(AstGenCtx &gctx, std::string message, TypeIdx ty);
 // Method-miss reporting that understands CONDITIONAL methods: an
 // instantiated generic method withdrawn for these type arguments
 // replays the recorded reason instead of a bare "unknown method".
-static JirRef reportMethodMiss(AstGenCtx &gctx,
-                               const std::string &qualified) {
+static JirRef reportMethodMiss(AstGenCtx &gctx, const std::string &qualified) {
 	if (const std::string *why = gctx.ctx.getWithdrawnMethod(qualified)) {
 		failHere(gctx, "method `" + qualified +
 		                   "` is not available for this instantiation — " +
@@ -407,6 +433,13 @@ static JirRef emitStructCfnDispatch(AstGenCtx &gctx,
 static inline void pushDropScope(AstGenCtx &gctx) {
 	gctx.dropScopes.emplace_back();
 	gctx.localScopes.emplace_back();
+	// Comp-binding frame, chained to the enclosing frame so lookups
+	// walk outward. The first push (function root) has no parent;
+	// astgenBodyInto seeds it right after.
+	jam::ComptimeScope *parent =
+	    gctx.compScopes.empty() ? nullptr : gctx.compScopes.back().get();
+	gctx.compScopes.push_back(std::make_unique<jam::ComptimeScope>(parent));
+	gctx.compBindInfo.emplace_back();
 }
 
 // Emit drops for every scope from the top of `dropScopes` down to (and
@@ -494,6 +527,8 @@ static inline void popDropScopeEmitting(AstGenCtx &gctx) {
 	}
 	gctx.dropScopes.pop_back();
 	if (!gctx.localScopes.empty()) gctx.localScopes.pop_back();
+	if (!gctx.compScopes.empty()) gctx.compScopes.pop_back();
+	if (!gctx.compBindInfo.empty()) gctx.compBindInfo.pop_back();
 }
 
 // Pop the top scope WITHOUT emitting drops (used when the divergent
@@ -502,6 +537,8 @@ static inline void popDropScopeEmitting(AstGenCtx &gctx) {
 static inline void popDropScope(AstGenCtx &gctx) {
 	if (!gctx.dropScopes.empty()) gctx.dropScopes.pop_back();
 	if (!gctx.localScopes.empty()) gctx.localScopes.pop_back();
+	if (!gctx.compScopes.empty()) gctx.compScopes.pop_back();
+	if (!gctx.compBindInfo.empty()) gctx.compBindInfo.pop_back();
 }
 
 // AstGen for a `NumberLit` AST node, materializing the appropriate
@@ -639,6 +676,289 @@ static JirRef astgenBoolLit(AstGenCtx &gctx, const AstNode &n) {
 	return emit(gctx, inst);
 }
 
+// ─── comp-value lowering helpers ────────────────────────────────────
+//
+// `comp const` / `comp var` bindings and comp params hold a
+// jam::ComptimeValue during astgen; a read in runtime position lowers
+// the value to the same JIR constants the literal paths emit.
+
+// Resolve an expected type through generic-call / substitution / alias
+// chains to its underlying scalar, mirroring what astgenNumberLit does
+// for literal narrowing. Returns the input unchanged when nothing
+// resolves.
+static TypeIdx resolveScalarExpected(AstGenCtx &gctx, TypeIdx t) {
+	for (int guard = 0; guard < 8 && t != kNoType; guard++) {
+		const TypeKey &k = gctx.ctx.getTypePool().get(t);
+		if (k.kind == TypeKind::GenericCall) {
+			TypeIdx r = gctx.ctx.resolveGenericCall(t);
+			if (r == kNoType || r == t) return t;
+			t = r;
+			continue;
+		}
+		if (k.kind == TypeKind::Named) {
+			const std::string &nm =
+			    gctx.ctx.getStringPool().get(static_cast<StringIdx>(k.a));
+			TypeIdx sub = gctx.ctx.lookupCurrentSubst(nm);
+			if (sub != kNoType && sub != t) {
+				t = sub;
+				continue;
+			}
+			TypeIdx alias = gctx.ctx.lookupTypeAlias(nm);
+			if (alias != kNoType && alias != t) {
+				t = alias;
+				continue;
+			}
+			return t;
+		}
+		return t;
+	}
+	return t;
+}
+
+// Does a comp integer value fit in `width`/`isSigned` without changing
+// its numeric meaning? Mirrors Zig's "type 'u8' cannot represent
+// integer value '256'" check.
+static bool compIntFits(const jam::ComptimeValue &v, uint16_t width,
+                        bool isSigned) {
+	if (width >= 64) {
+		// i64 target: any signed value fits; unsigned values above
+		// INT64_MAX flip sign. u64 target: negatives don't fit.
+		if (isSigned) {
+			return v.intVal.isSigned ||
+			       v.asU64() <= static_cast<uint64_t>(INT64_MAX);
+		}
+		return !v.intVal.isSigned || v.asI64() >= 0;
+	}
+	if (v.intVal.isSigned) {
+		int64_t x = v.asI64();
+		if (isSigned) {
+			int64_t min = -(1LL << (width - 1));
+			int64_t max = (1LL << (width - 1)) - 1;
+			return x >= min && x <= max;
+		}
+		if (x < 0) return false;
+		return static_cast<uint64_t>(x) <= ((1ULL << width) - 1);
+	}
+	uint64_t x = v.asU64();
+	if (isSigned) {
+		return x <= static_cast<uint64_t>((1LL << (width - 1)) - 1);
+	}
+	return x <= ((1ULL << width) - 1);
+}
+
+// Render a comp integer for diagnostics, honouring its signedness.
+static std::string compIntToString(const jam::ComptimeValue &v) {
+	if (v.intVal.isSigned) return std::to_string(v.asI64());
+	return std::to_string(v.asU64());
+}
+
+// Lower a compile-time value to a JIR constant at a use site. The
+// `expected` type narrows integer / float widths exactly like literal
+// lowering does (peer-type propagation); a value that can't represent
+// the expected width is a hard error rather than a silent truncation.
+// `what` names the binding for diagnostics ("comp binding `x`").
+static JirRef materializeComptimeValue(AstGenCtx &gctx,
+                                       const jam::ComptimeValue &cv,
+                                       TypeIdx expected,
+                                       const std::string &what) {
+	switch (cv.kind) {
+	case jam::ComptimeValue::Kind::Int: {
+		uint16_t width = cv.intVal.width;
+		bool isSigned = cv.intVal.isSigned;
+		if (expected != kNoType) {
+			TypeIdx resolved = resolveScalarExpected(gctx, expected);
+			const TypeKey &ek = gctx.ctx.getTypePool().get(resolved);
+			if (ek.kind == TypeKind::Int) {
+				uint16_t ew = static_cast<uint16_t>(ek.a);
+				bool es = ek.b != 0;
+				if (!compIntFits(cv, ew, es)) {
+					return recoverHere(
+					    gctx,
+					    what + " has value " + compIntToString(cv) +
+					        ", which does not fit the expected " +
+					        (es ? "i" : "u") + std::to_string(ew),
+					    resolved);
+				}
+				width = ew;
+				isSigned = es;
+			}
+		}
+		JirInst ic{};
+		ic.tag = JirTag::Int;
+		ic.a = static_cast<uint32_t>(cv.intVal.bits & 0xFFFFFFFFu);
+		ic.b = static_cast<uint32_t>(cv.intVal.bits >> 32);
+		ic.ty = gctx.ctx.getTypePool().internInt(width, isSigned);
+		return emit(gctx, ic);
+	}
+	case jam::ComptimeValue::Kind::Bool: {
+		JirInst ic{};
+		ic.tag = JirTag::Bool;
+		ic.a = cv.boolVal ? 1u : 0u;
+		ic.ty = BuiltinType::Bool;
+		return emit(gctx, ic);
+	}
+	case jam::ComptimeValue::Kind::Str: {
+		// Slice-of-u8 by default; decay to a bare pointer when the
+		// use site expects one — same contract as astgenStringLit.
+		TypeIdx resultTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
+		if (expected != kNoType) {
+			const TypeKey &ek = gctx.ctx.getTypePool().get(expected);
+			if ((ek.kind == TypeKind::PtrMany ||
+			     ek.kind == TypeKind::PtrSingle) &&
+			    ek.a == BuiltinType::U8) {
+				resultTy = expected;
+			}
+		}
+		JirInst si{};
+		si.tag = JirTag::Str;
+		si.a = cv.strVal;
+		si.ty = resultTy;
+		return emit(gctx, si);
+	}
+	case jam::ComptimeValue::Kind::Float: {
+		uint16_t width = cv.floatVal.width;
+		if (expected != kNoType) {
+			TypeIdx resolved = resolveScalarExpected(gctx, expected);
+			if (resolved == BuiltinType::F32) width = 32;
+			else if (resolved == BuiltinType::F64) width = 64;
+		}
+		JirInst fl{};
+		fl.tag = JirTag::Float;
+		uint64_t bits;
+		__builtin_memcpy(&bits, &cv.floatVal.value, sizeof(bits));
+		fl.a = static_cast<uint32_t>(bits & 0xFFFFFFFFu);
+		fl.b = static_cast<uint32_t>(bits >> 32);
+		fl.ty = gctx.ctx.getTypePool().internFloat(width);
+		return emit(gctx, fl);
+	}
+	case jam::ComptimeValue::Kind::Type:
+		// Type values have no runtime representation — a value
+		// position consuming one is an error, not a lowering.
+		return recoverHere(gctx,
+		                   what + " is of type `type` and has no runtime "
+		                          "representation",
+		                   kNoType);
+	case jam::ComptimeValue::Kind::Aggregate:
+	case jam::ComptimeValue::Kind::None:
+		return recoverHere(gctx, what + " has no runtime lowering yet",
+		                   kNoType);
+	}
+	return recoverHere(gctx, what + " has no runtime lowering yet", kNoType);
+}
+
+// Resolve `name` against the EXPLICIT comp bindings (`comp const` /
+// `comp var`) in scope. Walks the per-frame binding-info maps so the
+// seeded names (module consts, comp params — present in the scope
+// chain purely for the evaluator) do not match; those resolve through
+// their own astgenVariable paths to preserve declared-type lowering.
+static const jam::ComptimeValue *lookupCompBinding(AstGenCtx &gctx,
+                                                   const std::string &name) {
+	for (auto it = gctx.compBindInfo.rbegin(); it != gctx.compBindInfo.rend();
+	     ++it) {
+		if (it->count(name) != 0) {
+			// The scope chain's innermost hit IS this binding (or an
+			// inner shadow of it, also a comp binding) — both correct.
+			return gctx.compScopes.back()->lookup(name);
+		}
+	}
+	return nullptr;
+}
+
+// Find the binding-info record for an explicit comp binding, innermost
+// frame first. Returns nullptr when `name` is not a comp binding.
+static const AstGenCtx::CompBindingInfo *
+lookupCompBindingInfo(AstGenCtx &gctx, const std::string &name) {
+	for (auto it = gctx.compBindInfo.rbegin(); it != gctx.compBindInfo.rend();
+	     ++it) {
+		auto f = it->find(name);
+		if (f != it->end()) return &f->second;
+	}
+	return nullptr;
+}
+
+// Coerce a freshly evaluated comp value to a declared annotation
+// (`comp const N: u8 = 200;`). Scalar kinds only — comp bindings hold
+// int / float / bool / str. Misfits are hard errors anchored at the
+// current node.
+static jam::ComptimeValue coerceCompToDeclared(AstGenCtx &gctx,
+                                               jam::ComptimeValue v,
+                                               TypeIdx declared,
+                                               const std::string &name) {
+	TypeIdx resolved = resolveScalarExpected(gctx, declared);
+	const TypeKey &k = gctx.ctx.getTypePool().get(resolved);
+	switch (k.kind) {
+	case TypeKind::Int: {
+		if (v.kind != jam::ComptimeValue::Kind::Int) {
+			failHere(gctx, "comp binding `" + name +
+			                   "` declared as an integer type but its "
+			                   "initializer is not an integer");
+		}
+		uint16_t ew = static_cast<uint16_t>(k.a);
+		bool es = k.b != 0;
+		if (!compIntFits(v, ew, es)) {
+			failHere(gctx, "comp binding `" + name + "` value " +
+			                   compIntToString(v) + " does not fit " +
+			                   (es ? "i" : "u") + std::to_string(ew));
+		}
+		v.intVal.width = ew;
+		v.intVal.isSigned = es;
+		return v;
+	}
+	case TypeKind::Float: {
+		if (v.kind != jam::ComptimeValue::Kind::Float) {
+			// Match the runtime rule: no implicit int→float at a
+			// declared-float binding; ask for a float literal.
+			failHere(gctx, "comp binding `" + name +
+			                   "` declared as a float type; use a float "
+			                   "literal (e.g. `3.0`)");
+		}
+		v.floatVal.width = static_cast<uint16_t>(k.a);
+		return v;
+	}
+	case TypeKind::Bool:
+		if (v.kind != jam::ComptimeValue::Kind::Bool) {
+			failHere(gctx, "comp binding `" + name +
+			                   "` declared as bool but its initializer "
+			                   "is not a bool");
+		}
+		return v;
+	case TypeKind::Slice:
+		if (k.a == BuiltinType::U8 && v.kind == jam::ComptimeValue::Kind::Str) {
+			return v;
+		}
+		failHere(gctx, "comp binding `" + name +
+		                   "` declared as a slice type; only `[]u8` "
+		                   "(str) comp values are supported");
+	default:
+		failHere(gctx, "comp binding `" + name +
+		                   "` has an unsupported declared type — comp "
+		                   "bindings hold int / float / bool / str values");
+	}
+}
+
+// Fold `expr` against the current function's comp scope (so it can
+// reference comp bindings / module consts / comp params), with a call
+// resolver installed (so a `cfn` may appear in the expression). The
+// single entry point for every comp-position fold in astgen — comp
+// const/var initializers, comp assignments, `comp if` conditions, and
+// `inline while` / `inline for` bounds — so cfn-call support and scope
+// seeding stay uniform across all of them. Diagnostics route to the
+// shared channel; None on any non-fold (caller decides severity).
+static jam::ComptimeValue evalInCompScope(AstGenCtx &gctx, NodeIdx expr) {
+	jam::ComptimeEvaluator ev(gctx.ctx.getNodeStore(), gctx.ctx.getStringPool(),
+	                          gctx.ctx.getTypePool());
+	CompCallResolverImpl resolver(gctx.ctx, ev);
+	ev.setCallResolver(&resolver);
+	jam::SrcLoc loc{gctx.ctx.currentFile(),
+	                gctx.ctx.getNodeStore().getLine(expr)};
+	ev.setCallContext(nullptr, &gctx.ctx.diagnostics(), loc);
+	jam::ComptimeValue v = ev.eval(expr, *gctx.compScopes.back());
+	ev.clearCallContext();
+	ev.clearCallResolver();
+	return v;
+}
+
 // AstGen for `Return`. The arm body's tail expression (when present)
 // receives the function's declared return type as expected hint.
 // Drop calls for every drop-tracked binding currently in scope are
@@ -744,8 +1064,7 @@ static std::string lookupDropFnLLVMName(JamCodegenContext &ctx, TypeIdx ty) {
 		}
 		if (fn == nullptr) fn = ctx.lookupDropFn(name);
 		if (fn == nullptr) return "";
-		return mangledFunctionName(*fn, ctx.getTypePool(),
-		                           ctx.getStringPool());
+		return mangledFunctionName(*fn, ctx.getTypePool(), ctx.getStringPool());
 	};
 	std::string r = resolveName(typeName);
 	if (!r.empty()) return r;
@@ -800,6 +1119,28 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 	// still compiles — intentional inner-block shadowing is allowed.
 	if (!gctx.localScopes.empty() && gctx.localScopes.back().count(name) != 0) {
 		failHere(gctx, "redeclaration of `" + name + "` in the same scope");
+	}
+
+	// `comp const X = E;` / `comp var X = E;` (rhs bit 1) — the binding
+	// lives in the comp scope, not in a runtime slot: no alloca, no
+	// store, no JIR at all. Reads materialize the value as a constant
+	// (see astgenVariable); `comp var` mutates through the comp scope.
+	if ((n.rhs & 2u) != 0) {
+		bool isConstBinding = (n.rhs & 1u) != 0;
+		jam::ComptimeValue v = evalInCompScope(gctx, initIdx);
+		if (v.isNone()) {
+			failNode(gctx, initIdx,
+			         "comp initializer of `" + name +
+			             "` must be a compile-time-known value");
+		}
+		if (declared != kNoType) {
+			v = coerceCompToDeclared(gctx, std::move(v), declared, name);
+		}
+		gctx.compScopes.back()->bind(name, std::move(v));
+		gctx.compBindInfo.back()[name] = {gctx.runtimeCondDepth,
+		                                  isConstBinding};
+		if (!gctx.localScopes.empty()) { gctx.localScopes.back().insert(name); }
+		return;
 	}
 
 	// Type resolution.
@@ -1015,6 +1356,17 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n,
 		load.ty = gctx.localTypes[name];
 		return emit(gctx, load);
 	}
+	// Comp bindings (`comp const` / `comp var`). Locals shadow comp
+	// bindings; comp bindings shadow comp params and module consts.
+	// Only names EXPLICITLY declared `comp` resolve here (tracked in
+	// compBindInfo) — the seeded scope also holds folded module consts
+	// for the evaluator's benefit, but those must keep lowering through
+	// the getModuleConst re-astgen path below so their declared types
+	// (e.g. `const FLAG: u8 = 0x80;`) survive untouched.
+	if (const jam::ComptimeValue *cb = lookupCompBinding(gctx, name)) {
+		return materializeComptimeValue(gctx, *cb, expected,
+		                                "comp binding `" + name + "`");
+	}
 	// Comp-param substitution. When the enclosing function was
 	// instantiated with `comp n: u32` bound to a concrete value, refs
 	// to `n` in the body lower to that constant directly — no Param /
@@ -1023,58 +1375,26 @@ static JirRef astgenVariable(AstGenCtx &gctx, const AstNode &n,
 	// functions are checked after, so a comp-bound name takes
 	// precedence over a same-named module const.
 	if (const jam::ComptimeValue *cv = gctx.ctx.lookupCurrentCompSubst(name)) {
-		switch (cv->kind) {
-		case jam::ComptimeValue::Kind::Int: {
-			JirInst ic{};
-			ic.tag = JirTag::Int;
-			ic.a = static_cast<uint32_t>(cv->intVal.bits & 0xFFFFFFFFu);
-			ic.b = static_cast<uint32_t>(cv->intVal.bits >> 32);
-			ic.ty = gctx.ctx.getTypePool().internInt(cv->intVal.width,
-			                                         cv->intVal.isSigned);
-			return emit(gctx, ic);
-		}
-		case jam::ComptimeValue::Kind::Bool: {
-			JirInst ic{};
-			ic.tag = JirTag::Bool;
-			ic.a = cv->boolVal ? 1u : 0u;
-			ic.ty = BuiltinType::Bool;
-			return emit(gctx, ic);
-		}
-		case jam::ComptimeValue::Kind::Str: {
-			JirInst si{};
-			si.tag = JirTag::Str;
-			si.a = cv->strVal;
-			si.ty = gctx.ctx.getTypePool().intern(
-			    TypeKey{TypeKind::Slice, 0, 0, BuiltinType::U8, 0});
-			return emit(gctx, si);
-		}
-		case jam::ComptimeValue::Kind::Float: {
-			JirInst fl{};
-			fl.tag = JirTag::Float;
-			uint64_t bits;
-			__builtin_memcpy(&bits, &cv->floatVal.value, sizeof(bits));
-			fl.a = static_cast<uint32_t>(bits & 0xFFFFFFFFu);
-			fl.b = static_cast<uint32_t>(bits >> 32);
-			fl.ty = gctx.ctx.getTypePool().internFloat(cv->floatVal.width);
-			return emit(gctx, fl);
-		}
-		case jam::ComptimeValue::Kind::Type:
-			// Type values have no runtime representation. Reaching
-			// here means a value position used a comp param of meta-
-			// type kind — pure type values shouldn't lower to JIR.
-			return recoverHere(gctx,
-			                   "comp param `" + name +
-			                       "` is of type `type` and has no "
-			                       "runtime representation",
-			                   kNoType);
-		case jam::ComptimeValue::Kind::Aggregate:
-		case jam::ComptimeValue::Kind::None:
-			return recoverHere(
-			    gctx, "comp param `" + name + "` has no runtime lowering yet",
-			    kNoType);
-		}
+		return materializeComptimeValue(gctx, *cv, expected,
+		                                "comp param `" + name + "`");
 	}
 	if (const auto *mc = gctx.ctx.getModuleConst(name)) {
+		// A `comp const` folds to a single ComptimeValue (width u64 for
+		// untyped int literals) and materializes narrowed to the use
+		// site's expected type — same as a function-local comp binding.
+		// A plain const re-astgens its init expr (preserving its own
+		// minimal-width / declared-type lowering).
+		if (mc->isComp) {
+			jam::ComptimeValue v = gctx.ctx.foldComptimeExpr(mc->initExpr);
+			if (!v.isNone()) {
+				TypeIdx want =
+				    (expected != kNoType) ? expected : mc->declaredType;
+				return materializeComptimeValue(gctx, v, want,
+				                                "comp const `" + name + "`");
+			}
+			// Fall through to re-astgen if the fold failed (the eager
+			// validateCompConsts pass already surfaced the diagnostic).
+		}
 		return astgenExpr(gctx, mc->initExpr, mc->declaredType);
 	}
 	// Fn-name-as-value (Rust-style item coercion). The identifier
@@ -1152,6 +1472,66 @@ static JirRef astgenLvalue(AstGenCtx &gctx, NodeIdx node, TypeIdx &outLeafTy) {
 static void astgenAssign(AstGenCtx &gctx, const AstNode &n) {
 	NodeIdx targetIdx = static_cast<NodeIdx>(n.lhs);
 	NodeIdx valueIdx = static_cast<NodeIdx>(n.rhs);
+
+	// Assignment to a comp binding (`comp var x = ...; x = x + 1;`)
+	// mutates the comp scope — no JIR. Locals shadow comp bindings, so
+	// a same-named runtime local keeps the runtime store path.
+	{
+		const AstNode &t0 = gctx.ctx.getNodeStore().get(targetIdx);
+		if (t0.tag == AstTag::Variable) {
+			const std::string &tname =
+			    gctx.ctx.getStringPool().get(static_cast<StringIdx>(t0.lhs));
+			if (gctx.locals.find(tname) == gctx.locals.end()) {
+				if (const AstGenCtx::CompBindingInfo *info =
+				        lookupCompBindingInfo(gctx, tname)) {
+					if (info->isConst) {
+						failNode(gctx, targetIdx,
+						         "cannot assign to comp const `" + tname + "`");
+					}
+					if (gctx.runtimeCondDepth != info->declDepth) {
+						failNode(
+						    gctx, targetIdx,
+						    "cannot assign to comp binding `" + tname +
+						        "` from inside runtime conditional control "
+						        "flow — a comp value cannot depend on a "
+						        "runtime branch");
+					}
+					jam::ComptimeValue v = evalInCompScope(gctx, valueIdx);
+					if (v.isNone()) {
+						failNode(gctx, valueIdx,
+						         "comp assignment to `" + tname +
+						             "` must be a compile-time-known value");
+					}
+					// Keep the binding's shape stable: same kind, and
+					// for ints the established width/signedness (with a
+					// fit check) so reads keep lowering consistently.
+					const jam::ComptimeValue *prev =
+					    gctx.compScopes.back()->lookup(tname);
+					if (prev != nullptr && prev->kind != v.kind) {
+						failNode(gctx, valueIdx,
+						         "comp assignment changes the kind of `" +
+						             tname + "` (e.g. int -> str)");
+					}
+					if (prev != nullptr &&
+					    prev->kind == jam::ComptimeValue::Kind::Int) {
+						if (!compIntFits(v, prev->intVal.width,
+						                 prev->intVal.isSigned)) {
+							failNode(
+							    gctx, valueIdx,
+							    "comp assignment value " + compIntToString(v) +
+							        " does not fit `" + tname + "` (" +
+							        (prev->intVal.isSigned ? "i" : "u") +
+							        std::to_string(prev->intVal.width) + ")");
+						}
+						v.intVal.width = prev->intVal.width;
+						v.intVal.isSigned = prev->intVal.isSigned;
+					}
+					gctx.compScopes.back()->set(tname, std::move(v));
+					return;
+				}
+			}
+		}
+	}
 
 	// `v[i] = x` on a struct -> `v.setAt(i, x)`.
 	const AstNode &target = gctx.ctx.getNodeStore().get(targetIdx);
@@ -1935,10 +2315,9 @@ static JirRef astgenArrayRepeat(AstGenCtx &gctx, const AstNode &n,
 	// extra copy a future double-free. rustc requires `T: Copy` for
 	// `[x; N]`; jam rejects until explicit clone() lands.
 	if (typeNeedsDrop(gctx.ctx, elemTy)) {
-		failHere(gctx,
-		         "repeat literal would create " + std::to_string(count) +
-		             " owners of one drop-bearing value; initialize each "
-		             "element explicitly");
+		failHere(gctx, "repeat literal would create " + std::to_string(count) +
+		                   " owners of one drop-bearing value; initialize each "
+		                   "element explicitly");
 	}
 
 	// Zig-style fill: a constant byte fill (especially `[0; N]`)
@@ -2883,6 +3262,44 @@ static void astgenIf(AstGenCtx &gctx, const AstNode &n) {
 	uint32_t thenCount = ns.getExtra(extra);
 	uint32_t elseCount = ns.getExtra(extra + 1);
 
+	// `comp if` (flags bit 0): the condition folds during astgen and
+	// ONLY the taken arm lowers — the dead arm is never typechecked,
+	// so it may reference symbols that don't exist on this target
+	// (the `@isDarwin()` conditional-compilation story). The taken
+	// arm's statements run unconditionally at the surrounding runtime
+	// depth; they still get their own lexical scope, so locals (and
+	// their drops) stay arm-local. The verdict is recorded for
+	// init_analysis, which must observe the same elision.
+	if ((n.flags & 1) != 0) {
+		NodeIdx selfIdx = gctx.currentNode;
+		jam::ComptimeValue c = evalInCompScope(gctx, condIdx);
+		if (c.kind != jam::ComptimeValue::Kind::Bool) {
+			failNode(gctx, condIdx,
+			         "`comp if` condition must evaluate to a "
+			         "compile-time bool");
+		}
+		gctx.ctx.recordCompIfVerdict(gctx.fnAst, selfIdx, c.boolVal);
+		pushDropScope(gctx);
+		uint32_t base = c.boolVal ? 2 : 2 + thenCount;
+		uint32_t count = c.boolVal ? thenCount : elseCount;
+		for (uint32_t i = 0; i < count; i++) {
+			NodeIdx s = static_cast<NodeIdx>(ns.getExtra(base + extra + i));
+			astgenExpr(gctx, s, kNoType);
+		}
+		popDropScopeEmitting(gctx);
+		// If the taken arm diverged (return / break / continue), the
+		// current block now ends in a terminator. Statements following
+		// the comp-if in the enclosing body would otherwise append
+		// after that terminator. Open a fresh continuation block —
+		// dead if nothing reaches it, exactly like a runtime if's merge
+		// block when both arms diverge.
+		if (blockHasTerminator(gctx.jfn.getBlock(gctx.currentBlock),
+		                       gctx.jfn)) {
+			gctx.currentBlock = gctx.jfn.pushBlock("compifend");
+		}
+		return;
+	}
+
 	JirRef condRef = astgenExpr(gctx, condIdx, BuiltinType::Bool);
 	JirBlockRef thenB = gctx.jfn.pushBlock("then");
 	JirBlockRef elseB =
@@ -2892,7 +3309,9 @@ static void astgenIf(AstGenCtx &gctx, const AstNode &n) {
 	emitCondBr(gctx, condRef, thenB, (elseCount > 0) ? elseB : mergeB);
 
 	// Then arm — own scope so locals declared inside the body drop
-	// at branch exit.
+	// at branch exit. Arm bodies run at +1 runtime-conditional depth
+	// (comp bindings declared outside may not be mutated inside).
+	gctx.runtimeCondDepth++;
 	gctx.currentBlock = thenB;
 	pushDropScope(gctx);
 	for (uint32_t i = 0; i < thenCount; i++) {
@@ -2919,6 +3338,7 @@ static void astgenIf(AstGenCtx &gctx, const AstNode &n) {
 			emitBr(gctx, mergeB);
 		}
 	}
+	gctx.runtimeCondDepth--;
 
 	gctx.currentBlock = mergeB;
 }
@@ -3007,9 +3427,8 @@ static void astgenFor(AstGenCtx &gctx, const AstNode &n) {
 				loadIdx = emit(gctx, ext);
 			}
 		} else {
-			failHere(gctx,
-			         "for-range bounds have mismatched types; cast one "
-			         "side with `as` so both bounds agree");
+			failHere(gctx, "for-range bounds have mismatched types; cast one "
+			               "side with `as` so both bounds agree");
 		}
 	}
 	JirInst cmp{};
@@ -3026,10 +3445,12 @@ static void astgenFor(AstGenCtx &gctx, const AstNode &n) {
 	gctx.currentBlock = bodyB;
 	pushDropScope(gctx);
 	gctx.loopStack.push_back({stepB, exitB, gctx.dropScopes.size() - 1});
+	gctx.runtimeCondDepth++;
 	for (uint32_t i = 0; i < bodyCount; i++) {
 		NodeIdx s = static_cast<NodeIdx>(ns.getExtra(extra + 4 + i));
 		astgenExpr(gctx, s, kNoType);
 	}
+	gctx.runtimeCondDepth--;
 	popDropScopeEmitting(gctx);
 	if (!blockHasTerminator(gctx.jfn.getBlock(gctx.currentBlock), gctx.jfn)) {
 		emitBr(gctx, stepB);
@@ -3087,10 +3508,12 @@ static void astgenWhile(AstGenCtx &gctx, const AstNode &n) {
 	gctx.currentBlock = bodyB;
 	pushDropScope(gctx);
 	gctx.loopStack.push_back({condB, exitB, gctx.dropScopes.size() - 1});
+	gctx.runtimeCondDepth++;
 	for (uint32_t i = 0; i < bodyCount; i++) {
 		NodeIdx s = static_cast<NodeIdx>(ns.getExtra(extra + 1 + i));
 		astgenExpr(gctx, s, kNoType);
 	}
+	gctx.runtimeCondDepth--;
 	popDropScopeEmitting(gctx);
 	if (!blockHasTerminator(gctx.jfn.getBlock(gctx.currentBlock), gctx.jfn)) {
 		emitBr(gctx, condB);
@@ -3651,8 +4074,7 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 	// payload-less enum with its own cfn drop also consumes, or the two
 	// layers disagree (analyzer says moved, codegen drops at scope
 	// exit → false use-after-move rejections).
-	bool matchOwns =
-	    matchEinfo != nullptr && typeNeedsDrop(gctx.ctx, scrutTy);
+	bool matchOwns = matchEinfo != nullptr && typeNeedsDrop(gctx.ctx, scrutTy);
 	JirRef scrutOwned = kNoJirRef;
 	if (matchOwns) {
 		rejectDropBearingFieldExtract(gctx, scrutIdx, scrutTy, "consume");
@@ -3780,9 +4202,7 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		// on this path.
 		if (wildcardArmIdx < 0) {
 			gctx.currentBlock = defaultB;
-			if (matchOwns) {
-				emitDropInPlace(gctx, scrutOwned, scrutTy);
-			}
+			if (matchOwns) { emitDropInPlace(gctx, scrutOwned, scrutTy); }
 			emitBr(gctx, mergeB);
 		}
 	} else {
@@ -3814,9 +4234,7 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		// the value after a non-exhaustive match is at fault.)
 		if (wildcardArmIdx < 0) {
 			gctx.currentBlock = defaultB;
-			if (matchOwns) {
-				emitDropInPlace(gctx, scrutOwned, scrutTy);
-			}
+			if (matchOwns) { emitDropInPlace(gctx, scrutOwned, scrutTy); }
 			emitBr(gctx, mergeB);
 		}
 	}
@@ -3825,7 +4243,10 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 	// for the duration of body lowering, then removes them so the
 	// next arm sees a clean scope. Each arm runs in its own drop
 	// scope so locals declared inside the body are destroyed before
-	// the branch reaches the merge block.
+	// the branch reaches the merge block. Arm bodies run at +1
+	// runtime-conditional depth (comp bindings declared outside may
+	// not be mutated inside an arm).
+	gctx.runtimeCondDepth++;
 	for (uint32_t i = 0; i < armCount; i++) {
 		gctx.currentBlock = armBlocks[i];
 		// Install bindings (saving any prior entries with same name).
@@ -3864,15 +4285,13 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 				// owners in the arm's scope (same dual-flavor
 				// registration var-decls use).
 				for (const ArmBinding &bind : armBindings[i]) {
-					std::string dn =
-					    lookupDropFnLLVMName(gctx.ctx, bind.type);
+					std::string dn = lookupDropFnLLVMName(gctx.ctx, bind.type);
 					if (!dn.empty()) {
 						gctx.dropScopes.back().push_back(
 						    {bind.name, bind.slot, bind.type, dn});
 					} else if (typeNeedsDrop(gctx.ctx, bind.type)) {
 						gctx.dropScopes.back().push_back(
-						    {bind.name, bind.slot, bind.type,
-						     std::string()});
+						    {bind.name, bind.slot, bind.type, std::string()});
 					}
 				}
 			}
@@ -3920,6 +4339,7 @@ static JirRef astgenMatch(AstGenCtx &gctx, const AstNode &n, TypeIdx expected) {
 		for (const auto &kv : saved) gctx.locals[kv.first] = kv.second;
 		for (const auto &kv : savedTypes) gctx.localTypes[kv.first] = kv.second;
 	}
+	gctx.runtimeCondDepth--;
 
 	gctx.currentBlock = mergeB;
 	if (resultSlot == kNoJirRef) return kNoJirRef;
@@ -4075,9 +4495,7 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n,
 	// (not a NodeIdx). For the inner-call lookup we re-derive the
 	// callee's FunctionAST via the same registry path.
 	const FunctionAST *fn = gctx.ctx.getFunctionAST(qualified);
-	if (fn == nullptr) {
-		return reportMethodMiss(gctx, qualified);
-	}
+	if (fn == nullptr) { return reportMethodMiss(gctx, qualified); }
 	std::vector<JirRef> argRefs;
 	argRefs.reserve(argCount);
 	for (uint32_t i = 0; i < argCount; i++) {
@@ -4086,8 +4504,7 @@ static JirRef astgenTypeMethodCall(AstGenCtx &gctx, const AstNode &n,
 		if (i < fn->Args.size()) {
 			rejectAddrOfOnModeArg(gctx, argIdx, fn->Args[i]);
 			if (fn->Args[i].Mode == ParamMode::Move) {
-				rejectDropBearingFieldExtract(gctx, argIdx, expectArg,
-				                              "move");
+				rejectDropBearingFieldExtract(gctx, argIdx, expectArg, "move");
 			}
 		}
 		argRefs.push_back(astgenExpr(gctx, argIdx, expectArg));
@@ -4228,8 +4645,8 @@ static bool assignTargetIsValueWorld(AstGenCtx &gctx, NodeIdx targetIdx) {
 		}
 		const auto *sinfo = gctx.ctx.lookupStruct(curTy);
 		if (sinfo == nullptr) return false;
-		const std::string &member = gctx.ctx.getStringPool().get(
-		    static_cast<StringIdx>((*rit)->rhs));
+		const std::string &member =
+		    gctx.ctx.getStringPool().get(static_cast<StringIdx>((*rit)->rhs));
 		int fidx = gctx.ctx.getFieldIndex(sinfo->name, member);
 		if (fidx < 0) return false;
 		curTy = sinfo->fields[static_cast<size_t>(fidx)].second;
@@ -5901,15 +6318,28 @@ static JirRef astgenCompTimeFnCall(AstGenCtx &gctx, const AstNode &n,
 	}
 
 	// Evaluate each arg at compile time and bind to the param name.
+	// Args fold in the CALLER's comp scope (so they can reference the
+	// caller's comp bindings / module consts); the body then runs in a
+	// fresh scope holding only the params (lexical, not dynamic).
 	jam::ComptimeEvaluator ev(ns, gctx.ctx.getStringPool(),
 	                          gctx.ctx.getTypePool());
+	jam::ComptimeScope &callerScope = *gctx.compScopes.back();
 	jam::ComptimeScope outer;
 	jam::Diagnostics &diags = gctx.ctx.diagnostics();
-	jam::SrcLoc loc{gctx.ctx.currentFile(), 0};
+	jam::SrcLoc loc{gctx.ctx.currentFile(),
+	                gctx.ctx.getNodeStore().getLine(gctx.currentNode)};
+	// Resolver active during arg-fold AND body-exec so nested cfn calls
+	// resolve (`a()` calling `b()`); see CompCallResolverImpl.
+	CompCallResolverImpl resolver(gctx.ctx, ev);
+	ev.setCallResolver(&resolver);
 	for (uint32_t i = 0; i < argCount; i++) {
 		NodeIdx argIdx = static_cast<NodeIdx>(ns.getExtra(argsExtra + 1 + i));
-		jam::ComptimeValue v = ev.eval(argIdx, outer);
+		// The resolver needs the diag context even during arg-fold.
+		ev.setCallContext(nullptr, &diags, loc);
+		jam::ComptimeValue v = ev.eval(argIdx, callerScope);
+		ev.clearCallContext();
 		if (v.isNone()) {
+			ev.clearCallResolver();
 			return recoverHere(gctx,
 			                   "argument to cfn `" + fn->Name + "` (param `" +
 			                       fn->Args[i].Name +
@@ -5932,6 +6362,7 @@ static JirRef astgenCompTimeFnCall(AstGenCtx &gctx, const AstNode &n,
 	    bodyVec.data(), bodyVec.size(), outer, iterCounter,
 	    jam::ComptimeEvaluator::kDefaultIterCap, returned, diags, loc);
 	ev.clearCallContext();
+	ev.clearCallResolver();
 	if (r == jam::ExecResult::Error || r == jam::ExecResult::IterationCap) {
 		// Diagnostic already pushed; return a poison so the rest of
 		// the caller still gets analyzed.
@@ -5941,8 +6372,22 @@ static JirRef astgenCompTimeFnCall(AstGenCtx &gctx, const AstNode &n,
 		                       "time evaluation",
 		                   kNoType);
 	}
-	// cfn returns void in v1; the value (if any) is discarded for now.
-	return kNoJirRef;
+
+	// A void cfn (no declared return type) produces no value — its
+	// effect is the @-emit JIR it dropped into the caller. A
+	// value-returning cfn materializes its `return` value as a JIR
+	// constant at the call site, narrowed to the declared return type.
+	if (fn->ReturnType == kNoType) { return kNoJirRef; }
+	if (returned.isNone()) {
+		return recoverHere(gctx,
+		                   "cfn `" + fn->Name +
+		                       "` declares a return type but its body "
+		                       "did not `return` a compile-time value on "
+		                       "every path",
+		                   fn->ReturnType);
+	}
+	return materializeComptimeValue(gctx, returned, fn->ReturnType,
+	                                "cfn `" + fn->Name + "` result");
 }
 
 static JirRef astgenCompInstantiatedCall(AstGenCtx &gctx, const AstNode &n,
@@ -6210,9 +6655,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 		}
 		std::string qualified = recvName + "." + methodName;
 		const FunctionAST *method = gctx.ctx.getFunctionAST(qualified);
-		if (method == nullptr) {
-			return reportMethodMiss(gctx, qualified);
-		}
+		if (method == nullptr) { return reportMethodMiss(gctx, qualified); }
 		ParamMode mode =
 		    method->Args.empty() ? ParamMode::Let : method->Args[0].Mode;
 		// Dispatch on the full ABI, not just ParamMode: a `let
@@ -6268,8 +6711,7 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 			                        : kNoType;
 			if (1 + i < method->Args.size() &&
 			    method->Args[1 + i].Mode == ParamMode::Move) {
-				rejectDropBearingFieldExtract(gctx, argIdx, expectArg,
-				                              "move");
+				rejectDropBearingFieldExtract(gctx, argIdx, expectArg, "move");
 			}
 			argRefs.push_back(astgenExpr(gctx, argIdx, expectArg));
 			// A `move`-mode method argument (`v.push(local)`) transfers
@@ -6433,8 +6875,8 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 							// Enum payload capture is a MOVE — the enum
 							// owns the value (see the TypeMethodCall
 							// constructor for the same rule).
-							rejectDropBearingFieldExtract(
-							    gctx, argIdxN, fieldTy, "capture");
+							rejectDropBearingFieldExtract(gctx, argIdxN,
+							                              fieldTy, "capture");
 							consumeMovedVariable(gctx, argIdxN);
 							JirInst gepInst{};
 							gepInst.tag = JirTag::IndexAddr;
@@ -6504,8 +6946,8 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 				// user cfn clone returns kNoJirRef and dispatches as an
 				// ordinary method below.
 				if (methodName == "clone" && argCount == 0) {
-					JirRef cloned = tryLowerBuiltinClone(
-					    gctx, it->second, kNoJirRef, instTy);
+					JirRef cloned = tryLowerBuiltinClone(gctx, it->second,
+					                                     kNoJirRef, instTy);
 					if (cloned != kNoJirRef) return cloned;
 				}
 				// Built-in array methods: `arr.asPtr()` / `arr.asMutPtr()`
@@ -6592,8 +7034,8 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 								if (method->Args[1 + i].Mode ==
 								    ParamMode::Move) {
 									rejectDropBearingFieldExtract(
-									    gctx, argIdx,
-									    method->Args[1 + i].Type, "move");
+									    gctx, argIdx, method->Args[1 + i].Type,
+									    "move");
 								}
 							}
 							TypeIdx expectArg = (1 + i < method->Args.size())
@@ -7096,9 +7538,16 @@ void astgenBodyInto(JirFunction &jfn, const FunctionAST &fn,
 
 	JirBlockRef entry = jfn.pushBlock("entry");
 	AstGenCtx gctx{jfn, ctx, entry, {}, {}};
+	gctx.fnAst = &fn;
 	// Scope 0 is the function body itself — every local declared at
 	// the function top level drops here at function exit.
 	pushDropScope(gctx);
+	// Seed the root comp frame with the module-const fixpoint and any
+	// active comp-param substitutions, so `comp` initializers and
+	// `comp if` conditions can reference both. Explicit comp bindings
+	// are tracked separately (compBindInfo); the seeded names keep
+	// resolving through their own astgenVariable paths.
+	ctx.seedComptimeScope(*gctx.compScopes.back());
 
 	// A deferred `[expr]T` return annotation canonicalizes before any
 	// return statement compares its value type against it. Runs before

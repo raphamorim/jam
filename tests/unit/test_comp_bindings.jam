@@ -1,0 +1,184 @@
+// `comp const` / `comp var` — compile-time bindings (Stage 1 of
+// COMPTIME_PLAN.md). The binding lives in astgen's comp scope: no
+// alloca, no store, no runtime slot. Reads materialize the value as a
+// constant at the use site, narrowed to the consumer's type exactly
+// like a literal. `comp var` mutates through the comp scope between
+// statements; `comp const` rejects reassignment (compile-fail
+// coverage lives in tests/cpp/test_codegen_errors.cpp).
+
+const { assert } = import("test");
+
+// Module-scope comp const: must fold eagerly, usable like any const.
+comp const PAGE: u32 = 4096;
+comp const SHIFT = 4;
+pub comp const EXPORTED = 7;
+
+// A comp const referencing other module consts (fixpoint seeding).
+const BASE = 100;
+comp const DERIVED = BASE * 2 + 1;
+
+tfn moduleCompConst() {
+    var p: u32 = PAGE;
+    assert(p, 4096);
+}
+
+tfn moduleCompConstDerived() {
+    var d: u64 = DERIVED;
+    assert(d, 201);
+}
+
+tfn moduleCompConstExported() {
+    var e: u8 = EXPORTED;
+    assert(e, 7);
+}
+
+// Function-local comp const, default width (u64), narrowed at use.
+fn localCompConst() u8 {
+    comp const N = 200;
+    var x: u8 = N;
+    return x;
+}
+
+tfn localCompConstNarrows() {
+    assert(localCompConst(), 200);
+}
+
+// Declared-type annotation coerces the comp value at bind time.
+fn typedCompConst() u64 {
+    comp const SMALL: u8 = 255;
+    comp const WIDE: u64 = 70000;
+    var a: u64 = SMALL as u64;
+    var b: u64 = WIDE;
+    return a + b;
+}
+
+tfn typedCompConstCoerces() {
+    assert(typedCompConst(), 70255);
+}
+
+// comp const in an array-length-ish position: array repeat counts
+// fold against module consts; local comp bindings drive plain
+// arithmetic on indexes and bounds.
+fn compConstArithmetic() u32 {
+    comp const COUNT = 8;
+    var total: u32 = 0;
+    var i: u32 = 0;
+    while (i < COUNT) {
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+tfn compConstDrivesLoopBound() {
+    assert(compConstArithmetic(), 28);
+}
+
+// comp var: mutates in the comp scope between straight-line
+// statements — each read materializes the value at that program
+// point, so the three reads below see three different constants.
+fn compVarMutation() u64 {
+    comp var x = 1;
+    var a: u64 = x;
+    x = x + 10;
+    var b: u64 = x;
+    x = x * 2;
+    var c: u64 = x;
+    return a * 1000000 + b * 1000 + c;
+}
+
+tfn compVarMutates() {
+    assert(compVarMutation(), 1011022);
+}
+
+// comp bool and comp str bindings. A comp str materializes to a
+// runtime `[]u8` slice at the use site; `.len` then works on the
+// slice (member access on the comp value itself is a later stage).
+fn compBoolAndStr() u64 {
+    comp const ENABLED = true;
+    comp const NAME = "jam";
+    var n: u64 = 0;
+    if (ENABLED) {
+        var s: []u8 = NAME;
+        n = s.len;
+    }
+    return n;
+}
+
+tfn compBoolStrWork() {
+    assert(compBoolAndStr(), 3);
+}
+
+// comp float binding, f32 and f64 consumers.
+fn compFloat() f64 {
+    comp const PI: f64 = 3.5;
+    var x: f64 = PI;
+    return x;
+}
+
+tfn compFloatWorks() {
+    assert((compFloat() == 3.5) as u8, 1);
+}
+
+// Shadowing: an inner block may shadow an outer comp binding with a
+// fresh comp binding; the outer one is untouched after the block.
+fn compShadowing() u64 {
+    comp var x = 5;
+    var before: u64 = x;
+    if (true) {
+        comp const x = 50;
+        var inner: u64 = x;
+        before = before + inner;
+    }
+    var after: u64 = x;
+    return before + after;
+}
+
+tfn compShadowingScopes() {
+    assert(compShadowing(), 60);
+}
+
+// A runtime local shadows a comp binding of the same name in an
+// inner scope (locals win the resolution race).
+fn runtimeShadowsComp() u64 {
+    comp const v = 9;
+    if (true) {
+        var v: u64 = 100;
+        v = v + 1;
+        return v;
+    }
+    return v;
+}
+
+tfn runtimeShadowingWorks() {
+    assert(runtimeShadowsComp(), 101);
+}
+
+// comp binding declared INSIDE a runtime arm: assignment at the same
+// depth is fine (declaration and mutation share the arm).
+fn compVarInsideArm(flag: bool) u64 {
+    var out: u64 = 0;
+    if (flag) {
+        comp var local = 3;
+        local = local + 4;
+        out = local;
+    }
+    return out;
+}
+
+tfn compVarInsideArmSameDepth() {
+    assert(compVarInsideArm(true), 7);
+}
+
+// comp values feed runtime expressions transparently — binary ops,
+// indexes, call args.
+fn double(x: u32) u32 { return x * 2; }
+
+fn compFeedsCalls() u32 {
+    comp const SEED: u32 = 21;
+    return double(SEED);
+}
+
+tfn compFeedsCallArgs() {
+    assert(compFeedsCalls(), 42);
+}

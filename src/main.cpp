@@ -618,7 +618,7 @@ static int compileAndRun(const std::string &filename,
 		return kNoType;
 	};
 
-	auto registerConsts = [&](ModuleAST *m) {
+	auto registerConsts = [&](ModuleAST *m, const std::string &file) {
 		for (auto &c : m->Consts) {
 			if (c->AliasedType != kNoType) {
 				codegenCtx.registerTypeAlias(c->Name, c->AliasedType);
@@ -641,13 +641,19 @@ static int compileAndRun(const std::string &filename,
 				}
 			}
 			codegenCtx.registerModuleConst(c->Name, c->InitExpr,
-			                               c->DeclaredType);
+			                               c->DeclaredType, c->isComp, file);
 		}
 	};
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
-		registerConsts(importedModule.get());
+		registerConsts(importedModule.get(), path);
 	}
-	registerConsts(module.get());
+	registerConsts(module.get(), filename);
+
+	// Eager `comp const` validation: every comp-marked module const
+	// must fold against the const fixpoint. Plain consts stay lazy
+	// (they only error if a comp position consumes a non-foldable one);
+	// comp consts error here, at the declaration.
+	codegenCtx.validateCompConsts();
 
 	// Single demand-driven body-fill pass: walk every Struct/Enum/
 	// Union decl in the DeclTable and ask the analyzer to materialise
@@ -758,6 +764,16 @@ static int compileAndRun(const std::string &filename,
 	analysisHooks.ctx = &codegenCtx;
 	analysisHooks.typeNeedsDrop = +[](void *c, TypeIdx t) -> bool {
 		return typeNeedsDrop(*static_cast<JamCodegenContext *>(c), t);
+	};
+	// `comp if` verdict oracle: astgen records which arm it lowered;
+	// the analyzer walks only that arm (see Analyzer::analyzeIf).
+	analysisHooks.compIfVerdict =
+	    +[](void *c, const void *fnAst, NodeIdx node) -> int {
+		const bool *v =
+		    static_cast<JamCodegenContext *>(c)->lookupCompIfVerdict(fnAst,
+		                                                             node);
+		if (v == nullptr) return -1;
+		return *v ? 1 : 0;
 	};
 	codegenCtx.setAnalysisHooks(&analysisHooks);
 

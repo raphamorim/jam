@@ -457,8 +457,32 @@ JamCodegenContext::findEnumByLLVMType(JamTypeRef ty) const {
 }
 
 void JamCodegenContext::registerModuleConst(const std::string &name,
-                                            NodeIdx init, TypeIdx declared) {
-	moduleConsts[name] = ModuleConstInfo{init, declared};
+                                            NodeIdx init, TypeIdx declared,
+                                            bool isComp, std::string file) {
+	moduleConsts[name] =
+	    ModuleConstInfo{init, declared, isComp, std::move(file)};
+}
+
+void JamCodegenContext::validateCompConsts() {
+	jam::ComptimeEvaluator ev(nodeStore, stringPool, typePool);
+	jam::ComptimeScope scope;
+	seedComptimeScope(scope);
+	for (const auto &kv : moduleConsts) {
+		if (!kv.second.isComp) continue;
+		// A foldable comp const is already bound in the seeded scope;
+		// re-evaluating its init there is cheap and gives a definitive
+		// verdict for the ones the fixpoint never managed to bind.
+		jam::ComptimeValue v = ev.eval(kv.second.initExpr, scope);
+		if (v.isNone()) {
+			jam::SrcLoc loc{kv.second.file,
+			                nodeStore.getLine(kv.second.initExpr)};
+			diagnostics().error(
+			    loc, "comp const `" + kv.first +
+			             "` must be compile-time evaluable — its "
+			             "initializer depends on a runtime value or an "
+			             "unsupported construct");
+		}
+	}
 }
 
 // function-AST lookup. main.cpp registers each Jam-defined function
@@ -1095,14 +1119,13 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 	return result;
 }
 
-jam::ComptimeValue JamCodegenContext::foldComptimeExpr(NodeIdx expr) const {
+void JamCodegenContext::seedComptimeScope(jam::ComptimeScope &scope) const {
 	// Fold with every module const in scope. Consts may reference each
 	// other (`const B = A * 2;`), so seed the scope to a fixpoint: each
 	// pass folds the consts whose dependencies folded in an earlier
 	// pass. Consts that never fold (runtime-only inits) simply stay
 	// unbound — an expression referencing one comes back None.
 	jam::ComptimeEvaluator ev(nodeStore, stringPool, typePool);
-	jam::ComptimeScope scope;
 	bool progress = true;
 	while (progress) {
 		progress = false;
@@ -1115,7 +1138,90 @@ jam::ComptimeValue JamCodegenContext::foldComptimeExpr(NodeIdx expr) const {
 			}
 		}
 	}
-	return ev.eval(expr, scope);
+	// Active comp-param substitutions shadow same-named module consts —
+	// the same precedence astgenVariable applies (comp subst is checked
+	// before getModuleConst). Bound last so they overwrite.
+	for (const auto &kv : currentCompSubst_) {
+		scope.bind(kv.first, kv.second);
+	}
+}
+
+jam::ComptimeValue
+CompCallResolverImpl::resolveCall(const std::string &name,
+                                  const std::vector<jam::ComptimeValue> &args,
+                                  jam::Diagnostics &diags, jam::SrcLoc loc) {
+	const FunctionAST *fn = ctx_.getFunctionAST(name);
+	// Only compile-time functions are callable from comptime in v1.
+	// A plain `fn` that EXISTS is a definitive misuse — say so. An
+	// unknown name returns None silently (the surrounding context, e.g.
+	// "array length must be comptime-known", surfaces it). Plain-fn
+	// CTFE is Stage 7.
+	if (fn != nullptr && !fn->isCompTimeFn) {
+		diags.error(loc, "`" + name +
+		                     "` is a runtime function and cannot be called "
+		                     "at compile time — only `cfn` functions are "
+		                     "comptime-evaluable");
+		return jam::ComptimeValue::makeNone();
+	}
+	if (fn == nullptr) { return jam::ComptimeValue::makeNone(); }
+	if (args.size() != fn->Args.size()) {
+		diags.error(loc, "cfn `" + name + "` expects " +
+		                     std::to_string(fn->Args.size()) + " arg(s), got " +
+		                     std::to_string(args.size()));
+		return jam::ComptimeValue::makeNone();
+	}
+	if (++totalCalls_ > kMaxTotalCalls) {
+		diags.error(loc, "comptime total-call cap (" +
+		                     std::to_string(kMaxTotalCalls) +
+		                     ") exceeded — comptime evaluation does too much "
+		                     "work (runaway recursion?)");
+		return jam::ComptimeValue::makeNone();
+	}
+	if (++depth_ > kMaxDepth) {
+		diags.error(loc, "cfn call depth cap (" + std::to_string(kMaxDepth) +
+		                     ") exceeded — possible infinite recursion in `" +
+		                     name + "`");
+		depth_--;
+		return jam::ComptimeValue::makeNone();
+	}
+
+	// Fresh scope: a cfn body sees only its parameters (lexical, not
+	// dynamic — it cannot reach the caller's locals by name).
+	jam::ComptimeScope callScope;
+	for (std::size_t i = 0; i < args.size(); i++) {
+		callScope.bind(fn->Args[i].Name, args[i]);
+	}
+	uint32_t iter = 0;
+	jam::ComptimeValue ret;
+	std::vector<NodeIdx> body(fn->Body.begin(), fn->Body.end());
+	jam::ExecResult r =
+	    ev_.execBlock(body.data(), body.size(), callScope, iter,
+	                  jam::ComptimeEvaluator::kDefaultIterCap, ret, diags, loc);
+	depth_--;
+	if (r == jam::ExecResult::Error || r == jam::ExecResult::IterationCap) {
+		return jam::ComptimeValue::makeNone();
+	}
+	// A `return;` with no value, or fall-through, yields None — the
+	// caller decides whether a value was required.
+	return ret;
+}
+
+jam::ComptimeValue JamCodegenContext::foldComptimeExpr(NodeIdx expr) const {
+	jam::ComptimeEvaluator ev(nodeStore, stringPool, typePool);
+	jam::ComptimeScope scope;
+	seedComptimeScope(scope);
+	// Install a call resolver so a cfn can appear in a comptime
+	// expression position — `[bufLen(512)]u8`, `comp const N =
+	// f(3)`. Diagnostics route to this context's channel; the
+	// SrcLoc is best-effort (the expr's own line is not threaded here).
+	CompCallResolverImpl resolver(*this, ev);
+	ev.setCallResolver(&resolver);
+	jam::SrcLoc loc{currentFile(), nodeStore.getLine(expr)};
+	ev.setCallContext(nullptr, &diagnostics(), loc);
+	jam::ComptimeValue v = ev.eval(expr, scope);
+	ev.clearCallContext();
+	ev.clearCallResolver();
+	return v;
 }
 
 TypeIdx JamCodegenContext::resolveArrayExpr(TypeIdx ty) const {
@@ -1351,10 +1457,9 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 			// for this instantiation: <reason>" at the call site.
 			// `cfn drop` stays unconditional: silently withdrawing a
 			// destructor would change ownership semantics.
-			bool conditional =
-			    !(im.clonePtr->Name.size() >= 5 &&
-			      im.clonePtr->Name.rfind(".drop") ==
-			          im.clonePtr->Name.size() - 5);
+			bool conditional = !(im.clonePtr->Name.size() >= 5 &&
+			                     im.clonePtr->Name.rfind(".drop") ==
+			                         im.clonePtr->Name.size() - 5);
 			std::size_t diagMark = mutCtx.diagnostics().size();
 			auto withdraw = [&](const std::string &reason) {
 				mutCtx.diagnostics().truncateTo(diagMark);
@@ -1389,9 +1494,8 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 				static const std::vector<Token> kNoTokens;
 				auto adiags = jam::init_analysis::analyze(
 				    *im.clonePtr, nodeStore, stringPool, kNoTokens,
-				    mutCtx.analysisFns(), mutCtx.getDropRegistry(),
-				    &typePool, mutCtx.analysisEnums(),
-				    mutCtx.analysisHooks());
+				    mutCtx.analysisFns(), mutCtx.getDropRegistry(), &typePool,
+				    mutCtx.analysisEnums(), mutCtx.analysisHooks());
 				if (!adiags.empty()) {
 					mutCtx.popBodyModule();
 					clearCurrentSubst();

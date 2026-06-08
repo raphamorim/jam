@@ -383,8 +383,9 @@ class InitAnalysisTests {
 		                  testReturnMutParamByValueOK);
 
 		// Drop registry interaction
-		framework.addTest("InitAnalysis - unconditional move on drop-bearing OK",
-		                  testMoveOnDropBearingAccepted);
+		framework.addTest(
+		    "InitAnalysis - unconditional move on drop-bearing OK",
+		    testMoveOnDropBearingAccepted);
 		framework.addTest(
 		    "InitAnalysis - conditional move on drop-bearing rejected",
 		    testConditionalMoveOnDropBearingRejected);

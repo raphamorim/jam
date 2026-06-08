@@ -73,8 +73,7 @@ DropRegistry buildDropRegistry(const ModuleAST &module, const TypePool &types,
 // Clone counterpart of considerDropCandidate: `cfn clone(self: T) T`
 // (let-mode self — cloning borrows the original). The self param's
 // type names the struct the clone belongs to.
-static void considerCloneCandidate(const FunctionAST *fn,
-                                   const TypePool &types,
+static void considerCloneCandidate(const FunctionAST *fn, const TypePool &types,
                                    const StringPool &strings,
                                    CloneRegistry &registry) {
 	if (!fn->isCfn) return;

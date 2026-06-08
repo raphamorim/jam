@@ -187,6 +187,18 @@ class Analyzer {
 	// Cleared on exit. Lifetime bounded by the run() activation that set it.
 	const std::vector<Param> *args_ = nullptr;
 
+	// The FunctionAST being analyzed — keys the comp-if verdict lookup
+	// (astgen records verdicts per FunctionAST so generic clones, which
+	// share body NodeIdx values, cannot collide). Set in run().
+	const FunctionAST *fnAst_ = nullptr;
+
+	// Names declared as `comp const` / `comp var`. Those bindings live
+	// only in astgen's comp scope — no runtime slot, no init state, no
+	// drops — so the analyzer skips their decls and assignments. A
+	// runtime re-declaration of the same name (inner-block shadowing)
+	// removes the entry so the runtime binding tracks normally again.
+	std::unordered_set<std::string> compNames_;
+
 	// Static type per binding name. Populated as parameter list and
 	// VarDecls are walked. Used by the drop-bearing check on `move` args.
 	// Reset per function in run().
@@ -225,10 +237,12 @@ class Analyzer {
 
 std::vector<Diagnostic> Analyzer::run(const FunctionAST &fn) {
 	args_ = &fn.Args;
+	fnAst_ = &fn;
 	varTypes_.clear();
 	declDepth_.clear();
 	movedBindings_.clear();
 	movedDropBearing_.clear();
+	compNames_.clear();
 	condDepth_ = 0;
 
 	NameMap state;
@@ -391,8 +405,8 @@ Result Analyzer::analyze(NodeIdx idx, NameMap state) {
 			if (r.terminated) return r;
 			const AstNode &elemNode = nodes_.get(elemIdx);
 			if (elemNode.tag == AstTag::Variable) {
-				const std::string &src = strings_.get(
-				    static_cast<StringIdx>(elemNode.lhs));
+				const std::string &src =
+				    strings_.get(static_cast<StringIdx>(elemNode.lhs));
 				if (lookupDropFor(src) != nullptr) {
 					applyMoveToBinding(src, elemIdx, r.state);
 				}
@@ -456,6 +470,19 @@ Result Analyzer::analyzeVarDecl(NodeIdx idx, NameMap state) {
 	TypeIdx typeIdx = static_cast<TypeIdx>(nodes_.getExtra(extra + 1));
 	NodeIdx initIdx = nodes_.getExtra(extra + 2);
 	const std::string &name = strings_.get(nameIdx);
+
+	// `comp const` / `comp var` (rhs bit 1): the binding lives in
+	// astgen's comp scope — no runtime slot, no init state, no drops.
+	// Its initializer can only reference comp entities (astgen rejects
+	// anything else), so there is nothing to walk here either.
+	if ((n.rhs & 2u) != 0) {
+		compNames_.insert(name);
+		return Result{std::move(state), false};
+	}
+	// A runtime decl shadowing a previously seen comp name: the name
+	// now tracks as an ordinary binding again.
+	compNames_.erase(name);
+
 	varTypes_[name] = typeIdx;
 	declDepth_[name] = condDepth_;
 	// Re-declaration (shadowing in an inner block) starts a fresh
@@ -491,6 +518,19 @@ Result Analyzer::analyzeVarDecl(NodeIdx idx, NameMap state) {
 
 Result Analyzer::analyzeAssign(NodeIdx idx, NameMap state) {
 	const AstNode &n = nodes_.get(idx);
+	// Assignment to a comp binding mutates astgen's comp scope — no
+	// runtime store, and the RHS can only reference comp entities.
+	// Skip entirely so the comp name never enters the runtime state.
+	{
+		const AstNode &target = nodes_.get(n.lhs);
+		if (target.tag == AstTag::Variable) {
+			const std::string &tname =
+			    strings_.get(static_cast<StringIdx>(target.lhs));
+			if (compNames_.count(tname) != 0 && varTypes_.count(tname) == 0) {
+				return Result{std::move(state), false};
+			}
+		}
+	}
 	// Right-hand side is evaluated first (Rust semantics: drop old, then
 	// store new). Sub-expressions of the RHS may read other bindings.
 	auto r = analyze(n.rhs, std::move(state));
@@ -564,6 +604,34 @@ Result Analyzer::analyzeIf(NodeIdx idx, NameMap state) {
 	//         d.rhs = ExtraIdx -> [thenCount, elseCount, then0, ..., else0,
 	//         ...]
 	const AstNode &n = nodes_.get(idx);
+
+	// `comp if` (flags bit 0): astgen folded the condition and lowered
+	// ONLY the taken arm, inline at the surrounding conditional depth.
+	// Mirror that exactly — walk just the taken arm, no depth bump, no
+	// merge — so move/drop accounting matches the emitted code. The
+	// condition itself references only comp entities (astgen enforces
+	// it), so it is not walked. Without a verdict (astgen bailed on
+	// this fn before reaching the node), fall through to the
+	// conservative both-arm analysis below.
+	if ((n.flags & 1) != 0 && hooks_ != nullptr &&
+	    hooks_->compIfVerdict != nullptr) {
+		int verdict = hooks_->compIfVerdict(hooks_->ctx, fnAst_, idx);
+		if (verdict >= 0) {
+			ExtraIdx cExtra = n.rhs;
+			uint32_t cThen = nodes_.getExtra(cExtra + 0);
+			uint32_t cElse = nodes_.getExtra(cExtra + 1);
+			uint32_t base = (verdict == 1) ? 2 : 2 + cThen;
+			uint32_t count = (verdict == 1) ? cThen : cElse;
+			Result armR{std::move(state), false};
+			for (uint32_t i = 0; i < count; i++) {
+				if (armR.terminated) break;
+				NodeIdx s = nodes_.getExtra(cExtra + base + i);
+				armR = analyze(s, std::move(armR.state));
+			}
+			return armR;
+		}
+	}
+
 	auto r = analyze(n.lhs, std::move(state));
 	if (r.terminated) return r;
 
@@ -697,8 +765,7 @@ Result Analyzer::analyzeMatch(NodeIdx idx, NameMap state) {
 			    strings_.get(static_cast<StringIdx>(scrutNode.lhs));
 			auto vt = varTypes_.find(sname);
 			if (vt != varTypes_.end() && typeOwnsDrops(vt->second)) {
-				applyMoveToBinding(sname, static_cast<NodeIdx>(n.lhs),
-				                   r.state);
+				applyMoveToBinding(sname, static_cast<NodeIdx>(n.lhs), r.state);
 			}
 		}
 	}
@@ -924,9 +991,7 @@ void Analyzer::applyMoveToBinding(const std::string &name, NodeIdx anchor,
 	bool dropBearing = lookupDropFor(name) != nullptr;
 	if (!dropBearing) {
 		auto vt = varTypes_.find(name);
-		if (vt != varTypes_.end()) {
-			dropBearing = typeOwnsDrops(vt->second);
-		}
+		if (vt != varTypes_.end()) { dropBearing = typeOwnsDrops(vt->second); }
 	}
 	if (dropBearing) {
 		auto dd = declDepth_.find(name);
@@ -1148,8 +1213,7 @@ void Analyzer::checkVariableRead(NodeIdx idx, const NameMap &state) {
 			              name + ".clone()`)",
 			          idx, name);
 		} else {
-			emitError("use of uninitialized binding `" + name + "`", idx,
-			          name);
+			emitError("use of uninitialized binding `" + name + "`", idx, name);
 		}
 		return;
 	case InitState::MaybeInit:
@@ -1318,14 +1382,12 @@ NameMap Analyzer::mergeMaps(const NameMap &a, const NameMap &b) {
 
 // Public entry point.
 
-std::vector<Diagnostic> analyze(const FunctionAST &fn, const NodeStore &nodes,
-                                const StringPool &strings,
-                                const std::vector<Token> &tokens,
-                                const FunctionRegistry *registry,
-                                const drops::DropRegistry *drops,
-                                const TypePool *types,
-                                const EnumVariantMap *enums,
-                                const AnalysisHooks *hooks) {
+std::vector<Diagnostic>
+analyze(const FunctionAST &fn, const NodeStore &nodes,
+        const StringPool &strings, const std::vector<Token> &tokens,
+        const FunctionRegistry *registry, const drops::DropRegistry *drops,
+        const TypePool *types, const EnumVariantMap *enums,
+        const AnalysisHooks *hooks) {
 	Analyzer a(nodes, strings, tokens, registry, drops, types, enums, hooks);
 	return a.run(fn);
 }
