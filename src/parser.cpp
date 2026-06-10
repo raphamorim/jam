@@ -177,7 +177,9 @@ NodeIdx Parser::parsePrimary() {
 	// `match (…) { … }` is also valid in expression position so it can
 	// produce a value. The same call works for both statement and
 	// expression forms; the codegen builds a phi over arm values.
-	if (check(TOK_MATCH)) { return parseMatch(); }
+	if (check(TOK_MATCH)) {
+	    return parseMatch();
+	}
 
 	// `@name(arg, ...)` — compiler intrinsic invocation. Two encoding
 	// shapes:

@@ -1,0 +1,6 @@
+// Directory-index module: `import("pkg")` resolves here (pkg/mod.jam),
+// as does `import("../pkg")` from nested/. Its identity collapses to
+// `pkg` either way, so both spellings name one module.
+pub fn pkgValue() u64 {
+    return 42;
+}

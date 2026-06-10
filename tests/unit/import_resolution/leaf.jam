@@ -1,0 +1,19 @@
+// Root-level shadow. Shares the basename `leaf` with
+// nested/leaf.jam and sits beside the entry test file. A relative
+// `./leaf` from inside nested/ must NOT land here. Its `Thing` carries
+// an extra `onlyInRoot` field so that, if a relative import ever
+// mis-resolves to this file while nested/leaf.jam is also loaded, the
+// two `pub Thing`s collide in the global by-name type registry and the
+// build fails loudly — the original repro's symptom.
+pub const Thing = struct {
+    value: u64,
+    onlyInRoot: bool,
+};
+
+pub fn makeThing() Thing {
+    return Thing { value: 1, onlyInRoot: true };
+}
+
+pub fn leafValue() u64 {
+    return 1;
+}

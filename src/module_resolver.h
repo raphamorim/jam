@@ -51,6 +51,11 @@ class ModuleResolver {
 	std::vector<std::unique_ptr<EnumDeclAST>> *sharedAnonEnums_ = nullptr;
 	std::unordered_map<std::string, std::unique_ptr<ModuleAST>> loadedModules;
 
+	// Canonical entry-relative identity for a resolved module file, used
+	// as the cache key and `modulePath` prefix. Empty when the file lies
+	// outside the base dir (e.g. std-library modules).
+	std::string moduleIdentity(const std::string &resolvedFile) const;
+
 	std::string readFile(const std::string &path) const;
 
 	std::unique_ptr<ModuleAST> parseSource(const std::string &source) const;

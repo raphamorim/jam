@@ -1,0 +1,7 @@
+// `../pkg` from nested/ resolves to the directory-index module
+// pkg/mod.jam, exercising relative resolution into a directory module.
+const { pkgValue } = import("../pkg");
+
+pub fn fromPkg() u64 {
+    return pkgValue();
+}

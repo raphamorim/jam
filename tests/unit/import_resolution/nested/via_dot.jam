@@ -1,0 +1,8 @@
+// `./leaf` is relative to THIS file's directory (nested/), so it
+// resolves to nested/leaf.jam — not the same-named leaf.jam beside the
+// entry test file.
+const { leafValue } = import("./leaf");
+
+pub fn fromDot() u64 {
+    return leafValue();
+}

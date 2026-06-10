@@ -147,6 +147,44 @@ std::string ModuleResolver::resolve(const std::string &importPath) const {
 	return "";  // Not found
 }
 
+std::string
+ModuleResolver::moduleIdentity(const std::string &resolvedFile) const {
+	// Map a resolved (canonical) module file to the stable identity used
+	// as both the `loadedModules` cache key and the `modulePath`
+	// mangling prefix: the path relative to the entry base dir, with the
+	// `.jam` extension stripped and forward slashes. It is the
+	// project-root-relative path that names a module regardless of which
+	// relative spelling reached it, so `import("lib/b")` and
+	// `import("./b")` from `lib/a` agree on the identity `lib/b`.
+	//
+	// Returns "" when the file sits outside the base dir — std-library
+	// modules resolve under their own root, and the caller keeps the
+	// original import spelling, which `resolve` already maps through the
+	// std root.
+	std::error_code ec;
+	fs::path baseAbs = fs::canonical(baseDir, ec);
+	if (ec) return "";
+	fs::path rel = fs::relative(resolvedFile, baseAbs, ec);
+	if (ec || rel.empty()) return "";
+	std::string id = rel.generic_string();
+	if (id.rfind("..", 0) == 0) return "";  // escapes the base dir
+	static const std::string ext = ".jam";
+	if (id.size() > ext.size() &&
+	    id.compare(id.size() - ext.size(), ext.size(), ext) == 0) {
+		id.resize(id.size() - ext.size());
+	}
+	// A `<dir>/mod.jam` index file shares its directory's identity, so
+	// `import("foo")` and `import("foo/mod")` name one module — matching
+	// `resolve`, which maps a bare `import("foo")` to `foo/mod.jam`.
+	static const std::string modSuffix = "/mod";
+	if (id.size() > modSuffix.size() &&
+	    id.compare(id.size() - modSuffix.size(), modSuffix.size(),
+	               modSuffix) == 0) {
+		id.resize(id.size() - modSuffix.size());
+	}
+	return id;
+}
+
 std::string ModuleResolver::readFile(const std::string &path) const {
 	std::ifstream file(path);
 	if (!file.is_open()) { return ""; }
@@ -198,11 +236,10 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 	}
 
 	// Register the parsed module in the cache BEFORE recursing into its
-	// imports. Mirrors Zig's Module.importFile (Module.zig:4946 —
-	// import_table.getOrPut returns the cached File* as soon as it
-	// exists, no cycle check). A cyclic import (`bus.jam` imports
-	// `dma.jam` imports `bus.jam`) now hits the cache and returns this
-	// same partially-initialised ModuleAST instead of erroring. The
+	// imports: the entry is published as soon as the module exists, with
+	// no cycle check. A cyclic import (`bus.jam` imports `dma.jam`
+	// imports `bus.jam`) then hits the cache and returns this same
+	// partially-initialised ModuleAST instead of erroring. The
 	// post-parse passes below (loadNested + module-path stamping) mutate
 	// the module in place — by the time codegen / semantic analysis
 	// touches a cyclic-import target, it's complete.
@@ -210,29 +247,42 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 	loadedModules[importPath] = std::move(module);
 
 	// Recursively load both regular imports (`const x = import(...)`)
-	// and destructuring imports (`const { X } = import(...)`). The
-	// nested resolver runs in the source module's directory so relative
-	// paths work; we then forward to the top-level `getOrLoadModule` so
-	// every resolved module ends up in the shared `loadedModules` map
-	// and gets its `pub` symbols registered by main.cpp.
-	auto loadNested = [&](const std::string &importPath) {
+	// and destructuring imports (`const { X } = import(...)`).
+	//
+	// Each nested import is resolved against THIS module's directory, so
+	// a relative `./b` in `lib/a.jam` means `lib/b.jam` — not a same-
+	// named file beside the entry module. We then rewrite the import's
+	// path in place to its canonical entry-relative identity (see
+	// `moduleIdentity`) and recurse on that. Together these resolve each
+	// import against the importing file's directory and key the cache by
+	// the resolved identity, so the same file reached via different
+	// spellings is one module.
+	//
+	// The rewrite is load-bearing: without it `lib/b.jam` imported as
+	// both `lib/b` (from the entry) and `./b` (from `lib/a`) would key
+	// the cache under two strings, load twice, and register its `pub`
+	// types twice — colliding in the global by-name type registry that
+	// `main.cpp` builds. Collapsing to one identity dedupes the module
+	// and keeps `modulePath` (the mangling prefix) stable.
+	auto loadNested = [&](std::string &importPath) {
 		if (importPath == "test") return;
-		fs::path modulePath(resolvedPath);
-		std::string moduleDir = modulePath.parent_path().string();
-		ModuleResolver nestedResolver(moduleDir, *typePool, *stringPool,
-		                              *nodeStore);
+		fs::path moduleDir = fs::path(resolvedPath).parent_path();
+		ModuleResolver nestedResolver(moduleDir.string(), *typePool,
+		                              *stringPool, *nodeStore);
 		std::string nestedResolved = nestedResolver.resolve(importPath);
-		if (!nestedResolved.empty() && nestedResolved != "test") {
-			getOrLoadModule(importPath);
-		}
+		if (nestedResolved.empty() || nestedResolved == "test") return;
+		std::string id = moduleIdentity(nestedResolved);
+		if (!id.empty()) importPath = id;
+		getOrLoadModule(importPath);
 	};
-	for (const auto &import : modPtr->Imports) { loadNested(import->Path); }
-	for (const auto &destImport : modPtr->DestructuringImports) {
+	for (auto &import : modPtr->Imports) { loadNested(import->Path); }
+	for (auto &destImport : modPtr->DestructuringImports) {
 		loadNested(destImport->Path);
 	}
 
 	// Stamp the import path on every function/method so the mangler
-	// can build Zig-style FQNs (`timer.Timer.read32`). Without this,
+	// can build dotted fully-qualified names (`timer.Timer.read32`).
+	// Without this,
 	// two modules that both define `pub fn helper()` or `pub const
 	// Counter = struct { pub fn init() }` would emit the same LLVM
 	// symbol and the linker would silently merge them.

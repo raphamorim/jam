@@ -1,0 +1,51 @@
+// Relative-import resolution regression test.
+//
+// Mirrors github.com/olup/jam-import-resolution-repro: a relative
+// import from a nested module must resolve against that module's own
+// directory, not the entry module's. Before the fix, `./leaf` inside
+// nested/via_dot.jam wrongly resolved to leaf.jam beside this entry
+// file, dragging the root-level shadow into the build alongside
+// nested/leaf.jam; their same-named `pub Thing`s then collided in the
+// global by-name type registry and the build failed with
+// `struct literal missing field onlyInRoot`.
+//
+// The resolver now keys modules by their project-root-relative
+// identity, so `./leaf`, `../leaf`, and `nested/leaf` all name
+// nested/leaf.jam — one module, no collision.
+
+const { assert } = import("test");
+const dot = import("nested/via_dot");
+const deep = import("nested/deep/via_dotdot");
+const { Thing, makeThing } = import("nested/leaf");
+const pkg = import("pkg");
+const viaPkg = import("nested/via_pkg");
+
+// `./leaf` from nested/via_dot.jam means nested/leaf.jam (value 7),
+// not the same-named leaf.jam beside this file (value 1).
+tfn relativeDotResolvesToNestedSibling() {
+    assert(dot.fromDot(), 7);
+}
+
+// `../leaf` from nested/deep/via_dotdot.jam climbs one directory to
+// reach nested/leaf.jam.
+tfn relativeParentResolvesAcrossDir() {
+    assert(deep.fromDotDot(), 7);
+}
+
+// nested/leaf.jam is reached three ways — `./leaf`, `../leaf`, and
+// `nested/leaf` — but is one module. Its `pub Thing` therefore
+// registers once and its own literal type-checks against its own
+// fields. A double-load would re-trigger the global-registry collision
+// and fail to compile.
+tfn sameFileViaDistinctSpellingsIsOneModule() {
+    var t: Thing = makeThing();
+    assert(t.value, 7);
+}
+
+// A directory-index module (pkg/mod.jam) imported as `pkg` from the
+// entry and as `../pkg` from nested/ collapses to one identity, so
+// relative resolution reaches directory modules too.
+tfn directoryModuleResolvesByDirAndRelatively() {
+    assert(pkg.pkgValue(), 42);
+    assert(viaPkg.fromPkg(), 42);
+}

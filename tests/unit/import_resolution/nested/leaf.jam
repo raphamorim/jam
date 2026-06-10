@@ -1,0 +1,16 @@
+// The correct target of `./leaf` (from nested/via_dot.jam) and
+// `../leaf` (from nested/deep/via_dotdot.jam), and of the entry's
+// `import("nested/leaf")`. All three spellings name this one file, so
+// it must load exactly once. Returns 7 to distinguish it from the
+// root-level shadow (which returns 1).
+pub const Thing = struct {
+    value: u64,
+};
+
+pub fn makeThing() Thing {
+    return Thing { value: 7 };
+}
+
+pub fn leafValue() u64 {
+    return 7;
+}

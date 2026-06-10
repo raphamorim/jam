@@ -1,0 +1,8 @@
+// `../leaf` climbs from nested/deep/ to nested/leaf.jam — the same
+// file via_dot.jam reaches as `./leaf`. Exercises parent-relative
+// resolution and dedup against a different spelling of one file.
+const { leafValue } = import("../leaf");
+
+pub fn fromDotDot() u64 {
+    return leafValue();
+}
