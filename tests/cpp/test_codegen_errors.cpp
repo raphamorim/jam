@@ -1510,7 +1510,8 @@ fn main() {}
 )");
 		ASSERT_TRUE(idx.exitCode != 0);
 		ASSERT_TRUE(stderrContains(
-		    idx, "`Vec__Counter.at` is not available for this instantiation"));
+		    idx, "`std/collections.Vec__Counter.at` is not available for "
+		         "this instantiation"));
 		ASSERT_TRUE(stderrContains(idx, "owns resources"));
 
 		auto filled = compileSource("cond_filled_replay", prelude + R"(
@@ -1522,8 +1523,8 @@ fn main() {}
 )");
 		ASSERT_TRUE(filled.exitCode != 0);
 		ASSERT_TRUE(stderrContains(
-		    filled,
-		    "`Vec__Counter.filled` is not available for this instantiation"));
+		    filled, "`std/collections.Vec__Counter.filled` is not available "
+		            "for this instantiation"));
 		ASSERT_TRUE(stderrContains(filled, "borrowed, not owned"));
 
 		auto get = compileSource("cond_get_replay", prelude + R"(
@@ -1537,7 +1538,8 @@ fn main() {}
 )");
 		ASSERT_TRUE(get.exitCode != 0);
 		ASSERT_TRUE(stderrContains(
-		    get, "`Vec__Counter.get` is not available for this instantiation"));
+		    get, "`std/collections.Vec__Counter.get` is not available for "
+		         "this instantiation"));
 	}
 
 	// MATCH-MOVE rejections: matching a drop-bearing enum consumes the

@@ -1,0 +1,36 @@
+// Bug B regression: two modules each define `pub const Pair = struct {…}`
+// with DIFFERENT fields. Before types carried a module-qualified identity,
+// both `Pair`s collided on the bare name in the global type registries —
+// the second module's `Pair { a, b }` literal failed to compile with
+// "unknown struct field `b`", and a struct value built in one module could
+// be laid out with the other's fields. Types are now keyed by
+// `<module>.Pair`, so the two are distinct.
+
+const { assert } = import("test");
+const A = import("mod_samename_a");
+const B = import("mod_samename_b");
+const { Pair } = import("mod_samename_b");
+
+// Distinct layouts resolve correctly through import handles: A.Pair has
+// one field, B.Pair has two, and each module's own `mk()` body builds the
+// right one.
+tfn sameNamedStructsAcrossModulesAreDistinct() {
+    var pb: B.Pair = B.mk();
+    assert(A.mk().a, 11);
+    assert(B.sum(pb), 42);
+}
+
+// A module-local struct field whose type is itself a same-named type lays
+// out and reads back correctly — exercises declaration-level field
+// qualification and the analyzer's layout path.
+tfn moduleLocalFieldOfSameNamedTypeLaysOut() {
+    var w: A.Wrap = A.wrapped();
+    assert(A.innerA(w), 11);
+}
+
+// A destructuring import binds the bare name `Pair` to B's `Pair`, even
+// though A's `Pair` is also in scope via the `A` handle.
+tfn destructuredSameNamedTypeResolvesToItsSource() {
+    var p: Pair = B.mk();
+    assert(p.a + p.b, 42);
+}

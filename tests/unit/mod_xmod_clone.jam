@@ -1,0 +1,18 @@
+// Helper for test_xmod_clone: a drop-bearing struct with a user cfn
+// clone, owned by a non-entry module. Note the type is deliberately
+// named `Token` — mod_xmod_moves also defines a `Token`; the two must
+// stay distinct under qualified identity.
+pub const Token = struct {
+    sink: *mut u32,
+    cfn drop(self: mut Token) {
+        var p: *mut u32 = self.sink;
+        p.* = p.* + 1;
+    }
+    cfn clone(self: Token) Token {
+        return Token { sink: self.sink };
+    }
+};
+
+pub fn makeToken(s: *mut u32) Token {
+    return Token { sink: s };
+}

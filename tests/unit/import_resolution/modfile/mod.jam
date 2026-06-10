@@ -1,0 +1,5 @@
+// Directory-index module whose directory name collides with a direct
+// file (modfile.jam). See modfile.jam.
+pub fn which() u64 {
+    return 2;
+}

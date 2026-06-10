@@ -1,0 +1,15 @@
+// One program importing the same std module under both accepted
+// spellings — `import("std/collections")` here, `import("collections")`
+// in the helper — with a Vec value crossing the boundary. The two
+// spellings must resolve to ONE module identity so the value's type is
+// the same nominal type on both sides.
+
+const { assert } = import("test");
+const { Vec } = import("std/collections");
+const h = import("mod_std_two_spellings");
+
+tfn twoSpellingsShareOneModule() {
+    var v: Vec(u8) = h.makeVec();
+    v.push(9);
+    assert(v.len() as i32, 3);
+}

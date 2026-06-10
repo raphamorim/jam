@@ -92,6 +92,14 @@ TypeIdx JamCodegenContext::internFromString(const std::string &typeStr) const {
 }
 
 JamTypeRef JamCodegenContext::getLLVMType(TypeIdx ty) const {
+	// Resolve a bare user-type reference to its module-qualified TypeIdx
+	// before anything else, so the per-TypeIdx LLVM-type cache below keys
+	// each module's same-named type separately. Declaration-level types
+	// (struct fields, etc.) are already qualified at registration, so
+	// this only fires for body-level references, where currentBodyModule
+	// names the type's owning module. Qualified / primitive types are
+	// returned unchanged, so this is a cheap no-op in the common case.
+	ty = requalifyType(ty, currentBodyModule());
 	if (ty >= llvmTypeCache.size()) { llvmTypeCache.resize(ty + 1, nullptr); }
 	if (llvmTypeCache[ty]) return llvmTypeCache[ty];
 
@@ -274,6 +282,10 @@ void JamCodegenContext::registerStruct(
 const JamCodegenContext::StructInfo *
 JamCodegenContext::lookupStruct(TypeIdx ty) const {
 	if (ty == kNoType) return nullptr;
+	// Qualify a bare body-level reference to its owning module so the
+	// registry lookup below hits this module's struct, not a same-named
+	// one elsewhere. No-op for already-qualified / non-user types.
+	ty = requalifyType(ty, currentBodyModule());
 	const TypeKey &k = typePool.get(ty);
 	// a `GenericCall` TypeIdx resolves to a concrete type
 	// (typically a Named struct produced by instantiation). Recurse on
@@ -322,6 +334,104 @@ int JamCodegenContext::getFieldIndex(const std::string &structName,
 	return -1;
 }
 
+void JamCodegenContext::registerTypeOwner(const std::string &ctxModule,
+                                          const std::string &typeName,
+                                          const std::string &ownerModule) {
+	typeModuleOf_[ctxModule][typeName] = ownerModule;
+}
+
+TypeIdx JamCodegenContext::requalifyType(TypeIdx ty,
+                                         const std::string &ctxModule) const {
+	if (ty == kNoType) return ty;
+	// By value, not by reference: the recursive calls below intern new
+	// types, which can reallocate the TypePool's storage and dangle a
+	// reference into it.
+	TypeKey k = typePool.get(ty);
+	switch (k.kind) {
+	case TypeKind::Named:
+	case TypeKind::Struct:
+	case TypeKind::Enum:
+	case TypeKind::Union: {
+		const std::string &name = stringPool.get(static_cast<StringIdx>(k.a));
+		// Already qualified / handle.Type / chained: leave it for the
+		// alias and chained-resolution paths in lookupStruct.
+		if (name.find('.') != std::string::npos) return ty;
+		// An active generic-parameter substitution (T, Self) wins over a
+		// same-named module-level type: the body meant the parameter.
+		if (lookupCurrentSubst(name) != kNoType) return ty;
+		auto mIt = typeModuleOf_.find(ctxModule);
+		if (mIt == typeModuleOf_.end()) return ty;
+		auto tIt = mIt->second.find(name);
+		if (tIt == mIt->second.end()) return ty;  // std / generic param / Self
+		std::string q = qualifyTypeName(tIt->second, name);
+		if (q == name) return ty;  // owner is the entry module — stays bare
+		TypeKey nk = k;
+		nk.a = static_cast<uint32_t>(stringPool.intern(q));
+		return typePool.intern(nk);
+	}
+	case TypeKind::PtrSingle:
+	case TypeKind::PtrMany:
+	case TypeKind::Slice:
+	case TypeKind::Array:
+	case TypeKind::ArrayExpr: {
+		// Wrapper kinds carry the element TypeIdx in `a`; `b` (length /
+		// length-expr) is preserved untouched.
+		TypeIdx elem = requalifyType(static_cast<TypeIdx>(k.a), ctxModule);
+		if (elem == static_cast<TypeIdx>(k.a)) return ty;
+		TypeKey nk = k;
+		nk.a = static_cast<uint32_t>(elem);
+		return typePool.intern(nk);
+	}
+	case TypeKind::GenericCall: {
+		// Qualify BOTH the callee and the type arguments. The callee
+		// (`Vec`) qualifies to its owning module's identity
+		// (`std/collections.Vec`) exactly like a concrete type name —
+		// two modules' same-named generic factories must never share a
+		// GenericCall TypeIdx, or the per-TypeIdx resolution cache hands
+		// one module the other's instantiation. Args qualify so the
+		// instantiation substitutes the right concrete types
+		// (`Option(File)` -> `Option(std/fs.File)`).
+		//
+		// Copy the name and args BEFORE recursing: the recursive
+		// requalifyType calls below may intern new types, reallocating
+		// the TypePool's internal vectors and invalidating any reference
+		// into them (`k` and the args span).
+		StringIdx nameId = static_cast<StringIdx>(k.a);
+		std::vector<TypeIdx> args =
+		    typePool.genericArgsAt(static_cast<uint32_t>(k.b));
+		bool changed = false;
+		{
+			const std::string &callee = stringPool.get(nameId);
+			if (callee.find('.') == std::string::npos &&
+			    lookupCurrentSubst(callee) == kNoType) {
+				auto mIt = typeModuleOf_.find(ctxModule);
+				if (mIt != typeModuleOf_.end()) {
+					auto tIt = mIt->second.find(callee);
+					if (tIt != mIt->second.end()) {
+						std::string q = qualifyTypeName(tIt->second, callee);
+						if (q != callee) {
+							nameId = stringPool.intern(q);
+							changed = true;
+						}
+					}
+				}
+			}
+		}
+		std::vector<TypeIdx> newArgs;
+		newArgs.reserve(args.size());
+		for (TypeIdx a : args) {
+			TypeIdx r = requalifyType(a, ctxModule);
+			if (r != a) changed = true;
+			newArgs.push_back(r);
+		}
+		if (!changed) return ty;
+		return typePool.internGenericCall(nameId, std::move(newArgs));
+	}
+	default:
+		return ty;
+	}
+}
+
 // Union registry
 
 void JamCodegenContext::registerUnion(
@@ -344,6 +454,7 @@ JamCodegenContext::getUnion(const std::string &name) const {
 const JamCodegenContext::UnionInfo *
 JamCodegenContext::lookupUnion(TypeIdx ty) const {
 	if (ty == kNoType) return nullptr;
+	ty = requalifyType(ty, currentBodyModule());
 	const TypeKey &k = typePool.get(ty);
 	// Accept TypeKind::Union (explicit) or TypeKind::Named (parser-
 	// deferred user type that resolves to a union).
@@ -411,6 +522,7 @@ JamCodegenContext::getEnum(const std::string &name) const {
 const JamCodegenContext::EnumInfo *
 JamCodegenContext::lookupEnum(TypeIdx ty) const {
 	if (ty == kNoType) return nullptr;
+	ty = requalifyType(ty, currentBodyModule());
 	const TypeKey &k = typePool.get(ty);
 	// a GenericCall TypeIdx resolves to a concrete type;
 	// recurse on the resolved TypeIdx so generic enum instantiations
@@ -457,27 +569,31 @@ JamCodegenContext::findEnumByLLVMType(JamTypeRef ty) const {
 }
 
 void JamCodegenContext::registerModuleConst(const std::string &name,
+                                            const std::string &bareName,
+                                            const std::string &owner,
                                             NodeIdx init, TypeIdx declared,
                                             bool isComp, std::string file) {
-	moduleConsts[name] =
-	    ModuleConstInfo{init, declared, isComp, std::move(file)};
+	moduleConsts[name] = ModuleConstInfo{
+	    init, declared, isComp, std::move(file), bareName, owner};
 }
 
 void JamCodegenContext::validateCompConsts() {
 	jam::ComptimeEvaluator ev(nodeStore, stringPool, typePool);
-	jam::ComptimeScope scope;
-	seedComptimeScope(scope);
 	for (const auto &kv : moduleConsts) {
 		if (!kv.second.isComp) continue;
-		// A foldable comp const is already bound in the seeded scope;
-		// re-evaluating its init there is cheap and gives a definitive
-		// verdict for the ones the fixpoint never managed to bind.
+		// Evaluate each comp const against ITS OWN module's scope — the
+		// initializer may reference sibling consts by bare name, and
+		// those must be the owner's, not another module's.
+		pushBodyModule(kv.second.owner);
+		jam::ComptimeScope scope;
+		seedComptimeScope(scope);
 		jam::ComptimeValue v = ev.eval(kv.second.initExpr, scope);
+		popBodyModule();
 		if (v.isNone()) {
 			jam::SrcLoc loc{kv.second.file,
 			                nodeStore.getLine(kv.second.initExpr)};
 			diagnostics().error(
-			    loc, "comp const `" + kv.first +
+			    loc, "comp const `" + kv.second.bareName +
 			             "` must be compile-time evaluable — its "
 			             "initializer depends on a runtime value or an "
 			             "unsupported construct");
@@ -629,7 +745,15 @@ TypeIdx JamCodegenContext::resolveChainedType(const std::string &dotted) const {
 	auto r = walkChain(*this, dotted);
 	if (!r.leaf) return kNoType;
 	auto tit = r.leaf->types.find(r.lastSeg);
-	return (tit == r.leaf->types.end()) ? kNoType : tit->second;
+	if (tit == r.leaf->types.end()) return kNoType;
+	// No-progress guard: when an import handle shares its name with the
+	// module's identity (`const m = import("m")`), the chain resolves
+	// `m.Inner` to the SAME qualified Named that was asked about. Every
+	// caller tail-recurses on the result, so report "nothing further to
+	// resolve" instead of handing back the input.
+	TypeIdx asNamed = typePool.internNamed(stringPool.intern(dotted));
+	if (tit->second == asNamed) return kNoType;
+	return tit->second;
 }
 
 std::string JamCodegenContext::formatNamespaceLookupError(
@@ -654,8 +778,24 @@ std::string JamCodegenContext::formatNamespaceLookupError(
 
 const JamCodegenContext::ModuleConstInfo *
 JamCodegenContext::getModuleConst(const std::string &name) const {
-	auto it = moduleConsts.find(name);
-	if (it != moduleConsts.end()) return &it->second;
+	// Resolve the bare spelling through the current module's ownership
+	// map to the owner-qualified registry key — a body reads its OWN
+	// module's const (or one it destructure-imported), never another
+	// module's same-named one.
+	auto mIt = typeModuleOf_.find(currentBodyModule());
+	if (mIt != typeModuleOf_.end()) {
+		auto oIt = mIt->second.find(name);
+		if (oIt != mIt->second.end()) {
+			auto it = moduleConsts.find(qualifyTypeName(oIt->second, name));
+			if (it != moduleConsts.end()) return &it->second;
+		}
+	}
+	// Entry-module bodies fall back to the bare key (entry consts
+	// register bare); other modules' unresolved names are NOT consts.
+	if (currentBodyModule().empty()) {
+		auto it = moduleConsts.find(name);
+		if (it != moduleConsts.end()) return &it->second;
+	}
 	return nullptr;
 }
 
@@ -676,6 +816,7 @@ inline uint64_t alignUp(uint64_t off, uint64_t align) {
 }  // namespace
 
 uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
+	ty = requalifyType(ty, currentBodyModule());
 	const TypeKey &k = typePool.get(ty);
 	switch (k.kind) {
 	case TypeKind::Invalid:
@@ -800,6 +941,7 @@ uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
 // on every target we care about. For aggregates, the alignment is the
 // max of the constituent alignments.
 uint64_t JamCodegenContext::typeAlign(TypeIdx ty) const {
+	ty = requalifyType(ty, currentBodyModule());
 	const TypeKey &k = typePool.get(ty);
 	switch (k.kind) {
 	case TypeKind::Invalid:
@@ -959,9 +1101,59 @@ TypeIdx substituteType(TypeIdx ty,
 	}
 }
 
+// Stable spelling of a generic argument type, used to build the
+// instantiated name (`Vec__i32`, `Holder__lib/m.Inner`). The spelling
+// is the memoization key, so every distinct argument type MUST spell
+// distinctly — a shared catch-all would silently hand `Pair(f64)` the
+// struct layout already instantiated for `Pair(f32)`. Compound types
+// spell recursively (`Vec(*mut u8)` -> `Vec__pm_u8`).
+static std::string genericArgSpelling(const TypePool &typePool,
+                                      const StringPool &stringPool, TypeIdx t) {
+	const TypeKey ak = typePool.get(t);
+	switch (ak.kind) {
+	case TypeKind::Int: {
+		char buf[16];
+		std::snprintf(buf, sizeof(buf), "%c%u", ak.b ? 'i' : 'u', ak.a);
+		return buf;
+	}
+	case TypeKind::Bool:
+		return "bool";
+	case TypeKind::Float:
+		return ak.a == 32 ? "f32" : "f64";
+	case TypeKind::Struct:
+	case TypeKind::Named:
+	case TypeKind::Enum:
+	case TypeKind::Union:
+		return stringPool.get(static_cast<StringIdx>(ak.a));
+	case TypeKind::PtrSingle:
+		return "p_" + genericArgSpelling(typePool, stringPool,
+		                                 static_cast<TypeIdx>(ak.a));
+	case TypeKind::PtrMany:
+		return "pm_" + genericArgSpelling(typePool, stringPool,
+		                                  static_cast<TypeIdx>(ak.a));
+	case TypeKind::Slice:
+		return "sl_" + genericArgSpelling(typePool, stringPool,
+		                                  static_cast<TypeIdx>(ak.a));
+	case TypeKind::Array:
+		return "arr" + std::to_string(ak.b) + "_" +
+		       genericArgSpelling(typePool, stringPool,
+		                          static_cast<TypeIdx>(ak.a));
+	default:
+		// No stable spelling — include the TypeIdx so distinct types
+		// never share an instantiation.
+		return "T" + std::to_string(t);
+	}
+}
+
 }  // namespace
 
 TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
+	// Qualify the callee + args to their owning modules first (no-op for
+	// already-qualified or entry-owned names). Some callers requalify
+	// before calling; the ones that can't (jir_verify's hook) rely on
+	// this. Without it the per-TypeIdx caches below would conflate two
+	// modules' same-named generics.
+	callTy = requalifyType(callTy, currentBodyModule());
 	// Apply the active substitution context to the GenericCall's args
 	// before resolving. The same `Inner(T)` TypeIdx appears in every
 	// instantiation of an outer generic that mentions it — Wrap(i32)
@@ -994,8 +1186,28 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 	if (cached != genericResolutions_.end()) return cached->second;
 
 	const TypeKey &k = typePool.get(effectiveTy);
-	const std::string &calleeName = stringPool.get(static_cast<StringIdx>(k.a));
-	const auto &args = typePool.genericArgsAt(k.b);
+	const std::string calleeName = stringPool.get(static_cast<StringIdx>(k.a));
+
+	// Canonicalize the args to their owner identities so the identity
+	// cache and the instantiated name don't depend on how the caller
+	// SPELLED an argument: a handle-qualified `P.Pair` resolves through
+	// the scoped alias table to the same `lib/p.Pair` a requalified
+	// bare reference produces — one instantiation, not two.
+	std::vector<TypeIdx> args = typePool.genericArgsAt(k.b);
+	for (TypeIdx &a : args) {
+		const TypeKey &ak = typePool.get(a);
+		if (ak.kind != TypeKind::Named) continue;
+		const std::string &an = stringPool.get(static_cast<StringIdx>(ak.a));
+		if (an.find('.') == std::string::npos) continue;
+		TypeIdx aliased = lookupTypeAlias(an);
+		if (aliased == kNoType) {
+			TypeIdx chained = resolveChainedType(an);
+			if (chained != kNoType) aliased = chained;
+		}
+		if (aliased != kNoType && aliased != a) {
+			a = requalifyType(aliased, currentBodyModule());
+		}
+	}
 
 	// Demand-driven: consult the Analyzer first so cycle detection
 	// kicks in and any cross-decl dependency the user introduced is
@@ -1088,19 +1300,24 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 			break;
 		}
 		if (value.tag == AstTag::StructExpr) {
-			// Use generic->Name (the bare source-level name) for the
-			// instantiated struct name so syntactic prefixes like
-			// `c.Vec` don't bake into `Vec__i32`. Pass the generic's
-			// modulePath so the cloned methods inherit it — anon-struct
-			// methods returned from `pub fn Vec(T)` aren't visible to
-			// module_resolver, so we propagate the originating module
-			// here for body-scope identifier resolution.
-			result = instantiateStructExpr(value, generic->Name, args, subst,
-			                               generic->modulePath);
+			// The instantiated struct's name starts from the generic's
+			// OWNER-QUALIFIED identity (`lib/a.Pair__i32`), not the
+			// syntactic spelling: prefixes like `c.Vec` converge on the
+			// owner, while two modules' same-named factories stay
+			// distinct. Pass the generic's modulePath so the cloned
+			// methods and the anon struct's member types resolve against
+			// the DEFINING module — anon-struct bodies returned from
+			// `pub fn Vec(T)` aren't visible to module_resolver, so the
+			// originating module is propagated here.
+			result = instantiateStructExpr(
+			    value, qualifyTypeName(generic->modulePath, generic->Name),
+			    args, subst, generic->modulePath);
 			break;
 		}
 		if (value.tag == AstTag::EnumExpr) {
-			result = instantiateEnumExpr(value, generic->Name, args, subst);
+			result = instantiateEnumExpr(
+			    value, qualifyTypeName(generic->modulePath, generic->Name),
+			    args, subst, generic->modulePath);
 			break;
 		}
 		throw std::runtime_error(
@@ -1120,20 +1337,36 @@ TypeIdx JamCodegenContext::resolveGenericCall(TypeIdx callTy) const {
 }
 
 void JamCodegenContext::seedComptimeScope(jam::ComptimeScope &scope) const {
-	// Fold with every module const in scope. Consts may reference each
-	// other (`const B = A * 2;`), so seed the scope to a fixpoint: each
-	// pass folds the consts whose dependencies folded in an earlier
-	// pass. Consts that never fold (runtime-only inits) simply stay
-	// unbound — an expression referencing one comes back None.
+	// Fold the consts VISIBLE TO THE CURRENT MODULE into scope, bound
+	// by their bare source spelling: a body references `N`, and `N`
+	// must be its own module's (or a destructure-imported) const —
+	// never another module's same-named one, and never a private const
+	// of an unrelated module. Consts may reference each other
+	// (`const B = A * 2;`), so seed to a fixpoint: each pass folds the
+	// consts whose dependencies folded in an earlier pass. Consts that
+	// never fold (runtime-only inits) simply stay unbound — an
+	// expression referencing one comes back None.
 	jam::ComptimeEvaluator ev(nodeStore, stringPool, typePool);
+	const std::string &cur = currentBodyModule();
+	auto ownIt = typeModuleOf_.find(cur);
+	auto visible = [&](const ModuleConstInfo &info) -> bool {
+		if (ownIt != typeModuleOf_.end()) {
+			auto oIt = ownIt->second.find(info.bareName);
+			if (oIt != ownIt->second.end()) return oIt->second == info.owner;
+		}
+		// Entry bodies additionally see entry consts that predate the
+		// ownership map (bare-registered, owner "").
+		return cur.empty() && info.owner.empty();
+	};
 	bool progress = true;
 	while (progress) {
 		progress = false;
 		for (const auto &kv : moduleConsts) {
-			if (scope.lookup(kv.first) != nullptr) continue;
+			if (!visible(kv.second)) continue;
+			if (scope.lookup(kv.second.bareName) != nullptr) continue;
 			jam::ComptimeValue v = ev.eval(kv.second.initExpr, scope);
 			if (!v.isNone()) {
-				scope.bind(kv.first, v);
+				scope.bind(kv.second.bareName, v);
 				progress = true;
 			}
 		}
@@ -1277,33 +1510,14 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 	}
 	const StructDeclAST *anon = (*anonStructs_)[anonIdx].get();
 
-	// Build the instantiated struct's name from the callee + arg names.
-	// `Maybe(File)` -> `Maybe__File`. Pointer/array types lower through
-	// substituteType; we only need a stable spelling for the canonical
-	// non-compound cases here. v1's stdlib won't pass non-named types
-	// as generic args, so this is enough to get the demo running.
+	// Build the instantiated struct's name from the callee's qualified
+	// identity + arg spellings: `Maybe(File)` -> `Maybe__std/fs.File`.
+	// See genericArgSpelling for why every distinct arg type must spell
+	// distinctly.
 	std::string instName = calleeName;
 	for (TypeIdx a : args) {
 		instName += "__";
-		const TypeKey &ak = typePool.get(a);
-		switch (ak.kind) {
-		case TypeKind::Int: {
-			char buf[16];
-			std::snprintf(buf, sizeof(buf), "%c%u", ak.b ? 'i' : 'u', ak.a);
-			instName += buf;
-			break;
-		}
-		case TypeKind::Bool:
-			instName += "bool";
-			break;
-		case TypeKind::Struct:
-		case TypeKind::Named:
-			instName += stringPool.get(static_cast<StringIdx>(ak.a));
-			break;
-		default:
-			instName += "T";  // catch-all; v2 spec needed
-			break;
-		}
+		instName += genericArgSpelling(typePool, stringPool, a);
 	}
 
 	// Memoize on the instantiated name. If we've already produced this
@@ -1328,11 +1542,18 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 	bodySubst["Self"] = instNamed;
 
 	// Substitute each field's type, then declare + fill the LLVM struct.
+	// After substitution, qualify against the DEFINING module: a field
+	// like `inner: Inner` names the generic's sibling type, not whatever
+	// `Inner` happens to mean at the trigger site. Anon-struct bodies
+	// never pass through bindDeclTypes, so this is their decl-time
+	// qualification.
 	std::vector<std::pair<std::string, TypeIdx>> instFields;
 	instFields.reserve(anon->Fields.size());
 	for (const auto &f : anon->Fields) {
-		instFields.emplace_back(
-		    f.first, substituteType(f.second, bodySubst, typePool, stringPool));
+		TypeIdx subbed =
+		    substituteType(f.second, bodySubst, typePool, stringPool);
+		instFields.emplace_back(f.first,
+		                        requalifyType(subbed, definingModulePath_));
 	}
 
 	JamTypeRef llvmStruct =
@@ -1370,19 +1591,25 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 		JamCodegenContext &mutCtx = const_cast<JamCodegenContext &>(*this);
 
 		// Pass 1: clone + register + jirDeclarePrototype for every method.
+		// Signature types qualify against the DEFINING module after
+		// substitution (same as the field types above): a method like
+		// `fn makeInner(self: Self) Inner` names the generic's sibling
+		// type regardless of what the trigger site calls `Inner`.
 		for (const auto &origMethod : anon->Methods) {
 			std::vector<Param> instArgs;
 			instArgs.reserve(origMethod->Args.size());
 			for (const auto &p : origMethod->Args) {
 				Param sp = p;
-				sp.Type =
-				    substituteType(p.Type, bodySubst, typePool, stringPool);
+				sp.Type = requalifyType(
+				    substituteType(p.Type, bodySubst, typePool, stringPool),
+				    definingModulePath_);
 				instArgs.push_back(std::move(sp));
 			}
 			TypeIdx instReturn = origMethod->ReturnType;
 			if (instReturn != kNoType) {
-				instReturn =
-				    substituteType(instReturn, bodySubst, typePool, stringPool);
+				instReturn = requalifyType(
+				    substituteType(instReturn, bodySubst, typePool, stringPool),
+				    definingModulePath_);
 			}
 
 			std::string instMethodName = instName + "." + origMethod->Name;
@@ -1547,7 +1774,8 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 TypeIdx JamCodegenContext::instantiateEnumExpr(
     const AstNode &exprNode, const std::string &calleeName,
     const std::vector<TypeIdx> &args,
-    const std::unordered_map<std::string, TypeIdx> &subst) const {
+    const std::unordered_map<std::string, TypeIdx> &subst,
+    const std::string &definingModulePath) const {
 	if (!anonEnums_) {
 		throw std::runtime_error(
 		    "internal: anonymous enum table not registered on "
@@ -1561,30 +1789,12 @@ TypeIdx JamCodegenContext::instantiateEnumExpr(
 	}
 	const EnumDeclAST *anon = (*anonEnums_)[anonIdx].get();
 
-	// Build instantiated name `Option__i32` etc — same shape as struct.
+	// Build instantiated name `Option__i32` etc — same shape (and same
+	// shared speller) as the struct path.
 	std::string instName = calleeName;
 	for (TypeIdx a : args) {
 		instName += "__";
-		const TypeKey &ak = typePool.get(a);
-		switch (ak.kind) {
-		case TypeKind::Int: {
-			char buf[16];
-			std::snprintf(buf, sizeof(buf), "%c%u", ak.b ? 'i' : 'u', ak.a);
-			instName += buf;
-			break;
-		}
-		case TypeKind::Bool:
-			instName += "bool";
-			break;
-		case TypeKind::Struct:
-		case TypeKind::Enum:
-		case TypeKind::Named:
-			instName += stringPool.get(static_cast<StringIdx>(ak.a));
-			break;
-		default:
-			instName += "T";
-			break;
-		}
+		instName += genericArgSpelling(typePool, stringPool, a);
 	}
 
 	// Memoize. Return as a Named TypeIdx so the rest of codegen resolves
@@ -1609,8 +1819,13 @@ TypeIdx JamCodegenContext::instantiateEnumExpr(
 		vi.name = v.Name;
 		vi.discriminant = v.Discriminant;
 		for (TypeIdx ty : v.PayloadTypes) {
-			vi.payloadTypes.push_back(
-			    substituteType(ty, bodySubst, typePool, stringPool));
+			// Qualify against the DEFINING module after substitution —
+			// a payload naming the generic's sibling type must not
+			// capture the trigger site's same-named type. Mirrors the
+			// struct path's field qualification.
+			vi.payloadTypes.push_back(requalifyType(
+			    substituteType(ty, bodySubst, typePool, stringPool),
+			    definingModulePath));
 		}
 		if (!vi.payloadTypes.empty()) hasPayload = true;
 		variants.push_back(std::move(vi));

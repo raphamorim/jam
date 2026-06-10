@@ -1,0 +1,19 @@
+// A sibling fmt.jam must not hijack the std library's internals. The
+// resolver once re-resolved std's internal `import("fmt")` from the
+// ENTRY directory — where the user's fmt.jam shadowed the std one — so
+// `std.fmt.print` silently dispatched to user code. Nested imports now
+// load the exact file their own module's resolver found.
+//
+// Compiling this file is most of the test: `std.fmt.print` only
+// resolves if std's fmt re-export still points at the std library's
+// fmt (the user's fmt.jam defines no `print`). The user's module stays
+// importable under the same bare name from the entry.
+
+const { assert } = import("test");
+const std = import("std");
+const userFmt = import("fmt");
+
+tfn userFileDoesNotHijackStdInternals() {
+    std.fmt.print("");
+    assert(userFmt.userFmtMarker(), 77);
+}

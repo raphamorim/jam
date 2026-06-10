@@ -177,7 +177,7 @@ class Analyzer {
 			if (an.tag != AstTag::Variable) continue;
 			const std::string &src =
 			    strings_.get(static_cast<StringIdx>(an.lhs));
-			if (lookupDropFor(src) != nullptr) {
+			if (bindingIsDropBearing(src)) {
 				applyMoveToBinding(src, argIdx, state);
 			}
 		}
@@ -231,6 +231,21 @@ class Analyzer {
 	// no drop is registered, when the binding's type is unknown, or when
 	// the drop or type registry is unavailable.
 	const FunctionAST *lookupDropFor(const std::string &bindingName) const;
+
+	// Move-gate oracle: is `bindingName`'s type drop-bearing? Two
+	// answers combined: the drops registry (struct-name keyed — misses
+	// imported types, whose registry keys are module-qualified) and the
+	// codegen typeNeedsDrop hook (which requalifies, and also covers
+	// enums with dropping payloads, arrays of drop-bearing elements,
+	// structs whose FIELDS drop, and generic instantiations). Every
+	// "bare drop-bearing use is a MOVE" gate must consult this, not the
+	// raw registry, or moves of imported types go untracked.
+	bool bindingIsDropBearing(const std::string &bindingName) const {
+		if (lookupDropFor(bindingName) != nullptr) return true;
+		auto vt = varTypes_.find(bindingName);
+		if (vt == varTypes_.end()) return false;
+		return typeOwnsDrops(vt->second);
+	}
 };
 
 // Entry point.
@@ -407,7 +422,7 @@ Result Analyzer::analyze(NodeIdx idx, NameMap state) {
 			if (elemNode.tag == AstTag::Variable) {
 				const std::string &src =
 				    strings_.get(static_cast<StringIdx>(elemNode.lhs));
-				if (lookupDropFor(src) != nullptr) {
+				if (bindingIsDropBearing(src)) {
 					applyMoveToBinding(src, elemIdx, r.state);
 				}
 			}
@@ -507,7 +522,7 @@ Result Analyzer::analyzeVarDecl(NodeIdx idx, NameMap state) {
 	if (initNode.tag == AstTag::Variable) {
 		const std::string &src =
 		    strings_.get(static_cast<StringIdx>(initNode.lhs));
-		if (lookupDropFor(src) != nullptr) {
+		if (bindingIsDropBearing(src)) {
 			applyMoveToBinding(src, initIdx, r.state);
 		}
 	}
@@ -543,7 +558,7 @@ Result Analyzer::analyzeAssign(NodeIdx idx, NameMap state) {
 	if (rhsNode.tag == AstTag::Variable) {
 		const std::string &src =
 		    strings_.get(static_cast<StringIdx>(rhsNode.lhs));
-		if (lookupDropFor(src) != nullptr) {
+		if (bindingIsDropBearing(src)) {
 			applyMoveToBinding(src, n.rhs, r.state);
 		}
 	}
@@ -860,7 +875,17 @@ Result Analyzer::analyzeCall(NodeIdx idx, NameMap state) {
 				if (isEnumVariantCtor(recv, method)) { isVariantCtor = true; }
 				auto vt = varTypes_.find(recv);
 				if (vt != varTypes_.end()) {
-					const TypeKey &k = types_->get(vt->second);
+					// Requalify the receiver's type first: imported
+					// structs' methods register under the struct's
+					// module-qualified identity, while a local's
+					// annotation carries the bare spelling. The hook
+					// is null only in standalone unit tests, where
+					// bare keys are correct.
+					TypeIdx recvTy = vt->second;
+					if (hooks_ != nullptr && hooks_->requalifyType != nullptr) {
+						recvTy = hooks_->requalifyType(hooks_->ctx, recvTy);
+					}
+					const TypeKey &k = types_->get(recvTy);
 					if (k.kind == TypeKind::Struct ||
 					    k.kind == TypeKind::Named ||
 					    k.kind == TypeKind::GenericCall) {
@@ -984,16 +1009,7 @@ void Analyzer::applyMoveToBinding(const std::string &name, NodeIdx anchor,
 	// locals and `move`-mode params (both in declDepth_); a `let`/`mut`
 	// param is borrowed — moving a drop-bearing value out of it would
 	// leave the caller and the new owner both dropping the payload.
-	// Two oracles: the drops registry (struct-name keyed), and the
-	// codegen hook for everything the registry can't see — enums whose
-	// payloads drop, arrays of drop-bearing elements, generic
-	// instantiations.
-	bool dropBearing = lookupDropFor(name) != nullptr;
-	if (!dropBearing) {
-		auto vt = varTypes_.find(name);
-		if (vt != varTypes_.end()) { dropBearing = typeOwnsDrops(vt->second); }
-	}
-	if (dropBearing) {
+	if (bindingIsDropBearing(name)) {
 		auto dd = declDepth_.find(name);
 		if (dd == declDepth_.end()) {
 			if (args_ != nullptr) {
@@ -1177,7 +1193,7 @@ Result Analyzer::analyzeStructLit(NodeIdx idx, NameMap state) {
 		if (fieldExpr.tag == AstTag::Variable) {
 			const std::string &fname =
 			    strings_.get(static_cast<StringIdx>(fieldExpr.lhs));
-			if (lookupDropFor(fname) != nullptr) {
+			if (bindingIsDropBearing(fname)) {
 				applyMoveToBinding(fname, exprIdx, r.state);
 			}
 		}
@@ -1261,14 +1277,7 @@ void Analyzer::checkDropBearingLocalsInit(const NameMap &state,
 		}
 		if (isBorrowedParam) continue;
 
-		auto vt = varTypes_.find(name);
-		if (vt == varTypes_.end()) continue;
-		const TypeKey &k = types_->get(vt->second);
-		if (k.kind != TypeKind::Struct && k.kind != TypeKind::Named) continue;
-		StringIdx structNameIdx = static_cast<StringIdx>(k.a);
-		if (structNameIdx == kNoString) continue;
-		const std::string &structName = strings_.get(structNameIdx);
-		if (drops_->find(structName) == drops_->end()) continue;
+		if (!bindingIsDropBearing(name)) continue;
 
 		InitState s = sv.second;
 		if (s == InitState::Init) continue;
@@ -1281,8 +1290,21 @@ void Analyzer::checkDropBearingLocalsInit(const NameMap &state,
 			continue;
 		}
 
+		// Recover the source-spelled type name for the diagnostic.
+		std::string typeName = "?";
+		if (auto vt = varTypes_.find(name);
+		    vt != varTypes_.end() && types_ != nullptr) {
+			const TypeKey &k = types_->get(vt->second);
+			StringIdx ni = static_cast<StringIdx>(k.a);
+			if ((k.kind == TypeKind::Struct || k.kind == TypeKind::Named ||
+			     k.kind == TypeKind::Enum || k.kind == TypeKind::Union ||
+			     k.kind == TypeKind::GenericCall) &&
+			    ni != kNoString) {
+				typeName = strings_.get(ni);
+			}
+		}
 		std::string msg =
-		    "drop-bearing binding `" + name + "` of type `" + structName + "` ";
+		    "drop-bearing binding `" + name + "` of type `" + typeName + "` ";
 		if (s == InitState::Uninit) {
 			msg += "must be initialized before this exit; drop runs on it "
 			       "and would otherwise read uninit memory";

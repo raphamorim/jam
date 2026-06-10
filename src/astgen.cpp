@@ -599,12 +599,36 @@ static JirRef astgenNumberLit(AstGenCtx &gctx, const AstNode &n,
 	// transitively. Otherwise fall back to the smallest-fit width.
 	if (expected != kNoType) {
 		TypeIdx resolved = expected;
-		const TypeKey &k0 = gctx.ctx.getTypePool().get(resolved);
-		if (k0.kind == TypeKind::GenericCall) {
-			TypeIdx r = gctx.ctx.resolveGenericCall(resolved);
-			if (r != kNoType) resolved = r;
+		{
+			const TypeKey k0 = gctx.ctx.getTypePool().get(resolved);
+			if (k0.kind == TypeKind::GenericCall) {
+				TypeIdx r = gctx.ctx.resolveGenericCall(resolved);
+				if (r != kNoType) resolved = r;
+			}
 		}
-		const TypeKey &k = gctx.ctx.getTypePool().get(resolved);
+		// A Named expected may be a type-alias chain ending at an
+		// integer (`const Flag = u64; var f: Flag = 100000;`). Chase it
+		// — requalifying first so the alias resolves in the right
+		// module — the same way the init-mismatch check's resolveForCmp
+		// does, so the literal settles at the alias's width instead of
+		// smallest-fit (which would then fail that very check).
+		for (int hop = 0; hop < 8; hop++) {
+			TypeIdx rq =
+			    gctx.ctx.requalifyType(resolved, gctx.ctx.currentBodyModule());
+			const TypeKey kn = gctx.ctx.getTypePool().get(rq);
+			if (kn.kind != TypeKind::Named) {
+				resolved = rq;
+				break;
+			}
+			TypeIdx target = gctx.ctx.lookupTypeAlias(
+			    gctx.ctx.getStringPool().get(static_cast<StringIdx>(kn.a)));
+			if (target == kNoType || target == rq) {
+				resolved = rq;
+				break;
+			}
+			resolved = target;
+		}
+		const TypeKey k = gctx.ctx.getTypePool().get(resolved);
 		if (k.kind == TypeKind::Int) {
 			inst.ty = resolved;
 			return emit(gctx, inst);
@@ -1042,6 +1066,10 @@ static void astgenReturn(AstGenCtx &gctx, const AstNode &n) {
 // instantiated-drops table so generic struct/enum instantiations
 // (Vec(i32), Holder(i32), ...) fire drops too.
 static std::string lookupDropFnLLVMName(JamCodegenContext &ctx, TypeIdx ty) {
+	// Qualify a bare body-level type to its owning module so the drop
+	// registry (keyed by the qualified self-param type) hits for a type
+	// whose `cfn drop` lives in another module.
+	ty = ctx.requalifyType(ty, ctx.currentBodyModule());
 	const TypeKey &k = ctx.getTypePool().get(ty);
 	std::string typeName;
 	if (k.kind == TypeKind::Struct || k.kind == TypeKind::Named ||
@@ -1223,6 +1251,11 @@ static void astgenVarDecl(AstGenCtx &gctx, const AstNode &n) {
 			std::function<TypeIdx(TypeIdx)> resolveForCmp =
 			    [&](TypeIdx t) -> TypeIdx {
 				if (t == kNoType) return t;
+				// Qualify bare user-type references first so a declared
+				// bare `Color` and an initializer typed with the
+				// qualified `mod.Color` compare equal. No-op for
+				// already-qualified, substitution, and primitive types.
+				t = gctx.ctx.requalifyType(t, gctx.ctx.currentBodyModule());
 				const TypeKey &k = gctx.ctx.getTypePool().get(t);
 				// Generic substitution wins (inside an instantiated
 				// method body, `T` resolves to whatever the
@@ -2011,14 +2044,56 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 	const std::string &member = gctx.ctx.getStringPool().get(memberId);
 
 	const AstNode &baseNode = ns.get(baseIdx);
+	// The enum receiver may be a bare Variable (`Color.Red`) or a
+	// handle-qualified chain (`a.Status.Ok` — base is the MemberAccess
+	// `a.Status`). Stringify pure Variable/MemberAccess chains so both
+	// spellings resolve through the same requalifying enum lookup.
+	std::string baseName;
 	if (baseNode.tag == AstTag::Variable) {
-		const std::string &baseName =
+		baseName =
 		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(baseNode.lhs));
+	} else if (baseNode.tag == AstTag::MemberAccess) {
+		std::vector<std::string> segs;
+		NodeIdx cur = baseIdx;
+		while (true) {
+			const AstNode &c = ns.get(cur);
+			if (c.tag == AstTag::MemberAccess) {
+				segs.push_back(gctx.ctx.getStringPool().get(
+				    static_cast<StringIdx>(c.rhs)));
+				cur = static_cast<NodeIdx>(c.lhs);
+				continue;
+			}
+			if (c.tag == AstTag::Variable) {
+				segs.push_back(gctx.ctx.getStringPool().get(
+				    static_cast<StringIdx>(c.lhs)));
+				break;
+			}
+			segs.clear();  // not a pure name chain (index, call, ...)
+			break;
+		}
+		// Only treat the chain as a possible enum receiver when its
+		// ROOT is not a local — `self.field.member` stays a projection.
+		if (!segs.empty() &&
+		    gctx.locals.find(segs.back()) == gctx.locals.end()) {
+			for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+				if (!baseName.empty()) baseName += ".";
+				baseName += *it;
+			}
+		}
+	}
+	if (!baseName.empty()) {
 		// Enum-variant unit reference: emit JirTag::StructLit with a
 		// single field (the tag) for payloaded enums; for unit-only
 		// enums, the tag value IS the runtime form (i8).
-		if (const auto *einfo = gctx.ctx.getEnum(baseName)) {
-			int vidx = gctx.ctx.getEnumVariantIndex(baseName, member);
+		// Resolve the source name through lookupEnum (which requalifies
+		// against the current body module and follows handle aliases /
+		// re-export chains) so an enum owned by an imported module —
+		// registered under its qualified identity — is found from its
+		// own bodies, importers, and handle-qualified spellings.
+		TypeIdx baseTy = gctx.ctx.getTypePool().internNamed(
+		    gctx.ctx.getStringPool().intern(baseName));
+		if (const auto *einfo = gctx.ctx.lookupEnum(baseTy)) {
+			int vidx = gctx.ctx.getEnumVariantIndex(einfo->name, member);
 			if (vidx < 0) {
 				failHere(gctx, "astgen: enum `" + baseName +
 				                   "` has no variant `" + member + "`");
@@ -2027,14 +2102,24 @@ static JirRef astgenMemberAccess(AstGenCtx &gctx, const AstNode &n) {
 			TypeIdx enumTy = gctx.ctx.getTypePool().intern(
 			    TypeKey{TypeKind::Named, 0, 0,
 			            static_cast<uint32_t>(
-			                gctx.ctx.getStringPool().intern(baseName)),
+			                gctx.ctx.getStringPool().intern(einfo->name)),
 			            0});
 			JirInst tag{};
 			tag.tag = JirTag::Int;
 			tag.a = disc;
 			tag.ty = BuiltinType::U8;
 			JirRef tagRef = emit(gctx, tag);
-			if (!einfo->hasPayloadVariant) { return tagRef; }
+			if (!einfo->hasPayloadVariant) {
+				// Unit-only enums lower to i8, but the VALUE's type is
+				// the enum — retag via BitCast (same shape the match
+				// lowering uses) so `var d: Color = Color.Blue;`
+				// type-checks against the declared enum type.
+				JirInst cast{};
+				cast.tag = JirTag::BitCast;
+				cast.a = tagRef;
+				cast.ty = enumTy;
+				return emit(gctx, cast);
+			}
 			// Payloaded enum: build a {tag, payload-undef} struct.
 			// We carry the enum's TypeIdx so codegen materialises the
 			// right struct shape.
@@ -3871,8 +3956,17 @@ static void astgenPatternCompare(AstGenCtx &gctx, NodeIdx patIdx, JirRef scrut,
 		} else {
 			std::string recvName =
 			    gctx.ctx.getStringPool().get(static_cast<StringIdx>(recvSlot));
-			enumName = recvName;
-			einfo = gctx.ctx.getEnum(recvName);
+			// Resolve through lookupEnum so a bare receiver naming an
+			// enum owned by another module requalifies to its
+			// registered identity.
+			TypeIdx recvTy = gctx.ctx.getTypePool().internNamed(
+			    gctx.ctx.getStringPool().intern(recvName));
+			if (const auto *info = gctx.ctx.lookupEnum(recvTy)) {
+				enumName = info->name;
+				einfo = info;
+			} else {
+				enumName = recvName;
+			}
 		}
 		if (einfo == nullptr) {
 			// Not an enum. A bare-identifier pattern (infer-receiver, no
@@ -4584,9 +4678,10 @@ bool typeNeedsDropInner(JamCodegenContext &ctx, TypeIdx ty) {
 	if (tk.kind != TypeKind::Struct && tk.kind != TypeKind::Named) {
 		return false;
 	}
-	const std::string &name =
-	    ctx.getStringPool().get(static_cast<StringIdx>(tk.a));
-	const auto *sinfo = ctx.getStruct(name);
+	// lookupStruct requalifies a bare name against the current body
+	// module, so imported structs (registered under their qualified
+	// identity) classify their drop-bearing fields correctly here.
+	const auto *sinfo = ctx.lookupStruct(ty);
 	if (sinfo == nullptr) return false;
 	for (const auto &f : sinfo->fields) {
 		if (typeNeedsDrop(ctx, f.second)) return true;
@@ -4673,9 +4768,8 @@ static void emitFieldDrops(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy) {
 	const TypeKey &tk = gctx.ctx.getTypePool().get(pointeeTy);
 	const JamCodegenContext::StructInfo *sinfo = nullptr;
 	if (tk.kind == TypeKind::Struct || tk.kind == TypeKind::Named) {
-		std::string name =
-		    gctx.ctx.getStringPool().get(static_cast<StringIdx>(tk.a));
-		sinfo = gctx.ctx.getStruct(name);
+		// Requalifying lookup — see typeNeedsDropInner.
+		sinfo = gctx.ctx.lookupStruct(pointeeTy);
 	}
 	if (sinfo == nullptr) return;
 	for (size_t i = 0; i < sinfo->fields.size(); i++) {
@@ -5701,8 +5795,13 @@ static JirRef lowerArgInner(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 		if (gctx.locals.find(name) != gctx.locals.end()) return false;
 		// Not a local — likely an enum / module / type name.
 		// Treat as non-lvalueable so the spill path takes over.
-		return gctx.ctx.getEnum(name) != nullptr ||
-		       gctx.ctx.getStruct(name) != nullptr ||
+		// lookupEnum/lookupStruct requalify the bare name against the
+		// current body module, so enums/structs owned by an imported
+		// module are detected too.
+		TypeIdx namedTy = gctx.ctx.getTypePool().internNamed(
+		    gctx.ctx.getStringPool().intern(name));
+		return gctx.ctx.lookupEnum(namedTy) != nullptr ||
+		       gctx.ctx.lookupStruct(namedTy) != nullptr ||
 		       gctx.ctx.getImportHandle(name) != nullptr;
 	};
 	switch (argNode.tag) {
@@ -6453,7 +6552,14 @@ static JirRef astgenCompInstantiatedCall(AstGenCtx &gctx, const AstNode &n,
 		}
 	}
 
-	std::string instName = fn->Name + mangleSuffix;
+	// The clone's name doubles as the instantiation-cache key AND the
+	// LLVM symbol (the clone's modulePath stays empty, so mangling
+	// passes the name through). Prefix with the callee's qualified
+	// identity: two modules' same-named comp fns must neither share a
+	// cache slot (wrong clone dispatched) nor an LLVM symbol (linker
+	// silently merges them).
+	std::string instName =
+	    qualifyTypeName(fn->modulePath, fn->Name) + mangleSuffix;
 
 	// Cache hit? Skip the clone+lower and dispatch to the existing
 	// instantiation.
@@ -6510,6 +6616,115 @@ static JirRef astgenCompInstantiatedCall(AstGenCtx &gctx, const AstNode &n,
 		}
 	}
 	return emitCall(gctx, clone, argRefs);
+}
+
+// Construct `Enum.Variant(args...)`: the tag value for unit variants,
+// an alloca + tag/payload stores for payloaded ones. `canonicalType`
+// is the enum's registered (qualified) identity. Returns kNoJirRef
+// when `variantName` is not a variant of `einfo` — callers fall
+// through to method dispatch. Shared by the single-dot
+// (`Result.Ok(x)`) and handle-qualified (`a.Status.Bad(5)`) call
+// paths.
+static JirRef astgenEnumVariantCtor(
+    AstGenCtx &gctx, const JamCodegenContext::EnumInfo *enumForVariant,
+    const std::string &canonicalType, const std::string &methodName,
+    ExtraIdx argsExtra, uint32_t argCount) {
+	const NodeStore &ns = gctx.ctx.getNodeStore();
+	int vidx = gctx.ctx.getEnumVariantIndex(canonicalType, methodName);
+	if (vidx < 0) return kNoJirRef;
+	const auto &variant = enumForVariant->variants[vidx];
+	TypeIdx enumTy = gctx.ctx.getTypePool().intern(TypeKey{
+	    TypeKind::Named, 0, 0,
+	    static_cast<uint32_t>(gctx.ctx.getStringPool().intern(canonicalType)),
+	    0});
+	JirInst tag{};
+	tag.tag = JirTag::Int;
+	tag.a = static_cast<uint32_t>(variant.discriminant);
+	tag.ty = BuiltinType::U8;
+	JirRef tagRef = emit(gctx, tag);
+	if (!enumForVariant->hasPayloadVariant) { return tagRef; }
+	// Build {tag, payload-undef|val} via alloca + FieldAddr stores,
+	// then load. Mirrors the TypeMethodCall path.
+	JirInst alloca{};
+	alloca.tag = JirTag::Alloca;
+	alloca.ty = enumTy;
+	JirRef slot = emitAllocaHoisted(gctx, alloca);
+	TypeIdx u8PtrTy = gctx.ctx.getTypePool().intern(
+	    TypeKey{TypeKind::PtrSingle, 0, 0, BuiltinType::U8, 0});
+	JirInst tagFA{};
+	tagFA.tag = JirTag::FieldAddr;
+	tagFA.a = slot;
+	tagFA.b = 0;
+	tagFA.ty = u8PtrTy;
+	JirRef tagPtr = emit(gctx, tagFA);
+	JirInst tagStore{};
+	tagStore.tag = JirTag::Store;
+	tagStore.a = tagPtr;
+	tagStore.b = tagRef;
+	emit(gctx, tagStore);
+	// Store every payload field. Each one lives at its own byte offset
+	// within the payload area (field 1 of the enum struct is the
+	// alignment driver, which holds the first payload; subsequent
+	// payloads spill into the `extraBytes` array — see codegen.cpp's
+	// enum layout). We address them all uniformly via a payload-area
+	// pointer + byte offset GEP through i8.
+	if (argCount > variant.payloadTypes.size()) {
+		failHere(gctx, "astgen: too many args for variant `" + canonicalType +
+		                   "." + methodName + "`");
+	}
+	if (!variant.payloadTypes.empty() && argCount >= 1) {
+		TypeIdx payAreaPtrTy = gctx.ctx.getTypePool().intern(
+		    TypeKey{TypeKind::PtrSingle, 0, 0, BuiltinType::U8, 0});
+		JirInst payAreaFA{};
+		payAreaFA.tag = JirTag::FieldAddr;
+		payAreaFA.a = slot;
+		payAreaFA.b = 1;
+		payAreaFA.ty = payAreaPtrTy;
+		JirRef payAreaPtr = emit(gctx, payAreaFA);
+
+		// Byte-stride GEP through `payAreaPtr` (which is *u8) gives the
+		// per-field pointer. Encode the result type as `*u8` so
+		// jir_codegen's IndexAddr uses i8 stride (1 byte per `idx`
+		// step); opaque pointers let us Store the field's actual type
+		// to the resulting ptr without a separate cast.
+		uint64_t off = 0;
+		for (uint32_t i = 0; i < variant.payloadTypes.size() && i < argCount;
+		     i++) {
+			TypeIdx fieldTy = variant.payloadTypes[i];
+			uint64_t s = gctx.ctx.typeSize(fieldTy);
+			uint64_t a = gctx.ctx.typeAlign(fieldTy);
+			off = (off + a - 1) / a * a;
+			NodeIdx argIdxN =
+			    static_cast<NodeIdx>(ns.getExtra(argsExtra + 1 + i));
+			JirRef payVal = astgenExpr(gctx, argIdxN, fieldTy);
+			// Enum payload capture is a MOVE — the enum owns the value
+			// (see the TypeMethodCall constructor for the same rule).
+			rejectDropBearingFieldExtract(gctx, argIdxN, fieldTy, "capture");
+			consumeMovedVariable(gctx, argIdxN);
+			JirInst gepInst{};
+			gepInst.tag = JirTag::IndexAddr;
+			gepInst.a = payAreaPtr;
+			JirInst offC{};
+			offC.tag = JirTag::Int;
+			offC.a = static_cast<uint32_t>(off);
+			offC.ty = BuiltinType::U64;
+			JirRef offRef = emit(gctx, offC);
+			gepInst.b = offRef;
+			gepInst.ty = payAreaPtrTy;  // *u8 -> byte stride
+			JirRef fieldPtr = emit(gctx, gepInst);
+			JirInst payStore{};
+			payStore.tag = JirTag::Store;
+			payStore.a = fieldPtr;
+			payStore.b = payVal;
+			emit(gctx, payStore);
+			off += s;
+		}
+	}
+	JirInst load{};
+	load.tag = JirTag::Load;
+	load.a = slot;
+	load.ty = enumTy;
+	return emit(gctx, load);
 }
 
 static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
@@ -6738,7 +6953,24 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 	// importer's namespace handle, not in a flat global table. The
 	// registration site in main.cpp puts these under the key
 	// `handle.Struct.method`; we look them up directly here.
+	//
+	// Handle-qualified ENUM variants (`a.Status.Bad(5)`) take the same
+	// spelling: split at the LAST dot, resolve the prefix as an enum
+	// through the requalifying lookup (which follows handle aliases and
+	// re-export chains), and construct the variant.
 	if (callee.find('.') != callee.rfind('.')) {
+		{
+			size_t lastDot = callee.rfind('.');
+			std::string recvName = callee.substr(0, lastDot);
+			std::string variantName = callee.substr(lastDot + 1);
+			TypeIdx recvTy = gctx.ctx.getTypePool().internNamed(
+			    gctx.ctx.getStringPool().intern(recvName));
+			if (const auto *einfo = gctx.ctx.lookupEnum(recvTy)) {
+				JirRef built = astgenEnumVariantCtor(
+				    gctx, einfo, einfo->name, variantName, argsExtra, argCount);
+				if (built != kNoJirRef) return built;
+			}
+		}
 		if (const FunctionAST *method = gctx.ctx.getFunctionAST(callee)) {
 			std::vector<JirRef> argRefs;
 			argRefs.reserve(argCount);
@@ -6787,10 +7019,15 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 				}
 			}
 			if (canonicalType.empty()) {
-				if (const auto *sinfo = gctx.ctx.getStruct(resolvedPrefix)) {
+				// Qualify a bare type prefix (e.g. a destructuring-
+				// imported `File`) to its owning module before the
+				// registry lookup, via lookupStruct/lookupEnum which
+				// requalify against the current body module.
+				TypeIdx prefixTy = gctx.ctx.getTypePool().internNamed(
+				    gctx.ctx.getStringPool().intern(resolvedPrefix));
+				if (const auto *sinfo = gctx.ctx.lookupStruct(prefixTy)) {
 					canonicalType = sinfo->name;
-				} else if (const auto *einfo =
-				               gctx.ctx.getEnum(resolvedPrefix)) {
+				} else if (const auto *einfo = gctx.ctx.lookupEnum(prefixTy)) {
 					canonicalType = einfo->name;
 					enumForVariant = einfo;
 				}
@@ -6798,111 +7035,10 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 			// Enum-variant constructor (`Result.Ok(x)`-style Call):
 			// the suffix is a variant name on the resolved enum.
 			if (enumForVariant != nullptr) {
-				int vidx =
-				    gctx.ctx.getEnumVariantIndex(canonicalType, methodName);
-				if (vidx >= 0) {
-					const auto &variant = enumForVariant->variants[vidx];
-					TypeIdx enumTy = gctx.ctx.getTypePool().intern(TypeKey{
-					    TypeKind::Named, 0, 0,
-					    static_cast<uint32_t>(
-					        gctx.ctx.getStringPool().intern(canonicalType)),
-					    0});
-					JirInst tag{};
-					tag.tag = JirTag::Int;
-					tag.a = static_cast<uint32_t>(variant.discriminant);
-					tag.ty = BuiltinType::U8;
-					JirRef tagRef = emit(gctx, tag);
-					if (!enumForVariant->hasPayloadVariant) { return tagRef; }
-					// Build {tag, payload-undef|val} via alloca + FieldAddr
-					// stores, then load. Mirrors the TypeMethodCall path.
-					JirInst alloca{};
-					alloca.tag = JirTag::Alloca;
-					alloca.ty = enumTy;
-					JirRef slot = emitAllocaHoisted(gctx, alloca);
-					TypeIdx u8PtrTy = gctx.ctx.getTypePool().intern(
-					    TypeKey{TypeKind::PtrSingle, 0, 0, BuiltinType::U8, 0});
-					JirInst tagFA{};
-					tagFA.tag = JirTag::FieldAddr;
-					tagFA.a = slot;
-					tagFA.b = 0;
-					tagFA.ty = u8PtrTy;
-					JirRef tagPtr = emit(gctx, tagFA);
-					JirInst tagStore{};
-					tagStore.tag = JirTag::Store;
-					tagStore.a = tagPtr;
-					tagStore.b = tagRef;
-					emit(gctx, tagStore);
-					// Store every payload field. Each one lives at its own
-					// byte offset within the payload area (field 1 of the
-					// enum struct is the alignment driver, which holds the
-					// first payload; subsequent payloads spill into the
-					// `extraBytes` array — see codegen.cpp's enum layout).
-					// We address them all uniformly via a payload-area
-					// pointer + byte offset GEP through i8.
-					if (argCount > variant.payloadTypes.size()) {
-						failHere(gctx, "astgen: too many args for variant `" +
-						                   canonicalType + "." + methodName +
-						                   "`");
-					}
-					if (!variant.payloadTypes.empty() && argCount >= 1) {
-						TypeIdx payAreaPtrTy =
-						    gctx.ctx.getTypePool().intern(TypeKey{
-						        TypeKind::PtrSingle, 0, 0, BuiltinType::U8, 0});
-						JirInst payAreaFA{};
-						payAreaFA.tag = JirTag::FieldAddr;
-						payAreaFA.a = slot;
-						payAreaFA.b = 1;
-						payAreaFA.ty = payAreaPtrTy;
-						JirRef payAreaPtr = emit(gctx, payAreaFA);
-
-						// Byte-stride GEP through `payAreaPtr` (which is *u8)
-						// gives the per-field pointer. Encode the result type
-						// as `*u8` so jir_codegen's IndexAddr uses i8 stride
-						// (1 byte per `idx` step); opaque pointers let us
-						// Store the field's actual type to the resulting ptr
-						// without a separate cast.
-						uint64_t off = 0;
-						for (uint32_t i = 0;
-						     i < variant.payloadTypes.size() && i < argCount;
-						     i++) {
-							TypeIdx fieldTy = variant.payloadTypes[i];
-							uint64_t s = gctx.ctx.typeSize(fieldTy);
-							uint64_t a = gctx.ctx.typeAlign(fieldTy);
-							off = (off + a - 1) / a * a;
-							NodeIdx argIdxN = static_cast<NodeIdx>(
-							    ns.getExtra(argsExtra + 1 + i));
-							JirRef payVal = astgenExpr(gctx, argIdxN, fieldTy);
-							// Enum payload capture is a MOVE — the enum
-							// owns the value (see the TypeMethodCall
-							// constructor for the same rule).
-							rejectDropBearingFieldExtract(gctx, argIdxN,
-							                              fieldTy, "capture");
-							consumeMovedVariable(gctx, argIdxN);
-							JirInst gepInst{};
-							gepInst.tag = JirTag::IndexAddr;
-							gepInst.a = payAreaPtr;
-							JirInst offC{};
-							offC.tag = JirTag::Int;
-							offC.a = static_cast<uint32_t>(off);
-							offC.ty = BuiltinType::U64;
-							JirRef offRef = emit(gctx, offC);
-							gepInst.b = offRef;
-							gepInst.ty = payAreaPtrTy;  // *u8 -> byte stride
-							JirRef fieldPtr = emit(gctx, gepInst);
-							JirInst payStore{};
-							payStore.tag = JirTag::Store;
-							payStore.a = fieldPtr;
-							payStore.b = payVal;
-							emit(gctx, payStore);
-							off += s;
-						}
-					}
-					JirInst load{};
-					load.tag = JirTag::Load;
-					load.a = slot;
-					load.ty = enumTy;
-					return emit(gctx, load);
-				}
+				JirRef built =
+				    astgenEnumVariantCtor(gctx, enumForVariant, canonicalType,
+				                          methodName, argsExtra, argCount);
+				if (built != kNoJirRef) return built;
 			}
 			if (!canonicalType.empty()) {
 				std::string qualified = canonicalType + "." + methodName;
@@ -7502,17 +7638,22 @@ bool typeNeedsDrop(JamCodegenContext &ctx, TypeIdx ty) {
 }
 
 JirFunction astgenMetadata(const FunctionAST &fn, JamCodegenContext &ctx) {
-	(void)ctx;
 	JirFunction jfn;
 	jfn.name = fn.Name;
-	jfn.returnType = fn.ReturnType;
+	jfn.modulePath = fn.modulePath;
+	// Qualify the signature's user-type references to the function's
+	// owning module, so a prototype emitted with no body-module on the
+	// stack (the imported-prototype passes in main.cpp) still resolves
+	// `Thing` to `<module>.Thing`. Mirrors how bodies qualify via
+	// currentBodyModule; here the module comes straight from the AST.
+	jfn.returnType = ctx.requalifyType(fn.ReturnType, fn.modulePath);
 	jfn.isExtern = fn.isExtern;
 	jfn.isExport = fn.isExport;
 	jfn.isPub = fn.isPub;
 	jfn.isTest = fn.isTest;
 	jfn.isVarArgs = fn.isVarArgs;
 	for (const Param &p : fn.Args) {
-		jfn.paramTypes.push_back(p.Type);
+		jfn.paramTypes.push_back(ctx.requalifyType(p.Type, fn.modulePath));
 		jfn.paramModes.push_back(p.Mode);
 	}
 	return jfn;

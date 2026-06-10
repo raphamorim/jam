@@ -1,0 +1,15 @@
+// Entry-module `./conv_b` and a nested module's `conv_b` are two
+// spellings of one file and must share one module identity. Entry
+// imports were once cached under their RAW spelling while nested ones
+// used the canonical identity — the same file loaded twice, its types
+// split into two nominal identities, and values crossing the boundary
+// silently mixed them.
+
+const { assert } = import("test");
+const { Thing } = import("./conv_b");
+const a = import("conv_a");
+
+tfn entryRelativeSpellingConvergesWithNested() {
+    var t: Thing = a.makeViaA();
+    assert(t.value, 5);
+}

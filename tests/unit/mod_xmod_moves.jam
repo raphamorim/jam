@@ -1,0 +1,27 @@
+// Helper for test_xmod_moves: a drop-bearing struct plus a struct
+// whose method takes a move-mode parameter of it. Move tracking for
+// these from the entry module depends on the analyzer resolving the
+// imported types' qualified identities (drop registry keys and the
+// `Type.method` mode-lookup keys are both qualified).
+pub const Token = struct {
+    sink: *mut u32,
+    cfn drop(self: mut Token) {
+        var p: *mut u32 = self.sink;
+        p.* = p.* + 1;
+    }
+};
+
+pub fn makeToken(s: *mut u32) Token {
+    return Token { sink: s };
+}
+
+pub const Eater = struct {
+    pad: u32,
+    pub fn eat(self: Eater, t: move Token) u64 {
+        return 1;
+    }
+};
+
+pub fn makeEater() Eater {
+    return Eater { pad: 7 };
+}

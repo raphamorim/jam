@@ -1,0 +1,6 @@
+// Direct file that shares its name with a directory module
+// (modfile/mod.jam). The two are distinct modules: `import("modfile")`
+// binds this file, `import("modfile/mod")` binds the directory index.
+pub fn which() u64 {
+    return 1;
+}

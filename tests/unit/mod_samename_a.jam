@@ -1,0 +1,22 @@
+// Helper for test_samename_struct_collision: defines `Pair` and `Wrap`.
+// Another module (mod_samename_b) defines a DIFFERENT `Pair`; the two
+// must stay distinct types under module-qualified identity.
+pub const Pair = struct {
+    a: u64,
+};
+
+pub const Wrap = struct {
+    inner: Pair,
+};
+
+pub fn mk() Pair {
+    return Pair { a: 11 };
+}
+
+pub fn wrapped() Wrap {
+    return Wrap { inner: Pair { a: 11 } };
+}
+
+pub fn innerA(w: Wrap) u64 {
+    return w.inner.a;
+}

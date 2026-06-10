@@ -1,0 +1,15 @@
+// Helper for test_xmod_generics: a generic factory named `Pair` —
+// mod_gen_b defines a DIFFERENT `Pair` (other field name, other method
+// behavior). Generic identity is module-qualified, so the two must
+// never share an instantiation.
+pub fn Pair(T: type) type {
+    return struct {
+        x: T,
+        pub fn val(self: Self) T { return self.x * 2; }
+    };
+}
+
+pub fn makeA() u64 {
+    var p: Pair(u64) = Pair(u64) { x: 9 };
+    return p.val();
+}

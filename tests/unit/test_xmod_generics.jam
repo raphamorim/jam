@@ -1,0 +1,23 @@
+// Same-named generic factories in two modules. Generic callees once
+// resolved by BARE name: `Pair(u64)` interned to one GenericCall
+// TypeIdx everywhere, the resolution cache handed whichever module
+// resolved first to ALL modules, and the instantiated name `Pair__u64`
+// memoized across owners — one module silently used the other's
+// methods (or failed on the other's fields). Callees now qualify to
+// their owner (`mod_gen_a.Pair`) like every other type.
+
+const { assert } = import("test");
+const a = import("mod_gen_a");
+const b = import("mod_gen_b");
+
+tfn sameNamedGenericsStayDistinct() {
+    assert(a.makeA(), 18);
+    assert(b.makeB(), 1009);
+}
+
+tfn entryInstantiatesBothViaHandles() {
+    var pa: a.Pair(u64) = a.Pair(u64) { x: 5 };
+    var pb: b.Pair(u64) = b.Pair(u64) { y: 5 };
+    assert(pa.val(), 10);
+    assert(pb.val(), 1005);
+}

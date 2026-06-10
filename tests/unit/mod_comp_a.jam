@@ -1,0 +1,11 @@
+// Helper for test_xmod_comp_fns — mod_comp_b defines a same-named
+// comp-param fn with a different body. The per-call-site clone cache
+// keys by the callee's qualified identity, so the two never share a
+// clone (or an LLVM symbol).
+pub fn scale(comp k: u32, x: u32) u32 {
+    return x * k;
+}
+
+pub fn runA() u32 {
+    return scale(2, 10);
+}

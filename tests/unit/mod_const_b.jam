@@ -1,0 +1,18 @@
+// Helper for test_xmod_consts — see mod_const_a.
+pub const N: u32 = 9;
+comp const SIZE = 5;
+
+pub fn readN() u32 {
+    return N;
+}
+
+pub fn lastSlot() u8 {
+    var buf: [SIZE]u8 = [0; SIZE];
+    buf[SIZE - 1] = 42;
+    return buf[SIZE - 1];
+}
+
+pub fn sizeOfBuf() u64 {
+    var buf: [SIZE]u8 = [0; SIZE];
+    return @sizeOf([SIZE]u8);
+}

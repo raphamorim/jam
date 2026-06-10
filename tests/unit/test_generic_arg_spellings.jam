@@ -1,0 +1,29 @@
+// Generic instantiations memoize on a name built from the argument
+// types, so every distinct argument type must spell distinctly. The
+// spelling once fell back to a shared catch-all for floats (and
+// pointers/slices/arrays), handing `Pair(f64)` the struct layout
+// already instantiated for `Pair(f32)` — silent value corruption.
+
+const { assert } = import("test");
+
+fn Pair(T: type) type {
+    return struct {
+        a: T,
+        b: T,
+        pub fn sum(self: Self) T { return self.a + self.b; }
+    };
+}
+
+tfn floatInstantiationsStayDistinct() {
+    var p32: Pair(f32) = Pair(f32) { a: 1.5, b: 2.5 };
+    var p64: Pair(f64) = Pair(f64) { a: 1.25, b: 2.25 };
+    assert((p32.sum() == 4.0) as u8, 1);
+    assert((p64.sum() == 3.5) as u8, 1);
+}
+
+tfn intAndFloatInstantiationsCoexist() {
+    var pi: Pair(u32) = Pair(u32) { a: 3, b: 4 };
+    var pf: Pair(f64) = Pair(f64) { a: 0.5, b: 0.25 };
+    assert(pi.sum(), 7);
+    assert((pf.sum() == 0.75) as u8, 1);
+}

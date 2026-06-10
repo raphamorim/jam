@@ -133,7 +133,13 @@ static int compileAndRun(const std::string &filename,
 	auto resolveImportChain =
 	    [&](const std::string &basePath, const std::vector<std::string> &chain,
 	        auto &self) -> std::pair<std::string, ModuleAST *> {
-		std::string curPath = basePath;
+		// Canonicalize the spelling to the module's identity key so the
+		// path stored back on the import (and every registry keyed by
+		// it — symbol table, handle flats, type qualification) matches
+		// the key the resolver cached the module under. Entry-module
+		// spellings (`import("fs")`, `import("./b")`) converge with
+		// nested ones here.
+		std::string curPath = resolver.canonicalKey(basePath);
 		ModuleAST *curMod = resolver.getOrLoadModule(curPath);
 		if (!curMod) return {curPath, nullptr};
 		for (const auto &seg : chain) {
@@ -201,6 +207,88 @@ static int compileAndRun(const std::string &filename,
 	codegenCtx.setAnonStructs(&sharedAnonStructs);
 	codegenCtx.setAnonEnums(&sharedAnonEnums);
 
+	// Build the per-module type-origin map before any qualified
+	// registration: for each module, every type name it can refer to by
+	// a bare identifier maps to the module that owns it — itself for its
+	// own declarations, or the source module for a destructuring import
+	// (`const { Thing } = import("lib/b")` makes `Thing` mean
+	// `lib/b.Thing` inside the importer). `requalifyType` consults this
+	// to rewrite bare type references to their qualified identities.
+	auto recordTypeOwners = [&](ModuleAST *m, const std::string &P) {
+		for (auto &s : m->Structs) codegenCtx.registerTypeOwner(P, s->Name, P);
+		for (auto &e : m->Enums) codegenCtx.registerTypeOwner(P, e->Name, P);
+		for (auto &u : m->Unions) codegenCtx.registerTypeOwner(P, u->Name, P);
+		// Generic type factories (`fn Vec(T: type) type`) participate in
+		// type identity exactly like concrete types: a bare `Vec(u8)`
+		// reference qualifies to its owner so two modules' same-named
+		// generics never share an instantiation.
+		for (auto &fn : m->Functions) {
+			if (fn->isGeneric()) codegenCtx.registerTypeOwner(P, fn->Name, P);
+		}
+		// Module consts (value consts AND `const X = <type>` aliases)
+		// own their bare name too: getModuleConst / lookupTypeAlias
+		// resolve a body's bare reference through this map to the
+		// owner-qualified registry key, so two modules' same-named
+		// consts never read each other's values.
+		for (auto &c : m->Consts) codegenCtx.registerTypeOwner(P, c->Name, P);
+		for (auto &di : m->DestructuringImports) {
+			if (di->Path == "test") continue;
+			ModuleAST *src = resolver.getOrLoadModule(di->Path);
+			if (!src) continue;
+			for (const auto &name : di->Names) {
+				bool isType = false;
+				for (auto &s : src->Structs)
+					if (s->Name == name) isType = true;
+				for (auto &e : src->Enums)
+					if (e->Name == name) isType = true;
+				for (auto &u : src->Unions)
+					if (u->Name == name) isType = true;
+				for (auto &fn : src->Functions)
+					if (fn->isGeneric() && fn->isPub && fn->Name == name)
+						isType = true;
+				for (auto &c : src->Consts)
+					if (c->isPub && c->Name == name) isType = true;
+				if (isType) codegenCtx.registerTypeOwner(P, name, di->Path);
+			}
+		}
+	};
+	for (const auto &[path, importedModule] : resolver.getLoadedModules())
+		recordTypeOwners(importedModule.get(), path);
+	recordTypeOwners(module.get(), /*P=*/"");
+
+	// Bind every declaration-level type reference (function signatures,
+	// struct/union fields, enum payloads) to its module-qualified
+	// identity in place. After this, registration, the analyzer,
+	// prototype emission, and call-site return-type resolution all read
+	// already-qualified types — no body-module context needed. Body-level
+	// references (struct-literal types, local annotations) live in the
+	// node store and are qualified later at astgen time via
+	// currentBodyModule.
+	auto bindDeclTypes = [&](ModuleAST *m) {
+		auto rqFn = [&](FunctionAST *fn) {
+			fn->ReturnType =
+			    codegenCtx.requalifyType(fn->ReturnType, fn->modulePath);
+			for (auto &p : fn->Args)
+				p.Type = codegenCtx.requalifyType(p.Type, fn->modulePath);
+		};
+		for (auto &fn : m->Functions) rqFn(fn.get());
+		for (auto &s : m->Structs) {
+			for (auto &f : s->Fields)
+				f.second = codegenCtx.requalifyType(f.second, s->modulePath);
+			for (auto &mm : s->Methods) rqFn(mm.get());
+		}
+		for (auto &e : m->Enums)
+			for (auto &v : e->Variants)
+				for (auto &pt : v.PayloadTypes)
+					pt = codegenCtx.requalifyType(pt, e->modulePath);
+		for (auto &u : m->Unions)
+			for (auto &f : u->Fields)
+				f.second = codegenCtx.requalifyType(f.second, u->modulePath);
+	};
+	for (const auto &[path, importedModule] : resolver.getLoadedModules())
+		bindDeclTypes(importedModule.get());
+	bindDeclTypes(module.get());
+
 	// Populate the demand-driven DeclTable: one Decl per top-level
 	// binding across the main module + every imported module. The
 	// analyzer consults this table for cycle detection when codegen
@@ -219,40 +307,54 @@ static int compileAndRun(const std::string &filename,
 		};
 		for (auto &fn : m->Functions) {
 			if (publicOnly && !fn->isPub) continue;
+			// Generic factories key by their qualified identity — the
+			// requalified GenericCall callee that resolveGenericCall
+			// looks up. Bare-keying them lets one module's `Pair`
+			// shadow another's in the bare-first-wins byName table.
+			// Plain fns keep their bare source name.
+			std::string declName =
+			    fn->isGeneric() ? qualifyTypeName(fn->modulePath, fn->Name)
+			                    : fn->Name;
 			jam::DeclIndex idx = codegenCtx.declTable().create(
-			    jam::DeclKind::Function, fn->Name);
+			    jam::DeclKind::Function, std::move(declName));
 			auto &d = codegenCtx.declTable().get(idx);
 			d.fnAst = fn.get();
 			setSrc(d, fn->Name);
 		}
+		// Types register under their module-qualified identity so two
+		// modules that each declare `Thing` get distinct DeclTable
+		// entries (and the analyzer, which keys layout off the decl
+		// name, resolves the right one). The qualified name matches the
+		// key used by the struct/enum/union registries below and by the
+		// requalified field/body TypeIdxs that reference them.
 		for (auto &s : m->Structs) {
 			if (publicOnly && !s->isPub) continue;
-			jam::DeclIndex idx =
-			    codegenCtx.declTable().create(jam::DeclKind::Struct, s->Name);
+			jam::DeclIndex idx = codegenCtx.declTable().create(
+			    jam::DeclKind::Struct, qualifyTypeName(s->modulePath, s->Name));
 			auto &d = codegenCtx.declTable().get(idx);
 			d.structAst = s.get();
 			setSrc(d, s->Name);
 		}
 		for (auto &e : m->Enums) {
 			if (publicOnly && !e->isPub) continue;
-			jam::DeclIndex idx =
-			    codegenCtx.declTable().create(jam::DeclKind::Enum, e->Name);
+			jam::DeclIndex idx = codegenCtx.declTable().create(
+			    jam::DeclKind::Enum, qualifyTypeName(e->modulePath, e->Name));
 			auto &d = codegenCtx.declTable().get(idx);
 			d.enumAst = e.get();
 			setSrc(d, e->Name);
 		}
 		for (auto &u : m->Unions) {
 			if (publicOnly && !u->isPub) continue;
-			jam::DeclIndex idx =
-			    codegenCtx.declTable().create(jam::DeclKind::Union, u->Name);
+			jam::DeclIndex idx = codegenCtx.declTable().create(
+			    jam::DeclKind::Union, qualifyTypeName(u->modulePath, u->Name));
 			auto &d = codegenCtx.declTable().get(idx);
 			d.unionAst = u.get();
 			setSrc(d, u->Name);
 		}
 		for (auto &c : m->Consts) {
 			if (publicOnly && !c->isPub) continue;
-			jam::DeclIndex idx =
-			    codegenCtx.declTable().create(jam::DeclKind::Const, c->Name);
+			jam::DeclIndex idx = codegenCtx.declTable().create(
+			    jam::DeclKind::Const, qualifyTypeName(c->modulePath, c->Name));
 			auto &d = codegenCtx.declTable().get(idx);
 			d.constAst = c.get();
 			setSrc(d, c->Name);
@@ -267,20 +369,39 @@ static int compileAndRun(const std::string &filename,
 	// items get registered, so non-pub items can't leak into the
 	// importing module via bare-name lookup. Main-module decls always
 	// register since there's no outer consumer.
+	// Each type registers under its module-qualified identity
+	// (`qualifyTypeName`), and its field / payload TypeIdxs are
+	// requalified to the same scheme so a field typed `Inner` resolves
+	// to *this* module's `Inner`. requalifyType consults the type-origin
+	// map built above, so it doesn't depend on registration order.
+	auto requalFields =
+	    [&](const std::vector<std::pair<std::string, TypeIdx>> &fields,
+	        const std::string &mod) {
+		    std::vector<std::pair<std::string, TypeIdx>> out;
+		    out.reserve(fields.size());
+		    for (const auto &f : fields)
+			    out.emplace_back(f.first,
+			                     codegenCtx.requalifyType(f.second, mod));
+		    return out;
+	    };
 	auto declareStructs = [&](ModuleAST *m, bool publicOnly) {
 		for (auto &s : m->Structs) {
 			if (publicOnly && !s->isPub) continue;
-			JamTypeRef structType = JamLLVMStructCreateNamed(
-			    codegenCtx.getContext(), s->Name.c_str());
-			codegenCtx.registerStruct(s->Name, structType, s->Fields);
+			std::string q = qualifyTypeName(s->modulePath, s->Name);
+			JamTypeRef structType =
+			    JamLLVMStructCreateNamed(codegenCtx.getContext(), q.c_str());
+			codegenCtx.registerStruct(q, structType,
+			                          requalFields(s->Fields, s->modulePath));
 		}
 	};
 	auto declareUnions = [&](ModuleAST *m, bool publicOnly) {
 		for (auto &u : m->Unions) {
 			if (publicOnly && !u->isPub) continue;
-			JamTypeRef unionType = JamLLVMStructCreateNamed(
-			    codegenCtx.getContext(), u->Name.c_str());
-			codegenCtx.registerUnion(u->Name, unionType, u->Fields);
+			std::string q = qualifyTypeName(u->modulePath, u->Name);
+			JamTypeRef unionType =
+			    JamLLVMStructCreateNamed(codegenCtx.getContext(), q.c_str());
+			codegenCtx.registerUnion(q, unionType,
+			                         requalFields(u->Fields, u->modulePath));
 		}
 	};
 	auto declareEnums = [&](ModuleAST *m, bool publicOnly) {
@@ -291,11 +412,15 @@ static int compileAndRun(const std::string &filename,
 			for (auto &v : e->Variants) {
 				JamCodegenContext::EnumVariantInfo info;
 				info.name = v.Name;
-				info.payloadTypes = v.PayloadTypes;
+				info.payloadTypes.reserve(v.PayloadTypes.size());
+				for (TypeIdx pt : v.PayloadTypes)
+					info.payloadTypes.push_back(
+					    codegenCtx.requalifyType(pt, e->modulePath));
 				info.discriminant = v.Discriminant;
 				variants.push_back(std::move(info));
 			}
-			codegenCtx.registerEnum(e->Name, std::move(variants));
+			codegenCtx.registerEnum(qualifyTypeName(e->modulePath, e->Name),
+			                        std::move(variants));
 		}
 	};
 	// Enums that need a named struct type (i.e. those with payload
@@ -303,11 +428,12 @@ static int compileAndRun(const std::string &filename,
 	// that fillEnumBodies can set the body in a second pass.
 	auto declareEnumLLVMTypes = [&](ModuleAST *m) {
 		for (auto &e : m->Enums) {
-			const auto *info = codegenCtx.getEnum(e->Name);
+			std::string q = qualifyTypeName(e->modulePath, e->Name);
+			const auto *info = codegenCtx.getEnum(q);
 			if (!info || !info->hasPayloadVariant) continue;
-			JamTypeRef ty = JamLLVMStructCreateNamed(codegenCtx.getContext(),
-			                                         e->Name.c_str());
-			codegenCtx.setEnumLLVMType(e->Name, ty, 0, 1, true);
+			JamTypeRef ty =
+			    JamLLVMStructCreateNamed(codegenCtx.getContext(), q.c_str());
+			codegenCtx.setEnumLLVMType(q, ty, 0, 1, true);
 		}
 	};
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
@@ -347,6 +473,16 @@ static int compileAndRun(const std::string &filename,
 			// regardless of pub status. Only pub ones leak into the
 			// global flat map.
 			ns.functions[func->Name] = func.get();
+			// Generics (pub AND private — a private generic is reachable
+			// from its own module's bodies) also register under their
+			// qualified identity: the requalified GenericCall callee
+			// (`lib/a.Pair`) that resolveGenericCall looks up. Qualified
+			// keys contain `/` or `.`, so they can't collide with bare
+			// source names.
+			if (func->isGeneric()) {
+				codegenCtx.registerFunctionAST(
+				    qualifyTypeName(path, func->Name), func.get());
+			}
 			if (func->isPub) {
 				codegenCtx.registerFunctionAST(func->Name, func.get());
 				// Eagerly declare LLVM prototypes for pub-extern fns
@@ -367,22 +503,29 @@ static int compileAndRun(const std::string &filename,
 				}
 			}
 		}
+		// The namespace maps a bare member name (`Counter`) to the type's
+		// qualified identity (`a.Counter`), so `a.Counter` from an
+		// importer resolves to *this* module's struct, not a same-named
+		// one elsewhere.
 		for (auto &s : importedModule->Structs) {
 			if (s->isPub) {
 				ns.types[s->Name] = codegenCtx.getTypePool().internNamed(
-				    codegenCtx.getStringPool().intern(s->Name));
+				    codegenCtx.getStringPool().intern(
+				        qualifyTypeName(path, s->Name)));
 			}
 		}
 		for (auto &e : importedModule->Enums) {
 			if (e->isPub) {
 				ns.types[e->Name] = codegenCtx.getTypePool().internNamed(
-				    codegenCtx.getStringPool().intern(e->Name));
+				    codegenCtx.getStringPool().intern(
+				        qualifyTypeName(path, e->Name)));
 			}
 		}
 		for (auto &u : importedModule->Unions) {
 			if (u->isPub) {
 				ns.types[u->Name] = codegenCtx.getTypePool().internNamed(
-				    codegenCtx.getStringPool().intern(u->Name));
+				    codegenCtx.getStringPool().intern(
+				        qualifyTypeName(path, u->Name)));
 			}
 		}
 		for (auto &reexport : importedModule->Imports) {
@@ -435,11 +578,22 @@ static int compileAndRun(const std::string &filename,
 		auto regPriv = [&](const std::string &name) {
 			codegenCtx.registerScopedPrivateName(owner, handle, name);
 		};
+		// `handle.Type` (e.g. `a.Counter`) aliases to the type's
+		// qualified identity in its owning module, so two imported
+		// modules' same-named types resolve to distinct structs.
+		// When the handle spelling IS the qualified identity (a handle
+		// named like the module: `const m = import("m")`), registering
+		// the alias would map the name to itself — and every alias
+		// consumer tail-recurses on the target, so a self-alias spins
+		// forever. The registries already hold the identity directly;
+		// skip the no-op.
 		auto aliasNamed = [&](const std::string &bare) {
+			std::string qualified = qualifyTypeName(modulePath, bare);
+			std::string key = handle + "." + bare;
+			if (key == qualified) return;
 			TypeIdx target = codegenCtx.getTypePool().internNamed(
-			    codegenCtx.getStringPool().intern(bare));
-			codegenCtx.registerScopedTypeAlias(owner, handle + "." + bare,
-			                                   target);
+			    codegenCtx.getStringPool().intern(qualified));
+			codegenCtx.registerScopedTypeAlias(owner, key, target);
 		};
 		for (auto &func : importedModule->Functions) {
 			if (func->isPub) regFn(handle + "." + func->Name, func.get());
@@ -618,10 +772,20 @@ static int compileAndRun(const std::string &filename,
 		return kNoType;
 	};
 
+	// Consts and aliases register under their owner-qualified identity
+	// (`lib/a.LIMIT`), matching the ownership map recordTypeOwners
+	// built — getModuleConst / lookupTypeAlias resolve a body's bare
+	// spelling through that map, so two modules' same-named consts stay
+	// separate. Alias TARGETS requalify against the alias's own module
+	// so `pub const W = Holder(Inner)` captures the owner's `Inner`,
+	// not the consumer's.
 	auto registerConsts = [&](ModuleAST *m, const std::string &file) {
 		for (auto &c : m->Consts) {
+			std::string qname = qualifyTypeName(c->modulePath, c->Name);
 			if (c->AliasedType != kNoType) {
-				codegenCtx.registerTypeAlias(c->Name, c->AliasedType);
+				codegenCtx.registerTypeAlias(
+				    qname,
+				    codegenCtx.requalifyType(c->AliasedType, c->modulePath));
 				continue;
 			}
 			if (c->InitExpr != kNoNode) {
@@ -634,14 +798,16 @@ static int compileAndRun(const std::string &filename,
 					// builtin (i32) or a Named lookup that doesn't
 					// resolve fall through to value-const behavior.
 					if (k.kind == TypeKind::GenericCall) {
-						c->AliasedType = maybeAlias;
-						codegenCtx.registerTypeAlias(c->Name, c->AliasedType);
+						c->AliasedType =
+						    codegenCtx.requalifyType(maybeAlias, c->modulePath);
+						codegenCtx.registerTypeAlias(qname, c->AliasedType);
 						continue;
 					}
 				}
 			}
-			codegenCtx.registerModuleConst(c->Name, c->InitExpr,
-			                               c->DeclaredType, c->isComp, file);
+			codegenCtx.registerModuleConst(qname, c->Name, c->modulePath,
+			                               c->InitExpr, c->DeclaredType,
+			                               c->isComp, file);
 		}
 	};
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
@@ -699,6 +865,17 @@ static int compileAndRun(const std::string &filename,
 			// modules resolve last-wins.
 			fnRegistry[fn->Name] = fn.get();
 		}
+		// Imported structs' methods, under the struct's QUALIFIED
+		// identity — the analyzer's method-mode lookup requalifies the
+		// receiver's type (via the requalifyType hook) and builds
+		// `<qualified>.method`, so a move-mode arg on an imported
+		// type's method is tracked like a same-module one.
+		for (auto &s : kv.second->Structs) {
+			std::string qself = qualifyTypeName(s->modulePath, s->Name);
+			for (auto &m : s->Methods) {
+				fnRegistry[qself + "." + m->Name] = m.get();
+			}
+		}
 	}
 	// Methods of generic struct-returning functions register under
 	// "GenericName.method" — modes don't depend on T.
@@ -715,8 +892,13 @@ static int compileAndRun(const std::string &filename,
 				uint32_t anonIdx = value.lhs;
 				if (anonIdx >= sharedAnonStructs.size()) break;
 				const StructDeclAST *anon = sharedAnonStructs[anonIdx].get();
+				// Key by the factory's QUALIFIED identity — the
+				// analyzer's method-mode lookup requalifies the
+				// receiver's GenericCall callee before building
+				// `<callee>.method`, so the keys must agree.
+				std::string qfn = qualifyTypeName(fn->modulePath, fn->Name);
 				for (const auto &mth : anon->Methods) {
-					fnRegistry[fn->Name + "." + mth->Name] = mth.get();
+					fnRegistry[qfn + "." + mth->Name] = mth.get();
 				}
 				break;
 			}
@@ -764,6 +946,13 @@ static int compileAndRun(const std::string &filename,
 	analysisHooks.ctx = &codegenCtx;
 	analysisHooks.typeNeedsDrop = +[](void *c, TypeIdx t) -> bool {
 		return typeNeedsDrop(*static_cast<JamCodegenContext *>(c), t);
+	};
+	// Qualified-identity oracle: requalify against the module of the
+	// function under analysis (runAnalysisIn pushes it as the body
+	// module before calling analyze()).
+	analysisHooks.requalifyType = +[](void *c, TypeIdx t) -> TypeIdx {
+		auto *cc = static_cast<JamCodegenContext *>(c);
+		return cc->requalifyType(t, cc->currentBodyModule());
 	};
 	// `comp if` verdict oracle: astgen records which arm it lowered;
 	// the analyzer walks only that arm (see Analyzer::analyzeIf).
@@ -845,6 +1034,11 @@ static int compileAndRun(const std::string &filename,
 	// in module B is invisible to module A's call sites.
 	auto registerStructMethods = [&](ModuleAST *m, bool publicOnly) -> int {
 		for (auto &s : m->Structs) {
+			// Methods register and dispatch under the struct's qualified
+			// identity (`fs.File.size`), matching the qualified `sinfo->name`
+			// the call sites build. `self`/return types were requalified by
+			// bindDeclTypes, so validation compares against this too.
+			const std::string qself = qualifyTypeName(s->modulePath, s->Name);
 			for (auto &meth : s->Methods) {
 				// `cfn` methods (drop / default / at / setAt / len) are
 				// compiler-synthesized hooks that may be invoked from OTHER
@@ -865,7 +1059,7 @@ static int compileAndRun(const std::string &filename,
 						return 1;
 					}
 					std::string retStruct = resolveStructName(meth->ReturnType);
-					if (retStruct != s->Name) {
+					if (retStruct != qself) {
 						std::cerr << filename
 						          << ": error: cfn `default` on struct `"
 						          << s->Name << "` must return `Self` (got `"
@@ -882,7 +1076,7 @@ static int compileAndRun(const std::string &filename,
 					}
 					std::string selfStruct =
 					    resolveStructName(meth->Args[0].Type);
-					if (selfStruct != s->Name) {
+					if (selfStruct != qself) {
 						std::cerr << filename << ": error: cfn `" << meth->Name
 						          << "` on struct `" << s->Name
 						          << "` has self type `" << selfStruct
@@ -897,7 +1091,7 @@ static int compileAndRun(const std::string &filename,
 					                        codegenCtx.getStringPool());
 					jirDeclarePrototype(jfn, codegenCtx);
 				}
-				codegenCtx.registerFunctionAST(s->Name + "." + meth->Name,
+				codegenCtx.registerFunctionAST(qself + "." + meth->Name,
 				                               meth.get());
 			}
 		}
@@ -1051,6 +1245,9 @@ static int compileAndRun(const std::string &filename,
 	// LLVM-verifier crashes much later. Diagnostics are aborts: the
 	// function shouldn't reach jir_codegen if it's malformed.
 	for (const JirFunction &jfn : jirFunctions) {
+		// Resolve this body's bare type references against its own
+		// module (see JirFunction::modulePath).
+		codegenCtx.pushBodyModule(jfn.modulePath);
 		auto diags = verifyJirFunction(
 		    jfn, &codegenCtx.getTypePool(), &codegenCtx.getStringPool(),
 		    +[](void *c, TypeIdx t) -> TypeIdx {
@@ -1066,6 +1263,7 @@ static int compileAndRun(const std::string &filename,
 			    return t;
 		    },
 		    &codegenCtx);
+		codegenCtx.popBodyModule();
 		for (auto &d : diags) {
 			// jir_verify leaves file empty so the caller can stamp
 			// the unit's currentFile here.
@@ -1091,10 +1289,14 @@ static int compileAndRun(const std::string &filename,
 		auto runAnalysisIn = [&](FunctionAST *function,
 		                         const std::string &file) {
 			if (function->isExtern) return;
+			// Resolve body-level type references against the function's
+			// own module while analysis runs.
+			codegenCtx.pushBodyModule(function->modulePath);
 			auto diags = jam::init_analysis::analyze(
 			    *function, codegenCtx.getNodeStore(),
 			    codegenCtx.getStringPool(), tokens, &fnRegistry, &dropRegistry,
 			    &codegenCtx.getTypePool(), &enumVariants, &analysisHooks);
+			codegenCtx.popBodyModule();
 			// Funnel each init-analysis diagnostic into the unified
 			// `jam::Diagnostics` channel so they share the same
 			// formatting / ordering as astgen errors.
@@ -1149,8 +1351,12 @@ static int compileAndRun(const std::string &filename,
 		// Pass 2b: emit each JirFunction's LLVM body. Every prototype
 		// (main-module fns, struct methods, imported pub fns) was
 		// declared in pass 1a–1c so jir_codegen Call lookups resolve.
+		// Push the body's module so getLLVMType / typeSize on bare
+		// body-level type references resolve to the owning module.
 		for (const JirFunction &jfn : jirFunctions) {
+			codegenCtx.pushBodyModule(jfn.modulePath);
 			jirDefineBody(jfn, codegenCtx);
+			codegenCtx.popBodyModule();
 		}
 	}
 

@@ -1,0 +1,44 @@
+// A generic's anon body referencing its module's sibling types. These
+// references once resolved against the INSTANTIATING module (dynamic
+// scoping): instantiating from a module that didn't import `Inner`
+// failed with "Unknown user-defined type", and one that defined its
+// OWN `Inner` silently captured the wrong layout. Substituted field,
+// signature, and enum-payload types now qualify against the generic's
+// defining module.
+//
+// Note: this entry module deliberately defines its own unrelated
+// `Inner` and never imports the helper's.
+
+const { assert } = import("test");
+const m = import("mod_gen_sibling");
+const { MaybeInner, wrapInner } = import("mod_gen_sibling");
+
+const Inner = struct {
+    flag: bool,
+};
+
+tfn siblingFieldResolvesInDefiningModule() {
+    var h: m.Holder(i32) = m.makeHolder(41, 7);
+    assert(h.innerValue() as u64, 41);
+}
+
+tfn siblingSignatureResolvesInDefiningModule() {
+    var h: m.Holder(i32) = m.makeHolder(10, 1);
+    assert(h.makeInner().value as u64, 11);
+}
+
+tfn entryOwnSameNamedTypeNotCaptured() {
+    var h: m.Holder(i32) = m.makeHolder(123, 1);
+    assert(h.innerValue() as u64, 123);
+    var mine: Inner = Inner { flag: true };
+    assert(mine.flag as u64, 1);
+}
+
+tfn genericEnumSiblingPayloadResolves() {
+    var w: MaybeInner(u8) = wrapInner(55);
+    match (w) {
+        MaybeInner(u8).Has(i)  { assert(i.value as u64, 55); }
+        MaybeInner(u8).Item(x) { assert(x as u64, 0); }
+        _                      { assert(1, 0); }
+    }
+}

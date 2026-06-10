@@ -81,6 +81,14 @@ using EnumVariantMap =
 struct AnalysisHooks {
 	void *ctx = nullptr;
 	bool (*typeNeedsDrop)(void *ctx, TypeIdx ty) = nullptr;
+	// Rewrite a bare user-type reference to its module-qualified
+	// identity as seen from the function under analysis. The analyzer
+	// builds string keys (`Type.method`) from local-var annotation
+	// TypeIdxs, which carry bare source spellings; the registries key
+	// by qualified identity, so the analyzer must agree with codegen on
+	// the name. Null in standalone unit tests — callers fall back to
+	// the bare spelling.
+	TypeIdx (*requalifyType)(void *ctx, TypeIdx ty) = nullptr;
 	// `comp if` verdict recorded by astgen for (fnAst, IfNode). The
 	// analyzer must observe the same dead-arm elision astgen performed:
 	// only the taken arm exists, and its statements run at the SAME

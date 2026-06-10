@@ -107,6 +107,11 @@ std::string ModuleResolver::resolve(const std::string &importPath) const {
 	if (importPath == "test") { return importPath; }
 	std::string path = importPath;
 
+	// An explicitly file-relative spelling (`./x`, `../x`) names a file
+	// near the importer and nothing else — it must not fall through to
+	// the standard-library lookups below.
+	bool explicitRelative =
+	    path.rfind("./", 0) == 0 || path.rfind("../", 0) == 0;
 	if (path.substr(0, 2) == "./") { path = path.substr(2); }
 
 	fs::path base(baseDir);
@@ -119,6 +124,8 @@ std::string ModuleResolver::resolve(const std::string &importPath) const {
 	if (fs::exists(indexPath) && fs::is_regular_file(indexPath)) {
 		return fs::canonical(indexPath).string();
 	}
+
+	if (explicitRelative) { return ""; }  // never std for ./ or ../
 
 	// Standard-library lookup. Accept both `import("collections")` and
 	// `import("std/collections")` spellings by stripping a leading
@@ -147,42 +154,98 @@ std::string ModuleResolver::resolve(const std::string &importPath) const {
 	return "";  // Not found
 }
 
-std::string
-ModuleResolver::moduleIdentity(const std::string &resolvedFile) const {
-	// Map a resolved (canonical) module file to the stable identity used
-	// as both the `loadedModules` cache key and the `modulePath`
-	// mangling prefix: the path relative to the entry base dir, with the
-	// `.jam` extension stripped and forward slashes. It is the
-	// project-root-relative path that names a module regardless of which
-	// relative spelling reached it, so `import("lib/b")` and
-	// `import("./b")` from `lib/a` agree on the identity `lib/b`.
-	//
-	// Returns "" when the file sits outside the base dir — std-library
-	// modules resolve under their own root, and the caller keeps the
-	// original import spelling, which `resolve` already maps through the
-	// std root.
-	std::error_code ec;
-	fs::path baseAbs = fs::canonical(baseDir, ec);
-	if (ec) return "";
-	fs::path rel = fs::relative(resolvedFile, baseAbs, ec);
-	if (ec || rel.empty()) return "";
-	std::string id = rel.generic_string();
-	if (id.rfind("..", 0) == 0) return "";  // escapes the base dir
+namespace {
+
+// Strip the `.jam` extension and collapse a `<dir>/mod` index file to
+// `<dir>` — but only when no sibling `<dir>.jam` exists under `root`.
+// `resolve` prefers the direct file, so when both exist they are two
+// distinct modules and must keep distinct identities.
+std::string finishIdentity(std::string id, const fs::path &rootAbs) {
 	static const std::string ext = ".jam";
 	if (id.size() > ext.size() &&
 	    id.compare(id.size() - ext.size(), ext.size(), ext) == 0) {
 		id.resize(id.size() - ext.size());
 	}
-	// A `<dir>/mod.jam` index file shares its directory's identity, so
-	// `import("foo")` and `import("foo/mod")` name one module — matching
-	// `resolve`, which maps a bare `import("foo")` to `foo/mod.jam`.
 	static const std::string modSuffix = "/mod";
 	if (id.size() > modSuffix.size() &&
-	    id.compare(id.size() - modSuffix.size(), modSuffix.size(),
-	               modSuffix) == 0) {
-		id.resize(id.size() - modSuffix.size());
+	    id.compare(id.size() - modSuffix.size(), modSuffix.size(), modSuffix) ==
+	        0) {
+		std::string collapsed = id.substr(0, id.size() - modSuffix.size());
+		std::error_code ec;
+		if (!fs::exists(rootAbs / (collapsed + ext), ec)) {
+			id = std::move(collapsed);
+		}
 	}
 	return id;
+}
+
+// Identity of `resolvedFile` relative to `rootAbs`, or "" when the file
+// is not under that root.
+std::string identityUnder(const std::string &resolvedFile,
+                          const fs::path &rootAbs) {
+	std::error_code ec;
+	fs::path rel = fs::relative(resolvedFile, rootAbs, ec);
+	if (ec || rel.empty()) return "";
+	std::string id = rel.generic_string();
+	if (id.rfind("..", 0) == 0 || id == ".") return "";
+	return finishIdentity(std::move(id), rootAbs);
+}
+
+}  // namespace
+
+std::string
+ModuleResolver::moduleIdentity(const std::string &resolvedFile) const {
+	// Map a resolved (canonical) module file to the stable identity used
+	// as both the `loadedModules` cache key and the `modulePath`
+	// mangling prefix, so the same file reached via different spellings
+	// is one module. Three tiers:
+	//   1. Under the entry base dir: the entry-relative path, `.jam`
+	//      stripped (`lib/b`). `import("lib/b")` and `import("./b")`
+	//      from `lib/a` agree on `lib/b`.
+	//   2. Under the standard-library root (installed or the in-tree
+	//      dev `std/` fallback): `std/<name>`. `import("fs")` and
+	//      `import("std/fs")` agree on `std/fs` — without this the std
+	//      file loads twice and registers its types under two
+	//      identities.
+	//   3. Anywhere else: the canonical absolute path, `.jam` stripped.
+	//      Out-of-tree imports still converge per file. (The reference
+	//      compiler rejects these outright; jam permits them.)
+	std::error_code ec;
+	fs::path baseAbs = fs::canonical(baseDir, ec);
+	if (!ec) {
+		std::string id = identityUnder(resolvedFile, baseAbs);
+		if (!id.empty()) return id;
+	}
+	if (const auto &root = stdRoot(); root) {
+		fs::path stdAbs = fs::canonical(*root, ec);
+		if (!ec) {
+			std::string id = identityUnder(resolvedFile, stdAbs);
+			if (!id.empty()) return "std/" + id;
+		}
+	}
+	// Dev fallback root (`<CWD>/std`), mirroring resolve()'s last
+	// lookup tier.
+	fs::path devAbs = fs::canonical("std", ec);
+	if (!ec) {
+		std::string id = identityUnder(resolvedFile, devAbs);
+		if (!id.empty()) return "std/" + id;
+	}
+	fs::path abs = fs::path(resolvedFile);
+	std::string id = abs.generic_string();
+	static const std::string ext = ".jam";
+	if (id.size() > ext.size() &&
+	    id.compare(id.size() - ext.size(), ext.size(), ext) == 0) {
+		id.resize(id.size() - ext.size());
+	}
+	return id;
+}
+
+std::string ModuleResolver::canonicalKey(const std::string &importPath) const {
+	if (importPath == "test") return importPath;
+	std::string resolved = resolve(importPath);
+	if (resolved.empty() || resolved == "test") return importPath;
+	std::string id = moduleIdentity(resolved);
+	return id.empty() ? importPath : id;
 }
 
 std::string ModuleResolver::readFile(const std::string &path) const {
@@ -221,6 +284,18 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 		return loadedModules[importPath].get();
 	}
 
+	// Key the cache by the file's canonical identity so every spelling
+	// of the same file shares one module.
+	std::string key = moduleIdentity(resolvedPath);
+	if (key.empty()) key = importPath;
+	return loadModuleAt(key, resolvedPath);
+}
+
+ModuleAST *ModuleResolver::loadModuleAt(const std::string &key,
+                                        const std::string &resolvedPath) {
+	auto it = loadedModules.find(key);
+	if (it != loadedModules.end()) { return it->second.get(); }
+
 	std::string source = readFile(resolvedPath);
 	if (source.empty()) {
 		std::cerr << "Error: Cannot read module file: " << resolvedPath
@@ -244,7 +319,7 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 	// the module in place — by the time codegen / semantic analysis
 	// touches a cyclic-import target, it's complete.
 	ModuleAST *modPtr = module.get();
-	loadedModules[importPath] = std::move(module);
+	loadedModules[key] = std::move(module);
 
 	// Recursively load both regular imports (`const x = import(...)`)
 	// and destructuring imports (`const { X } = import(...)`).
@@ -273,7 +348,11 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 		if (nestedResolved.empty() || nestedResolved == "test") return;
 		std::string id = moduleIdentity(nestedResolved);
 		if (!id.empty()) importPath = id;
-		getOrLoadModule(importPath);
+		// Load the file the nested resolver actually found. Re-resolving
+		// the spelling from the entry dir could bind a DIFFERENT file —
+		// e.g. a user `fmt.jam` beside the entry silently hijacking the
+		// std library's internal `import("fmt")`.
+		loadModuleAt(importPath, nestedResolved);
 	};
 	for (auto &import : modPtr->Imports) { loadNested(import->Path); }
 	for (auto &destImport : modPtr->DestructuringImports) {
@@ -293,14 +372,25 @@ ModuleAST *ModuleResolver::getOrLoadModule(const std::string &importPath) {
 	// asked for that exact symbol to be visible to C callers.
 	for (auto &fn : modPtr->Functions) {
 		if (fn->isExtern || fn->isExport) continue;
-		fn->modulePath = importPath;
+		fn->modulePath = key;
 	}
 	for (auto &s : modPtr->Structs) {
 		for (auto &m : s->Methods) {
 			if (m->isExtern || m->isExport) continue;
-			m->modulePath = importPath;
+			m->modulePath = key;
 		}
 	}
+
+	// Stamp the module path on every type declaration too, so a struct/
+	// enum/union gets a qualified identity (`lib/b.Thing`) and two
+	// modules that each define `pub const Thing = struct {…}` no longer
+	// collide in the global by-name type registries. The entry module
+	// (parsed directly in main.cpp, never via this resolver) keeps an
+	// empty modulePath, so its types stay bare-named.
+	for (auto &s : modPtr->Structs) { s->modulePath = key; }
+	for (auto &e : modPtr->Enums) { e->modulePath = key; }
+	for (auto &u : modPtr->Unions) { u->modulePath = key; }
+	for (auto &c : modPtr->Consts) { c->modulePath = key; }
 
 	return modPtr;
 }

@@ -1,0 +1,18 @@
+// An imported struct with a drop-bearing FIELD (and no own cfn drop)
+// must still fire the field's drop at scope exit in the entry module.
+// Regression: typeNeedsDrop and the field-drop walker once looked the
+// struct up by its BARE name against the qualified-keyed registry,
+// classified `Outer` as plain data, and silently leaked the field.
+
+const { assert } = import("test");
+const { Outer, makeOuter } = import("mod_xmod_fielddrop");
+
+fn build(s: *mut u32) {
+    var o: Outer = makeOuter(s);
+}
+
+tfn importedFieldDropFires() {
+    var hits: u32 = 0;
+    build(&hits);
+    assert(hits, 1);
+}

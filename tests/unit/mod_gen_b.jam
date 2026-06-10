@@ -1,0 +1,14 @@
+// Helper for test_xmod_generics — see mod_gen_a. Different field name
+// AND different method behavior, so a shared instantiation fails
+// loudly (unknown field) or wrongly (bad value).
+pub fn Pair(T: type) type {
+    return struct {
+        y: T,
+        pub fn val(self: Self) T { return self.y + 1000; }
+    };
+}
+
+pub fn makeB() u64 {
+    var p: Pair(u64) = Pair(u64) { y: 9 };
+    return p.val();
+}

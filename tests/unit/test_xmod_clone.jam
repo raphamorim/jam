@@ -1,0 +1,17 @@
+// Cross-module cfn clone: `.clone()` on a value whose clone is defined
+// in an imported module must dispatch to the user clone (not degrade
+// to a bitwise copy), and both the original and the clone drop.
+
+const { assert } = import("test");
+const { Token, makeToken } = import("mod_xmod_clone");
+
+fn cloneBoth(s: *mut u32) {
+    var t: Token = makeToken(s);
+    var c: Token = t.clone();
+}
+
+tfn importedCloneDispatchesAndBothDrop() {
+    var hits: u32 = 0;
+    cloneBoth(&hits);
+    assert(hits, 2);
+}

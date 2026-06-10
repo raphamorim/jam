@@ -1,0 +1,31 @@
+// Helper for test_xmod_enum: a unit enum and a payloaded enum owned by
+// a non-entry module. Regression for the qualified-identity scheme:
+// enum registries key by the qualified name, and every variant
+// reference site (member access, match patterns, the lvalue
+// classifier) must requalify before lookup — including uses inside
+// this module's OWN bodies.
+pub const Signal = enum { Stop, Go, Wait };
+
+pub fn pick() Signal {
+    var s: Signal = Signal.Go;
+    return s;
+}
+
+pub fn classify(s: Signal) u64 {
+    match (s) {
+        Signal.Stop { return 1; }
+        Signal.Go   { return 2; }
+        Signal.Wait { return 3; }
+    }
+    return 0;
+}
+
+pub const Box = enum { Empty, Val(u64) };
+
+pub fn classifyBox(b: Box) u64 {
+    match (b) {
+        Box.Empty  { return 0; }
+        Box.Val(v) { return v; }
+    }
+    return 99;
+}

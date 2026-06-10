@@ -1,0 +1,8 @@
+// Helper for test_xmod_comp_fns — see mod_comp_a.
+pub fn scale(comp k: u32, x: u32) u32 {
+    return x + k;
+}
+
+pub fn runB() u32 {
+    return scale(2, 10);
+}

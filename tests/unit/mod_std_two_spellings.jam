@@ -1,0 +1,13 @@
+// Helper for test_std_two_spellings: imports a std module by its BARE
+// spelling while the entry test uses the `std/` spelling. Both must
+// canonicalize to one module identity (`std/collections`) — the same
+// file once loaded twice under two keys, duplicating every type and
+// function it defines.
+const { Vec } = import("collections");
+
+pub fn makeVec() Vec(u8) {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    v.push(2);
+    return v;
+}

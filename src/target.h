@@ -65,6 +65,6 @@ struct Target {
 	CallingConvention getDefaultCC() const;
 };
 
-}
+}  // namespace jam
 
 #endif

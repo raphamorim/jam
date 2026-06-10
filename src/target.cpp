@@ -303,4 +303,4 @@ Target::CallingConvention Target::getDefaultCC() const {
 	return CallingConvention::C;
 }
 
-}
+}  // namespace jam

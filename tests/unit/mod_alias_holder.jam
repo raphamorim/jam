@@ -1,0 +1,18 @@
+// Helper for test_xmod_aliases: a generic, a sibling type, and a type
+// alias whose argument names the sibling. The alias's argument must
+// capture THIS module's `Inner` even when the importer defines its own
+// type of the same name.
+pub const Inner = struct { value: i64 };
+
+pub fn Holder(T: type) type {
+    return struct {
+        inner: T,
+        pub fn val(self: Self) i64 { return self.inner.value; }
+    };
+}
+
+pub const W = Holder(Inner);
+
+pub fn makeHolder(v: i64) Holder(Inner) {
+    return Holder(Inner) { inner: Inner { value: v } };
+}

@@ -138,6 +138,12 @@ class StructDeclAST {
 	std::vector<std::pair<std::string, TypeIdx>> Fields;  // (name, type)
 	std::vector<std::unique_ptr<FunctionAST>> Methods;
 	bool isPub = false;
+	// Owning module's entry-relative identity (e.g. "lib/b"); empty for
+	// the entry module. Stamped post-parse by the module resolver and
+	// used to give same-named types in different modules distinct
+	// qualified identities (`lib/b.Thing`), mirroring how functions are
+	// qualified by `FunctionAST::modulePath`.
+	std::string modulePath;
 
 	StructDeclAST(std::string Name,
 	              std::vector<std::pair<std::string, TypeIdx>> Fields,
@@ -175,6 +181,9 @@ class EnumDeclAST {
 	std::string Name;
 	std::vector<EnumVariantAST> Variants;
 	bool isPub = false;
+	// Owning module's entry-relative identity; empty for the entry
+	// module. See StructDeclAST::modulePath.
+	std::string modulePath;
 
 	EnumDeclAST(std::string Name, std::vector<EnumVariantAST> Variants)
 	    : Name(std::move(Name)), Variants(std::move(Variants)) {}
@@ -197,6 +206,9 @@ class UnionDeclAST {
 	std::string Name;
 	std::vector<std::pair<std::string, TypeIdx>> Fields;  // (name, type)
 	bool isPub = false;
+	// Owning module's entry-relative identity; empty for the entry
+	// module. See StructDeclAST::modulePath.
+	std::string modulePath;
 
 	UnionDeclAST(std::string Name,
 	             std::vector<std::pair<std::string, TypeIdx>> Fields)
@@ -227,6 +239,9 @@ class ConstDeclAST {
 	// plain const with a non-foldable init only errors when a comp
 	// position consumes it; a comp const errors at the declaration).
 	bool isComp = false;
+	// Owning module's entry-relative identity; empty for the entry
+	// module. See StructDeclAST::modulePath.
+	std::string modulePath;
 
 	ConstDeclAST(std::string Name, TypeIdx DeclaredType, NodeIdx InitExpr)
 	    : Name(std::move(Name)), DeclaredType(DeclaredType),

@@ -1,0 +1,6 @@
+// Imports conv_b by its bare spelling; the entry uses `./conv_b`.
+const { Thing, make } = import("conv_b");
+
+pub fn makeViaA() Thing {
+    return make();
+}

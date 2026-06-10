@@ -533,7 +533,15 @@ class TypePool {
 		return pushKey(k);
 	}
 
-	const TypeKey &get(TypeIdx i) const { return keys_[i]; }
+	// Returned BY VALUE deliberately: interning can reallocate `keys_`,
+	// and resolution code routinely interns (module-qualified names,
+	// instantiation results) while still holding the result of an
+	// earlier get(). A reference would dangle and read freed memory —
+	// this fired in practice as an "unsupported `as` cast" whose
+	// destination TypeKey read as Invalid. The 12-byte copy is free;
+	// existing `const TypeKey &k = pool.get(i)` callers bind the
+	// temporary with extended lifetime.
+	TypeKey get(TypeIdx i) const { return keys_[i]; }
 	std::size_t size() const { return keys_.size(); }
 
 	// Convenience constructors that intern in one call.

@@ -1,0 +1,20 @@
+// Helper for test_xmod_fielddrop: a drop-bearing struct and an
+// aggregate holding it as a FIELD (no own drop). The aggregate's
+// drop-bearing-ness is derived transitively from its fields, so the
+// classification sites must resolve this module's structs by their
+// qualified identity.
+pub const XThing = struct {
+    sink: *mut u32,
+    cfn drop(self: mut XThing) {
+        var p: *mut u32 = self.sink;
+        p.* = p.* + 1;
+    }
+};
+
+pub const Outer = struct {
+    thing: XThing,
+};
+
+pub fn makeOuter(s: *mut u32) Outer {
+    return Outer { thing: XThing { sink: s } };
+}

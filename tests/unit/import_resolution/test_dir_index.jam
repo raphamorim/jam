@@ -1,0 +1,14 @@
+// modfile.jam vs modfile/mod.jam: a direct file and a directory-index
+// module sharing one name are two distinct modules. The identity
+// collapse of `<dir>/mod` to `<dir>` is guarded on the direct file's
+// absence — when both exist, a nested `import("modfile/mod")` once
+// silently bound modfile.jam instead.
+
+const { assert } = import("test");
+const f = import("modfile");
+const nested = import("nest_dir");
+
+tfn directFileAndDirIndexAreDistinct() {
+    assert(f.which(), 1);
+    assert(nested.viaNested(), 2);
+}

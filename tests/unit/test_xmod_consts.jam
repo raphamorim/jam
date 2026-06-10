@@ -1,0 +1,35 @@
+// Module consts are per-module. The const registry and the comptime
+// scope it seeds were once ONE flat bare-name map shared by every
+// module (entry registered last, so it won every collision): a body
+// reading `N` could get another module's value, and a comptime array
+// length `[SIZE]u8` folded against whichever module registered last.
+// Consts now register under their owner-qualified identity and each
+// body's comptime scope seeds only its own module's (+ destructured)
+// consts.
+
+const { assert } = import("test");
+const a = import("mod_const_a");
+const b = import("mod_const_b");
+
+// The entry's own same-named consts must not leak into the modules.
+comp const N = 77;
+comp const SIZE = 11;
+
+tfn eachModuleReadsItsOwnConst() {
+    assert(a.readN(), 4);
+    assert(b.readN(), 9);
+}
+
+tfn comptimeArrayLengthsFoldPerModule() {
+    assert(a.lastSlot(), 42);
+    assert(b.lastSlot(), 42);
+    assert(a.sizeOfBuf(), 3);
+    assert(b.sizeOfBuf(), 5);
+}
+
+tfn entryReadsItsOwnConsts() {
+    var n: u32 = N;
+    var s: u32 = SIZE;
+    assert(n, 77);
+    assert(s, 11);
+}

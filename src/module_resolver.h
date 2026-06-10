@@ -26,6 +26,14 @@ class ModuleResolver {
 
 	std::string resolve(const std::string &importPath) const;
 
+	// Canonical cache key for an import spelling: resolve it, then map
+	// the file to its stable identity (entry-relative, `std/<name>` for
+	// standard-library files, or the absolute path for out-of-tree
+	// files). Distinct spellings of one file agree on the key; returns
+	// the spelling unchanged when resolution fails (the load will then
+	// report the error) or for the `test` builtin.
+	std::string canonicalKey(const std::string &importPath) const;
+
 	ModuleAST *getOrLoadModule(const std::string &importPath);
 
 	bool isLoaded(const std::string &importPath) const;
@@ -51,10 +59,19 @@ class ModuleResolver {
 	std::vector<std::unique_ptr<EnumDeclAST>> *sharedAnonEnums_ = nullptr;
 	std::unordered_map<std::string, std::unique_ptr<ModuleAST>> loadedModules;
 
-	// Canonical entry-relative identity for a resolved module file, used
-	// as the cache key and `modulePath` prefix. Empty when the file lies
-	// outside the base dir (e.g. std-library modules).
+	// Canonical identity for a resolved module file, used as the cache
+	// key and `modulePath` prefix: entry-relative for in-tree files,
+	// `std/<name>` for standard-library files, the absolute path for
+	// out-of-tree files. Empty only when canonicalization fails.
 	std::string moduleIdentity(const std::string &resolvedFile) const;
+
+	// Load (or return the cached) module for `key`, reading from
+	// `resolvedPath` — the file the caller already resolved. Never
+	// re-resolves: a nested import loads the file its own module's
+	// resolver found, not whatever the entry dir happens to shadow it
+	// with.
+	ModuleAST *loadModuleAt(const std::string &key,
+	                        const std::string &resolvedPath);
 
 	std::string readFile(const std::string &path) const;
 

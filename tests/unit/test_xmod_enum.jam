@@ -1,0 +1,40 @@
+// Cross-module enums. Regression: enum registries key by the
+// module-qualified identity, but the variant-reference sites in astgen
+// (member access for `Enum.Variant`, match-pattern receivers, the
+// non-lvalue classifier) once looked up the BARE source name — every
+// enum owned by a non-entry module failed with
+// `unknown lvalue variable` at its first variant use, even inside the
+// defining module's own bodies.
+
+const { assert } = import("test");
+const { Signal, pick, classify, Box, classifyBox } = import("mod_xmod_enum");
+
+tfn definingModuleConstructsOwnVariants() {
+    assert(classify(pick()), 2);
+}
+
+tfn entryConstructsImportedUnitVariant() {
+    var s: Signal = Signal.Wait;
+    assert(classify(s), 3);
+}
+
+tfn entryMatchesImportedEnumByName() {
+    var s: Signal = Signal.Stop;
+    match (s) {
+        Signal.Stop { assert(1, 1); }
+        _           { assert(1, 0); }
+    }
+}
+
+tfn entryPassesImportedVariantAsArg() {
+    assert(classify(Signal.Go), 2);
+}
+
+tfn importedPayloadVariantConstructsAndMatches() {
+    assert(classifyBox(Box.Val(42)), 42);
+    var b: Box = Box.Empty;
+    match (b) {
+        Box.Empty  { assert(1, 1); }
+        Box.Val(v) { assert(v, 0); }
+    }
+}

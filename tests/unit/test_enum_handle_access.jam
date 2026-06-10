@@ -1,0 +1,25 @@
+// Handle-qualified enum access: `a.Status.Bad(5)` construction,
+// `a.Status.Ok` unit-variant expressions, and `a.Status.Variant` match
+// patterns. None of these had a working spelling before: the multi-dot
+// call path covered struct methods only, the member-access path only
+// bare Variable receivers, and the pattern grammar stopped at one dot.
+
+const { assert } = import("test");
+const a = import("mod_status");
+
+tfn handleQualifiedPayloadCtor() {
+    assert(a.describe(a.Status.Bad(5)), 5);
+}
+
+tfn handleQualifiedUnitVariantExpr() {
+    var s: a.Status = a.Status.Ok;
+    assert(a.describe(s), 0);
+}
+
+tfn handleQualifiedPattern() {
+    var s: a.Status = a.Status.Bad(7);
+    match (s) {
+        a.Status.Ok     { assert(1, 0); }
+        a.Status.Bad(c) { assert(c, 7); }
+    }
+}

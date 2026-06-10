@@ -1,0 +1,8 @@
+// A user file deliberately named after a std module (`fmt`). It must
+// NOT replace the std library's fmt inside std's own imports — only
+// the user's own `import("fmt")` binds here. Defines no `print`, so if
+// std's internal `import("fmt")` ever mis-resolved to this file,
+// `std.fmt.print` would fail to compile.
+pub fn userFmtMarker() u64 {
+    return 77;
+}

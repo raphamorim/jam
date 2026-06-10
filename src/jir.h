@@ -309,6 +309,11 @@ class JirFunction {
 	// in; carrying intent keeps the door open.
 	std::vector<ParamMode> paramModes;
 	TypeIdx returnType = kNoType;
+	// Owning module's identity (FunctionAST::modulePath). The JIR-
+	// consuming passes (verify, init-analysis, define-body) push this as
+	// the body module so bare body-level type references resolve to their
+	// owning module — the same role currentBodyModule() plays in astgen.
+	std::string modulePath;
 	bool isExtern = false;
 	bool isExport = false;
 	bool isPub = false;

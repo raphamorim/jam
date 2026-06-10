@@ -1,0 +1,15 @@
+// Same-named comp-param fns in two modules. The per-call-site clone
+// cache was once keyed by the BARE name + comp-arg suffix
+// (`scale__u2`), so both modules shared one cache slot and whichever
+// instantiated first answered for both — runA()/runB() silently
+// returned the same value. The key now carries the callee's qualified
+// identity.
+
+const { assert } = import("test");
+const a = import("mod_comp_a");
+const b = import("mod_comp_b");
+
+tfn sameNamedCompFnsStayDistinct() {
+    assert(a.runA() as u64, 20);
+    assert(b.runB() as u64, 12);
+}

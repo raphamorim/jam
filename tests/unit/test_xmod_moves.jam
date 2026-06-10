@@ -1,0 +1,36 @@
+// Move tracking for imported drop-bearing types used in the entry
+// module. Regression: the analyzer's move gates and method-mode lookup
+// once used BARE names against qualified-keyed registries — a bare
+// store of an imported drop-bearing value wasn't tracked as a move and
+// the value dropped TWICE (double-free), and a move-mode method arg
+// went unseen with the same result. Each scenario must drop exactly
+// once.
+
+const { assert } = import("test");
+const { Token, makeToken, Eater, makeEater } = import("mod_xmod_moves");
+
+fn moveOnce(s: *mut u32) {
+    var t: Token = makeToken(s);
+    // Bare drop-bearing var-init MOVES `t`; only `a` drops at exit.
+    var a = t;
+}
+
+tfn bareMoveOfImportedDropBearingDropsOnce() {
+    var hits: u32 = 0;
+    moveOnce(&hits);
+    assert(hits, 1);
+}
+
+fn methodMove(s: *mut u32) {
+    var t: Token = makeToken(s);
+    var e: Eater = makeEater();
+    // move-mode arg: the callee owns and drops `t`; the caller's
+    // scope-exit drop is suppressed.
+    e.eat(t);
+}
+
+tfn moveModeMethodArgDropsOnce() {
+    var hits: u32 = 0;
+    methodMove(&hits);
+    assert(hits, 1);
+}

@@ -1,0 +1,14 @@
+// Helper for test_samename_struct_collision: defines a `Pair` whose
+// layout differs from mod_samename_a's `Pair` (two fields, not one).
+pub const Pair = struct {
+    a: u64,
+    b: u64,
+};
+
+pub fn mk() Pair {
+    return Pair { a: 20, b: 22 };
+}
+
+pub fn sum(p: Pair) u64 {
+    return p.a + p.b;
+}

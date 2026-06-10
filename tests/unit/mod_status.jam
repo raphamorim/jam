@@ -1,0 +1,14 @@
+// Helper for test_enum_handle_access: a payloaded enum used through an
+// import handle.
+pub const Status = enum {
+    Ok,
+    Bad(u32),
+};
+
+pub fn describe(s: Status) u32 {
+    match (s) {
+        Status.Ok     { return 0; }
+        Status.Bad(c) { return c; }
+    }
+    return 99;
+}

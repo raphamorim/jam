@@ -64,22 +64,22 @@ enum TokenType {
 	TOK_STRUCT,
 	TOK_UNION,
 	TOK_ENUM,
-	TOK_STAR,       // * (pointer prefix; multiplication)
-	TOK_SLASH,      // / (division)
-	TOK_PERCENT,    // % (modulo)
-	TOK_AMP,        // & (bitwise AND; address-of)
-	TOK_PIPE,       // | (bitwise OR)
-	TOK_CARET,      // ^ (bitwise XOR)
-	TOK_TILDE,      // ~ (bitwise NOT)
-	TOK_LSHIFT,     // << (left shift)
-	TOK_RSHIFT,     // >> (right shift)
+	TOK_STAR,     // * (pointer prefix; multiplication)
+	TOK_SLASH,    // / (division)
+	TOK_PERCENT,  // % (modulo)
+	TOK_AMP,      // & (bitwise AND; address-of)
+	TOK_PIPE,     // | (bitwise OR)
+	TOK_CARET,    // ^ (bitwise XOR)
+	TOK_TILDE,    // ~ (bitwise NOT)
+	TOK_LSHIFT,   // << (left shift)
+	TOK_RSHIFT,   // >> (right shift)
 	TOK_MOVE,
-	TOK_ELLIPSIS,   // ... (variadic marker in extern fn parameters)
+	TOK_ELLIPSIS,  // ... (variadic marker in extern fn parameters)
 	TOK_MATCH,
 	TOK_DOTDOT,     // .. (exclusive range / slice)
 	TOK_DOTDOT_EQ,  // ..= (inclusive range in match patterns)
 	TOK_AS,
-	TOK_AT,         // @
+	TOK_AT,  // @
 	TOK_COMP,
 	TOK_INLINE,
 };

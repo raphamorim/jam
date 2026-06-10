@@ -1,0 +1,8 @@
+// Imports the directory-index module from a NESTED module, exercising
+// the nested-resolution path where the identity collapse of
+// `<dir>/mod` once swallowed the distinct sibling modfile.jam.
+const fm = import("modfile/mod");
+
+pub fn viaNested() u64 {
+    return fm.which();
+}

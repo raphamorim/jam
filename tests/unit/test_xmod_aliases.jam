@@ -1,0 +1,18 @@
+// Type aliases are per-module. The flat alias table was once keyed by
+// bare name for every module (entry wins collisions), and an alias's
+// generic ARGUMENTS were interned as bare names that requalified
+// against the CONSUMER's module — `W = Holder(Inner)` could capture
+// the importer's `Inner`. Aliases now register owner-qualified with
+// their targets requalified against the owning module.
+
+const { assert } = import("test");
+const { W, makeHolder } = import("mod_alias_holder");
+
+// Entry defines its own unrelated Inner; W must still mean
+// Holder(<owner's Inner>).
+const Inner = struct { flag: bool };
+
+tfn aliasArgsCaptureOwnersTypes() {
+    var w: W = makeHolder(77);
+    assert(w.val() as u64, 77);
+}

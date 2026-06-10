@@ -177,9 +177,7 @@ NodeIdx Parser::parsePrimary() {
 	// `match (…) { … }` is also valid in expression position so it can
 	// produce a value. The same call works for both statement and
 	// expression forms; the codegen builds a phi over arm values.
-	if (check(TOK_MATCH)) {
-	    return parseMatch();
-	}
+	if (check(TOK_MATCH)) { return parseMatch(); }
 
 	// `@name(arg, ...)` — compiler intrinsic invocation. Two encoding
 	// shapes:
@@ -882,10 +880,21 @@ NodeIdx Parser::parsePatternAtom() {
 		advance();  // consume enum name
 		if (match(TOK_DOT)) {
 			consume(TOK_IDENTIFIER, "Expected variant name after `.`");
-			StringIdx enumNameId =
-			    stringPool->intern(tokens[saved].text(source_));
-			StringIdx variantNameId =
-			    stringPool->intern(previous().text(source_));
+			// Handle-qualified receivers: `a.Status.Ok` parses as
+			// receiver `a.Status` + variant `Ok` — every segment before
+			// the last joins the receiver chain (the lowering resolves
+			// it through the import-handle namespace), the last names
+			// the variant.
+			std::string recvName(tokens[saved].text(source_));
+			std::string lastSeg(previous().text(source_));
+			while (match(TOK_DOT)) {
+				consume(TOK_IDENTIFIER, "Expected variant name after `.`");
+				recvName += ".";
+				recvName += lastSeg;
+				lastSeg = std::string(previous().text(source_));
+			}
+			StringIdx enumNameId = stringPool->intern(recvName);
+			StringIdx variantNameId = stringPool->intern(lastSeg);
 
 			// Optional payload binding: `(name1, name2, ...)`. Empty
 			// list `()` is permitted and equivalent to no parens.

@@ -1,0 +1,10 @@
+// Helper for test_entry_relative_convergence — the module both
+// spellings (`./conv_b` from the entry, `conv_b` from conv_a) must
+// agree on.
+pub const Thing = struct {
+    value: u64,
+};
+
+pub fn make() Thing {
+    return Thing { value: 5 };
+}

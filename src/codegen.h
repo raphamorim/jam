@@ -22,6 +22,17 @@
 #include <unordered_set>
 #include <vector>
 
+// Module-qualified identity for a type/decl: `modulePath.name`, or just
+// `name` for the entry module (empty modulePath). This is the single key
+// under which a type registers and resolves, so two modules that each
+// define `Thing` get distinct identities (`a.Thing` vs `lib/b.Thing`).
+// Mirrors how `mangledFunctionName` qualifies functions by modulePath.
+inline std::string qualifyTypeName(const std::string &modulePath,
+                                   const std::string &name) {
+	if (modulePath.empty()) return name;
+	return modulePath + "." + name;
+}
+
 // Forward declarations for AST types referenced by pointer/reference
 // here. Full definitions live in ast.h, included by ast.cpp / codegen.cpp.
 class FunctionAST;
@@ -88,6 +99,26 @@ class JamCodegenContext {
 	const StructInfo *lookupStruct(TypeIdx ty) const;
 	int getFieldIndex(const std::string &structName,
 	                  const std::string &fieldName) const;
+
+	// Record that, within module `ctxModule`, the bare type name
+	// `typeName` denotes a type owned by `ownerModule` — either because
+	// `ctxModule` declares it (ownerModule == ctxModule) or imports it
+	// (a destructuring import names another module's `pub` type). Built
+	// once up front in main.cpp; consulted by `requalifyType`.
+	void registerTypeOwner(const std::string &ctxModule,
+	                       const std::string &typeName,
+	                       const std::string &ownerModule);
+
+	// Rewrite a type so every bare user-type leaf is replaced by its
+	// module-qualified identity, as seen from `ctxModule`. A bare
+	// `Named("Thing")` referenced inside module `m` becomes
+	// `Named("m.Thing")` (own type) or `Named("<src>.Thing")` (imported);
+	// pointer/slice/array/generic-call wrappers are rewritten recursively.
+	// Names already containing a `.` (handle/chained) and names with no
+	// known owner (std, generic params, `Self`, builtins) are left as-is.
+	// This is what gives same-named types in different modules distinct
+	// TypeIdxs, which the per-TypeIdx LLVM-type cache relies on.
+	TypeIdx requalifyType(TypeIdx ty, const std::string &ctxModule) const;
 
 	// Union registry. Untagged unions: every field shares the same
 	// address. UnionInfo carries the union's LLVM storage type plus the
@@ -160,16 +191,28 @@ class JamCodegenContext {
 	// fold at compile time, validated eagerly after registration (see
 	// validateCompConsts) instead of lazily at first comp-position use.
 	// `file` records the declaring module's path so the eager
-	// validation can anchor its diagnostic.
+	// validation can anchor its diagnostic. `bareName`/`owner` carry
+	// the source spelling and owning module so the comptime-scope
+	// seeding can decide per-module visibility and bind the name the
+	// body actually spells.
 	struct ModuleConstInfo {
 		NodeIdx initExpr;
 		TypeIdx declaredType;
 		bool isComp = false;
 		std::string file;
+		std::string bareName;
+		std::string owner;
 	};
-	void registerModuleConst(const std::string &name, NodeIdx init,
+	// `name` is the owner-qualified registry key (`lib/a.LIMIT`; bare
+	// for the entry module).
+	void registerModuleConst(const std::string &name,
+	                         const std::string &bareName,
+	                         const std::string &owner, NodeIdx init,
 	                         TypeIdx declared, bool isComp = false,
 	                         std::string file = std::string());
+	// Resolve a body's bare const spelling against the CURRENT module:
+	// the ownership map gives the owner, the qualified key indexes the
+	// registry. A module never reads another module's same-named const.
 	const ModuleConstInfo *getModuleConst(const std::string &name) const;
 
 	// Eager `comp const` validation: every registered module const
@@ -318,6 +361,13 @@ class JamCodegenContext {
 	mutable std::map<std::string, StructInfo> structs;
 	std::map<std::string, UnionInfo> unions;
 	mutable std::map<std::string, EnumInfo> enums;
+	// Per-module type-name origin: typeModuleOf_[ctxModule][typeName] =
+	// owning module path. Lets `requalifyType` map a bare `Thing` in
+	// module `m` to the module that actually declares it (m itself, or a
+	// destructuring-import source). Populated up front in main.cpp.
+	std::unordered_map<std::string,
+	                   std::unordered_map<std::string, std::string>>
+	    typeModuleOf_;
 	std::map<std::string, ModuleConstInfo> moduleConsts;
 	// (FunctionAST*, IfNode NodeIdx) -> comp-if condition verdict. See
 	// recordCompIfVerdict / lookupCompIfVerdict above.
@@ -613,10 +663,29 @@ class JamCodegenContext {
 			auto tIt = mIt->second.typeAliases.find(name);
 			if (tIt != mIt->second.typeAliases.end()) return tIt->second;
 		}
-		// Local `const Name = T` aliases live in the flat table (not import-
-		// derived), and stay reachable from any body.
-		auto it = typeAliases_.find(name);
-		if (it != typeAliases_.end()) return it->second;
+		// `const Name = T` aliases register under their owner-qualified
+		// identity. A dotted name IS such an identity (or a handle
+		// spelling, already missed above) — look it up directly. A bare
+		// name resolves through the current module's ownership map, so
+		// a body sees its own module's alias (or a destructure-imported
+		// one), never another module's same-named alias.
+		if (name.find('.') != std::string::npos) {
+			auto it = typeAliases_.find(name);
+			return it != typeAliases_.end() ? it->second : kNoType;
+		}
+		auto oIt = typeModuleOf_.find(currentBodyModule());
+		if (oIt != typeModuleOf_.end()) {
+			auto tIt = oIt->second.find(name);
+			if (tIt != oIt->second.end()) {
+				auto it = typeAliases_.find(qualifyTypeName(tIt->second, name));
+				if (it != typeAliases_.end()) return it->second;
+			}
+		}
+		// Entry bodies: entry aliases register bare.
+		if (currentBodyModule().empty()) {
+			auto it = typeAliases_.find(name);
+			if (it != typeAliases_.end()) return it->second;
+		}
 		return kNoType;
 	}
 
@@ -683,10 +752,11 @@ class JamCodegenContext {
 	// returns an Enum TypeIdx pointing at it. Memoizes by instantiated
 	// name. Used to materialize `Option(i32)`, `Result(File, Errno)`,
 	// and other sum-type generics on demand.
-	TypeIdx instantiateEnumExpr(
-	    const AstNode &exprNode, const std::string &calleeName,
-	    const std::vector<TypeIdx> &args,
-	    const std::unordered_map<std::string, TypeIdx> &subst) const;
+	TypeIdx
+	instantiateEnumExpr(const AstNode &exprNode, const std::string &calleeName,
+	                    const std::vector<TypeIdx> &args,
+	                    const std::unordered_map<std::string, TypeIdx> &subst,
+	                    const std::string &definingModulePath) const;
 };
 
 // Resolves comptime `Call` nodes (cfn -> cfn) for a ComptimeEvaluator.
