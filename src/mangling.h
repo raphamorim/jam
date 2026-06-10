@@ -14,9 +14,9 @@
 #include <string>
 
 // Translate a FunctionAST into the LLVM-level symbol the linker sees.
-// Modeled on Zig's `Decl.getFullyQualifiedName` (Module.zig:713) —
-// dot-separated, walking up the namespace chain. LLVM accepts `.` in
-// symbol names, so no further escaping is needed.
+// Builds a dot-separated fully-qualified name, walking up the
+// namespace chain. LLVM accepts `.` in symbol names, so no further
+// escaping is needed.
 //
 // The rules:
 //   - `tfn t()` -> `__test_t` (the harness in main.cpp calls these by

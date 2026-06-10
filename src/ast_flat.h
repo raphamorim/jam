@@ -372,8 +372,8 @@ enum class TypeKind : uint8_t {
 	// are values of this type only at compile time; codegen rejects any
 	// attempt to lower a Module-typed JIR ref to LLVM.
 	//
-	// Mirrors Zig's "file = zero-field struct with namespace" pattern,
-	// but kept distinct from TypeKind::Struct so module values can't be
+	// Modeled as a zero-field struct that carries a namespace, but
+	// kept distinct from TypeKind::Struct so module values can't be
 	// confused with user-defined aggregates.
 	Module,
 	// Function-typed value: a pointer to a function with a known

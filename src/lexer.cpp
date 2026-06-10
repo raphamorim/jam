@@ -53,7 +53,7 @@ void Lexer::skipWhitespace() {
 				break;
 			}
 			// `/*` is NOT a comment — jam has only `//` line comments
-			// (same deliberate choice as Zig: greppable, no nesting
+			// (a deliberate choice: greppable, no nesting
 			// rules). Without this check the `/` lexes as divide and the
 			// parser reports a baffling "Expected primary expression".
 			if (peekNext() == '*') {

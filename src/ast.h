@@ -85,12 +85,12 @@ class FunctionAST {
 	std::string parentStruct;
 
 	// Path of the module this function was declared in (e.g. "timer"
-	// for code in timer.jam). Empty for the entry module (matching
-	// Zig's behavior where the root file scope is the unqualified
+	// for code in timer.jam). Empty for the entry module (whose
+	// root file scope is the unqualified
 	// namespace) and for generic clones that already carry qualified
 	// names. ModuleResolver stamps this when a module is loaded.
 	//
-	// Combined with parentStruct, the mangler can emit Zig-style
+	// Combined with parentStruct, the mangler can emit
 	// dotted LLVM symbols (`timer.Timer.read32`) so same-named
 	// methods or free fns in different modules don't collide.
 	std::string modulePath;

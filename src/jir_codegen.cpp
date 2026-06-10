@@ -588,13 +588,13 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		// JirRef VALUE is the storage pointer, never a materialized
 		// aggregate in SSA. Skip the trailing `load %T, ptr %gep`;
 		// downstream Store / Ret / arg-passing then sees a byref pointer
-		// and emits memcpy / pointer-forward. Mirrors the byref branch in
-		// Zig's airSliceElemVal / airPtrElemVal / airArrayElemVal
-		// (references/zig-0.10.1 src/codegen/llvm.zig ~5678/5716/5745):
-		// they do the same GEP + return-pointer-for-byref-elem. jam's
-		// universal "byref JirRef = pointer" invariant means we don't
-		// need Zig's `loadByRef` fallback — every downstream byref
-		// consumer (Store/Ret/Call) already memcpy's from the pointer.
+		// and emits memcpy / pointer-forward. This is the byref branch
+		// for slice / many-ptr / array element access: do the GEP and
+		// return the element pointer rather than loading the value.
+		// jam's universal "byref JirRef = pointer" invariant means we
+		// don't need a load-by-reference fallback — every downstream
+		// byref consumer (Store/Ret/Call) already memcpy's from the
+		// pointer.
 		// Without this guard the aggregate was loaded into SSA, but the
 		// byref consumer still treated the JirRef as a pointer — the
 		// result was a malformed memcpy passing a struct value where a
@@ -622,10 +622,9 @@ static JamValueRef emitInstImpl(JirCodegenCtx &lctx, JirRef r) {
 		}
 		// Array case. Arrays are byref (abi::isByRef is always true for
 		// TypeKind::Array), so `emitInst` returns a *pointer* to the
-		// backing storage — GEP straight into it, mirroring Zig's
-		// airArrayElemVal byref branch (references/zig-0.10.1
-		// src/codegen/llvm.zig:5724: resolveInst gives a pointer, then
-		// inBoundsGEP {0, idx}). The previous code unconditionally
+		// backing storage — GEP straight into it: resolving the base
+		// gives a pointer, then an in-bounds GEP of {0, idx} indexes the
+		// element. The previous code unconditionally
 		// spilled `base` into a fresh alloca; for a byref base that
 		// stores the *pointer bits* into a [N]T slot and then indexes
 		// garbage — the bug behind module-const array reads (`TABLE[i]`)

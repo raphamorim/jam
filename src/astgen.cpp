@@ -639,9 +639,9 @@ static JirRef astgenNumberLit(AstGenCtx &gctx, const AstNode &n,
 // Pointer decay: a string literal is a NUL-terminated `u8` array constant,
 // so when the use site expects a many-/single-item pointer to u8
 // (`*const[] u8`, `*mut[] u8`, `*const u8`) it lowers to the bare global
-// pointer instead of a fat slice. This mirrors Zig, where a literal's type
-// `*const [N:0]u8` coerces to `[*]const u8` / `[*c]const u8` (Sema.zig's
-// `src_array_ptr` array-pointer decay). It is what lets a literal be passed
+// pointer instead of a fat slice. A NUL-terminated array constant
+// coerces to a many- or single-item pointer through array-pointer
+// decay. It is what lets a literal be passed
 // straight to C FFI — `snprintf(.., "n=%d", ..)` — without an explicit
 // `.ptr`, while a runtime `[]u8` slice (which carries no static NUL
 // guarantee) still requires `.ptr`. The decay is keyed on the EXPECTED
@@ -716,8 +716,8 @@ static TypeIdx resolveScalarExpected(AstGenCtx &gctx, TypeIdx t) {
 }
 
 // Does a comp integer value fit in `width`/`isSigned` without changing
-// its numeric meaning? Mirrors Zig's "type 'u8' cannot represent
-// integer value '256'" check.
+// its numeric meaning? Rejects cases like a u8 that cannot represent
+// the integer value 256.
 static bool compIntFits(const jam::ComptimeValue &v, uint16_t width,
                         bool isSigned) {
 	if (width >= 64) {
@@ -2320,7 +2320,7 @@ static JirRef astgenArrayRepeat(AstGenCtx &gctx, const AstNode &n,
 		                   "element explicitly");
 	}
 
-	// Zig-style fill: a constant byte fill (especially `[0; N]`)
+	// Constant-byte fill: a constant byte fill (especially `[0; N]`)
 	// lowers to one memset instead of N unrolled IndexAddr+Store.
 	// memset covers any zero fill (zeros every element type) and a
 	// byte-element fill; other constant fills use the per-element path.
@@ -5401,8 +5401,8 @@ static JirRef astgenAtCall(AstGenCtx &gctx, const AstNode &n) {
 		// linker) on Linux. Sourced from the host target, which is the
 		// only target today; switch to the selected target once
 		// cross-compilation lands.
-		// `isDarwin` follows Zig (std.Target.Os.Tag.isDarwin = the Apple
-		// family). Jam's OS enum only has MacOS today, so it reduces to
+		// `isDarwin` covers the Apple OS family. Jam's OS enum only has
+		// MacOS today, so it reduces to
 		// that and widens automatically if iOS/tvOS/etc. are ever added.
 		// `isUnix` is "not Windows" for the current enum.
 		jam::OS os = jam::Target::getHostTarget().os;
@@ -5419,8 +5419,8 @@ static JirRef astgenAtCall(AstGenCtx &gctx, const AstNode &n) {
 		return emit(gctx, inst);
 	}
 	if (name == "os") {
-		// `@os()` → the OS name as a `[]u8`, mirroring Zig's
-		// `@tagName(builtin.os.tag)` (e.g. "macos", "linux"). This is the
+		// `@os()` → the OS name as a `[]u8` (e.g. "macos", "linux"),
+		// the tag name of the current OS. This is the
 		// display form: unlike the boolean predicates it does NOT fold a
 		// branch (string `==` isn't comptime-evaluated), so keep using
 		// `@isDarwin()` & co. for conditional compilation / dead-code
@@ -5661,8 +5661,8 @@ static JirRef lowerArgInner(AstGenCtx &gctx, NodeIdx argIdx, const Param &p) {
 		// A runtime slice does not implicitly decay to a pointer parameter;
 		// passing a {ptr,len} aggregate where the callee expects a bare
 		// pointer silently corrupts the ABI (e.g. desyncs C varargs).
-		// Require an explicit `.ptr`, matching Zig (a `[]T` slice has no
-		// static NUL guarantee, so it never coerces to `[*]T`). String
+		// Require an explicit `.ptr`: a `[]T` slice has no static NUL
+		// guarantee, so it never coerces to a many-item pointer. String
 		// literals decay in astgenStringLit, so they arrive here already
 		// typed as a pointer and skip this check.
 		const TypeKey &vk = gctx.ctx.getTypePool().get(gctx.jfn.getInst(v).ty);
@@ -6732,9 +6732,9 @@ static JirRef astgenCall(AstGenCtx &gctx, const AstNode &n, JirRef destPtr) {
 	// not as a regular function call.
 	if (callee == "assert") { return astgenAssertCall(gctx, n); }
 
-	// Multi-dot qualified call: `handle.Struct.method(args)`. Mirrors
-	// Zig's `container_ty.getNamespace().lookupInNamespace(name)`
-	// (Sema.zig:5295) — methods on imported structs live under the
+	// Multi-dot qualified call: `handle.Struct.method(args)`. Looks up
+	// the method in the container type's namespace — methods on
+	// imported structs live under the
 	// importer's namespace handle, not in a flat global table. The
 	// registration site in main.cpp puts these under the key
 	// `handle.Struct.method`; we look them up directly here.
