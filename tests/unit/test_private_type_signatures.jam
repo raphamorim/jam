@@ -1,0 +1,15 @@
+// A module whose pub fns traffic in a PRIVATE struct. Private types
+// were once never registered at all — the module's own signatures
+// failed to resolve (`unknown module handle` on the compiler's own
+// qualified identity) unless some other module happened to define a
+// same-named type that collided into the same registry slot. They now
+// register under their qualified identity; the importer passes the
+// values through opaquely. (Privacy still holds: naming the type via a
+// handle is rejected — pinned by the C++ namespace-access tests.)
+
+const { assert } = import("test");
+const { makeInner, readInner } = import("mod_private_type");
+
+tfn privateTypeFlowsThroughPubFns() {
+    assert(readInner(makeInner(41)), 41);
+}

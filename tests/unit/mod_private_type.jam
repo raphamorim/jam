@@ -1,0 +1,16 @@
+// Helper for test_private_type_signatures: a PRIVATE struct used in
+// this module's own pub-fn signatures. Private types register under
+// their qualified identity so these signatures resolve; importers can
+// only touch the values opaquely (through the pub fns), never name the
+// type.
+const Inner = struct {
+    value: u32,
+};
+
+pub fn makeInner(v: u32) Inner {
+    return Inner { value: v };
+}
+
+pub fn readInner(i: Inner) u32 {
+    return i.value;
+}
