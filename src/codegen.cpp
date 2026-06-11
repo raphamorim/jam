@@ -182,11 +182,14 @@ JamTypeRef JamCodegenContext::getLLVMType(TypeIdx ty) const {
 			result = getLLVMType(substTarget);
 			break;
 		}
-		if (const auto *sinfo = getStruct(name)) {
+		bool privacyBlocked = handlePrivacyBlocked(name);
+		if (const auto *sinfo = privacyBlocked ? nullptr : getStruct(name)) {
 			result = sinfo->type;
-		} else if (const auto *uinfo = getUnion(name)) {
+		} else if (const auto *uinfo =
+		               privacyBlocked ? nullptr : getUnion(name)) {
 			result = uinfo->type;
-		} else if (const auto *einfo = getEnum(name)) {
+		} else if (const auto *einfo =
+		               privacyBlocked ? nullptr : getEnum(name)) {
 			// Unit-only enums lower to i8. Payloaded enums lower
 			// to {i8, [N x i8]} via the named struct type set during
 			// declaration.
@@ -304,6 +307,11 @@ JamCodegenContext::lookupStruct(TypeIdx ty) const {
 	// resolved per-instantiation during method body codegen).
 	TypeIdx substTarget = lookupCurrentSubst(name);
 	if (substTarget != kNoType) { return lookupStruct(substTarget); }
+	// A handle-spelled reference to another module's PRIVATE type must
+	// miss (the caller's error path then reports `is not exported`),
+	// even when the handle name coincides with the module identity the
+	// registry keys by.
+	if (handlePrivacyBlocked(name)) { return nullptr; }
 	if (const StructInfo *direct = getStruct(name)) { return direct; }
 	// try the type alias table — `const BoxI32 = Box(i32);`
 	// maps `BoxI32` to the instantiated struct's TypeIdx.
@@ -510,6 +518,7 @@ JamCodegenContext::lookupUnion(TypeIdx ty) const {
 		return nullptr;
 	}
 	const std::string &name = stringPool.get(static_cast<StringIdx>(k.a));
+	if (handlePrivacyBlocked(name)) return nullptr;
 	if (const UnionInfo *direct = getUnion(name)) return direct;
 	if (name.find('.') != std::string::npos) {
 		TypeIdx chained = resolveChainedType(name);
@@ -584,6 +593,7 @@ JamCodegenContext::lookupEnum(TypeIdx ty) const {
 		return nullptr;
 	}
 	const std::string &name = stringPool.get(static_cast<StringIdx>(k.a));
+	if (handlePrivacyBlocked(name)) return nullptr;
 	if (const EnumInfo *direct = getEnum(name)) return direct;
 	// try the type alias table — `const OptI32 =
 	// Option(i32);` maps `OptI32` to the instantiated enum's TypeIdx.
@@ -1648,6 +1658,14 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 	    JamLLVMStructCreateNamed(getContext(), instName.c_str());
 	registerStruct(instName, llvmStruct, instFields);
 
+	// Field-type lowering and Pass 1 signature declaration resolve in
+	// the generic's DEFINING module scope — a field naming the owner's
+	// private sibling type must not trip the trigger-site module's
+	// handle-privacy gate. (Pass 2 bodies push the same module
+	// per-method below.)
+	const_cast<JamCodegenContext &>(*this).pushBodyModule(
+	    definingModulePath_);
+
 	std::vector<JamTypeRef> fieldLLVM;
 	fieldLLVM.reserve(instFields.size());
 	for (const auto &f : instFields) {
@@ -1851,6 +1869,7 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 		if (savedBB) { JamLLVMPositionBuilderAtEnd(getBuilder(), savedBB); }
 	}
 
+	const_cast<JamCodegenContext &>(*this).popBodyModule();
 	return typePool.internNamed(stringPool.intern(instName));
 }
 

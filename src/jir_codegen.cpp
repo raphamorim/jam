@@ -1103,6 +1103,10 @@ void jirDeclarePrototype(const JirFunction &jfn, JamCodegenContext &ctx) {
 	if (externalLinkage) {
 		JamLLVMSetLinkage(reinterpret_cast<JamValueRef>(f),
 		                  JAM_LINKAGE_EXTERNAL);
+		// `export` symbols exist for C callers the optimizer can't see
+		// — pin them in llvm.used so the pre-pipeline internalize /
+		// global-DCE pass in JamLLVMEmitObjectFile never touches them.
+		if (jfn.isExport) { JamLLVMAppendToUsed(ctx.getModule(), f); }
 		JamLLVMSetFunctionCallConv(f, JAM_CALLCONV_C);
 		// C ABI requires bool args / returns to be zero-extended to
 		// the underlying register width. Internal-linkage callers use

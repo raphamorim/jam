@@ -37,6 +37,9 @@
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
+#include "llvm/Transforms/IPO/Internalize.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <cstring>
 
@@ -508,6 +511,11 @@ void JamLLVMApplyDefaultFnAttrs(JamFunctionRef func, bool isExtern) {
 
 void JamLLVMSetFunctionNoReturn(JamFunctionRef func) {
 	UNWRAP_FUNCTION(func)->addFnAttr(llvm::Attribute::NoReturn);
+}
+
+void JamLLVMAppendToUsed(JamModuleRef mod, JamFunctionRef func) {
+	llvm::GlobalValue *gv = UNWRAP_FUNCTION(func);
+	llvm::appendToUsed(*UNWRAP_MODULE(mod), {gv});
 }
 
 void JamLLVMAddParamAttrSret(JamFunctionRef func, unsigned argIdx,
@@ -1256,6 +1264,25 @@ bool JamLLVMEmitObjectFile(JamModuleRef mod, JamTargetMachineRef tm,
 	default:
 		level = llvm::OptimizationLevel::O0;
 		break;
+	}
+
+	// Internalize + strip dead code BEFORE the optimization pipeline.
+	// Every loaded module's every function is emitted eagerly, so a
+	// typical program carries unused std (and project) functions that
+	// the O2/O3 pipeline would otherwise fully optimize — and ISel /
+	// register allocation would lower — only for the linker's
+	// dead-strip to discard the result. `main` is preserved by the
+	// predicate; `export` fns sit in llvm.used (see jirDeclarePrototype
+	// via JamLLVMAppendToUsed), which InternalizePass always respects;
+	// declarations are untouched. Skipped under LTO, where the link-time
+	// pipeline owns whole-program internalization.
+	if (level != llvm::OptimizationLevel::O0 && lto == JAM_LTO_OFF) {
+		llvm::ModulePassManager pre;
+		pre.addPass(llvm::InternalizePass([](const llvm::GlobalValue &gv) {
+			return gv.getName() == "main";
+		}));
+		pre.addPass(llvm::GlobalDCEPass());
+		pre.run(*M, mam);
 	}
 
 	// LTO mode swaps in the LTO pre-link pipeline. The actual cross-module

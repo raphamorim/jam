@@ -478,6 +478,22 @@ class JamCodegenContext {
 	// Resolves `handle` against the CURRENT body module's imports (the ""
 	// scope for the entry module). No cross-module fallback -- see the .cpp.
 	const ImportHandleInfo *getImportHandle(const std::string &handle) const;
+
+	// Privacy gate for handle-spelled dotted type names. Private types
+	// register under their qualified identity (`lib.Private`) so their
+	// own module resolves them — but when an import HANDLE shares the
+	// module's name, the source spelling `lib.Private` coincides with
+	// that registry key. A spelling whose first segment is one of the
+	// current module's import handles and whose member is private to
+	// that module must miss, so the `is not exported` diagnostic fires
+	// instead of leaking the type.
+	bool handlePrivacyBlocked(const std::string &dotted) const {
+		size_t dot = dotted.find('.');
+		if (dot == std::string::npos) return false;
+		const ImportHandleInfo *ih = getImportHandle(dotted.substr(0, dot));
+		if (ih == nullptr) return false;
+		return ih->privateNames.count(dotted.substr(dot + 1)) != 0;
+	}
 	std::string formatNamespaceLookupError(const std::string &kind,
 	                                       const std::string &qualified) const;
 

@@ -417,8 +417,15 @@ static int compileAndRun(const std::string &filename,
 		// name, resolves the right one). The qualified name matches the
 		// key used by the struct/enum/union registries below and by the
 		// requalified field/body TypeIdxs that reference them.
+		//
+		// PRIVATE types register too — a module's own bodies and pub-fn
+		// signatures reference them (`fn freshCpu() Cpu` where `Cpu` is
+		// module-private), and those references requalify to the
+		// qualified key. Privacy is enforced at NAME RESOLUTION: other
+		// modules' bare spellings can't reach a qualified key (their
+		// ownership maps only carry pub destructured names, and handle
+		// aliases register pub-only).
 		for (auto &s : m->Structs) {
-			if (publicOnly && !s->isPub) continue;
 			jam::DeclIndex idx = codegenCtx.declTable().create(
 			    jam::DeclKind::Struct, qualifyTypeName(s->modulePath, s->Name));
 			auto &d = codegenCtx.declTable().get(idx);
@@ -426,7 +433,6 @@ static int compileAndRun(const std::string &filename,
 			setSrc(d, s->Name);
 		}
 		for (auto &e : m->Enums) {
-			if (publicOnly && !e->isPub) continue;
 			jam::DeclIndex idx = codegenCtx.declTable().create(
 			    jam::DeclKind::Enum, qualifyTypeName(e->modulePath, e->Name));
 			auto &d = codegenCtx.declTable().get(idx);
@@ -434,7 +440,6 @@ static int compileAndRun(const std::string &filename,
 			setSrc(d, e->Name);
 		}
 		for (auto &u : m->Unions) {
-			if (publicOnly && !u->isPub) continue;
 			jam::DeclIndex idx = codegenCtx.declTable().create(
 			    jam::DeclKind::Union, qualifyTypeName(u->modulePath, u->Name));
 			auto &d = codegenCtx.declTable().get(idx);
@@ -475,8 +480,8 @@ static int compileAndRun(const std::string &filename,
 		    return out;
 	    };
 	auto declareStructs = [&](ModuleAST *m, bool publicOnly) {
+		(void)publicOnly;  // see registerTopLevelDecls: private types register too
 		for (auto &s : m->Structs) {
-			if (publicOnly && !s->isPub) continue;
 			std::string q = qualifyTypeName(s->modulePath, s->Name);
 			JamTypeRef structType =
 			    JamLLVMStructCreateNamed(codegenCtx.getContext(), q.c_str());
@@ -485,8 +490,8 @@ static int compileAndRun(const std::string &filename,
 		}
 	};
 	auto declareUnions = [&](ModuleAST *m, bool publicOnly) {
+		(void)publicOnly;
 		for (auto &u : m->Unions) {
-			if (publicOnly && !u->isPub) continue;
 			std::string q = qualifyTypeName(u->modulePath, u->Name);
 			JamTypeRef unionType =
 			    JamLLVMStructCreateNamed(codegenCtx.getContext(), q.c_str());
@@ -495,8 +500,8 @@ static int compileAndRun(const std::string &filename,
 		}
 	};
 	auto declareEnums = [&](ModuleAST *m, bool publicOnly) {
+		(void)publicOnly;
 		for (auto &e : m->Enums) {
-			if (publicOnly && !e->isPub) continue;
 			std::vector<JamCodegenContext::EnumVariantInfo> variants;
 			variants.reserve(e->Variants.size());
 			for (auto &v : e->Variants) {
@@ -633,6 +638,11 @@ static int compileAndRun(const std::string &filename,
 	// already-populated global registry — or, via getFunctionAST's
 	// fallback, against the generic's defining-module namespace.
 	for (const auto &[path, importedModule] : resolver.getLoadedModules()) {
+		// Resolve each module's signature types in ITS OWN scope — a
+		// signature naming the module's private type must not trip the
+		// handle-privacy gate of whichever module the iteration would
+		// otherwise run under.
+		codegenCtx.pushBodyModule(path);
 		for (auto &func : importedModule->Functions) {
 			if (func->isGeneric()) continue;
 			// Pub fns need prototypes so callers can call them. Private
@@ -644,6 +654,7 @@ static int compileAndRun(const std::string &filename,
 			                               codegenCtx.getStringPool());
 			jirDeclarePrototype(jfn, codegenCtx);
 		}
+		codegenCtx.popBodyModule();
 	}
 	// Register every flat `handle.X` mapping for a given (handle name,
 	// resolved module). Shared by direct-import bindings and module-
@@ -1175,11 +1186,15 @@ static int compileAndRun(const std::string &filename,
 					}
 				}
 				{
+					// Method signatures resolve in the struct's own
+					// module scope (see the Pass B comment).
+					codegenCtx.pushBodyModule(meth->modulePath);
 					JirFunction jfn = astgenMetadata(*meth, codegenCtx);
 					jfn.name =
 					    mangledFunctionName(*meth, codegenCtx.getTypePool(),
 					                        codegenCtx.getStringPool());
 					jirDeclarePrototype(jfn, codegenCtx);
+					codegenCtx.popBodyModule();
 				}
 				codegenCtx.registerFunctionAST(qself + "." + meth->Name,
 				                               meth.get());

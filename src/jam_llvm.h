@@ -192,6 +192,12 @@ JAM_EXTERN_C void JamLLVMAddRetAttrZeroExt(JamFunctionRef func);
 
 JAM_EXTERN_C void JamLLVMSetFunctionNoReturn(JamFunctionRef func);
 
+// Add `func` to llvm.used so whole-module internalization (the
+// pre-pipeline InternalizePass in JamLLVMEmitObjectFile) never strips
+// or hides it. Used for `export fn` — symbols that exist for external
+// C callers the optimizer can't see.
+JAM_EXTERN_C void JamLLVMAppendToUsed(JamModuleRef mod, JamFunctionRef func);
+
 JAM_EXTERN_C void JamLLVMApplyDefaultFnAttrs(JamFunctionRef func,
                                              bool isExtern);
 

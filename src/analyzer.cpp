@@ -122,10 +122,26 @@ DeclValue Analyzer::ensureDeclAnalyzed(DeclIndex idx) {
 	return again.value;
 }
 
+// Resolve a decl's member types in its OWNING module's scope: the
+// demand-driven fill can run while any other module's body is current,
+// and a private member type must not trip the handle-privacy gate of
+// whichever module happened to trigger the fill.
+namespace {
+struct BodyModuleGuard {
+	JamCodegenContext &ctx;
+	BodyModuleGuard(JamCodegenContext &c, const std::string &m) : ctx(c) {
+		ctx.pushBodyModule(m);
+	}
+	~BodyModuleGuard() { ctx.popBodyModule(); }
+};
+}  // namespace
+
 bool Analyzer::resolveTypeFieldsStruct(DeclIndex idx) {
 	if (idx == kNoDecl) return false;
 	Decl &d = decls_.get(idx);
 	if (d.kind != DeclKind::Struct) return false;
+	BodyModuleGuard bmg(
+	    ctx_, d.structAst ? d.structAst->modulePath : std::string());
 
 	switch (d.structStatus) {
 	case StructStatus::HaveFieldTypes:
@@ -266,6 +282,8 @@ bool Analyzer::resolveTypeFieldsEnum(DeclIndex idx) {
 	if (idx == kNoDecl) return false;
 	Decl &d = decls_.get(idx);
 	if (d.kind != DeclKind::Enum) return false;
+	BodyModuleGuard bmg(ctx_,
+	                    d.enumAst ? d.enumAst->modulePath : std::string());
 
 	switch (d.enumStatus) {
 	case EnumStatus::HaveBody:
@@ -420,6 +438,8 @@ bool Analyzer::resolveTypeFieldsUnion(DeclIndex idx) {
 	if (idx == kNoDecl) return false;
 	Decl &d = decls_.get(idx);
 	if (d.kind != DeclKind::Union) return false;
+	BodyModuleGuard bmg(ctx_,
+	                    d.unionAst ? d.unionAst->modulePath : std::string());
 
 	switch (d.unionStatus) {
 	case UnionStatus::HaveBody:
