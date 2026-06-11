@@ -18,6 +18,12 @@
 #include <unistd.h>
 #include <vector>
 #ifndef _WIN32
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+extern char **environ;
+#endif
+#ifndef _WIN32
 #include <sys/wait.h>
 #endif
 
@@ -75,6 +81,90 @@ class ProgressGuard {
 		}
 	}
 };
+
+#ifndef _WIN32
+// Spawn `argv` directly via posix_spawnp (no /bin/sh hop — system()
+// costs an extra shell fork per link and per test run) and wait.
+// Returns the raw waitpid status, or -1 when the spawn failed. When
+// `outFd` >= 0 the child's stdout+stderr are redirected to it.
+static int spawnAndWait(const std::vector<std::string> &argv, int outFd = -1) {
+	std::vector<char *> cargv;
+	cargv.reserve(argv.size() + 1);
+	for (const auto &a : argv) cargv.push_back(const_cast<char *>(a.c_str()));
+	cargv.push_back(nullptr);
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	if (outFd >= 0) {
+		posix_spawn_file_actions_adddup2(&fa, outFd, 1);
+		posix_spawn_file_actions_adddup2(&fa, outFd, 2);
+	}
+	pid_t pid = 0;
+	int rc = posix_spawnp(&pid, cargv[0], &fa, nullptr, cargv.data(), environ);
+	posix_spawn_file_actions_destroy(&fa);
+	if (rc != 0) return -1;
+	int status = 0;
+	if (waitpid(pid, &status, 0) < 0) return -1;
+	return status;
+}
+
+// Async variant for the parallel test runner: spawn `argv` with its
+// stdout+stderr redirected into a fresh pipe, return the pid and the
+// (nonblocking) read end via `outFd`. Returns -1 on failure.
+static pid_t spawnAsync(const std::vector<std::string> &argv, int &outFd) {
+	int fds[2];
+	if (pipe(fds) != 0) return -1;
+	std::vector<char *> cargv;
+	cargv.reserve(argv.size() + 1);
+	for (const auto &a : argv) cargv.push_back(const_cast<char *>(a.c_str()));
+	cargv.push_back(nullptr);
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+	posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+	posix_spawn_file_actions_addclose(&fa, fds[0]);
+	posix_spawn_file_actions_addclose(&fa, fds[1]);
+	pid_t pid = 0;
+	int rc = posix_spawnp(&pid, cargv[0], &fa, nullptr, cargv.data(), environ);
+	posix_spawn_file_actions_destroy(&fa);
+	close(fds[1]);
+	if (rc != 0) {
+		close(fds[0]);
+		return -1;
+	}
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+	outFd = fds[0];
+	return pid;
+}
+
+// FNV-1a over a file's bytes. Keys the linked-test-binary cache: macOS
+// assesses every fresh executable inode on first exec (60-290ms), so
+// re-running a byte-identical test binary from a cached inode instead
+// of relinking a new one is the difference between ~1ms and ~100ms per
+// test file.
+static bool hashFileFNV(const std::string &path, uint64_t &out) {
+	std::ifstream f(path, std::ios::binary);
+	if (!f.is_open()) return false;
+	uint64_t h = 1469598103934665603ull;
+	char buf[1 << 16];
+	while (f) {
+		f.read(buf, sizeof(buf));
+		std::streamsize n = f.gcount();
+		for (std::streamsize i = 0; i < n; i++) {
+			h ^= static_cast<unsigned char>(buf[i]);
+			h *= 1099511628211ull;
+		}
+	}
+	out = h;
+	return true;
+}
+
+static void hashMixString(uint64_t &h, const std::string &s) {
+	for (unsigned char c : s) {
+		h ^= c;
+		h *= 1099511628211ull;
+	}
+}
+#endif
 
 static int compileAndRun(const std::string &filename,
                          const std::string &outputName, bool runFlag,
@@ -1492,10 +1582,11 @@ static int compileAndRun(const std::string &filename,
 	// extern fns from system libraries resolve. When LTO is on, hand the
 	// bitcode to clang with `-flto=` so its driver picks the right linker
 	// plugin (lld for ELF, ld64 for Mach-O, both with LTO support).
-	std::string linkCmd = "clang " + intermediate + " -o " + outputName;
-	if (lto == JAM_LTO_THIN) linkCmd += " -flto=thin";
-	else if (lto == JAM_LTO_FAT) linkCmd += " -flto=full";
-	for (const auto &lib : linkLibs) { linkCmd += " -l" + lib; }
+	std::vector<std::string> linkArgs = {"clang", intermediate, "-o",
+	                                     outputName};
+	if (lto == JAM_LTO_THIN) linkArgs.push_back("-flto=thin");
+	else if (lto == JAM_LTO_FAT) linkArgs.push_back("-flto=full");
+	for (const auto &lib : linkLibs) { linkArgs.push_back("-l" + lib); }
 
 	jam::Target host = jam::Target::getHostTarget();
 
@@ -1514,7 +1605,7 @@ static int compileAndRun(const std::string &filename,
 	if (linkLibc &&
 	    (host.os == jam::OS::Linux || host.os == jam::OS::FreeBSD) &&
 	    host.abi != jam::ABI::Musl) {
-		linkCmd += " -lm";
+		linkArgs.push_back("-lm");
 	}
 
 	// Strip unreferenced functions/data at link time. Pairs with
@@ -1525,11 +1616,11 @@ static int compileAndRun(const std::string &filename,
 	if (optLevel != JAM_OPT_NONE) {
 		switch (host.os) {
 		case jam::OS::MacOS:
-			linkCmd += " -Wl,-dead_strip";
+			linkArgs.push_back("-Wl,-dead_strip");
 			break;
 		case jam::OS::Linux:
 		case jam::OS::FreeBSD:
-			linkCmd += " -Wl,--gc-sections";
+			linkArgs.push_back("-Wl,--gc-sections");
 			break;
 		case jam::OS::Windows:
 		case jam::OS::Unknown:
@@ -1547,20 +1638,86 @@ static int compileAndRun(const std::string &filename,
 	if (strip != JAM_STRIP_NONE) {
 		switch (host.os) {
 		case jam::OS::MacOS:
-			linkCmd += " -Wl,-S";
-			if (strip == JAM_STRIP_SYMBOLS) linkCmd += " -Wl,-x";
+			linkArgs.push_back("-Wl,-S");
+			if (strip == JAM_STRIP_SYMBOLS) linkArgs.push_back("-Wl,-x");
 			break;
 		case jam::OS::Linux:
 		case jam::OS::FreeBSD:
-			linkCmd +=
-			    (strip == JAM_STRIP_SYMBOLS) ? " -Wl,-s" : " -Wl,--strip-debug";
+			linkArgs.push_back((strip == JAM_STRIP_SYMBOLS)
+			                       ? "-Wl,-s"
+			                       : "-Wl,--strip-debug");
 			break;
 		case jam::OS::Windows:
 		case jam::OS::Unknown:
 			break;
 		}
 	}
+#ifndef _WIN32
+	// Decode a waitpid status into a shell-convention exit code. A
+	// signal-killed child (segfault, abort, …) has no exit status;
+	// WEXITSTATUS on it reads garbage bits that decode to 0, which
+	// would report a crashed test binary as "passed" — and since the
+	// crash also loses the child's unflushed stdout, the failure would
+	// be completely silent. Follow the shell convention: 128 + signal.
+	auto decodeRunStatus = [](int status, const std::string &what) -> int {
+		if (status == -1) {
+			std::cerr << "Failed to run " << what << std::endl;
+			return 1;
+		}
+		if (WIFSIGNALED(status)) {
+			int sig = WTERMSIG(status);
+			std::cerr << what << " terminated by signal " << sig << " ("
+			          << strsignal(sig) << ")" << std::endl;
+			return 128 + sig;
+		}
+		return WEXITSTATUS(status);
+	};
+
+	// Test-mode fast path: cache the linked binary keyed by the object
+	// bytes + link flags, and re-exec the CACHED INODE when nothing
+	// changed. macOS assesses every fresh executable inode on first
+	// exec (60-290ms of kernel-side content scanning — ~70% of a warm
+	// suite run's wall time); a previously-executed inode starts in
+	// ~1ms. The cached binary is deliberately NOT removed after the
+	// run, and the link is skipped entirely on a cache hit.
+	if (testMode) {
+		uint64_t h = 0;
+		if (hashFileFNV(intermediate, h)) {
+			for (size_t i = 4; i < linkArgs.size(); i++) {
+				hashMixString(h, linkArgs[i]);
+			}
+			char hex[24];
+			std::snprintf(hex, sizeof(hex), "t%016llx",
+			              static_cast<unsigned long long>(h));
+			std::error_code ec;
+			std::filesystem::path cacheDir =
+			    std::filesystem::path("output") / "testcache";
+			std::filesystem::create_directories(cacheDir, ec);
+			std::string cachePath = (cacheDir / hex).string();
+			if (!std::filesystem::exists(cachePath, ec)) {
+				std::vector<std::string> cacheLink = linkArgs;
+				cacheLink[3] = cachePath;
+				if (spawnAndWait(cacheLink) != 0) {
+					std::cerr << "Linking failed" << std::endl;
+					std::remove(intermediate.c_str());
+					return 1;
+				}
+			}
+			std::remove(intermediate.c_str());
+			progress.stop();
+			return decodeRunStatus(spawnAndWait({cachePath}), cachePath);
+		}
+	}
+
+	int linkResult = spawnAndWait(linkArgs);
+#else
+	std::string linkCmd;
+	for (const auto &a : linkArgs) {
+		if (!linkCmd.empty()) linkCmd += ' ';
+		linkCmd += a;
+	}
 	int linkResult = system(linkCmd.c_str());
+#endif
 	if (linkResult != 0) {
 		std::cerr << "Linking failed" << std::endl;
 		return 1;
@@ -1575,33 +1732,16 @@ static int compileAndRun(const std::string &filename,
 	progress.stop();
 
 	if (testMode || runFlag) {
-		std::string runCmd = "./" + outputName;
-		int exitCode = system(runCmd.c_str());
-
-		// Clean up executable after running
-		std::remove(outputName.c_str());
-
-// Extract actual exit code (system() returns encoded status)
+		std::string runPath = "./" + outputName;
 #ifdef _WIN32
+		int exitCode = system(runPath.c_str());
+		std::remove(outputName.c_str());
 		return exitCode;
 #else
-		if (exitCode == -1) {
-			std::cerr << "Failed to run " << outputName << std::endl;
-			return 1;
-		}
-		// A signal-killed child (segfault, abort, …) has no exit status;
-		// WEXITSTATUS on it reads garbage bits that decode to 0, which
-		// would report a crashed test binary as "passed" — and since the
-		// crash also loses the child's unflushed stdout, the failure
-		// would be completely silent. Follow the shell convention:
-		// 128 + signal number.
-		if (WIFSIGNALED(exitCode)) {
-			int sig = WTERMSIG(exitCode);
-			std::cerr << outputName << " terminated by signal " << sig << " ("
-			          << strsignal(sig) << ")" << std::endl;
-			return 128 + sig;
-		}
-		return WEXITSTATUS(exitCode);
+		int status = spawnAndWait({runPath});
+		// Clean up executable after running
+		std::remove(outputName.c_str());
+		return decodeRunStatus(status, outputName);
 #endif
 	}
 
@@ -1971,18 +2111,134 @@ int main(int argc, char *argv[]) {
 		int passed = 0;
 		int failed = 0;
 		int skipped = 0;
+		std::vector<std::string> runnable;
 		for (const auto &f : files) {
-			if (!fileHasTests(f)) {
-				skipped++;
-				continue;
+			if (fileHasTests(f)) runnable.push_back(f);
+			else skipped++;
+		}
+
+#ifndef _WIN32
+		// Per-file work is ~98% blocked subprocess waits (clang link +
+		// first-exec assessment of the freshly linked test binary), so
+		// a small pool of worker processes — each a `jam test <file>`
+		// re-invocation of this binary — gives near-linear speedup.
+		// Each worker's output is buffered through a pipe and printed
+		// as a coherent block on completion. JAM_TEST_JOBS=1 forces the
+		// serial in-process path (useful under a debugger).
+		long hw = sysconf(_SC_NPROCESSORS_ONLN);
+		unsigned jobs =
+		    static_cast<unsigned>(hw > 1 ? (hw > 8 ? 8 : hw) : 1);
+		if (const char *env = std::getenv("JAM_TEST_JOBS")) {
+			int v = std::atoi(env);
+			if (v >= 1) jobs = static_cast<unsigned>(v);
+		}
+		if (jobs > 1 && runnable.size() > 1) {
+			auto optName = [](JamOptLevel o) -> const char * {
+				switch (o) {
+				case JAM_OPT_LESS:
+					return "1";
+				case JAM_OPT_DEFAULT:
+					return "2";
+				case JAM_OPT_AGGRESSIVE:
+					return "3";
+				case JAM_OPT_SIZE:
+					return "s";
+				case JAM_OPT_SMALL:
+					return "z";
+				default:
+					return "0";
+				}
+			};
+			struct Job {
+				pid_t pid;
+				int fd;
+				std::string file;
+				std::string out;
+			};
+			std::vector<Job> active;
+			size_t next = 0;
+			while (next < runnable.size() || !active.empty()) {
+				while (active.size() < jobs && next < runnable.size()) {
+					const std::string &f = runnable[next++];
+					std::filesystem::path p(f);
+					std::vector<std::string> childArgv = {
+					    argv[0], "test", f, "-o",
+					    "jam_test_" + p.stem().string()};
+					if (optLevel != JAM_OPT_NONE) {
+						childArgv.push_back("-C");
+						childArgv.push_back(std::string("opt-level=") +
+						                    optName(optLevel));
+					}
+					for (const auto &lib : linkLibs) {
+						childArgv.push_back("-l" + lib);
+					}
+					int fd = -1;
+					pid_t pid = spawnAsync(childArgv, fd);
+					if (pid < 0) {
+						std::cout << std::endl
+						          << "@" << f << std::endl
+						          << "error: failed to spawn test worker"
+						          << std::endl;
+						failed++;
+						continue;
+					}
+					active.push_back(Job{pid, fd, f, std::string()});
+				}
+				// Drain whatever the running workers have produced so a
+				// chatty child never blocks on a full pipe.
+				bool sawData = false;
+				char buf[4096];
+				for (auto &j : active) {
+					ssize_t n;
+					while ((n = read(j.fd, buf, sizeof(buf))) > 0) {
+						j.out.append(buf, static_cast<size_t>(n));
+						sawData = true;
+					}
+				}
+				// Reap finished workers; print each one's buffered
+				// output as a block, in completion order.
+				bool reaped = false;
+				for (size_t i = 0; i < active.size();) {
+					int st = 0;
+					pid_t r = waitpid(active[i].pid, &st, WNOHANG);
+					if (r != active[i].pid) {
+						i++;
+						continue;
+					}
+					// The child (and everything it spawned) is gone, so
+					// the write end is closed — read to EOF.
+					ssize_t n;
+					while ((n = read(active[i].fd, buf, sizeof(buf))) > 0) {
+						active[i].out.append(buf, static_cast<size_t>(n));
+					}
+					close(active[i].fd);
+					int rc = 1;
+					if (WIFEXITED(st)) rc = WEXITSTATUS(st);
+					else if (WIFSIGNALED(st)) rc = 128 + WTERMSIG(st);
+					std::cout << std::endl
+					          << "@" << active[i].file << std::endl
+					          << active[i].out;
+					if (rc != 0) failed++;
+					else passed++;
+					active.erase(active.begin() +
+					             static_cast<long>(i));
+					reaped = true;
+				}
+				if (!sawData && !reaped && !active.empty()) usleep(2000);
 			}
-			std::cout << std::endl << "@" << f << std::endl;
-			std::filesystem::path p(f);
-			std::string perFileOutput = "jam_test_" + p.stem().string();
-			int rc = compileAndRun(f, perFileOutput, runFlag, emitIR, testMode,
-			                       optLevel, lto, strip, linkLibs);
-			if (rc != 0) failed++;
-			else passed++;
+		} else
+#endif
+		{
+			for (const auto &f : runnable) {
+				std::cout << std::endl << "@" << f << std::endl;
+				std::filesystem::path p(f);
+				std::string perFileOutput = "jam_test_" + p.stem().string();
+				int rc =
+				    compileAndRun(f, perFileOutput, runFlag, emitIR, testMode,
+				                  optLevel, lto, strip, linkLibs);
+				if (rc != 0) failed++;
+				else passed++;
+			}
 		}
 
 		std::cout << std::endl;
@@ -1991,6 +2247,17 @@ int main(int argc, char *argv[]) {
 		          << " file(s) without tests, " << files.size()
 		          << " file(s) scanned" << std::endl;
 		return failed == 0 ? 0 : 1;
+	}
+
+	// The default output name `output` collides with a same-named
+	// directory (this repo has one): the link fails with a cryptic
+	// `ld: errno=21`. Fall back to a usable name instead.
+	if (std::filesystem::is_directory(outputName)) {
+		std::string fallback = outputName + ".bin";
+		std::cerr << "note: output name '" << outputName
+		          << "' is a directory; writing '" << fallback << "'"
+		          << std::endl;
+		outputName = fallback;
 	}
 
 	// Catch compile-time exceptions cleanly so the user sees a single-line

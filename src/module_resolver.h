@@ -10,6 +10,7 @@
 
 #include "ast.h"
 #include "ast_flat.h"
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -52,12 +53,22 @@ class ModuleResolver {
 
   private:
 	std::string baseDir;
+	// fs::canonical(baseDir), computed once in the ctor — moduleIdentity
+	// runs per import edge, and realpath walks every path component.
+	std::filesystem::path baseAbs_;
+	bool baseAbsOk_ = false;
+	// resolve() results per import spelling: up to five exists/canonical
+	// probes each, and the same spelling resolves repeatedly
+	// (canonicalKey, then getOrLoadModule, then chain walks).
+	mutable std::unordered_map<std::string, std::string> resolveCache_;
 	TypePool *typePool;
 	StringPool *stringPool;
 	NodeStore *nodeStore;
 	std::vector<std::unique_ptr<StructDeclAST>> *sharedAnonStructs_ = nullptr;
 	std::vector<std::unique_ptr<EnumDeclAST>> *sharedAnonEnums_ = nullptr;
 	std::unordered_map<std::string, std::unique_ptr<ModuleAST>> loadedModules;
+
+	std::string resolveUncached(const std::string &importPath) const;
 
 	// Canonical identity for a resolved module file, used as the cache
 	// key and `modulePath` prefix: entry-relative for in-tree files,

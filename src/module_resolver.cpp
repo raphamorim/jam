@@ -98,9 +98,26 @@ void setStdPathOverride(const std::string &path) {
 ModuleResolver::ModuleResolver(const std::string &baseDir, TypePool &typePool_,
                                StringPool &stringPool_, NodeStore &nodeStore_)
     : baseDir(baseDir), typePool(&typePool_), stringPool(&stringPool_),
-      nodeStore(&nodeStore_) {}
+      nodeStore(&nodeStore_) {
+	std::error_code ec;
+	baseAbs_ = fs::canonical(baseDir, ec);
+	baseAbsOk_ = !ec;
+}
 
 std::string ModuleResolver::resolve(const std::string &importPath) const {
+	// Memoized per spelling: each uncached resolve runs up to five
+	// exists/canonical probes, and the same spelling resolves several
+	// times per import edge (canonicalKey, getOrLoadModule, chain
+	// walks). The filesystem doesn't change mid-compile.
+	auto cached = resolveCache_.find(importPath);
+	if (cached != resolveCache_.end()) return cached->second;
+	std::string r = resolveUncached(importPath);
+	resolveCache_.emplace(importPath, r);
+	return r;
+}
+
+std::string
+ModuleResolver::resolveUncached(const std::string &importPath) const {
 	// `test` stays a compiler-builtin namespace (provides `assert`).
 	// `std` used to short-circuit too, but now resolves to a real
 	// `std/std.jam` file that re-exports the standard-library modules.
@@ -210,24 +227,35 @@ ModuleResolver::moduleIdentity(const std::string &resolvedFile) const {
 	//   3. Anywhere else: the canonical absolute path, `.jam` stripped.
 	//      Out-of-tree imports still converge per file. (The reference
 	//      compiler rejects these outright; jam permits them.)
-	std::error_code ec;
-	fs::path baseAbs = fs::canonical(baseDir, ec);
-	if (!ec) {
-		std::string id = identityUnder(resolvedFile, baseAbs);
+	// The roots are loop-invariant: the base dir canonicalizes once in
+	// the ctor, and the std roots once per process (the installed root
+	// is a static; the dev fallback hangs off the process CWD). Without
+	// this, every import edge re-walked all three with realpath.
+	if (baseAbsOk_) {
+		std::string id = identityUnder(resolvedFile, baseAbs_);
 		if (!id.empty()) return id;
 	}
-	if (const auto &root = stdRoot(); root) {
-		fs::path stdAbs = fs::canonical(*root, ec);
-		if (!ec) {
-			std::string id = identityUnder(resolvedFile, stdAbs);
-			if (!id.empty()) return "std/" + id;
+	static const std::pair<bool, fs::path> stdAbsOnce = [] {
+		std::error_code e;
+		if (const auto &root = stdRoot(); root) {
+			fs::path p = fs::canonical(*root, e);
+			if (!e) return std::make_pair(true, p);
 		}
+		return std::make_pair(false, fs::path());
+	}();
+	if (stdAbsOnce.first) {
+		std::string id = identityUnder(resolvedFile, stdAbsOnce.second);
+		if (!id.empty()) return "std/" + id;
 	}
 	// Dev fallback root (`<CWD>/std`), mirroring resolve()'s last
 	// lookup tier.
-	fs::path devAbs = fs::canonical("std", ec);
-	if (!ec) {
-		std::string id = identityUnder(resolvedFile, devAbs);
+	static const std::pair<bool, fs::path> devAbsOnce = [] {
+		std::error_code e;
+		fs::path p = fs::canonical("std", e);
+		return std::make_pair(!e, e ? fs::path() : p);
+	}();
+	if (devAbsOnce.first) {
+		std::string id = identityUnder(resolvedFile, devAbsOnce.second);
 		if (!id.empty()) return "std/" + id;
 	}
 	fs::path abs = fs::path(resolvedFile);
@@ -339,11 +367,13 @@ ModuleAST *ModuleResolver::loadModuleAt(const std::string &key,
 	// types twice — colliding in the global by-name type registry that
 	// `main.cpp` builds. Collapsing to one identity dedupes the module
 	// and keeps `modulePath` (the mangling prefix) stable.
+	// One nested resolver per MODULE (not per import edge): its ctor
+	// canonicalizes the module dir, and its resolve cache serves every
+	// edge this module declares.
+	ModuleResolver nestedResolver(fs::path(resolvedPath).parent_path().string(),
+	                              *typePool, *stringPool, *nodeStore);
 	auto loadNested = [&](std::string &importPath) {
 		if (importPath == "test") return;
-		fs::path moduleDir = fs::path(resolvedPath).parent_path();
-		ModuleResolver nestedResolver(moduleDir.string(), *typePool,
-		                              *stringPool, *nodeStore);
 		std::string nestedResolved = nestedResolver.resolve(importPath);
 		if (nestedResolved.empty() || nestedResolved == "test") return;
 		std::string id = moduleIdentity(nestedResolved);

@@ -186,6 +186,10 @@ class Analyzer {
 	// Pointer to the current function's parameter list. Set in run(),
 	// Cleared on exit. Lifetime bounded by the run() activation that set it.
 	const std::vector<Param> *args_ = nullptr;
+	// Param name -> mode, prebuilt in run(): checkDropBearingLocalsInit
+	// consults this per in-scope binding per exit point, where a linear
+	// rescan of the param vector goes quadratic on big functions.
+	std::unordered_map<std::string, ParamMode> paramModes_;
 
 	// The FunctionAST being analyzed — keys the comp-if verdict lookup
 	// (astgen records verdicts per FunctionAST so generic clones, which
@@ -252,6 +256,8 @@ class Analyzer {
 
 std::vector<Diagnostic> Analyzer::run(const FunctionAST &fn) {
 	args_ = &fn.Args;
+	paramModes_.clear();
+	for (const Param &p : fn.Args) paramModes_[p.Name] = p.Mode;
 	fnAst_ = &fn;
 	varTypes_.clear();
 	declDepth_.clear();
@@ -1267,13 +1273,8 @@ void Analyzer::checkDropBearingLocalsInit(const NameMap &state,
 		// parameters are owned by the callee and DO drop at exit, so
 		// they go through the same classification as locals.
 		bool isBorrowedParam = false;
-		if (args_) {
-			for (const Param &p : *args_) {
-				if (p.Name == name) {
-					isBorrowedParam = (p.Mode != ParamMode::Move);
-					break;
-				}
-			}
+		if (auto pIt = paramModes_.find(name); pIt != paramModes_.end()) {
+			isBorrowedParam = (pIt->second != ParamMode::Move);
 		}
 		if (isBorrowedParam) continue;
 

@@ -338,9 +338,57 @@ void JamCodegenContext::registerTypeOwner(const std::string &ctxModule,
                                           const std::string &typeName,
                                           const std::string &ownerModule) {
 	typeModuleOf_[ctxModule][typeName] = ownerModule;
+	// Ownership feeds every memoized resolution below; registration
+	// only happens during the up-front pass, so these clears are
+	// effectively free.
+	requalifyMemo_.clear();
+	dropMemo_.clear();
+	sizeMemo_.clear();
+	alignMemo_.clear();
+}
+
+uint32_t JamCodegenContext::moduleIdOf(const std::string &m) const {
+	auto it = moduleIds_.find(m);
+	if (it != moduleIds_.end()) return it->second;
+	uint32_t id = static_cast<uint32_t>(moduleIds_.size()) + 1;
+	moduleIds_.emplace(m, id);
+	return id;
 }
 
 TypeIdx JamCodegenContext::requalifyType(TypeIdx ty,
+                                         const std::string &ctxModule) const {
+	if (ty == kNoType) return ty;
+	// Kinds that can never carry a user-type name skip everything —
+	// the common case for primitive-typed expressions.
+	switch (typePool.get(ty).kind) {
+	case TypeKind::Named:
+	case TypeKind::Struct:
+	case TypeKind::Enum:
+	case TypeKind::Union:
+	case TypeKind::PtrSingle:
+	case TypeKind::PtrMany:
+	case TypeKind::Slice:
+	case TypeKind::Array:
+	case TypeKind::ArrayExpr:
+	case TypeKind::GenericCall:
+		break;
+	default:
+		return ty;
+	}
+	// Subst contexts change which names stay un-qualified — compute
+	// fresh there (bounded: only generic-instantiation lowering).
+	if (!currentSubst_.empty()) return requalifyTypeUncached(ty, ctxModule);
+	uint64_t key = (static_cast<uint64_t>(moduleIdOf(ctxModule)) << 32) |
+	               static_cast<uint64_t>(ty);
+	auto it = requalifyMemo_.find(key);
+	if (it != requalifyMemo_.end()) return it->second;
+	TypeIdx r = requalifyTypeUncached(ty, ctxModule);
+	requalifyMemo_.emplace(key, r);
+	return r;
+}
+
+TypeIdx
+JamCodegenContext::requalifyTypeUncached(TypeIdx ty,
                                          const std::string &ctxModule) const {
 	if (ty == kNoType) return ty;
 	// By value, not by reference: the recursive calls below intern new
@@ -363,8 +411,10 @@ TypeIdx JamCodegenContext::requalifyType(TypeIdx ty,
 		if (mIt == typeModuleOf_.end()) return ty;
 		auto tIt = mIt->second.find(name);
 		if (tIt == mIt->second.end()) return ty;  // std / generic param / Self
+		// Entry-module owner: the qualified name IS the bare name —
+		// skip the string build entirely.
+		if (tIt->second.empty()) return ty;
 		std::string q = qualifyTypeName(tIt->second, name);
-		if (q == name) return ty;  // owner is the entry module — stays bare
 		TypeKey nk = k;
 		nk.a = static_cast<uint32_t>(stringPool.intern(q));
 		return typePool.intern(nk);
@@ -407,12 +457,10 @@ TypeIdx JamCodegenContext::requalifyType(TypeIdx ty,
 				auto mIt = typeModuleOf_.find(ctxModule);
 				if (mIt != typeModuleOf_.end()) {
 					auto tIt = mIt->second.find(callee);
-					if (tIt != mIt->second.end()) {
-						std::string q = qualifyTypeName(tIt->second, callee);
-						if (q != callee) {
-							nameId = stringPool.intern(q);
-							changed = true;
-						}
+					if (tIt != mIt->second.end() && !tIt->second.empty()) {
+						nameId = stringPool.intern(
+						    qualifyTypeName(tIt->second, callee));
+						changed = true;
 					}
 				}
 			}
@@ -575,6 +623,8 @@ void JamCodegenContext::registerModuleConst(const std::string &name,
                                             bool isComp, std::string file) {
 	moduleConsts[name] = ModuleConstInfo{
 	    init, declared, isComp, std::move(file), bareName, owner};
+	// The seeded-scope cache derives from the const set.
+	comptimeSeedCache_.clear();
 }
 
 void JamCodegenContext::validateCompConsts() {
@@ -817,6 +867,21 @@ inline uint64_t alignUp(uint64_t off, uint64_t align) {
 
 uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
 	ty = requalifyType(ty, currentBodyModule());
+	// Layout never changes for a concrete requalified type, and the
+	// recursive aggregate walk below re-asks for every field on every
+	// query — memoize per TypeIdx. Subst contexts bypass (a `T` field
+	// sizes differently per instantiation).
+	bool cacheable = currentSubst_.empty();
+	if (cacheable) {
+		auto it = sizeMemo_.find(ty);
+		if (it != sizeMemo_.end()) return it->second;
+	}
+	uint64_t r = typeSizeImpl(ty);
+	if (cacheable) sizeMemo_.emplace(ty, r);
+	return r;
+}
+
+uint64_t JamCodegenContext::typeSizeImpl(TypeIdx ty) const {
 	const TypeKey &k = typePool.get(ty);
 	switch (k.kind) {
 	case TypeKind::Invalid:
@@ -942,6 +1007,17 @@ uint64_t JamCodegenContext::typeSize(TypeIdx ty) const {
 // max of the constituent alignments.
 uint64_t JamCodegenContext::typeAlign(TypeIdx ty) const {
 	ty = requalifyType(ty, currentBodyModule());
+	bool cacheable = currentSubst_.empty();
+	if (cacheable) {
+		auto it = alignMemo_.find(ty);
+		if (it != alignMemo_.end()) return it->second;
+	}
+	uint64_t r = typeAlignImpl(ty);
+	if (cacheable) alignMemo_.emplace(ty, r);
+	return r;
+}
+
+uint64_t JamCodegenContext::typeAlignImpl(TypeIdx ty) const {
 	const TypeKey &k = typePool.get(ty);
 	switch (k.kind) {
 	case TypeKind::Invalid:
@@ -1346,31 +1422,43 @@ void JamCodegenContext::seedComptimeScope(jam::ComptimeScope &scope) const {
 	// consts whose dependencies folded in an earlier pass. Consts that
 	// never fold (runtime-only inits) simply stay unbound — an
 	// expression referencing one comes back None.
-	jam::ComptimeEvaluator ev(nodeStore, stringPool, typePool);
+	//
+	// The fixpoint re-evaluates const initializer ASTs and used to run
+	// for EVERY function body and every comptime fold — cache the
+	// seeded scope per module (consts are immutable once registered;
+	// registerModuleConst clears the cache).
 	const std::string &cur = currentBodyModule();
-	auto ownIt = typeModuleOf_.find(cur);
-	auto visible = [&](const ModuleConstInfo &info) -> bool {
-		if (ownIt != typeModuleOf_.end()) {
-			auto oIt = ownIt->second.find(info.bareName);
-			if (oIt != ownIt->second.end()) return oIt->second == info.owner;
-		}
-		// Entry bodies additionally see entry consts that predate the
-		// ownership map (bare-registered, owner "").
-		return cur.empty() && info.owner.empty();
-	};
-	bool progress = true;
-	while (progress) {
-		progress = false;
-		for (const auto &kv : moduleConsts) {
-			if (!visible(kv.second)) continue;
-			if (scope.lookup(kv.second.bareName) != nullptr) continue;
-			jam::ComptimeValue v = ev.eval(kv.second.initExpr, scope);
-			if (!v.isNone()) {
-				scope.bind(kv.second.bareName, v);
-				progress = true;
+	auto cacheIt = comptimeSeedCache_.find(cur);
+	if (cacheIt == comptimeSeedCache_.end()) {
+		jam::ComptimeScope seeded;
+		jam::ComptimeEvaluator ev(nodeStore, stringPool, typePool);
+		auto ownIt = typeModuleOf_.find(cur);
+		auto visible = [&](const ModuleConstInfo &info) -> bool {
+			if (ownIt != typeModuleOf_.end()) {
+				auto oIt = ownIt->second.find(info.bareName);
+				if (oIt != ownIt->second.end())
+					return oIt->second == info.owner;
+			}
+			// Entry bodies additionally see entry consts that predate
+			// the ownership map (bare-registered, owner "").
+			return cur.empty() && info.owner.empty();
+		};
+		bool progress = true;
+		while (progress) {
+			progress = false;
+			for (const auto &kv : moduleConsts) {
+				if (!visible(kv.second)) continue;
+				if (seeded.lookup(kv.second.bareName) != nullptr) continue;
+				jam::ComptimeValue v = ev.eval(kv.second.initExpr, seeded);
+				if (!v.isNone()) {
+					seeded.bind(kv.second.bareName, v);
+					progress = true;
+				}
 			}
 		}
+		cacheIt = comptimeSeedCache_.emplace(cur, std::move(seeded)).first;
 	}
+	cacheIt->second.copyBindingsInto(scope);
 	// Active comp-param substitutions shadow same-named module consts —
 	// the same precedence astgenVariable applies (comp subst is checked
 	// before getModuleConst). Bound last so they overwrite.

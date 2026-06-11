@@ -38,10 +38,17 @@
 // `codegen.cpp`) reads the same rules — duplicating the mangling table
 // per call site is exactly how "unknown callee" miscompiles creep in
 // when one site gains a new case and the others don't.
-inline std::string mangledFunctionName(const FunctionAST &fn,
-                                       const TypePool &types,
-                                       const StringPool &strings) {
-	if (fn.isTest) return "__test_" + fn.Name;
+// Memoized on `fn.mangledNameCache`: the symbol is requested per call
+// expression and per drop lookup, and every input is fixed before the
+// first request.
+inline const std::string &mangledFunctionName(const FunctionAST &fn,
+                                              const TypePool &types,
+                                              const StringPool &strings) {
+	if (!fn.mangledNameCache.empty()) return fn.mangledNameCache;
+	if (fn.isTest) {
+		fn.mangledNameCache = "__test_" + fn.Name;
+		return fn.mangledNameCache;
+	}
 	// Free-function drop: qualify by receiver type so `cfn drop(self:
 	// mut A)` and `cfn drop(self: mut B)` get distinct symbols. Only
 	// kicks in when parentStruct is empty — in-struct `cfn drop` goes
@@ -49,10 +56,13 @@ inline std::string mangledFunctionName(const FunctionAST &fn,
 	if (fn.parentStruct.empty() && fn.Name == "drop" && fn.Args.size() == 1) {
 		const Param &p = fn.Args[0];
 		if (p.Name == "self" && p.Mode == ParamMode::Mut) {
-			const TypeKey &k = types.get(p.Type);
+			const TypeKey k = types.get(p.Type);
 			if (k.kind == TypeKind::Struct || k.kind == TypeKind::Named) {
 				StringIdx ni = static_cast<StringIdx>(k.a);
-				if (ni != kNoString) { return strings.get(ni) + ".drop"; }
+				if (ni != kNoString) {
+					fn.mangledNameCache = strings.get(ni) + ".drop";
+					return fn.mangledNameCache;
+				}
 			}
 		}
 	}
@@ -66,7 +76,8 @@ inline std::string mangledFunctionName(const FunctionAST &fn,
 		out += '.';
 	}
 	out += fn.Name;
-	return out;
+	fn.mangledNameCache = std::move(out);
+	return fn.mangledNameCache;
 }
 
 #endif  // JAM_MANGLING_H

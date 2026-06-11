@@ -95,6 +95,12 @@ class FunctionAST {
 	// methods or free fns in different modules don't collide.
 	std::string modulePath;
 
+	// Memoized result of `mangledFunctionName` — otherwise the symbol
+	// string is rebuilt per call expression and per drop lookup. Its
+	// inputs (Name, parentStruct, modulePath, isTest, drop-receiver
+	// type) are all fixed before the first mangling.
+	mutable std::string mangledNameCache;
+
 	FunctionAST(std::string Name, std::vector<Param> Args, TypeIdx ReturnType,
 	            std::vector<NodeIdx> Body, bool isExtern = false,
 	            bool isExport = false, bool isPub = false, bool isTest = false,

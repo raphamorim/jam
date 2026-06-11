@@ -382,6 +382,7 @@ static void emitDrops(AstGenCtx &gctx, const std::vector<DropTrack> &bindings);
 // emitDrops + astgenVarDecl can call them.
 static void emitDropInPlace(AstGenCtx &gctx, JirRef ptrRef, TypeIdx pointeeTy);
 bool typeNeedsDropInner(JamCodegenContext &ctx, TypeIdx ty);
+static bool typeNeedsDropResolved(JamCodegenContext &ctx, TypeIdx ty);
 static void emitEnumPayloadDrops(AstGenCtx &gctx, JirRef ptrRef,
                                  const JamCodegenContext::EnumInfo *einfo);
 static void rejectDropBearingFieldExtract(AstGenCtx &gctx, NodeIdx exprIdx,
@@ -4653,7 +4654,26 @@ static TypeIdx resolveGenericIfAny(JamCodegenContext &ctx, TypeIdx ty) {
 // auto-drop its pointee; if the user wants that, they own a Box/Vec
 // whose own `cfn drop` handles deallocation).
 bool typeNeedsDropInner(JamCodegenContext &ctx, TypeIdx ty) {
+	// Canonicalize, then memoize per TypeIdx: this is queried per
+	// expression (var inits, struct-literal captures, scope exits, the
+	// analyzer's per-return drop checks) and each uncached query runs
+	// the full string cascade (mangled-name build, registry finds,
+	// alias chase) plus a recursive field walk. Subst contexts bypass
+	// the memo — a `T` field's verdict is per-instantiation.
 	ty = resolveGenericIfAny(ctx, ty);
+	ty = ctx.requalifyType(ty, ctx.currentBodyModule());
+	bool cacheable = !ctx.hasActiveSubst();
+	if (cacheable) {
+		int8_t m = ctx.dropMemoLookup(ty);
+		if (m >= 0) return m != 0;
+	}
+	bool r = typeNeedsDropResolved(ctx, ty);
+	if (cacheable) ctx.dropMemoStore(ty, r);
+	return r;
+}
+
+// The uncached walk; `ty` is already generic-resolved and requalified.
+static bool typeNeedsDropResolved(JamCodegenContext &ctx, TypeIdx ty) {
 	if (!lookupDropFnLLVMName(ctx, ty).empty()) return true;
 	const TypeKey &tk = ctx.getTypePool().get(ty);
 	// A fixed-size array owns its elements: it needs drop iff the

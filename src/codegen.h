@@ -118,7 +118,32 @@ class JamCodegenContext {
 	// known owner (std, generic params, `Self`, builtins) are left as-is.
 	// This is what gives same-named types in different modules distinct
 	// TypeIdxs, which the per-TypeIdx LLVM-type cache relies on.
+	//
+	// Memoized per (module, TypeIdx): this runs on every resolution
+	// chokepoint (getLLVMType, lookupStruct, typeSize/typeAlign per
+	// field per nesting level), so the string walk must happen once per
+	// type per module, not once per query. Bypassed while a generic
+	// substitution context is active — subst names change the outcome.
 	TypeIdx requalifyType(TypeIdx ty, const std::string &ctxModule) const;
+
+	// True while a generic instantiation's substitution map is active.
+	// Resolution results computed under a subst are context-dependent,
+	// so the memo layers (requalify, drop, size/align) bypass
+	// themselves while this holds.
+	bool hasActiveSubst() const { return !currentSubst_.empty(); }
+
+	// typeNeedsDrop memo, keyed by the requalified TypeIdx. Returns -1
+	// unknown, 0 no-drop, 1 drop-bearing. A concrete type's verdict
+	// never changes once computed (drop registries only gain entries
+	// at instantiation, before the first query for that type).
+	int8_t dropMemoLookup(TypeIdx ty) const {
+		auto it = dropMemo_.find(ty);
+		return it == dropMemo_.end() ? int8_t{-1}
+		                             : static_cast<int8_t>(it->second);
+	}
+	void dropMemoStore(TypeIdx ty, bool needsDrop) const {
+		dropMemo_[ty] = needsDrop ? 1 : 0;
+	}
 
 	// Union registry. Untagged unions: every field shares the same
 	// address. UnionInfo carries the union's LLVM storage type plus the
@@ -368,6 +393,23 @@ class JamCodegenContext {
 	std::unordered_map<std::string,
 	                   std::unordered_map<std::string, std::string>>
 	    typeModuleOf_;
+	// Memo layers for the per-expression resolution chokepoints, keyed
+	// by (interned-module-id << 32 | TypeIdx) or by requalified
+	// TypeIdx. Cleared whenever their inputs change (registerTypeOwner
+	// / registerModuleConst — both run only during up-front
+	// registration in main.cpp, before any body lowers).
+	mutable std::unordered_map<std::string, uint32_t> moduleIds_;
+	mutable std::unordered_map<uint64_t, TypeIdx> requalifyMemo_;
+	mutable std::unordered_map<TypeIdx, uint8_t> dropMemo_;
+	mutable std::unordered_map<TypeIdx, uint64_t> sizeMemo_;
+	mutable std::unordered_map<TypeIdx, uint64_t> alignMemo_;
+	mutable std::unordered_map<std::string, jam::ComptimeScope>
+	    comptimeSeedCache_;
+	uint32_t moduleIdOf(const std::string &m) const;
+	TypeIdx requalifyTypeUncached(TypeIdx ty,
+	                              const std::string &ctxModule) const;
+	uint64_t typeSizeImpl(TypeIdx ty) const;
+	uint64_t typeAlignImpl(TypeIdx ty) const;
 	std::map<std::string, ModuleConstInfo> moduleConsts;
 	// (FunctionAST*, IfNode NodeIdx) -> comp-if condition verdict. See
 	// recordCompIfVerdict / lookupCompIfVerdict above.

@@ -119,6 +119,13 @@ class ComptimeScope {
 	// Returns nullptr if `name` isn't bound here OR in any ancestor.
 	const ComptimeValue *lookup(const std::string &name) const;
 
+	// Copy every binding in THIS scope (ancestors excluded) into `dst`.
+	// Lets the per-module seed cache replay a computed const fixpoint
+	// into a fresh scope without re-evaluating the initializers.
+	void copyBindingsInto(ComptimeScope &dst) const {
+		for (const auto &kv : bindings_) dst.bind(kv.first, kv.second);
+	}
+
   private:
 	ComptimeScope *parent_ = nullptr;
 	std::unordered_map<std::string, ComptimeValue> bindings_;
