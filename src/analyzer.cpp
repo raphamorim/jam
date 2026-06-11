@@ -140,8 +140,8 @@ bool Analyzer::resolveTypeFieldsStruct(DeclIndex idx) {
 	if (idx == kNoDecl) return false;
 	Decl &d = decls_.get(idx);
 	if (d.kind != DeclKind::Struct) return false;
-	BodyModuleGuard bmg(
-	    ctx_, d.structAst ? d.structAst->modulePath : std::string());
+	BodyModuleGuard bmg(ctx_,
+	                    d.structAst ? d.structAst->modulePath : std::string());
 
 	switch (d.structStatus) {
 	case StructStatus::HaveFieldTypes:

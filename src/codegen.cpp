@@ -1663,8 +1663,7 @@ TypeIdx JamCodegenContext::instantiateStructExpr(
 	// private sibling type must not trip the trigger-site module's
 	// handle-privacy gate. (Pass 2 bodies push the same module
 	// per-method below.)
-	const_cast<JamCodegenContext &>(*this).pushBodyModule(
-	    definingModulePath_);
+	const_cast<JamCodegenContext &>(*this).pushBodyModule(definingModulePath_);
 
 	std::vector<JamTypeRef> fieldLLVM;
 	fieldLLVM.reserve(instFields.size());

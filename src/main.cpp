@@ -480,7 +480,8 @@ static int compileAndRun(const std::string &filename,
 		    return out;
 	    };
 	auto declareStructs = [&](ModuleAST *m, bool publicOnly) {
-		(void)publicOnly;  // see registerTopLevelDecls: private types register too
+		(void)publicOnly;  // see registerTopLevelDecls: private types register
+		                   // too
 		for (auto &s : m->Structs) {
 			std::string q = qualifyTypeName(s->modulePath, s->Name);
 			JamTypeRef structType =
@@ -1658,9 +1659,8 @@ static int compileAndRun(const std::string &filename,
 			break;
 		case jam::OS::Linux:
 		case jam::OS::FreeBSD:
-			linkArgs.push_back((strip == JAM_STRIP_SYMBOLS)
-			                       ? "-Wl,-s"
-			                       : "-Wl,--strip-debug");
+			linkArgs.push_back(
+			    (strip == JAM_STRIP_SYMBOLS) ? "-Wl,-s" : "-Wl,--strip-debug");
 			break;
 		case jam::OS::Windows:
 		case jam::OS::Unknown:
@@ -2141,8 +2141,7 @@ int main(int argc, char *argv[]) {
 		// as a coherent block on completion. JAM_TEST_JOBS=1 forces the
 		// serial in-process path (useful under a debugger).
 		long hw = sysconf(_SC_NPROCESSORS_ONLN);
-		unsigned jobs =
-		    static_cast<unsigned>(hw > 1 ? (hw > 8 ? 8 : hw) : 1);
+		unsigned jobs = static_cast<unsigned>(hw > 1 ? (hw > 8 ? 8 : hw) : 1);
 		if (const char *env = std::getenv("JAM_TEST_JOBS")) {
 			int v = std::atoi(env);
 			if (v >= 1) jobs = static_cast<unsigned>(v);
@@ -2235,8 +2234,7 @@ int main(int argc, char *argv[]) {
 					          << active[i].out;
 					if (rc != 0) failed++;
 					else passed++;
-					active.erase(active.begin() +
-					             static_cast<long>(i));
+					active.erase(active.begin() + static_cast<long>(i));
 					reaped = true;
 				}
 				if (!sawData && !reaped && !active.empty()) usleep(2000);
