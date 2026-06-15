@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/jam"
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+authors = ["Raphael Amorim <rapha850@gmail.com>"]
+edition = "2024"
+license = "MIT"
+keywords = ["compiler"]
+rust-version = "1.96.0"
+repository = "https://github.com/raphamorim/jam"
+homepage = "https://jamlang.org"
+documentation = "https://github.com/raphamorim/jam#readme"
+readme = "README.md"
+
+[workspace.dependencies]

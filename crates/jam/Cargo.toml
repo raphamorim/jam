@@ -1,0 +1,8 @@
+[package]
+name = "jam"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Jam programming langauge compiler"
