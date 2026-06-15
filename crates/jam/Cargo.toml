@@ -6,3 +6,6 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Jam programming language compiler"
+
+[[bin]]
+name = "jam"
