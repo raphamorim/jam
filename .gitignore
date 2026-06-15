@@ -15,6 +15,9 @@
 *.a
 *.lib
 
+# Rust
+target/
+
 # Jam folders
 output/
 build/
