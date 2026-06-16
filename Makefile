@@ -262,6 +262,10 @@ test-release: test test-unit-release
 
 fmt: format
 
+lint:
+	cargo fmt -- --check --color always
+	cargo clippy --all-targets --all-features -- -D warnings
+
 format:
 	@echo "Formatting $(words $(FORMAT_SOURCES)) C++ file(s)..."
 	@$(CLANG_FORMAT) --style=$(CLANG_FORMAT_STYLE) -i $(FORMAT_SOURCES)
