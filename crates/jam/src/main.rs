@@ -11,7 +11,7 @@ fn main() {
         "version" => {
             println!("0.0.1");
         },
-        _ => {
+        "help" | _ => {
             display_help();
         }
     }
