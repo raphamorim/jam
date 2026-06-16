@@ -63,7 +63,7 @@ jam run hello.jam             # compile and run
 jam run -lncurses tetris.jam  # compile, link with ncurses, run
 jam help                      # show help
 jam version                   # show version
-jam test                      # run tests in cwd (recursive)
+jam test                      # run tests in current working directory
 jam test tests/unit           # run tests under tests/unit
 jam test tests/unit/foo.jam   # run tests in a single file
     "#);
