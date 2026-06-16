@@ -1,61 +1,54 @@
-// Terminal progress reporting via OSC 9;4. Supported by ConEmu,
-// Rio Terminal, Windows Terminal, iTerm2, WezTerm, Ghostty, etc.
+/*
+ * Copyright (c) 2026-present Raphael Amorim
+ *
+ * This file is part of jam.
+ * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
+ */
 
-// 0=remove, 1=normal+percent, 2=error, 3=indeterminate,
-// 4=warning.
+// 0=remove
+// 1=normal+percent
+// 2=error
+// 3=indeterminate
+// 4=warning
 
-// in jam we use 3 during compile, 2 on error, 0 on success.
+use std::io;
+use std::io::Write;
+
 pub struct ProgressGuard {
-	active: bool
+    active: bool,
 }
 
 impl Drop for ProgressGuard {
-	fn drop(&mut self) {
-    self.stop();
-  }
+    fn drop(&mut self) {
+        self.clear();
+    }
 }
 
 impl ProgressGuard {
-	pub fn error(&mut self) {
-		if self.active {
-			println!("\033]9;4;2;\033\\");
-			self.active = false;
-		}
-	}
+    pub fn new() -> Self {
+        let mut out = io::stdout();
+        write!(out, "\x1b]9;4;3;\x1b\\").unwrap();
+        out.flush().unwrap();
+        ProgressGuard {
+            active: true
+        }
+    }
 
-	pub fn stop(&mut self) {
-		if self.active {
-			println!("\033]9;4;0;\033\\");
-			self.active = false;
-		}
+    pub fn error(&mut self) {
+        if self.active {
+            let mut out = io::stdout();
+            write!(out, "\x1b]9;4;2;\x1b\\").unwrap();
+            out.flush().unwrap();
+            self.active = false;
+        }
+    }
 
-	}
+    fn clear(&mut self) {
+        if self.active {
+            let mut out = io::stdout();
+            write!(out, "\x1b]9;4;0;\x1b\\").unwrap();
+            out.flush().unwrap();
+            self.active = false;
+        }
+    }
 }
-
-// Pr
-//   public:
-// 	ProgressGuard(bool enabled) {
-// 		if (!enabled) return;
-// 		if (!isatty(STDERR_FILENO)) return;
-// 		active = true;
-// 		std::cerr << "\033]9;4;3;\033\\" << std::flush;
-// 	}
-// 	~ProgressGuard() { clear(); }
-
-// 	void error() {
-// 		if (active) {
-// 			std::cerr << "\033]9;4;2;\033\\" << std::flush;
-// 			active = false;
-// 		}
-// 	}
-// 	// Stop without flagging error — same exit as success.
-// 	void stop() { clear(); }
-
-//   private:
-// 	void clear() {
-// 		if (active) {
-// 			std::cerr << "\033]9;4;0;\033\\" << std::flush;
-// 			active = false;
-// 		}
-// 	}
-// };

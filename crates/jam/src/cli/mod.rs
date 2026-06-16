@@ -1,7 +1,15 @@
+/*
+ * Copyright (c) 2026-present Raphael Amorim
+ *
+ * This file is part of jam.
+ * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
+ */
+
 pub mod progress;
 
 pub fn display_help() {
-    println!(r#"Jam programming language compiler
+    println!(
+        r#"Jam programming language compiler
 
 Usage: jam [OPTIONS] <file|directory>
        jam run [LINKER-FLAGS] <file>
@@ -48,5 +56,6 @@ jam help                      # show help
 jam version                   # show version
 jam test                      # run tests in current working directory
 jam test tests/unit           # run tests under tests/unit
-jam test tests/unit/foo.jam   # run tests in a single file"#);
+jam test tests/unit/foo.jam   # run tests in a single file"#
+    );
 }
