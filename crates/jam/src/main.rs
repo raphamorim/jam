@@ -1,3 +1,22 @@
+use std::env;
+
 fn main() {
-    println!("oi");
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2  {
+        displayHelp();
+        return;
+    }
+    let command = &args[1];
+    match command.as_str() {
+        "version" => {
+            println!("0.0.1");
+        },
+        _ => {
+
+        }
+    }
+}
+
+fn displayHelp() {
+    println!("Display help");
 }
