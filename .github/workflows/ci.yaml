@@ -16,13 +16,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-linux-x86:
-    name: Build on Linux (x86_64)
-    runs-on: ubuntu-latest
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux (x86_64), runner: ubuntu-latest, os: linux }
+          - { name: Linux (ARM64), runner: ubuntu-24.04-arm, os: linux }
+          - { name: macOS, runner: macos-latest, os: macos }
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM 22
+      - name: Install LLVM 22 (Linux)
+        if: matrix.os == 'linux'
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
             | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
@@ -31,122 +39,48 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
           sudo apt-get install -y llvm-22-dev libclang-22-dev clang-22 cmake
+          echo "LLVM_CONFIG=/usr/lib/llvm-22/bin/llvm-config" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
           /usr/lib/llvm-22/bin/llvm-config --version
 
-      - name: Configure and build
-        run: |
-          mkdir -p build
-          cd build
-          cmake .. -DCMAKE_PREFIX_PATH=/usr/lib/llvm-22
-          cmake --build . -j $(nproc)
-
-      - name: Run unit tests (debug, -C opt-level=0)
-        run: ./build/jam test tests/unit
-
-      # catches bugs that only surface once LLVM's optimizer engages
-      # (dead-load explosions, mem2reg interactions, GEP coalescing, etc.)
-      - name: Run unit tests (release, -C opt-level=3)
-        run: ./build/jam -C opt-level=3 test tests/unit
-
-      - name: Run codegen-error tests
-        run: |
-          ln -sf build/jam jam.out
-          clang++ -c tests/cpp/test_codegen_errors.cpp -o codegen_error_tests.o \
-            `/usr/lib/llvm-22/bin/llvm-config --cxxflags` -fexceptions
-          clang++ -o codegen_error_tests codegen_error_tests.o
-          ./codegen_error_tests
-
-      - name: Archive build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-x86-artifacts
-          path: build/jam
-
-  build-linux-arm:
-    name: Build on Linux (ARM64)
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install LLVM 22
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
-          codename=$(lsb_release -cs)
-          echo "deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-22 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update
-          sudo apt-get install -y llvm-22-dev libclang-22-dev clang-22 cmake
-          /usr/lib/llvm-22/bin/llvm-config --version
-
-      - name: Configure and build
-        run: |
-          mkdir -p build
-          cd build
-          cmake .. -DCMAKE_PREFIX_PATH=/usr/lib/llvm-22
-          cmake --build . -j $(nproc)
-
-      - name: Run unit tests (debug, -C opt-level=0)
-        run: ./build/jam test tests/unit
-
-      # catches bugs that only surface once LLVM's optimizer engages
-      # (dead-load explosions, mem2reg interactions, GEP coalescing, etc.)
-      - name: Run unit tests (release, -C opt-level=3)
-        run: ./build/jam -C opt-level=3 test tests/unit
-
-      - name: Run codegen-error tests
-        run: |
-          ln -sf build/jam jam.out
-          clang++ -c tests/cpp/test_codegen_errors.cpp -o codegen_error_tests.o \
-            `/usr/lib/llvm-22/bin/llvm-config --cxxflags` -fexceptions
-          clang++ -o codegen_error_tests codegen_error_tests.o
-          ./codegen_error_tests
-
-      - name: Archive ARM build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-arm-artifacts
-          path: build/jam
-
-  build-macos:
-    name: Build on macOS
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install LLVM 22 via Homebrew
+      - name: Install LLVM 22 (macOS)
+        if: matrix.os == 'macos'
         run: |
           brew install llvm@22
           LLVM_PREFIX="$(brew --prefix llvm@22)"
           echo "${LLVM_PREFIX}/bin" >> "$GITHUB_PATH"
+          echo "LLVM_CONFIG=${LLVM_PREFIX}/bin/llvm-config" >> "$GITHUB_ENV"
           echo "LLVM_PREFIX=${LLVM_PREFIX}" >> "$GITHUB_ENV"
           "${LLVM_PREFIX}/bin/llvm-config" --version
 
-      - name: Configure and build
+      - name: Install Rust
         run: |
-          mkdir -p build
-          cd build
-          cmake .. -DCMAKE_PREFIX_PATH="${LLVM_PREFIX}"
-          cmake --build . -j $(sysctl -n hw.ncpu)
+          rustup toolchain install 1.96 --profile minimal --component rustfmt,clippy
+          rustup show
 
-      - name: Run unit tests (debug, -C opt-level=0)
-        run: ./build/jam test tests/unit
-
-      # catches bugs that only surface once LLVM's optimizer engages
-      # (dead-load explosions, mem2reg interactions, GEP coalescing, etc.)
-      - name: Run unit tests (release, -C opt-level=3)
-        run: ./build/jam -C opt-level=3 test tests/unit
-
-      - name: Run codegen-error tests
-        run: |
-          ln -sf build/jam jam.out
-          clang++ -c tests/cpp/test_codegen_errors.cpp -o codegen_error_tests.o \
-            $("${LLVM_PREFIX}/bin/llvm-config" --cxxflags) -fexceptions
-          clang++ -o codegen_error_tests codegen_error_tests.o
-          ./codegen_error_tests
-
-      - name: Archive macOS build artifacts
-        uses: actions/upload-artifact@v4
+      - name: Cargo cache
+        uses: actions/cache@v4
         with:
-          name: macos-artifacts
-          path: build/jam
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.name }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build (release)
+        run: cargo build --release -p jam
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Unit tests
+        run: cargo test --workspace
+
+      # - name: Archive jam binary
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: jam-${{ matrix.name }}
+      #     path: target/release/jam
