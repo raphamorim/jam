@@ -1,0 +1,15 @@
+[package]
+name = "float128"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "fully rust IEEE-754 binary128 (also known as quad) float-literal parsing and rounding. This project was created for jam programming language compiler."
+
+[lib]
+name = "float128"
+path = "src/lib.rs"
+
+[dependencies]
