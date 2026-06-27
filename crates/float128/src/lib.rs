@@ -9,4 +9,13 @@
 // is a standard for representing floating-point numbers in computers.
 
 // for anyone contributing to this (maybe in the future idk):
-// this crate should be fully in rust and dep free
+// this crate should be fully in rust and dep free.
+
+// we use float128 due to LLVM APFloat
+// https://llvm.org/doxygen/classllvm_1_1APFloat.html
+// Quadruple-precision floating-point format
+// https://en.wikipedia.org/wiki/Quadruple-precision_floating-point_format
+
+// The IEEE 754 standard specifies a binary128 as having:
+// Sign bit: 1bit (in our case it's on position 127, 0 for positive and 1 for negative)
+// Exponent width: 15bits
