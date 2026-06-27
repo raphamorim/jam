@@ -18,4 +18,15 @@
 
 // The IEEE 754 standard specifies a binary128 as having:
 // Sign bit: 1bit (in our case it's on position 127, 0 for positive and 1 for negative)
-// Exponent width: 15bits
+// Exponent width: 15bits, it basically encodes the magnitude (positions 112 to 126).
+
+// for example
+// 15.3013
+// 0     10000010     11101001101001000100000
+// |     └──┬───┘     └──────────┬──────────┘
+// sign  exponent            mantissa
+
+// -15.3013
+// 1     10000010     11101001101001000100000
+// |     └──┬───┘     └──────────┬──────────┘
+// sign  exponent            mantissa
