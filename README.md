@@ -46,3 +46,8 @@ Jam logo/mascot was created by [Anthony Orozco](https://www.behance.net/ntnay).
 ## License
 
 This software is distributed under the Apache License 2.0 with LLVM Exceptions.
+
+## TODO
+
+- [ ] Minifloats.
+- [ ] MLIR rs.
