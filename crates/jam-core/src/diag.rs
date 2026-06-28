@@ -254,3 +254,158 @@ impl Diagnostics {
     }
 }
 
+fn emit_one<W: io::Write>(out: &mut W, d: &Diagnostic, indent: usize) -> io::Result<()> {
+    let pad = " ".repeat(indent);
+    write!(out, "{pad}")?;
+    if !d.loc.file.is_empty() {
+        write!(out, "{}:", d.loc.file)?;
+        if d.loc.line > 0 {
+            write!(out, "{}:", d.loc.line)?;
+        }
+        write!(out, " ")?;
+    }
+    writeln!(out, "{}: {}", d.severity.label(), d.message)?;
+
+    for note in &d.notes {
+        // Attached notes inherit Note severity when the caller left them Error,
+        // so an attached note renders as `note:` not `error:`.
+        let mut nd = note.clone();
+        if nd.severity == Severity::Error {
+            nd.severity = Severity::Note;
+        }
+        emit_one(out, &nd, indent + 4)?;
+    }
+
+    for frame in &d.reference_trace {
+        let verb = match frame.kind {
+            TraceKind::Reference => "referenced by",
+            TraceKind::Instantiation => "in instantiation of",
+        };
+        write!(out, "{pad}    note: {verb} `{}`", frame.decl)?;
+        if !frame.loc.file.is_empty() && frame.loc.line > 0 {
+            write!(out, " at {}:{}", frame.loc.file, frame.loc.line)?;
+        }
+        if frame.hidden > 0 {
+            write!(out, " ({} more references hidden)", frame.hidden)?;
+        }
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_error() {
+        let mut d = Diagnostics::new();
+        d.error(SrcLoc::new("a.jam", 5), "bad thing");
+        assert_eq!(d.render_to_string(), "a.jam:5: error: bad thing\n");
+    }
+
+    #[test]
+    fn error_with_demoted_note() {
+        let mut d = Diagnostics::new();
+        // Note built as Error (no file) must render as `note:`, indented 4.
+        let note = Diagnostic::new(Severity::Error, SrcLoc::none(), "declared here");
+        d.error_with_notes(SrcLoc::new("a.jam", 5), "bad thing", vec![note]);
+        assert_eq!(
+            d.render_to_string(),
+            "a.jam:5: error: bad thing\n    note: declared here\n"
+        );
+    }
+
+    #[test]
+    fn instantiation_trace_frame() {
+        let mut d = Diagnostics::new();
+        let frame = Trace::new(
+            SrcLoc::new("v.jam", 10),
+            "Vec(i32).default",
+            TraceKind::Instantiation,
+        );
+        d.error_with_trace(SrcLoc::new("a.jam", 5), "bad thing", vec![frame]);
+        assert_eq!(
+            d.render_to_string(),
+            "a.jam:5: error: bad thing\n    note: in instantiation of `Vec(i32).default` at v.jam:10\n"
+        );
+    }
+
+    #[test]
+    fn reference_trace_with_hidden() {
+        let mut d = Diagnostics::new();
+        let mut frame = Trace::new(SrcLoc::none(), "B", TraceKind::Reference);
+        frame.hidden = 3;
+        d.error_with_trace(SrcLoc::new("a.jam", 1), "x", vec![frame]);
+        assert_eq!(
+            d.render_to_string(),
+            "a.jam:1: error: x\n    note: referenced by `B` (3 more references hidden)\n"
+        );
+    }
+
+    #[test]
+    fn file_without_line() {
+        let mut d = Diagnostics::new();
+        d.error(SrcLoc::file_only("x.jam"), "msg");
+        assert_eq!(d.render_to_string(), "x.jam: error: msg\n");
+    }
+
+    #[test]
+    fn no_location() {
+        let mut d = Diagnostics::new();
+        d.error(SrcLoc::none(), "msg");
+        assert_eq!(d.render_to_string(), "error: msg\n");
+    }
+
+    #[test]
+    fn stable_sort_by_line_then_severity() {
+        let mut d = Diagnostics::new();
+        // Pushed out of order; warning at line 5 before error at line 5.
+        d.warning(SrcLoc::new("a.jam", 5), "w5");
+        d.error(SrcLoc::new("a.jam", 5), "e5");
+        d.error(SrcLoc::new("a.jam", 3), "e3");
+        assert_eq!(
+            d.render_to_string(),
+            "a.jam:3: error: e3\n\
+             a.jam:5: error: e5\n\
+             a.jam:5: warning: w5\n"
+        );
+    }
+
+    #[test]
+    fn truncate_and_counts() {
+        let mut d = Diagnostics::new();
+        d.error(SrcLoc::new("a", 1), "1");
+        let mark = d.len();
+        d.error(SrcLoc::new("a", 2), "2");
+        d.warning(SrcLoc::new("a", 3), "3");
+        assert_eq!(d.len(), 3);
+        assert_eq!(d.error_count(), 2);
+        assert!(d.has_errors());
+        d.truncate_to(mark);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d.error_count(), 1);
+        // truncate_to never grows.
+        d.truncate_to(99);
+        assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    fn ref_trace_guard_push_pop() {
+        let mut stack: Vec<Trace> = Vec::new();
+        {
+            let _g = RefTraceGuard::push(
+                &mut stack,
+                Trace::new(SrcLoc::none(), "A", TraceKind::Instantiation),
+            );
+            // can't inspect stack here (borrowed), so re-check after drop
+        }
+        assert!(stack.is_empty(), "guard must pop on drop");
+        let g = RefTraceGuard::push(
+            &mut stack,
+            Trace::new(SrcLoc::none(), "B", TraceKind::Reference),
+        );
+        drop(g);
+        assert!(stack.is_empty());
+    }
+}
