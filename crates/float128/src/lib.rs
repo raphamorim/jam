@@ -126,3 +126,55 @@ fn parse_to_binary128(lexeme: &str) -> u128 {
     magnitude | sign
 }
 
+/// Decimal: `intdigits[.fracdigits][(e|E)[sign]expdigits]`.
+fn parse_decimal(s: &str) -> u128 {
+    let (mant, exp_str) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
+    };
+    let (int_part, frac_part) = match mant.find('.') {
+        Some(i) => (&mant[..i], &mant[i + 1..]),
+        None => (mant, ""),
+    };
+
+    // Significant digits = int ++ frac, as one big integer D.
+    let mut digits: Vec<u8> = Vec::with_capacity(int_part.len() + frac_part.len());
+    digits.extend(
+        int_part
+            .bytes()
+            .filter(u8::is_ascii_digit)
+            .map(|b| b - b'0'),
+    );
+    digits.extend(
+        frac_part
+            .bytes()
+            .filter(u8::is_ascii_digit)
+            .map(|b| b - b'0'),
+    );
+
+    let explicit_exp: i64 = exp_str.parse().unwrap_or(0);
+    // The decimal point shifts the exponent left by the fraction length.
+    let exp10 = explicit_exp - frac_part.bytes().filter(u8::is_ascii_digit).count() as i64;
+
+    let d = Big::from_digits(&digits);
+    if d.is_zero() {
+        return 0;
+    }
+
+    // value = D * 10^exp10  ->  num/den
+    let (num, den) = if exp10 >= 0 {
+        let mut n = d;
+        for _ in 0..exp10 {
+            n.mul_small(10);
+        }
+        (n, Big::one())
+    } else {
+        let mut den = Big::one();
+        for _ in 0..(-exp10) {
+            den.mul_small(10);
+        }
+        (d, den)
+    };
+    ratio_to_binary128(num, den)
+}
+
