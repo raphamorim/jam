@@ -178,3 +178,43 @@ fn parse_decimal(s: &str) -> u128 {
     ratio_to_binary128(num, den)
 }
 
+/// Hex float: `hexint[.hexfrac](p|P)[sign]binexp`.
+fn parse_hex_float(s: &str) -> u128 {
+    let (mant, exp_str) = match s.find(['p', 'P']) {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
+    };
+    let (int_part, frac_part) = match mant.find('.') {
+        Some(i) => (&mant[..i], &mant[i + 1..]),
+        None => (mant, ""),
+    };
+
+    // M = integer value of (hexint ++ hexfrac); value = M * 2^(p - 4*fraclen).
+    let mut m = Big::zero();
+    let mut hex_frac_digits = 0i64;
+    for b in int_part.bytes().chain(frac_part.bytes()) {
+        if let Some(v) = (b as char).to_digit(16) {
+            m.mul_small(16);
+            m.add_small(v);
+        }
+    }
+    for b in frac_part.bytes() {
+        if (b as char).is_ascii_hexdigit() {
+            hex_frac_digits += 1;
+        }
+    }
+    if m.is_zero() {
+        return 0;
+    }
+    let p: i64 = exp_str.parse().unwrap_or(0);
+    let bin_exp = p - 4 * hex_frac_digits;
+
+    // value = M * 2^bin_exp  ->  num/den
+    let (num, den) = if bin_exp >= 0 {
+        (m.shl(bin_exp as usize), Big::one())
+    } else {
+        (m, Big::one().shl((-bin_exp) as usize))
+    };
+    ratio_to_binary128(num, den)
+}
+
