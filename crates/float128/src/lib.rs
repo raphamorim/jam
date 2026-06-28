@@ -106,3 +106,23 @@ fn from_quad(quad: &[u32; 4]) -> u128 {
 // Lexeme parsing -> binary128 bit pattern
 // ===========================================================================
 
+fn parse_to_binary128(lexeme: &str) -> u128 {
+    // Strip a leading sign defensively (the contract says lexemes are
+    // sign-stripped). A leading '-' sets the sign bit.
+    let mut s = lexeme.trim();
+    let mut sign: u128 = 0;
+    if let Some(rest) = s.strip_prefix('-') {
+        sign = 1u128 << 127;
+        s = rest;
+    } else if let Some(rest) = s.strip_prefix('+') {
+        s = rest;
+    }
+
+    let magnitude = if s.len() >= 2 && (&s[..2] == "0x" || &s[..2] == "0X") {
+        parse_hex_float(&s[2..])
+    } else {
+        parse_decimal(s)
+    };
+    magnitude | sign
+}
+
