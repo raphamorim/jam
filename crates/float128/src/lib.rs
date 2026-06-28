@@ -300,3 +300,128 @@ enum FloatFmt {
     F64,
 }
 
+impl FloatFmt {
+    fn exp_bits(self) -> u32 {
+        match self {
+            FloatFmt::F32 => 8,
+            FloatFmt::F64 => 11,
+        }
+    }
+    fn frac_bits(self) -> u32 {
+        match self {
+            FloatFmt::F32 => 23,
+            FloatFmt::F64 => 52,
+        }
+    }
+    fn bias(self) -> i64 {
+        match self {
+            FloatFmt::F32 => 127,
+            FloatFmt::F64 => 1023,
+        }
+    }
+}
+
+/// Round binary128 `bits` to the given target format. Returns `(target_bits,
+/// lost)` where `target_bits` holds the result in the low bits (32 for f32, 64
+/// for f64) and `lost` is true iff the conversion discarded any information
+/// (the APFloat `lostInfo` semantics — used to decide the `Fits64` storage).
+fn f128_to_target(bits: u128, fmt: FloatFmt) -> (u64, bool) {
+    let exp_bits = fmt.exp_bits();
+    let frac_bits = fmt.frac_bits();
+    let bias = fmt.bias();
+    let sign = ((bits >> 127) & 1) as u64;
+    let src_exp = ((bits >> F128_FRAC_BITS) & 0x7FFF) as i64;
+    let src_frac = bits & ((1u128 << F128_FRAC_BITS) - 1);
+    let exp_all = (1u64 << exp_bits) - 1;
+    let sign_shifted = sign << (exp_bits + frac_bits);
+
+    // Inf / NaN.
+    if src_exp == 0x7FFF {
+        return if src_frac == 0 {
+            (sign_shifted | (exp_all << frac_bits), false) // inf
+        } else {
+            // Quiet NaN (set the top fraction bit). lost=false: NaN -> NaN.
+            (
+                sign_shifted | (exp_all << frac_bits) | (1u64 << (frac_bits - 1)),
+                false,
+            )
+        };
+    }
+    // Zero (binary128 subnormals don't arise from literals; treat as ~0).
+    if src_exp == 0 {
+        return (sign_shifted, src_frac != 0);
+    }
+
+    // Normal binary128: significand has implicit leading 1 at bit 112.
+    let sig = (1u128 << F128_FRAC_BITS) | src_frac; // in [2^112, 2^113)
+    let unbiased = src_exp - QUAD_BIAS;
+
+    // Overflow of the target -> inf.
+    if unbiased > bias {
+        return (sign_shifted | (exp_all << frac_bits), true);
+    }
+
+    // Bits of `sig` to discard, and the target biased exponent.
+    let (discard, mut biased_exp, subnormal) = if unbiased >= 1 - bias {
+        (
+            (F128_FRAC_BITS - frac_bits) as i64,
+            (unbiased + bias) as u64,
+            false,
+        )
+    } else {
+        let extra = (1 - bias) - unbiased; // >= 1
+        ((F128_FRAC_BITS - frac_bits) as i64 + extra, 0u64, true)
+    };
+
+    // Discarding >=114 bits means the whole significand (which is <2^113) is
+    // below half a ULP of the smallest representable value -> rounds to zero.
+    if discard >= 114 {
+        return (sign_shifted, true);
+    }
+
+    let d = discard as u32;
+    let mut keep = sig >> d;
+    let rem = sig & ((1u128 << d) - 1);
+    let half = 1u128 << (d - 1);
+    let lost = rem != 0;
+
+    // Round nearest, ties to even.
+    if rem > half || (rem == half && (keep & 1) == 1) {
+        keep += 1;
+    }
+
+    if subnormal {
+        // Rounding may push a subnormal up into the smallest normal (mantissa
+        // carries into the implicit bit).
+        if keep >= (1u128 << frac_bits) {
+            biased_exp = 1;
+            keep &= (1u128 << frac_bits) - 1;
+        }
+    } else {
+        // Normal: `keep` is in [2^frac_bits, 2^(frac_bits+1)); a round-up can
+        // overflow it, bumping the exponent.
+        if keep == (1u128 << (frac_bits + 1)) {
+            keep >>= 1;
+            biased_exp += 1;
+            if biased_exp >= exp_all {
+                return (sign_shifted | (exp_all << frac_bits), true); // -> inf
+            }
+        }
+    }
+
+    let frac_mask = (1u64 << frac_bits) - 1;
+    let frac_t = (keep as u64) & frac_mask;
+    (sign_shifted | (biased_exp << frac_bits) | frac_t, lost)
+}
+
+// ===========================================================================
+// Minimal big unsigned integer (little-endian u32 limbs)
+// ===========================================================================
+
+#[derive(Clone, Debug)]
+struct Big {
+    /// little-endian base-2^32 limbs, normalized (no trailing zero limb except
+    /// the canonical empty == zero).
+    limbs: Vec<u32>,
+}
+
