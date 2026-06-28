@@ -86,3 +86,23 @@ pub fn quad_to_target_as_double(quad: &[u32; 4], to_f32: bool) -> f64 {
     }
 }
 
+// quad <-> u128 (little-endian word order).
+fn to_quad(bits: u128) -> [u32; 4] {
+    [
+        bits as u32,
+        (bits >> 32) as u32,
+        (bits >> 64) as u32,
+        (bits >> 96) as u32,
+    ]
+}
+fn from_quad(quad: &[u32; 4]) -> u128 {
+    (quad[0] as u128)
+        | ((quad[1] as u128) << 32)
+        | ((quad[2] as u128) << 64)
+        | ((quad[3] as u128) << 96)
+}
+
+// ===========================================================================
+// Lexeme parsing -> binary128 bit pattern
+// ===========================================================================
+
