@@ -218,3 +218,85 @@ fn parse_hex_float(s: &str) -> u128 {
     ratio_to_binary128(num, den)
 }
 
+/// Correctly-rounded (nearest, ties-to-even) conversion of the positive
+/// rational `num/den` into a binary128 bit pattern (sign bit left 0).
+fn ratio_to_binary128(num: Big, den: Big) -> u128 {
+    if num.is_zero() {
+        return 0;
+    }
+    // Choose k so that q = floor((num<<k)/den) lands in [2^112, 2^113), i.e.
+    //   den*2^112 <= num*2^k < den*2^113.
+    // Equivalently scale one side; `k` is the net left shift of num/den.
+    let mut k: i64 = 112 - (num.bit_len() as i64 - den.bit_len() as i64);
+    let (a, b) = loop {
+        let (a, b) = scaled_pair(&num, &den, k);
+        let lo = b.shl(112); // den_scaled * 2^112
+        let hi = b.shl(113);
+        if a.cmp(&lo) == std::cmp::Ordering::Less {
+            k += 1; // q would be < 2^112 -> need more left shift
+            continue;
+        }
+        if a.cmp(&hi) != std::cmp::Ordering::Less {
+            k -= 1; // q would be >= 2^113 -> too much
+            continue;
+        }
+        break (a, b);
+    };
+
+    // Now q = floor(a/b) is exactly 113 bits; r = a mod b.
+    let (mut q, r) = divmod_u128(&a, &b);
+    let mut e: i64 = -k; // value == q * 2^e
+
+    // Round nearest, ties to even, using 2*r vs b.
+    let twice_r = r.shl(1);
+    match twice_r.cmp(&b) {
+        std::cmp::Ordering::Greater => q += 1,
+        std::cmp::Ordering::Equal if (q & 1) == 1 => q += 1,
+        _ => {}
+    }
+    if q == (1u128 << 113) {
+        q = 1u128 << 112; // mantissa carry-out -> renormalize
+        e += 1;
+    }
+    assemble_binary128(q, e)
+}
+
+/// Build (num<<k, den) for k>=0, or (num, den<<-k) for k<0.
+fn scaled_pair(num: &Big, den: &Big, k: i64) -> (Big, Big) {
+    if k >= 0 {
+        (num.shl(k as usize), den.clone())
+    } else {
+        (num.clone(), den.shl((-k) as usize))
+    }
+}
+
+/// Assemble a binary128 pattern from a 113-bit significand `q` (top bit at
+/// position 112) and binary scale `e` such that the value is `q * 2^e`.
+fn assemble_binary128(q: u128, e: i64) -> u128 {
+    // value = q * 2^e = (q / 2^112) * 2^(112+e); q/2^112 in [1,2).
+    let unbiased = 112 + e;
+    let biased = unbiased + QUAD_BIAS;
+    if biased >= 0x7FFF {
+        // Overflow of binary128 itself -> +inf. Unreachable for any f32/f64
+        // literal (binary128 max ~1.2e4932); the tokenizer rejects such ranges.
+        return (0x7FFFu128) << F128_FRAC_BITS;
+    }
+    if biased <= 0 {
+        // Underflow below binary128 normal range -> 0. Likewise unreachable for
+        // real literals (binary128 min normal ~3.4e-4932).
+        return 0;
+    }
+    let frac = q & ((1u128 << F128_FRAC_BITS) - 1);
+    ((biased as u128) << F128_FRAC_BITS) | frac
+}
+
+// ===========================================================================
+// binary128 -> f32 / f64 narrowing (single correct rounding)
+// ===========================================================================
+
+#[derive(Clone, Copy)]
+enum FloatFmt {
+    F32,
+    F64,
+}
+
