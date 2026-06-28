@@ -169,3 +169,25 @@ impl TokenType {
     }
 }
 
+/// One lexed token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Token {
+    pub ttype: TokenType,
+    /// Decoded value — only populated for `StringLiteral`; empty otherwise.
+    pub lexeme: Vec<u8>,
+    /// 1-based source line.
+    pub line: u32,
+    pub byte_offset: u32,
+    pub length: u32,
+}
+
+impl Token {
+    /// Raw source span. The returned slice is valid as long as `source` is the
+    /// same buffer the lexer ran over. For `StringLiteral` this is the raw
+    /// `"..."`-bracketed bytes — use [`Token::lexeme`] for the decoded value.
+    pub fn text<'a>(&self, source: &'a [u8]) -> &'a [u8] {
+        let start = self.byte_offset as usize;
+        let end = start + self.length as usize;
+        &source[start..end]
+    }
+}
