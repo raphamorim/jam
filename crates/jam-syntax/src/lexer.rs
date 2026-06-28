@@ -103,3 +103,65 @@ impl Lexer {
         }
     }
 
+    fn skip_whitespace(&mut self) -> Result<(), LexError> {
+        loop {
+            let c = self.peek();
+            match c {
+                b' ' | b'\r' | b'\t' => {
+                    self.advance();
+                }
+                b'\n' => {
+                    self.line += 1;
+                    self.advance();
+                }
+                b'/' => {
+                    if self.peek_next() == b'/' {
+                        // `//` line comment — to end of line.
+                        while self.peek() != b'\n' && !self.is_at_end() {
+                            self.advance();
+                        }
+                        // continue the loop (handle following ws/comments)
+                    } else if self.peek_next() == b'*' {
+                        // jam has no block comments (deliberate).
+                        return Err(self.err(format!(
+                            "jam has no block comments; use `//` line comments (line {})",
+                            self.line
+                        )));
+                    } else {
+                        // bare `/` is the divide operator — leave it.
+                        return Ok(());
+                    }
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    fn is_digit(c: u8) -> bool {
+        c.is_ascii_digit()
+    }
+    fn is_alpha(c: u8) -> bool {
+        c.is_ascii_alphabetic() || c == b'_'
+    }
+    fn is_alpha_numeric(c: u8) -> bool {
+        Self::is_alpha(c) || Self::is_digit(c)
+    }
+    fn is_alpha_digit(c: u8) -> bool {
+        c.is_ascii_alphanumeric()
+    }
+
+    fn add_token(&mut self, ttype: TokenType) {
+        self.add_token_lex(ttype, Vec::new());
+    }
+
+    fn add_token_lex(&mut self, ttype: TokenType, lexeme: Vec<u8>) {
+        let length = self.current as u32 - self.token_start;
+        self.tokens.push(Token {
+            ttype,
+            lexeme,
+            line: self.line,
+            byte_offset: self.token_start,
+            length,
+        });
+    }
+
