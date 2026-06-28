@@ -107,3 +107,41 @@ idx_newtype!(
     JirBlockRef
 );
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sentinel_and_roundtrip() {
+        assert!(NodeIdx::NONE.is_none());
+        assert_eq!(NodeIdx::NONE.raw(), 0);
+        let n = NodeIdx::from_usize(7);
+        assert_eq!(n.index(), 7);
+        assert_eq!(n.raw(), 7);
+        assert!(!n.is_none());
+        assert_eq!(NodeIdx::new(7), n);
+    }
+
+    #[test]
+    fn distinct_types_dont_mix() {
+        // Compile-time guarantee: these are different types. This test just
+        // exercises ordering/hashing used by interning maps.
+        use std::collections::HashSet;
+        let mut s = HashSet::new();
+        s.insert(TypeIdx::new(1));
+        s.insert(TypeIdx::new(1));
+        s.insert(TypeIdx::new(2));
+        assert_eq!(s.len(), 2);
+        assert!(TypeIdx::new(1) < TypeIdx::new(2));
+    }
+
+    #[test]
+    fn debug_format() {
+        assert_eq!(format!("{:?}", DeclIndex::new(3)), "DeclIndex(3)");
+    }
+
+    #[test]
+    fn transparent_layout() {
+        assert_eq!(std::mem::size_of::<TypeIdx>(), std::mem::size_of::<u32>());
+    }
+}
