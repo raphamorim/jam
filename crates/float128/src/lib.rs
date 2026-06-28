@@ -425,3 +425,165 @@ struct Big {
     limbs: Vec<u32>,
 }
 
+impl Big {
+    fn zero() -> Big {
+        Big { limbs: Vec::new() }
+    }
+    fn one() -> Big {
+        Big { limbs: vec![1] }
+    }
+    fn from_digits(digits: &[u8]) -> Big {
+        let mut b = Big::zero();
+        for &d in digits {
+            b.mul_small(10);
+            b.add_small(d as u32);
+        }
+        b
+    }
+    fn is_zero(&self) -> bool {
+        self.limbs.is_empty()
+    }
+    fn normalize(&mut self) {
+        while let Some(&0) = self.limbs.last() {
+            self.limbs.pop();
+        }
+    }
+    fn mul_small(&mut self, m: u32) {
+        if m == 0 {
+            self.limbs.clear();
+            return;
+        }
+        let mut carry: u64 = 0;
+        for limb in self.limbs.iter_mut() {
+            let v = (*limb as u64) * (m as u64) + carry;
+            *limb = v as u32;
+            carry = v >> 32;
+        }
+        while carry != 0 {
+            self.limbs.push(carry as u32);
+            carry >>= 32;
+        }
+    }
+    fn add_small(&mut self, a: u32) {
+        if a == 0 {
+            return;
+        }
+        let mut carry = a as u64;
+        let mut i = 0;
+        while carry != 0 {
+            if i == self.limbs.len() {
+                self.limbs.push(0);
+            }
+            let v = self.limbs[i] as u64 + carry;
+            self.limbs[i] = v as u32;
+            carry = v >> 32;
+            i += 1;
+        }
+    }
+    /// Multiply by 2^bits (left shift).
+    fn shl(&self, bits: usize) -> Big {
+        if self.is_zero() {
+            return Big::zero();
+        }
+        let limb_shift = bits / 32;
+        let bit_shift = (bits % 32) as u32;
+        let mut out = vec![0u32; limb_shift];
+        if bit_shift == 0 {
+            out.extend_from_slice(&self.limbs);
+        } else {
+            let mut carry: u32 = 0;
+            for &limb in &self.limbs {
+                let v = ((limb as u64) << bit_shift) | (carry as u64);
+                out.push(v as u32);
+                carry = (v >> 32) as u32;
+            }
+            if carry != 0 {
+                out.push(carry);
+            }
+        }
+        let mut b = Big { limbs: out };
+        b.normalize();
+        b
+    }
+    fn bit_len(&self) -> usize {
+        match self.limbs.last() {
+            None => 0,
+            Some(&top) => (self.limbs.len() - 1) * 32 + (32 - top.leading_zeros() as usize),
+        }
+    }
+    fn bit(&self, i: usize) -> u32 {
+        let limb = i / 32;
+        if limb >= self.limbs.len() {
+            0
+        } else {
+            (self.limbs[limb] >> (i % 32)) & 1
+        }
+    }
+    fn cmp(&self, other: &Big) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if self.limbs.len() != other.limbs.len() {
+            return self.limbs.len().cmp(&other.limbs.len());
+        }
+        for i in (0..self.limbs.len()).rev() {
+            match self.limbs[i].cmp(&other.limbs[i]) {
+                Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        Ordering::Equal
+    }
+    /// self -= other (requires self >= other).
+    fn sub_assign(&mut self, other: &Big) {
+        let mut borrow: i64 = 0;
+        for i in 0..self.limbs.len() {
+            let o = if i < other.limbs.len() {
+                other.limbs[i] as i64
+            } else {
+                0
+            };
+            let mut v = self.limbs[i] as i64 - o - borrow;
+            if v < 0 {
+                v += 1 << 32;
+                borrow = 1;
+            } else {
+                borrow = 0;
+            }
+            self.limbs[i] = v as u32;
+        }
+        self.normalize();
+    }
+    /// Append a bit at position 0 then OR — i.e. self = self*2 + bit.
+    fn shl1_or(&mut self, bit: u32) {
+        // multiply by 2
+        let mut carry: u32 = 0;
+        for limb in self.limbs.iter_mut() {
+            let v = ((*limb as u64) << 1) | (carry as u64);
+            *limb = v as u32;
+            carry = (v >> 32) as u32;
+        }
+        if carry != 0 {
+            self.limbs.push(carry);
+        }
+        if bit != 0 {
+            self.add_small(1);
+        }
+    }
+}
+
+/// Long division producing `floor(a/b)` (known to fit u128 here) and `a mod b`.
+fn divmod_u128(a: &Big, b: &Big) -> (u128, Big) {
+    let mut q: u128 = 0;
+    let mut r = Big::zero();
+    let n = a.bit_len();
+    for i in (0..n).rev() {
+        r.shl1_or(a.bit(i));
+        if r.cmp(b) != std::cmp::Ordering::Less {
+            r.sub_assign(b);
+            if i < 128 {
+                q |= 1u128 << i;
+            }
+        }
+    }
+    (q, r)
+}
+
