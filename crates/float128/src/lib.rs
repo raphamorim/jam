@@ -587,3 +587,329 @@ fn divmod_u128(a: &Big, b: &Big) -> (u128, Big) {
     (q, r)
 }
 
+// ===========================================================================
+// Tests — validated bit-for-bit against ground truth captured from LLVM's
+// APFloat (the very code this module replaces).
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // (lexeme, needs_quad, f64_or_zero, quad, to_f32, to_f64)
+    // Captured by driving the real JamLLVMParseDecimalFloat /
+    // JamLLVMQuadToTargetAsDouble (LLVM 22 APFloat). quad/to_* are 0 when N/A.
+    struct V {
+        lit: &'static str,
+        needs_quad: bool,
+        f64: u64,
+        quad: [u32; 4],
+        to_f32: u64,
+        to_f64: u64,
+    }
+
+    fn oracle() -> Vec<V> {
+        macro_rules! v {
+            ($lit:expr, 0, $f64:expr) => {
+                V {
+                    lit: $lit,
+                    needs_quad: false,
+                    f64: $f64,
+                    quad: [0; 4],
+                    to_f32: 0,
+                    to_f64: 0,
+                }
+            };
+            ($lit:expr, 1, $q0:expr, $q1:expr, $q2:expr, $q3:expr, $tf32:expr, $tf64:expr) => {
+                V {
+                    lit: $lit,
+                    needs_quad: true,
+                    f64: 0,
+                    quad: [$q0, $q1, $q2, $q3],
+                    to_f32: $tf32,
+                    to_f64: $tf64,
+                }
+            };
+        }
+        vec![
+            v!("0.0", 0, 0x0000000000000000),
+            v!("1.0", 0, 0x3ff0000000000000),
+            v!("0.5", 0, 0x3fe0000000000000),
+            v!("1.5", 0, 0x3ff8000000000000),
+            v!("2.5", 0, 0x4004000000000000),
+            v!("100.0", 0, 0x4059000000000000),
+            v!("1024.0", 0, 0x4090000000000000),
+            v!("0.25", 0, 0x3fd0000000000000),
+            v!("65536.0", 0, 0x40f0000000000000),
+            v!("0.125", 0, 0x3fc0000000000000),
+            v!("3.0", 0, 0x4008000000000000),
+            v!("256.0", 0, 0x4070000000000000),
+            v!(
+                "0.1",
+                1,
+                0x9999999a,
+                0x99999999,
+                0x99999999,
+                0x3ffb9999,
+                0x3fb99999a0000000,
+                0x3fb999999999999a
+            ),
+            v!(
+                "0.2",
+                1,
+                0x9999999a,
+                0x99999999,
+                0x99999999,
+                0x3ffc9999,
+                0x3fc99999a0000000,
+                0x3fc999999999999a
+            ),
+            v!(
+                "0.3",
+                1,
+                0x33333333,
+                0x33333333,
+                0x33333333,
+                0x3ffd3333,
+                0x3fd3333340000000,
+                0x3fd3333333333333
+            ),
+            v!(
+                "3.14159",
+                1,
+                0xbadc0981,
+                0xe43aa79b,
+                0x9f01b866,
+                0x4000921f,
+                0x400921fa00000000,
+                0x400921f9f01b866e
+            ),
+            v!(
+                "3.141592653589793",
+                1,
+                0x78573de5,
+                0x7bd21b8d,
+                0xb54442d1,
+                0x4000921f,
+                0x400921fb60000000,
+                0x400921fb54442d18
+            ),
+            v!(
+                "2.718281828459045",
+                1,
+                0x747027e5,
+                0x8cba8ef4,
+                0xa8b14576,
+                0x40005bf0,
+                0x4005bf0a80000000,
+                0x4005bf0a8b145769
+            ),
+            v!(
+                "1.1",
+                1,
+                0x9999999a,
+                0x99999999,
+                0x99999999,
+                0x3fff1999,
+                0x3ff19999a0000000,
+                0x3ff199999999999a
+            ),
+            v!(
+                "0.123456789",
+                1,
+                0x1e6dba7f,
+                0xf3124208,
+                0xd3739635,
+                0x3ffbf9ad,
+                0x3fbf9add40000000,
+                0x3fbf9add3739635f
+            ),
+            v!("1e10", 0, 0x4202a05f20000000),
+            v!(
+                "1e-10",
+                1,
+                0x881cb511,
+                0xab7d6ae6,
+                0xfd9d7bdb,
+                0x3fddb7cd,
+                0x3ddb7cdfe0000000,
+                0x3ddb7cdfd9d7bdbb
+            ),
+            v!(
+                "1e100",
+                1,
+                0x4c4ce0bf,
+                0xceb0b278,
+                0xd2594c37,
+                0x414b249a,
+                0x7ff0000000000000,
+                0x54b249ad2594c37d
+            ),
+            v!(
+                "1e-100",
+                1,
+                0xfc572779,
+                0xfd7ab2f0,
+                0xee48e052,
+                0x3eb2bff2,
+                0x0000000000000000,
+                0x2b2bff2ee48e0530
+            ),
+            v!(
+                "1e308",
+                1,
+                0x13d54fd5,
+                0xff1eae1e,
+                0x385ebc89,
+                0x43fe1ccf,
+                0x7ff0000000000000,
+                0x7fe1ccf385ebc8a0
+            ),
+            v!(
+                "1e-308",
+                1,
+                0x490e531c,
+                0x8bbedf72,
+                0x9e067a34,
+                0x3bffcc35,
+                0x0000000000000000,
+                0x000730d67819e8d2
+            ),
+            v!(
+                "1.7976931348623157e308",
+                1,
+                0xe2b76a4c,
+                0xef58d64c,
+                0xffffffff,
+                0x43feffff,
+                0x7ff0000000000000,
+                0x7fefffffffffffff
+            ),
+            v!(
+                "2.2250738585072014e-308",
+                1,
+                0xcf867de0,
+                0x008c304c,
+                0x00000000,
+                0x3c010000,
+                0x0000000000000000,
+                0x0010000000000000
+            ),
+            v!(
+                "123456789.123456789",
+                1,
+                0xcc490820,
+                0x4dce58d7,
+                0x4547e6b7,
+                0x4019d6f3,
+                0x419d6f3460000000,
+                0x419d6f34547e6b75
+            ),
+            v!(
+                "0.30000000000000004",
+                1,
+                0x569d7e78,
+                0x3ebaadd6,
+                0x33333333,
+                0x3ffd3333,
+                0x3fd3333340000000,
+                0x3fd3333333333334
+            ),
+            v!(
+                "9.999999999999999e22",
+                1,
+                0x00000000,
+                0x5e769800,
+                0x2c7e14af,
+                0x404b52d0,
+                0x44b52d02c0000000,
+                0x44b52d02c7e14af6
+            ),
+            v!("0x1.0p0", 0, 0x3ff0000000000000),
+            v!("0x1.8p1", 0, 0x4008000000000000),
+            v!("0x1.fp4", 0, 0x403f000000000000),
+            v!("0x1.999999999999ap-4", 0, 0x3fb999999999999a),
+            v!(
+                "1.0000000596046448",
+                1,
+                0xd7927954,
+                0x01c5f67c,
+                0x01000000,
+                0x3fff0000,
+                0x3ff0000020000000,
+                0x3ff0000010000000
+            ),
+            v!("16777217.0", 0, 0x4170000010000000),
+            v!(
+                "0.10000000149011612",
+                1,
+                0x896dca21,
+                0x00b595cb,
+                0x9a000000,
+                0x3ffb9999,
+                0x3fb99999a0000000,
+                0x3fb99999a0000000
+            ),
+        ]
+    }
+
+    #[test]
+    fn parse_matches_apfloat_oracle() {
+        for v in oracle() {
+            let got = parse_decimal_float(v.lit);
+            if v.needs_quad {
+                assert_eq!(
+                    got,
+                    ParsedFloat::Quad(v.quad),
+                    "parse({}) quad mismatch: got {:?}",
+                    v.lit,
+                    got
+                );
+            } else {
+                assert_eq!(
+                    got,
+                    ParsedFloat::Fits64(v.f64),
+                    "parse({}) f64 mismatch: got {:?}, want {:#018x}",
+                    v.lit,
+                    got,
+                    v.f64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quad_to_target_matches_apfloat_oracle() {
+        for v in oracle() {
+            if !v.needs_quad {
+                continue;
+            }
+            let f32_bits = quad_to_target_as_double(&v.quad, true).to_bits();
+            let f64_bits = quad_to_target_as_double(&v.quad, false).to_bits();
+            assert_eq!(
+                f32_bits, v.to_f32,
+                "quad_to_target({}, f32): got {:#018x}, want {:#018x}",
+                v.lit, f32_bits, v.to_f32
+            );
+            assert_eq!(
+                f64_bits, v.to_f64,
+                "quad_to_target({}, f64): got {:#018x}, want {:#018x}",
+                v.lit, f64_bits, v.to_f64
+            );
+        }
+    }
+
+    // Property check: any value that parses to Fits64(bits) must, when we read
+    // those bits back as an f64 and re-render, match Rust's own correctly
+    // rounded parse — guards the lossless-storage decision.
+    #[test]
+    fn fits64_agrees_with_rust_parse() {
+        for lit in ["0.0", "1.0", "0.5", "1024.0", "1e10", "256.0", "0.125"] {
+            if let ParsedFloat::Fits64(bits) = parse_decimal_float(lit) {
+                let want = lit.parse::<f64>().unwrap().to_bits();
+                assert_eq!(bits, want, "Fits64({lit})");
+            } else {
+                panic!("{lit} should fit f64");
+            }
+        }
+    }
+}
