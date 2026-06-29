@@ -419,3 +419,122 @@ impl Lexer {
         Ok(())
     }
 
+    /// Scan the whole source into tokens (plus a trailing `Eof`).
+    pub fn scan_tokens(&mut self) -> Result<(), LexError> {
+        while !self.is_at_end() {
+            self.skip_whitespace()?;
+            if self.is_at_end() {
+                break;
+            }
+            self.token_start = self.current as u32;
+            let c = self.advance();
+            match c {
+                b'(' => self.add_token(TokenType::OpenParen),
+                b')' => self.add_token(TokenType::CloseParen),
+                b'{' => self.add_token(TokenType::OpenBrace),
+                b'}' => self.add_token(TokenType::CloseBrace),
+                b'[' => self.add_token(TokenType::OpenBracket),
+                b']' => self.add_token(TokenType::CloseBracket),
+                b',' => self.add_token(TokenType::Comma),
+                b';' => self.add_token(TokenType::Semi),
+                b':' => self.add_token(TokenType::Colon),
+                b'+' => self.add_token(TokenType::Plus),
+                b'.' => {
+                    if self.peek() == b'.' && self.peek_next() == b'.' {
+                        self.advance();
+                        self.advance();
+                        self.add_token(TokenType::Ellipsis);
+                    } else if self.peek() == b'.' && self.peek_next() == b'=' {
+                        self.advance();
+                        self.advance();
+                        self.add_token(TokenType::DotDotEq);
+                    } else if self.peek() == b'.' {
+                        self.advance();
+                        self.add_token(TokenType::DotDot);
+                    } else {
+                        self.add_token(TokenType::Dot);
+                    }
+                }
+                b'"' => self.string_literal()?,
+                b'=' => {
+                    if self.match_(b'=') {
+                        self.add_token(TokenType::EqualEqual);
+                    } else {
+                        self.add_token(TokenType::Equal);
+                    }
+                }
+                b'!' => {
+                    if self.match_(b'=') {
+                        self.add_token(TokenType::NotEqual);
+                    } else {
+                        self.add_token(TokenType::Not);
+                    }
+                }
+                b'@' => self.add_token(TokenType::At),
+                b'<' => {
+                    if self.match_(b'=') {
+                        self.add_token(TokenType::LessEqual);
+                    } else if self.match_(b'<') {
+                        self.add_token(TokenType::Lshift);
+                    } else {
+                        self.add_token(TokenType::Less);
+                    }
+                }
+                b'>' => {
+                    if self.match_(b'=') {
+                        self.add_token(TokenType::GreaterEqual);
+                    } else if self.match_(b'>') {
+                        self.add_token(TokenType::Rshift);
+                    } else {
+                        self.add_token(TokenType::Greater);
+                    }
+                }
+                b'*' => self.add_token(TokenType::Star),
+                b'/' => self.add_token(TokenType::Slash),
+                b'%' => self.add_token(TokenType::Percent),
+                b'&' => {
+                    if self.match_(b'&') {
+                        self.add_token(TokenType::And);
+                    } else {
+                        self.add_token(TokenType::Amp);
+                    }
+                }
+                b'|' => {
+                    if self.match_(b'|') {
+                        self.add_token(TokenType::Or);
+                    } else {
+                        self.add_token(TokenType::Pipe);
+                    }
+                }
+                b'^' => self.add_token(TokenType::Caret),
+                b'~' => self.add_token(TokenType::Tilde),
+                b'-' => {
+                    if Self::is_digit(self.peek()) {
+                        self.negative_number();
+                    } else {
+                        self.add_token(TokenType::Minus);
+                    }
+                }
+                _ => {
+                    if Self::is_digit(c) {
+                        self.number();
+                    } else if Self::is_alpha(c) {
+                        self.identifier();
+                    } else {
+                        // Unexpected character: report and skip (matches C++).
+                        eprintln!("Unexpected character at line {}: {}", self.line, c as char);
+                    }
+                }
+            }
+        }
+        self.tokens.push(Token {
+            ttype: TokenType::Eof,
+            lexeme: Vec::new(),
+            line: self.line,
+            byte_offset: 0,
+            length: 0,
+        });
+        Ok(())
+    }
+}
+
