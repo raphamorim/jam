@@ -289,3 +289,133 @@ impl Lexer {
         self.add_token(TokenType::Number);
     }
 
+    fn parse_hex_byte(&mut self) -> Result<u8, LexError> {
+        let mut value: u8 = 0;
+        for _ in 0..2 {
+            let c = self.peek();
+            if c.is_ascii_digit() {
+                value = value.wrapping_mul(16).wrapping_add(c - b'0');
+            } else if (b'a'..=b'f').contains(&c) {
+                value = value.wrapping_mul(16).wrapping_add(c - b'a' + 10);
+            } else if (b'A'..=b'F').contains(&c) {
+                value = value.wrapping_mul(16).wrapping_add(c - b'A' + 10);
+            } else {
+                return Err(self.err(format!("Expected hex digit at line {}", self.line)));
+            }
+            self.advance();
+        }
+        Ok(value)
+    }
+
+    fn parse_unicode_escape(&mut self) -> Result<Vec<u8>, LexError> {
+        if self.peek() != b'{' {
+            return Err(self.err(format!("Expected '{{' after \\u at line {}", self.line)));
+        }
+        self.advance(); // '{'
+
+        let mut codepoint: u32 = 0;
+        let mut digit_count = 0;
+        while self.peek() != b'}' && !self.is_at_end() {
+            let c = self.peek();
+            if c.is_ascii_digit() {
+                codepoint = codepoint * 16 + (c - b'0') as u32;
+            } else if (b'a'..=b'f').contains(&c) {
+                codepoint = codepoint * 16 + (c - b'a' + 10) as u32;
+            } else if (b'A'..=b'F').contains(&c) {
+                codepoint = codepoint * 16 + (c - b'A' + 10) as u32;
+            } else {
+                return Err(self.err(format!(
+                    "Expected hex digit in unicode escape at line {}",
+                    self.line
+                )));
+            }
+            self.advance();
+            digit_count += 1;
+            if digit_count > 6 {
+                return Err(self.err(format!(
+                    "Unicode escape too long (max 6 hex digits) at line {}",
+                    self.line
+                )));
+            }
+        }
+        if self.is_at_end() || self.peek() != b'}' {
+            return Err(self.err(format!(
+                "Expected '}}' to close unicode escape at line {}",
+                self.line
+            )));
+        }
+        self.advance(); // '}'
+        if digit_count == 0 {
+            return Err(self.err(format!("Empty unicode escape at line {}", self.line)));
+        }
+        if codepoint > 0x10FFFF {
+            return Err(self.err(format!(
+                "Unicode codepoint out of range (max 0x10FFFF) at line {}",
+                self.line
+            )));
+        }
+        // Encode as UTF-8 (manual, matching the C++ byte sequence exactly).
+        let mut out = Vec::new();
+        if codepoint <= 0x7F {
+            out.push(codepoint as u8);
+        } else if codepoint <= 0x7FF {
+            out.push(0xC0 | (codepoint >> 6) as u8);
+            out.push(0x80 | (codepoint & 0x3F) as u8);
+        } else if codepoint <= 0xFFFF {
+            out.push(0xE0 | (codepoint >> 12) as u8);
+            out.push(0x80 | ((codepoint >> 6) & 0x3F) as u8);
+            out.push(0x80 | (codepoint & 0x3F) as u8);
+        } else {
+            out.push(0xF0 | (codepoint >> 18) as u8);
+            out.push(0x80 | ((codepoint >> 12) & 0x3F) as u8);
+            out.push(0x80 | ((codepoint >> 6) & 0x3F) as u8);
+            out.push(0x80 | (codepoint & 0x3F) as u8);
+        }
+        Ok(out)
+    }
+
+    fn string_literal(&mut self) -> Result<(), LexError> {
+        let mut value: Vec<u8> = Vec::new();
+        while self.peek() != b'"' && !self.is_at_end() {
+            if self.peek() == b'\n' {
+                return Err(self.err(format!("Unterminated string at line {}", self.line)));
+            }
+            if self.peek() == b'\\' {
+                self.advance(); // backslash
+                if self.is_at_end() {
+                    return Err(self.err(format!(
+                        "Unterminated escape sequence at line {}",
+                        self.line
+                    )));
+                }
+                let escaped = self.advance();
+                match escaped {
+                    b'n' => value.push(b'\n'),
+                    b'r' => value.push(b'\r'),
+                    b't' => value.push(b'\t'),
+                    b'\\' => value.push(b'\\'),
+                    b'"' => value.push(b'"'),
+                    b'\'' => value.push(b'\''),
+                    b'0' => value.push(b'\0'),
+                    b'x' => value.push(self.parse_hex_byte()?),
+                    b'u' => value.extend_from_slice(&self.parse_unicode_escape()?),
+                    other => {
+                        return Err(self.err(format!(
+                            "Invalid escape sequence '\\{}' at line {}",
+                            other as char, self.line
+                        )));
+                    }
+                }
+            } else {
+                let b = self.advance();
+                value.push(b);
+            }
+        }
+        if self.is_at_end() {
+            return Err(self.err(format!("Unterminated string at line {}", self.line)));
+        }
+        self.advance(); // closing "
+        self.add_token_lex(TokenType::StringLiteral, value);
+        Ok(())
+    }
+
