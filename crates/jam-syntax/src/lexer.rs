@@ -538,3 +538,76 @@ impl Lexer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(src: &str) -> Vec<TokenType> {
+        let mut lx = Lexer::new(src.as_bytes().to_vec());
+        lx.scan_tokens().unwrap();
+        lx.tokens().iter().map(|t| t.ttype).collect()
+    }
+
+    #[test]
+    fn keywords_and_ops() {
+        use TokenType::*;
+        assert_eq!(
+            kinds("fn add ( ) { return 1 + 2 ; }"),
+            vec![
+                Fn, Identifier, OpenParen, CloseParen, OpenBrace, Return, Number, Plus, Number,
+                Semi, CloseBrace, Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn range_vs_float() {
+        use TokenType::*;
+        // `0..=9` must split, not swallow the dot into a float.
+        assert_eq!(kinds("0..=9"), vec![Number, DotDotEq, Number, Eof]);
+        assert_eq!(kinds("1.5"), vec![Number, Eof]);
+        // The number scanner is greedy (letters are potential suffixes;
+        // validation is deferred to the parser), so `1.x` is one NUMBER token —
+        // confirmed against the C++ oracle.
+        assert_eq!(kinds("1.x"), vec![Number, Eof]);
+    }
+
+    #[test]
+    fn negative_number_is_one_token() {
+        let mut lx = Lexer::new(b"-5".to_vec());
+        lx.scan_tokens().unwrap();
+        assert_eq!(lx.tokens()[0].ttype, TokenType::Number);
+        assert_eq!(lx.tokens()[0].text(lx.source()), b"-5");
+    }
+
+    #[test]
+    fn line_comment_and_lines() {
+        let mut lx = Lexer::new("// hi\nfn".as_bytes().to_vec());
+        lx.scan_tokens().unwrap();
+        assert_eq!(lx.tokens()[0].ttype, TokenType::Fn);
+        assert_eq!(lx.tokens()[0].line, 2);
+    }
+
+    #[test]
+    fn string_escapes_decode() {
+        let mut lx = Lexer::new(b"\"a\\nb\"".to_vec());
+        lx.scan_tokens().unwrap();
+        assert_eq!(lx.tokens()[0].ttype, TokenType::StringLiteral);
+        assert_eq!(lx.tokens()[0].lexeme, b"a\nb");
+    }
+
+    #[test]
+    fn block_comment_errors() {
+        let mut lx = Lexer::new(b"/* x */".to_vec());
+        assert!(lx.scan_tokens().is_err());
+    }
+
+    #[test]
+    fn type_keywords() {
+        use TokenType::*;
+        assert_eq!(
+            kinds("i32 bool type Foo"),
+            vec![Type, Type, Type, Identifier, Eof]
+        );
+    }
+}
