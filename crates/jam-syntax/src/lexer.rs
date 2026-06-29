@@ -165,3 +165,47 @@ impl Lexer {
         });
     }
 
+    fn identifier(&mut self) {
+        let start = self.current - 1; // first char already consumed
+        while Self::is_alpha_numeric(self.peek()) {
+            self.advance();
+        }
+        let text = &self.source[start..self.current];
+        let ttype = match text {
+            b"fn" => TokenType::Fn,
+            b"cfn" => TokenType::Cfn,
+            b"return" => TokenType::Return,
+            b"const" => TokenType::Const,
+            b"var" => TokenType::Var,
+            b"mut" => TokenType::Mut,
+            b"if" => TokenType::If,
+            b"else" => TokenType::Else,
+            b"match" => TokenType::Match,
+            b"while" => TokenType::While,
+            b"loop" => TokenType::Loop,
+            b"for" => TokenType::For,
+            b"break" => TokenType::Break,
+            b"continue" => TokenType::Continue,
+            b"in" => TokenType::In,
+            b"true" => TokenType::True,
+            b"false" => TokenType::False,
+            b"extern" => TokenType::Extern,
+            b"export" => TokenType::Export,
+            b"pub" => TokenType::Pub,
+            b"import" => TokenType::Import,
+            b"tfn" => TokenType::Tfn,
+            b"struct" => TokenType::Struct,
+            b"union" => TokenType::Union,
+            b"enum" => TokenType::Enum,
+            b"as" => TokenType::As,
+            b"move" => TokenType::Move,
+            b"comp" => TokenType::Comp,
+            b"inline" => TokenType::Inline,
+            // The scalar built-ins and the meta-type `type` all lex as TYPE.
+            b"u1" | b"u8" | b"u16" | b"u32" | b"u64" | b"i8" | b"i16" | b"i32" | b"i64"
+            | b"f32" | b"f64" | b"bool" | b"str" | b"type" | b"noreturn" => TokenType::Type,
+            _ => TokenType::Identifier,
+        };
+        self.add_token(ttype);
+    }
+
