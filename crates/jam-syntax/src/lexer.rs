@@ -209,3 +209,83 @@ impl Lexer {
         self.add_token(ttype);
     }
 
+    fn number(&mut self) {
+        self.scan_number_body();
+    }
+
+    fn negative_number(&mut self) {
+        self.advance(); // consume the first digit after the leading `-`
+        self.scan_number_body();
+    }
+
+    fn scan_number_body(&mut self) {
+        let mut state = NumState::Int;
+        loop {
+            let c = self.peek();
+            let mut stop = false;
+            match state {
+                NumState::Int => {
+                    if c == b'.' {
+                        let n = self.peek_next();
+                        if n == b'.' || n == b'=' {
+                            stop = true;
+                        } else {
+                            self.advance();
+                            state = NumState::IntPeriod;
+                        }
+                    } else if c == b'_' || Self::is_alpha_digit(c) {
+                        if c == b'e' || c == b'E' || c == b'p' || c == b'P' {
+                            self.advance();
+                            state = NumState::FloatExp;
+                        } else {
+                            self.advance();
+                        }
+                    } else {
+                        stop = true;
+                    }
+                }
+                NumState::IntPeriod => {
+                    if c == b'_' || Self::is_alpha_digit(c) {
+                        if c == b'e' || c == b'E' || c == b'p' || c == b'P' {
+                            self.advance();
+                            state = NumState::FloatExp;
+                        } else {
+                            self.advance();
+                            state = NumState::Float;
+                        }
+                    } else {
+                        // `1.` then non-numeric: rewind the `.` to tokenize it
+                        // separately (member access / operator).
+                        self.current -= 1;
+                        stop = true;
+                    }
+                }
+                NumState::Float => {
+                    if c == b'_' || Self::is_alpha_digit(c) {
+                        if c == b'e' || c == b'E' || c == b'p' || c == b'P' {
+                            self.advance();
+                            state = NumState::FloatExp;
+                        } else {
+                            self.advance();
+                        }
+                    } else {
+                        stop = true;
+                    }
+                }
+                NumState::FloatExp => {
+                    if c == b'+' || c == b'-' {
+                        self.advance();
+                        state = NumState::Float;
+                    } else {
+                        // sign was optional; bounce to Float and retry.
+                        state = NumState::Float;
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+        }
+        self.add_token(TokenType::Number);
+    }
+
