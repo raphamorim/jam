@@ -295,3 +295,227 @@ impl StringPool {
     }
 }
 
+/// Type kinds. See `src/ast_flat.h` for the per-kind `a`/`b` slot meanings.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum TypeKind {
+    Invalid = 0,
+    Void,
+    NoReturn,
+    Bool,
+    Int,         // a = bits, b = isSigned
+    Float,       // a = bits
+    PtrSingle,   // a = elem
+    PtrMany,     // a = elem
+    Slice,       // a = elem
+    Array,       // a = elem, b = len
+    ArrayExpr,   // a = elem, b = len-expr NodeIdx
+    Struct,      // a = StringIdx (name)
+    Enum,        // a = StringIdx (name)
+    Union,       // a = StringIdx (name)
+    Named,       // a = StringIdx (name)
+    Type,        // the meta-type (singleton)
+    GenericCall, // a = StringIdx (callee), b = genericArgs index
+    Module,      // a = StringIdx (resolved path)
+    Fn,          // a = return TypeIdx, b = fnParams index
+}
+
+/// Interned type key. `a`/`b` are raw `u32` slots whose meaning depends on
+/// `kind`. Unused slots are always 0 (the constructors guarantee it), so the
+/// derived `PartialEq`/`Hash` is exactly the C++ kind-aware `operator==`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TypeKey {
+    pub kind: TypeKind,
+    pub a: u32,
+    pub b: u32,
+}
+
+impl TypeKey {
+    pub const fn new(kind: TypeKind, a: u32, b: u32) -> TypeKey {
+        TypeKey { kind, a, b }
+    }
+}
+
+/// Built-in type indices — pre-interned at fixed slots by [`TypePool::new`].
+pub mod builtin {
+    use jam_core::index::TypeIdx;
+    pub const VOID: TypeIdx = TypeIdx::new(1);
+    pub const BOOL: TypeIdx = TypeIdx::new(2);
+    pub const U8: TypeIdx = TypeIdx::new(3);
+    pub const I8: TypeIdx = TypeIdx::new(4);
+    pub const U16: TypeIdx = TypeIdx::new(5);
+    pub const I16: TypeIdx = TypeIdx::new(6);
+    pub const U32: TypeIdx = TypeIdx::new(7);
+    pub const I32: TypeIdx = TypeIdx::new(8);
+    pub const U64: TypeIdx = TypeIdx::new(9);
+    pub const I64: TypeIdx = TypeIdx::new(10);
+    pub const F32: TypeIdx = TypeIdx::new(11);
+    pub const F64: TypeIdx = TypeIdx::new(12);
+    pub const TYPE: TypeIdx = TypeIdx::new(13);
+    pub const NORETURN: TypeIdx = TypeIdx::new(14);
+    pub const U1: TypeIdx = BOOL;
+}
+
+/// Type interning. Built-ins occupy fixed pre-interned slots (see [`builtin`]).
+/// Generic-call arg lists and fn-param lists are interned in ordered side
+/// tables (`BTreeMap`, deterministic) so identical lists share an index — and
+/// thus identical `GenericCall`/`Fn` keys share a `TypeIdx`.
+/// Interior mutability (RefCell) so `intern*` are `&self` — mirrors the C++
+/// `typePool` being a `mutable` field, so `&self` layout queries can instantiate
+/// generics on-demand. `get` returns `TypeKey` by Copy and `generic_args_at`/
+/// `fn_params_at` return owned `Vec`s, so no borrow is held across an `intern`.
+pub struct TypePool {
+    keys: RefCell<Vec<TypeKey>>,
+    idx: RefCell<HashMap<TypeKey, u32>>,
+    generic_args: RefCell<Vec<Vec<TypeIdx>>>,
+    generic_args_idx: RefCell<BTreeMap<Vec<TypeIdx>, u32>>,
+    fn_params: RefCell<Vec<Vec<TypeIdx>>>,
+    fn_params_idx: RefCell<BTreeMap<Vec<TypeIdx>, u32>>,
+}
+
+impl Default for TypePool {
+    fn default() -> Self {
+        TypePool::new()
+    }
+}
+
+impl TypePool {
+    pub fn new() -> TypePool {
+        let p = TypePool {
+            keys: RefCell::new(Vec::new()),
+            idx: RefCell::new(HashMap::new()),
+            generic_args: RefCell::new(Vec::new()),
+            generic_args_idx: RefCell::new(BTreeMap::new()),
+            fn_params: RefCell::new(Vec::new()),
+            fn_params_idx: RefCell::new(BTreeMap::new()),
+        };
+        // Slot 0 = invalid sentinel.
+        p.keys
+            .borrow_mut()
+            .push(TypeKey::new(TypeKind::Invalid, 0, 0));
+        // Pre-intern built-ins in the order the `builtin` constants expect.
+        p.push_key(TypeKey::new(TypeKind::Void, 0, 0)); // 1
+        p.push_key(TypeKey::new(TypeKind::Bool, 0, 0)); // 2
+        p.push_key(TypeKey::new(TypeKind::Int, 8, 0)); // 3 u8
+        p.push_key(TypeKey::new(TypeKind::Int, 8, 1)); // 4 i8
+        p.push_key(TypeKey::new(TypeKind::Int, 16, 0)); // 5 u16
+        p.push_key(TypeKey::new(TypeKind::Int, 16, 1)); // 6 i16
+        p.push_key(TypeKey::new(TypeKind::Int, 32, 0)); // 7 u32
+        p.push_key(TypeKey::new(TypeKind::Int, 32, 1)); // 8 i32
+        p.push_key(TypeKey::new(TypeKind::Int, 64, 0)); // 9 u64
+        p.push_key(TypeKey::new(TypeKind::Int, 64, 1)); // 10 i64
+        p.push_key(TypeKey::new(TypeKind::Float, 32, 0)); // 11 f32
+        p.push_key(TypeKey::new(TypeKind::Float, 64, 0)); // 12 f64
+        p.push_key(TypeKey::new(TypeKind::Type, 0, 0)); // 13
+        p.push_key(TypeKey::new(TypeKind::NoReturn, 0, 0)); // 14
+        p
+    }
+
+    fn push_key(&self, k: TypeKey) -> TypeIdx {
+        let mut keys = self.keys.borrow_mut();
+        let id = keys.len() as u32;
+        keys.push(k);
+        self.idx.borrow_mut().insert(k, id);
+        TypeIdx::new(id)
+    }
+
+    pub fn intern(&self, k: TypeKey) -> TypeIdx {
+        let existing = self.idx.borrow().get(&k).copied();
+        if let Some(id) = existing {
+            return TypeIdx::new(id);
+        }
+        self.push_key(k)
+    }
+
+    /// Returned by value (Copy) — interning can grow `keys`, so a reference
+    /// could dangle (the C++ documents this exact footgun).
+    pub fn get(&self, i: TypeIdx) -> TypeKey {
+        self.keys.borrow()[i.index()]
+    }
+    pub fn len(&self) -> usize {
+        self.keys.borrow().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.keys.borrow().is_empty()
+    }
+
+    pub fn intern_int(&self, bits: u16, is_signed: bool) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::Int, bits as u32, is_signed as u32))
+    }
+    pub fn intern_float(&self, bits: u16) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::Float, bits as u32, 0))
+    }
+    pub fn intern_ptr_single(&self, elem: TypeIdx) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::PtrSingle, elem.raw(), 0))
+    }
+    pub fn intern_ptr_many(&self, elem: TypeIdx) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::PtrMany, elem.raw(), 0))
+    }
+    pub fn intern_slice(&self, elem: TypeIdx) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::Slice, elem.raw(), 0))
+    }
+    pub fn intern_array(&self, elem: TypeIdx, len: u32) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::Array, elem.raw(), len))
+    }
+    pub fn intern_array_expr(&self, elem: TypeIdx, len_expr: NodeIdx) -> TypeIdx {
+        self.intern(TypeKey::new(
+            TypeKind::ArrayExpr,
+            elem.raw(),
+            len_expr.raw(),
+        ))
+    }
+    pub fn intern_struct(&self, name: StringIdx) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::Struct, name.raw(), 0))
+    }
+    pub fn intern_enum(&self, name: StringIdx) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::Enum, name.raw(), 0))
+    }
+    pub fn intern_union(&self, name: StringIdx) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::Union, name.raw(), 0))
+    }
+    pub fn intern_named(&self, name: StringIdx) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::Named, name.raw(), 0))
+    }
+    pub fn intern_module(&self, path: StringIdx) -> TypeIdx {
+        self.intern(TypeKey::new(TypeKind::Module, path.raw(), 0))
+    }
+
+    pub fn intern_generic_call(&self, name: StringIdx, args: Vec<TypeIdx>) -> TypeIdx {
+        let existing = self.generic_args_idx.borrow().get(&args).copied();
+        let args_idx = match existing {
+            Some(i) => i,
+            None => {
+                let mut ga = self.generic_args.borrow_mut();
+                let i = ga.len() as u32;
+                ga.push(args.clone());
+                self.generic_args_idx.borrow_mut().insert(args, i);
+                i
+            }
+        };
+        self.intern(TypeKey::new(TypeKind::GenericCall, name.raw(), args_idx))
+    }
+
+    pub fn generic_args_at(&self, idx: u32) -> Vec<TypeIdx> {
+        self.generic_args.borrow()[idx as usize].clone()
+    }
+
+    pub fn intern_fn(&self, return_ty: TypeIdx, param_tys: Vec<TypeIdx>) -> TypeIdx {
+        let existing = self.fn_params_idx.borrow().get(&param_tys).copied();
+        let params_idx = match existing {
+            Some(i) => i,
+            None => {
+                let mut fp = self.fn_params.borrow_mut();
+                let i = fp.len() as u32;
+                fp.push(param_tys.clone());
+                self.fn_params_idx.borrow_mut().insert(param_tys, i);
+                i
+            }
+        };
+        self.intern(TypeKey::new(TypeKind::Fn, return_ty.raw(), params_idx))
+    }
+
+    pub fn fn_params_at(&self, idx: u32) -> Vec<TypeIdx> {
+        self.fn_params.borrow()[idx as usize].clone()
+    }
+}
+
