@@ -184,3 +184,148 @@ impl UnionDeclAST {
     }
 }
 
+/// Module-scope value binding: `const NAME[: T]? = expr;`. May instead be a
+/// type alias (`aliased_type` set, `init_expr` = `kNoNode`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstDeclAST {
+    pub name: String,
+    /// `kNoType` when omitted; init drives the type.
+    pub declared_type: TypeIdx,
+    pub init_expr: NodeIdx,
+    /// Non-`kNoType` => this const is a type alias; `init_expr` is `kNoNode`.
+    pub aliased_type: TypeIdx,
+    pub is_pub: bool,
+    /// `comp const` — the initializer must fold at compile time.
+    pub is_comp: bool,
+    pub module_path: String,
+}
+
+impl ConstDeclAST {
+    pub fn new(
+        name: impl Into<String>,
+        declared_type: TypeIdx,
+        init_expr: NodeIdx,
+    ) -> ConstDeclAST {
+        ConstDeclAST {
+            name: name.into(),
+            declared_type,
+            init_expr,
+            aliased_type: TypeIdx::NONE,
+            is_pub: false,
+            is_comp: false,
+            module_path: String::new(),
+        }
+    }
+}
+
+/// `const std = import("std");` — a module handle. `chain` captures trailing
+/// `.seg.seg` access (`import("std").fmt` => `path="std"`, `chain=["fmt"]`).
+/// `pub` makes it a re-export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportDeclAST {
+    pub name: String,
+    pub path: String,
+    pub chain: Vec<String>,
+    pub is_pub: bool,
+}
+
+impl ImportDeclAST {
+    pub fn new(name: impl Into<String>, path: impl Into<String>) -> ImportDeclAST {
+        ImportDeclAST {
+            name: name.into(),
+            path: path.into(),
+            chain: Vec::new(),
+            is_pub: false,
+        }
+    }
+}
+
+/// `const {print, eprint} = import("std").fmt;` — a destructuring import.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DestructuringImportDeclAST {
+    pub names: Vec<String>,
+    pub path: String,
+    pub chain: Vec<String>,
+}
+
+impl DestructuringImportDeclAST {
+    pub fn new(names: Vec<String>, path: impl Into<String>) -> DestructuringImportDeclAST {
+        DestructuringImportDeclAST {
+            names,
+            path: path.into(),
+            chain: Vec::new(),
+        }
+    }
+}
+
+/// A parsed module: all top-level declarations, plus the anonymous struct/enum
+/// bodies referenced by `StructExpr`/`EnumExpr` nodes (by index).
+#[derive(Default, Debug)]
+pub struct ModuleAST {
+    pub imports: Vec<ImportDeclAST>,
+    pub destructuring_imports: Vec<DestructuringImportDeclAST>,
+    pub structs: Vec<StructDeclAST>,
+    pub unions: Vec<UnionDeclAST>,
+    pub enums: Vec<EnumDeclAST>,
+    pub consts: Vec<ConstDeclAST>,
+    pub functions: Vec<FunctionAST>,
+    /// Bodies of `struct { ... }` expressions (synthetic names); indexed by the
+    /// `StructExpr` node's `lhs` slot.
+    pub anon_structs: Vec<StructDeclAST>,
+    pub anon_enums: Vec<EnumDeclAST>,
+}
+
+impl ModuleAST {
+    pub fn new() -> ModuleAST {
+        ModuleAST::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generic_predicate() {
+        // Non-generic: concrete params + return.
+        let f = FunctionAST::new(
+            "add",
+            vec![Param::new("a", builtin::I32)],
+            builtin::I32,
+            vec![],
+        );
+        assert!(!f.is_generic());
+
+        // `T: type` param => generic.
+        let g = FunctionAST::new(
+            "id",
+            vec![Param::new("x", builtin::TYPE)],
+            builtin::I32,
+            vec![],
+        );
+        assert!(g.is_generic());
+
+        // `type` return => generic.
+        let h = FunctionAST::new("Maker", vec![], builtin::TYPE, vec![]);
+        assert!(h.is_generic());
+
+        // `comp` value param => generic.
+        let mut p = Param::new("n", builtin::U32);
+        p.is_comp = true;
+        let k = FunctionAST::new("rep", vec![p], builtin::I32, vec![]);
+        assert!(k.is_generic());
+    }
+
+    #[test]
+    fn module_assembly() {
+        let mut m = ModuleAST::new();
+        m.imports.push(ImportDeclAST::new("std", "std"));
+        m.structs
+            .push(StructDeclAST::new("Vec3", vec![("x".into(), builtin::F32)]));
+        m.functions
+            .push(FunctionAST::new("main", vec![], builtin::I32, vec![]));
+        assert_eq!(m.imports.len(), 1);
+        assert_eq!(m.structs[0].fields[0].1, builtin::F32);
+        assert_eq!(m.functions[0].name, "main");
+    }
+}
