@@ -229,3 +229,69 @@ impl NodeStore {
     }
 }
 
+/// Interned identifiers + string literals. The C++ used a `deque<string>` to
+/// keep `string_view` keys stable; Rust owns the bytes in a `Vec` and keys the
+/// map by the owned bytes, so no deque is needed. Stores `Vec<u8>` because
+/// decoded string-literal values can be non-UTF-8 (`\xFF`).
+/// Interior mutability (RefCell) so `intern` is `&self` — this mirrors the C++
+/// `stringPool` being a `mutable` field, letting `&self` layout queries
+/// (get_llvm_type/type_size) instantiate generics on-demand. `get` returns owned
+/// bytes (every caller copies them anyway via `into_owned()`/`to_vec()`), so no
+/// borrow is ever held across an `intern` — there is no double-borrow panic risk.
+pub struct StringPool {
+    strings: RefCell<Vec<Vec<u8>>>,
+    idx: RefCell<HashMap<Vec<u8>, u32>>,
+}
+
+impl Default for StringPool {
+    fn default() -> Self {
+        StringPool::new()
+    }
+}
+
+impl StringPool {
+    pub fn new() -> StringPool {
+        // Slot 0 reserved for kNoString (the empty string).
+        let mut idx = HashMap::new();
+        idx.insert(Vec::new(), 0u32);
+        StringPool {
+            strings: RefCell::new(vec![Vec::new()]),
+            idx: RefCell::new(idx),
+        }
+    }
+
+    pub fn intern(&self, s: &[u8]) -> StringIdx {
+        if let Some(&id) = self.idx.borrow().get(s) {
+            return StringIdx::new(id);
+        }
+        let mut strings = self.strings.borrow_mut();
+        let id = strings.len() as u32;
+        strings.push(s.to_vec());
+        self.idx.borrow_mut().insert(s.to_vec(), id);
+        StringIdx::new(id)
+    }
+
+    pub fn intern_str(&self, s: &str) -> StringIdx {
+        self.intern(s.as_bytes())
+    }
+
+    /// Resolve a `StringIdx` to its (owned) bytes. Out-of-range indices return
+    /// the empty slice — the AST dumper reads `lhs`/`rhs` of some nodes (e.g.
+    /// `PatEnumVariant` with bindings, whose slots actually hold an ExtraIdx)
+    /// as if they were string indices; the C++ oracle's `std::deque` yields a
+    /// zeroed (empty) string for those reads, and we reproduce that exactly.
+    pub fn get(&self, id: StringIdx) -> Vec<u8> {
+        self.strings
+            .borrow()
+            .get(id.index())
+            .cloned()
+            .unwrap_or_default()
+    }
+    pub fn len(&self) -> usize {
+        self.strings.borrow().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.strings.borrow().is_empty()
+    }
+}
+
