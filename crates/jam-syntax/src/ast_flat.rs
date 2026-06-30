@@ -519,3 +519,89 @@ impl TypePool {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<AstNode>(), 16);
+    }
+
+    #[test]
+    fn node_store_slot0_sentinel() {
+        let mut ns = NodeStore::new();
+        assert_eq!(ns.get(NodeIdx::NONE).tag, AstTag::Invalid);
+        let id = ns.add_node_at(
+            AstNode {
+                tag: AstTag::BoolLit,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: 1,
+                rhs: 0,
+            },
+            7,
+        );
+        assert_eq!(id, NodeIdx::new(1));
+        assert_eq!(ns.get(id).tag, AstTag::BoolLit);
+        assert_eq!(ns.get_line(id), 7);
+    }
+
+    #[test]
+    fn extra_pool() {
+        let mut ns = NodeStore::new();
+        let e = ns.push_extra_span(&[3, 10, 20, 30]);
+        assert_eq!(ns.get_extra(e), 3);
+        assert_eq!(ns.get_extra(ExtraIdx::new(e.raw() + 2)), 20);
+        let r = ns.reserve_extra(2);
+        ns.set_extra(r, 99);
+        assert_eq!(ns.get_extra(r), 99);
+    }
+
+    #[test]
+    fn string_pool_interning() {
+        let sp = StringPool::new();
+        assert_eq!(sp.get(StringIdx::NONE), b"");
+        let a = sp.intern_str("foo");
+        let b = sp.intern_str("bar");
+        let a2 = sp.intern_str("foo");
+        assert_eq!(a, a2, "interning is canonical");
+        assert_ne!(a, b);
+        assert_eq!(sp.get(a), b"foo");
+        // Non-UTF-8 byte string round-trips.
+        let nul = sp.intern(&[0xff, 0x00, 0x80]);
+        assert_eq!(sp.get(nul), &[0xff, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn type_pool_builtins_at_fixed_indices() {
+        let p = TypePool::new();
+        assert_eq!(p.get(builtin::VOID).kind, TypeKind::Void);
+        assert_eq!(p.get(builtin::I32), TypeKey::new(TypeKind::Int, 32, 1));
+        assert_eq!(p.get(builtin::U8), TypeKey::new(TypeKind::Int, 8, 0));
+        assert_eq!(p.get(builtin::F64), TypeKey::new(TypeKind::Float, 64, 0));
+        assert_eq!(p.get(builtin::TYPE).kind, TypeKind::Type);
+        assert_eq!(builtin::U1, builtin::BOOL);
+    }
+
+    #[test]
+    fn type_pool_interning_canonical() {
+        let p = TypePool::new();
+        // Interning a builtin key returns the pre-interned index.
+        assert_eq!(p.intern_int(32, true), builtin::I32);
+        // Structural types intern canonically.
+        let p1 = p.intern_ptr_single(builtin::I32);
+        let p2 = p.intern_ptr_single(builtin::I32);
+        assert_eq!(p1, p2);
+        // GenericCall: identical arg lists share a TypeIdx.
+        let sp = StringPool::new();
+        let vec_name = sp.intern_str("Vec");
+        let g1 = p.intern_generic_call(vec_name, vec![builtin::I32]);
+        let g2 = p.intern_generic_call(vec_name, vec![builtin::I32]);
+        let g3 = p.intern_generic_call(vec_name, vec![builtin::I64]);
+        assert_eq!(g1, g2);
+        assert_ne!(g1, g3);
+        assert_eq!(p.generic_args_at(p.get(g1).b), &[builtin::I32]);
+    }
+}
