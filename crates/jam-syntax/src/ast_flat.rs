@@ -144,3 +144,88 @@ impl AstNode {
     };
 }
 
+/// Owns the flat node array, the `extra` `u32` pool for variadic payloads, and
+/// the parallel per-node source-line table.
+pub struct NodeStore {
+    nodes: Vec<AstNode>,
+    extra: Vec<u32>,
+    lines: Vec<u32>,
+}
+
+impl Default for NodeStore {
+    fn default() -> Self {
+        NodeStore::new()
+    }
+}
+
+impl NodeStore {
+    pub fn new() -> NodeStore {
+        // Reserve slot 0 as the null sentinel so kNoNode is a no-op.
+        NodeStore {
+            nodes: vec![AstNode::INVALID],
+            extra: Vec::new(),
+            lines: vec![0],
+        }
+    }
+
+    pub fn add_node(&mut self, n: AstNode) -> NodeIdx {
+        self.add_node_at(n, 0)
+    }
+
+    /// Add a node, recording its source line.
+    pub fn add_node_at(&mut self, n: AstNode, line: u32) -> NodeIdx {
+        let id = NodeIdx::from_usize(self.nodes.len());
+        self.nodes.push(n);
+        self.lines.push(line);
+        id
+    }
+
+    pub fn get_line(&self, id: NodeIdx) -> u32 {
+        self.lines.get(id.index()).copied().unwrap_or(0)
+    }
+
+    pub fn get(&self, id: NodeIdx) -> &AstNode {
+        &self.nodes[id.index()]
+    }
+    pub fn get_mut(&mut self, id: NodeIdx) -> &mut AstNode {
+        &mut self.nodes[id.index()]
+    }
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Append a single `u32` to the extra pool; return its index.
+    pub fn push_extra(&mut self, v: u32) -> ExtraIdx {
+        let i = ExtraIdx::from_usize(self.extra.len());
+        self.extra.push(v);
+        i
+    }
+
+    /// Append a span of `u32`s; return the index of the first.
+    pub fn push_extra_span(&mut self, data: &[u32]) -> ExtraIdx {
+        let start = ExtraIdx::from_usize(self.extra.len());
+        self.extra.extend_from_slice(data);
+        start
+    }
+
+    /// Reserve `len` zeroed `u32`s; fill later via [`NodeStore::set_extra`].
+    pub fn reserve_extra(&mut self, len: usize) -> ExtraIdx {
+        let start = ExtraIdx::from_usize(self.extra.len());
+        self.extra.resize(self.extra.len() + len, 0);
+        start
+    }
+
+    pub fn get_extra(&self, i: ExtraIdx) -> u32 {
+        self.extra[i.index()]
+    }
+    pub fn set_extra(&mut self, i: ExtraIdx, v: u32) {
+        self.extra[i.index()] = v;
+    }
+    pub fn extra(&self) -> &[u32] {
+        &self.extra
+    }
+}
+
