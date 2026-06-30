@@ -354,3 +354,120 @@ pub fn parse_number_literal(bytes: &[u8]) -> NumberResult {
     NumberResult::ok_int(x, base)
 }
 
+/// Human-readable message for a numeric-literal error (ported 1:1).
+pub fn number_error_message(kind: NumberErrorKind) -> &'static str {
+    use NumberErrorKind::*;
+    match kind {
+        LeadingZero => "leading zero is not allowed (use `0o` for octal)",
+        DigitAfterBase => "expected digit after base prefix",
+        UpperCaseBase => "base prefix must be lowercase (`0x`, `0b`, `0o`)",
+        InvalidFloatBase => "float literals are only allowed in decimal or hex",
+        RepeatedUnderscore => "consecutive underscores in numeric literal",
+        InvalidUnderscoreAfterSpecial => {
+            "underscore not allowed immediately after `0x`/`0b`/`0o` or after `.`/`+`/`-`/`e`/`E`/`p`/`P`"
+        }
+        InvalidDigit => "invalid digit for the literal's base",
+        InvalidDigitExponent => "non-decimal digit in exponent",
+        DuplicatePeriod => "more than one `.` in numeric literal",
+        DuplicateExponent => "more than one exponent in numeric literal",
+        InvalidHexExponent => "hex literal cannot use `e`/`E` exponent (use `p`/`P`)",
+        ExponentAfterUnderscore => "exponent letter cannot follow `_`",
+        SpecialAfterUnderscore => "`.`/`+`/`-` cannot follow `_`",
+        TrailingSpecial => "numeric literal ends with `.`/`+`/`-`/`e`/`p`",
+        TrailingUnderscore => "numeric literal ends with `_`",
+        InvalidCharacter => "character not allowed in numeric literal",
+        InvalidExponentSign => "`+`/`-` is only valid immediately after `e`/`E`/`p`/`P`",
+        IntegerTooLarge => "integer literal exceeds u64 range",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> NumberResult {
+        parse_number_literal(s.as_bytes())
+    }
+
+    #[test]
+    fn integers_by_base() {
+        assert_eq!(parse("42").kind, NumberResultKind::Int);
+        assert_eq!(parse("42").int_value, 42);
+        assert_eq!(parse("0x800").int_value, 0x800); // test_array_type_sizes
+        assert_eq!(parse("0x800").base, NumberBase::Hex);
+        assert_eq!(parse("0b1010").int_value, 0b1010);
+        assert_eq!(parse("0o17").int_value, 0o17);
+        assert_eq!(parse("1_000_000").int_value, 1_000_000);
+    }
+
+    #[test]
+    fn overflow_is_bigint() {
+        // 2^64 overflows u64.
+        assert_eq!(parse("18446744073709551616").kind, NumberResultKind::BigInt);
+        assert_eq!(parse("18446744073709551615").int_value, u64::MAX);
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)] // `3.14` is the parse input under test, not an approximation of PI
+    fn floats_decimal_and_hex() {
+        let d = parse("3.14");
+        assert_eq!(d.kind, NumberResultKind::Float);
+        assert_eq!(d.float_value, 3.14_f64);
+        assert_eq!(d.base, NumberBase::Decimal);
+
+        let e = parse("1.5e-3");
+        assert_eq!(e.float_value, 1.5e-3_f64);
+
+        let h = parse("0x1.8p1");
+        assert_eq!(h.kind, NumberResultKind::Float);
+        assert_eq!(h.base, NumberBase::Hex);
+        assert_eq!(h.float_value, 3.0_f64); // 1.5 * 2^1
+    }
+
+    #[test]
+    fn float_matches_rust_parse() {
+        for s in [
+            "0.1",
+            "3.141592653589793",
+            "1e100",
+            "2.5",
+            "0.30000000000000004",
+        ] {
+            assert_eq!(parse(s).float_value, s.parse::<f64>().unwrap(), "{s}");
+        }
+    }
+
+    #[test]
+    fn rejects() {
+        assert_eq!(
+            parse("07").failure.unwrap().kind,
+            NumberErrorKind::LeadingZero
+        );
+        assert_eq!(
+            parse("0X42").failure.unwrap().kind,
+            NumberErrorKind::UpperCaseBase
+        );
+        assert_eq!(
+            parse("0x").failure.unwrap().kind,
+            NumberErrorKind::DigitAfterBase
+        );
+        assert_eq!(
+            parse("1__0").failure.unwrap().kind,
+            NumberErrorKind::RepeatedUnderscore
+        );
+        assert_eq!(
+            parse("1.0.5").failure.unwrap().kind,
+            NumberErrorKind::DuplicatePeriod
+        );
+        assert_eq!(
+            parse("0b2").failure.unwrap().kind,
+            NumberErrorKind::InvalidDigit
+        );
+        assert_eq!(
+            parse("1_").failure.unwrap().kind,
+            NumberErrorKind::TrailingUnderscore
+        );
+        // base reported on InvalidDigit
+        assert_eq!(parse("0b2").failure.unwrap().base, NumberBase::Binary);
+    }
+}
