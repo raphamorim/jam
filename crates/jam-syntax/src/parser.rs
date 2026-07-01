@@ -1107,3 +1107,157 @@ impl<'a> Parser<'a> {
 
     // ---- unary prefixes + postfix `as` casts ----
 
+    fn parse_unary(&mut self) -> PResult<NodeIdx> {
+        // Prefix unary ops recurse; `as` casts are applied postfix via wrap_as.
+        if self.match_(TokenType::Not) {
+            let operand = self.parse_unary()?;
+            let node = self.emit_unop(UnaryOp::LogNot, operand);
+            return self.wrap_as(node);
+        }
+        if self.match_(TokenType::Tilde) {
+            let operand = self.parse_unary()?;
+            let node = self.emit_unop(UnaryOp::BitNot, operand);
+            return self.wrap_as(node);
+        }
+        if self.match_(TokenType::Amp) {
+            let operand = self.parse_unary()?;
+            let node = self.emit(AstNode {
+                tag: AstTag::AddressOf,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: operand.raw(),
+                rhs: 0,
+            });
+            return self.wrap_as(node);
+        }
+        if self.match_(TokenType::Minus) {
+            let operand = self.parse_unary()?;
+            // fold a leading "-" into the literal's sign so the natural type
+            // is signed. Otherwise "-16 as i64" parses as "Neg(AsCast(16,
+            // i64))" where the inner 16 is a u8.
+            let inner_lit = {
+                let mut cur = operand;
+                loop {
+                    let n = self.nodes.get(cur);
+                    match n.tag {
+                        AstTag::NumberLit => break Some(cur),
+                        AstTag::AsCast => cur = NodeIdx::new(n.lhs),
+                        _ => break None,
+                    }
+                }
+            };
+            if let Some(lit_idx) = inner_lit {
+                let mut lit = *self.nodes.get(lit_idx);
+                lit.flags ^= 1;
+                let mut new_lit = self.emit(lit);
+                // if the original operand was a cast, rebuild the cast chain
+                // around the sign-flipped literal so "-16 as i64" becomes
+                // "AsCast(NumberLit(-16), i64)".
+                if operand != lit_idx {
+                    let mut casts = Vec::new();
+                    let mut cur = operand;
+                    while cur != lit_idx {
+                        let n = self.nodes.get(cur);
+                        casts.push(n.rhs);
+                        cur = NodeIdx::new(n.lhs);
+                    }
+                    for ty in casts.into_iter().rev() {
+                        new_lit = self.emit(AstNode {
+                            tag: AstTag::AsCast,
+                            op: 0,
+                            flags: 0,
+                            main_token: 0,
+                            lhs: new_lit.raw(),
+                            rhs: ty,
+                        });
+                    }
+                }
+                return self.wrap_as(new_lit);
+            }
+            let node = self.emit_unop(UnaryOp::Neg, operand);
+            return self.wrap_as(node);
+        }
+        let p = self.parse_primary()?;
+        self.wrap_as(p)
+    }
+
+    fn wrap_as(&mut self, mut node: NodeIdx) -> PResult<NodeIdx> {
+        while self.match_(TokenType::As) {
+            let ty = self.parse_type()?;
+            node = self.emit(AstNode {
+                tag: AstTag::AsCast,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: node.raw(),
+                rhs: ty.raw(),
+            });
+        }
+        Ok(node)
+    }
+
+    fn emit_unop(&mut self, op: UnaryOp, operand: NodeIdx) -> NodeIdx {
+        self.emit(AstNode {
+            tag: AstTag::UnaryOp,
+            op: op as u8,
+            flags: 0,
+            main_token: 0,
+            lhs: operand.raw(),
+            rhs: 0,
+        })
+    }
+
+    // ---- primary + postfix ----
+
+    /// Parse a NUMBER token already consumed. Reproduces the C++
+    /// f64-inline-vs-f128-quad encoding exactly. A preceding unary `-` is
+    /// folded into the literal's sign flag by `parse_unary`, not here.
+    fn parse_number(&mut self) -> PResult<NodeIdx> {
+        let raw = self.prev_text().to_vec();
+        let (mag, lex_neg, is_float) = self.parse_num_lexeme(&raw)?;
+        let is_neg = lex_neg;
+        let mut flags: u16 = 0;
+        if is_neg {
+            flags |= 1;
+        }
+        let (lhs, rhs) = if is_float {
+            flags |= 2;
+            // Re-derive the float via the f128 path (NOT parse_num_lexeme's
+            // bits): strip one leading '-' and all '_', then parse.
+            let mut clean: Vec<u8> = Vec::with_capacity(raw.len());
+            let body = if !raw.is_empty() && raw[0] == b'-' {
+                &raw[1..]
+            } else {
+                &raw[..]
+            };
+            for &c in body {
+                if c != b'_' {
+                    clean.push(c);
+                }
+            }
+            let s = std::str::from_utf8(&clean).unwrap_or("");
+            match float128::parse_decimal_float(s) {
+                float128::ParsedFloat::Quad(q) => {
+                    flags |= 4;
+                    let e: ExtraIdx = self.nodes.push_extra_span(&q);
+                    (e.raw(), 0)
+                }
+                float128::ParsedFloat::Fits64(bits) => {
+                    ((bits & 0xFFFF_FFFF) as u32, (bits >> 32) as u32)
+                }
+            }
+        } else {
+            let _ = mag; // (force_neg path still uses mag for the value)
+            ((mag & 0xFFFF_FFFF) as u32, (mag >> 32) as u32)
+        };
+        Ok(self.emit(AstNode {
+            tag: AstTag::NumberLit,
+            op: 0,
+            flags,
+            main_token: 0,
+            lhs,
+            rhs,
+        }))
+    }
+
