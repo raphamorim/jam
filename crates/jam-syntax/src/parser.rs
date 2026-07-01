@@ -391,3 +391,105 @@ impl<'a> Parser<'a> {
     // for-bounds and assign-target use parse_comparison.
     // ===================================================================
 
+    /// Parse statements until `}` (not consumed) or EOF.
+    fn parse_stmts_until_brace(&mut self) -> PResult<Vec<NodeIdx>> {
+        let mut body = Vec::new();
+        while !self.check(TokenType::CloseBrace) && !self.is_at_end() {
+            body.push(self.parse_expression()?);
+        }
+        Ok(body)
+    }
+
+    /// `[thenCount, elseCount, then..., else...]` extra-pool block (If).
+    fn push_if_extra(&mut self, then_body: &[NodeIdx], else_body: &[NodeIdx]) -> ExtraIdx {
+        let e = self
+            .nodes
+            .reserve_extra(2 + then_body.len() + else_body.len());
+        self.nodes.set_extra(e, then_body.len() as u32);
+        self.nodes
+            .set_extra(ExtraIdx::new(e.raw() + 1), else_body.len() as u32);
+        let mut p = e.raw() + 2;
+        for b in then_body {
+            self.nodes.set_extra(ExtraIdx::new(p), b.raw());
+            p += 1;
+        }
+        for b in else_body {
+            self.nodes.set_extra(ExtraIdx::new(p), b.raw());
+            p += 1;
+        }
+        e
+    }
+
+    /// `[bodyCount, body...]` extra-pool block (While).
+    fn push_body_extra(&mut self, body: &[NodeIdx]) -> ExtraIdx {
+        let e = self.nodes.reserve_extra(1 + body.len());
+        self.nodes.set_extra(e, body.len() as u32);
+        for (i, b) in body.iter().enumerate() {
+            self.nodes
+                .set_extra(ExtraIdx::new(e.raw() + 1 + i as u32), b.raw());
+        }
+        e
+    }
+
+    /// Parse one `name [: type] = init ;` var binding into a VarDecl whose rhs
+    /// flags are `flags` (bit0 = isConst, bit1 = comp).
+    fn parse_var_decl(&mut self, flags: u32) -> PResult<NodeIdx> {
+        self.consume(TokenType::Identifier, "Expected variable name")?;
+        let name = self.prev_text().to_vec();
+        let name_id = self.intern_str(&name);
+        let ty = if self.match_(TokenType::Colon) {
+            self.parse_type()?
+        } else {
+            TypeIdx::NONE
+        };
+        self.consume(
+            TokenType::Equal,
+            "Expected '=' (every variable must be initialized at declaration)",
+        )?;
+        let init = self.parse_logical_or()?;
+        self.consume(TokenType::Semi, "Expected ';' after variable declaration")?;
+        let e = self.nodes.reserve_extra(3);
+        self.nodes.set_extra(e, name_id.raw());
+        self.nodes.set_extra(ExtraIdx::new(e.raw() + 1), ty.raw());
+        self.nodes.set_extra(ExtraIdx::new(e.raw() + 2), init.raw());
+        Ok(self.emit(AstNode {
+            tag: AstTag::VarDecl,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: e.raw(),
+            rhs: flags,
+        }))
+    }
+
+    /// Parse a parenthesized `( cond )` head + `{ body }`, returning
+    /// `(cond, body)`. Used by if/while (heads are unambiguous via parens, so
+    /// `allow_struct_lit` is left as-is). `kw_quoted` is the keyword as quoted
+    /// in the open-paren message (the C++ quotes `'while'` but
+    /// `` `inline while` ``); `kw` is the form used in the remaining messages.
+    fn parse_paren_cond_block(
+        &mut self,
+        kw_quoted: &str,
+        kw: &str,
+    ) -> PResult<(NodeIdx, Vec<NodeIdx>)> {
+        self.consume(
+            TokenType::OpenParen,
+            &format!("Expected '(' after {kw_quoted}"),
+        )?;
+        let cond = self.parse_logical_or()?;
+        self.consume(
+            TokenType::CloseParen,
+            &format!("Expected ')' after {kw} condition"),
+        )?;
+        self.consume(
+            TokenType::OpenBrace,
+            &format!("Expected '{{' after {kw} condition"),
+        )?;
+        let body = self.parse_stmts_until_brace()?;
+        self.consume(
+            TokenType::CloseBrace,
+            &format!("Expected '}}' after {kw} body"),
+        )?;
+        Ok((cond, body))
+    }
+
