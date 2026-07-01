@@ -2417,3 +2417,476 @@ impl<'a> Parser<'a> {
         Ok(decl)
     }
 
+    /// Parse a whole module.
+    pub fn parse(&mut self) -> PResult<crate::ast::ModuleAST> {
+        let mut module = crate::ast::ModuleAST::new();
+        while !self.is_at_end() {
+            let mut is_pub = false;
+
+            // `pub` absorb: only consume it here if it precedes const/comp;
+            // otherwise leave it for parse_function.
+            if self.check(TokenType::Pub) {
+                let pub_saved = self.current;
+                self.advance();
+                let next_is_const = self.check(TokenType::Const) || self.check(TokenType::Comp);
+                self.current = pub_saved;
+                if next_is_const {
+                    self.advance(); // consume `pub`
+                    is_pub = true;
+                    // `pub const { ... }` (destructuring import) is rejected.
+                    let peek = self.current + 1;
+                    if peek < self.tokens.len() && self.tokens[peek].ttype == TokenType::OpenBrace {
+                        return Err(
+                            self.parse_error("`pub` is not allowed on destructuring imports")
+                        );
+                    }
+                }
+            }
+
+            // `comp const`.
+            if self.check(TokenType::Comp) {
+                self.advance();
+                if !self.check(TokenType::Const) {
+                    return Err(
+                        self.parse_error("`comp` at module scope must be followed by `const`")
+                    );
+                }
+                let mut c = self.parse_const_decl()?;
+                c.is_pub = is_pub;
+                c.is_comp = true;
+                module.consts.push(c);
+                continue;
+            }
+
+            // `const` classification (import / destructuring / struct / union /
+            // enum / typed-or-untyped const) via cursor save/restore.
+            if self.check(TokenType::Const) {
+                let saved = self.current;
+                self.advance(); // past `const`
+                if self.check(TokenType::OpenBrace) {
+                    self.current = saved;
+                    module
+                        .destructuring_imports
+                        .push(self.parse_destructuring_import()?);
+                    continue;
+                }
+                if self.check(TokenType::Identifier) {
+                    self.advance(); // past ident
+                    if self.check(TokenType::Colon) {
+                        self.current = saved;
+                        let mut c = self.parse_const_decl()?;
+                        c.is_pub = is_pub;
+                        module.consts.push(c);
+                        continue;
+                    }
+                    if self.check(TokenType::Equal) {
+                        self.advance(); // past `=`
+                        let rhs = self.peek_type();
+                        self.current = saved;
+                        match rhs {
+                            TokenType::Import => {
+                                let mut d = self.parse_import_decl()?;
+                                d.is_pub = is_pub;
+                                module.imports.push(d);
+                            }
+                            TokenType::Struct => {
+                                let mut d = self.parse_struct_decl()?;
+                                d.is_pub = is_pub;
+                                module.structs.push(d);
+                            }
+                            TokenType::Union => {
+                                let mut d = self.parse_union_decl()?;
+                                d.is_pub = is_pub;
+                                module.unions.push(d);
+                            }
+                            TokenType::Enum => {
+                                let mut d = self.parse_enum_decl()?;
+                                d.is_pub = is_pub;
+                                module.enums.push(d);
+                            }
+                            _ => {
+                                let mut c = self.parse_const_decl()?;
+                                c.is_pub = is_pub;
+                                module.consts.push(c);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                // const + ident but neither `:` nor `=`: rewind, fall to fn.
+                self.current = saved;
+            }
+
+            // Function declaration (handles its own pub/extern/export/tfn/cfn).
+            let mut f = self.parse_function()?;
+            if f.is_cfn {
+                // A top-level `cfn` whose first param isn't `self` is a
+                // compile-time function, not a drop-method.
+                let first_is_self = f.args.first().map(|p| p.name == "self").unwrap_or(false);
+                if !first_is_self {
+                    f.is_cfn = false;
+                    f.is_comp_time_fn = true;
+                }
+            }
+            module.functions.push(f);
+        }
+        // Move parser-collected anonymous decls into the module (StructExpr /
+        // EnumExpr nodes index into these).
+        module.anon_structs = std::mem::take(&mut self.anon_structs);
+        module.anon_enums = std::mem::take(&mut self.anon_enums);
+        Ok(module)
+    }
+
+    fn builtin_type(&self, name: &[u8]) -> TypeIdx {
+        match name {
+            b"void" => builtin::VOID,
+            b"bool" | b"u1" => builtin::BOOL,
+            b"u8" => builtin::U8,
+            b"i8" => builtin::I8,
+            b"u16" => builtin::U16,
+            b"i16" => builtin::I16,
+            b"u32" => builtin::U32,
+            b"i32" => builtin::I32,
+            b"u64" => builtin::U64,
+            b"i64" => builtin::I64,
+            b"f32" => builtin::F32,
+            b"f64" => builtin::F64,
+            b"type" => builtin::TYPE,
+            b"noreturn" => builtin::NORETURN,
+            // `str` and others resolve later; treat as named for now.
+            _ => builtin::VOID,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+
+    /// Lex `src` and run the expression ladder; return (NodeStore, root).
+    fn parse_expr(src: &str) -> (NodeStore, NodeIdx) {
+        let mut lx = Lexer::new(src.as_bytes().to_vec());
+        lx.scan_tokens().unwrap();
+        let tokens = lx.tokens().to_vec();
+        let source = lx.source().to_vec();
+        let mut tp = TypePool::new();
+        let mut sp = StringPool::new();
+        let mut ns = NodeStore::new();
+        let mut diags = Diagnostics::new();
+        let root = {
+            let mut p = Parser::new(
+                tokens, source, &mut tp, &mut sp, &mut ns, &mut diags, "t.jam",
+            );
+            p.parse_logical_or().expect("parse")
+        };
+        (ns, root)
+    }
+
+    #[test]
+    fn precedence_mul_binds_tighter_than_add() {
+        // 1 + 2 * 3  =>  Add(1, Mul(2,3))
+        let (ns, root) = parse_expr("1 + 2 * 3");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::BinaryOp);
+        assert_eq!(n.op, BinOp::Add as u8);
+        let rhs = ns.get(NodeIdx::new(n.rhs));
+        assert_eq!(rhs.tag, AstTag::BinaryOp);
+        assert_eq!(rhs.op, BinOp::Mul as u8);
+    }
+
+    #[test]
+    fn logical_below_comparison() {
+        // a && b == c  =>  And(a, Eq(b,c))
+        let (ns, root) = parse_expr("a && b == c");
+        let n = ns.get(root);
+        assert_eq!(n.op, BinOp::LogAnd as u8);
+        assert_eq!(ns.get(NodeIdx::new(n.rhs)).op, BinOp::Eq as u8);
+    }
+
+    #[test]
+    fn number_int_and_neg() {
+        let (ns, root) = parse_expr("42");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::NumberLit);
+        assert_eq!(n.lhs, 42);
+        assert_eq!(n.flags & 1, 0);
+        // -7 (lexed as one token) -> negative flag.
+        let (ns2, r2) = parse_expr("-7");
+        let n2 = ns2.get(r2);
+        assert_eq!(n2.tag, AstTag::NumberLit);
+        assert_eq!(n2.lhs, 7);
+        assert_eq!(n2.flags & 1, 1);
+    }
+
+    #[test]
+    fn unary_minus_folds_into_literal() {
+        // `- 7` (whitespace keeps the lexer from gluing) folds the sign into
+        // the literal, consuming both tokens.
+        let (ns, root) = parse_expr("- 7");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::NumberLit);
+        assert_eq!(n.lhs, 7);
+        assert_eq!(n.flags & 1, 1);
+
+        // The number token is consumed: the rest of the expression parses.
+        let (ns2, r2) = parse_expr("a + - 7");
+        let n2 = ns2.get(r2);
+        assert_eq!(n2.tag, AstTag::BinaryOp);
+        assert_eq!(n2.op, BinOp::Add as u8);
+        let rhs = ns2.get(NodeIdx::new(n2.rhs));
+        assert_eq!(rhs.tag, AstTag::NumberLit);
+        assert_eq!(rhs.lhs, 7);
+        assert_eq!(rhs.flags & 1, 1);
+
+        // Double negation cancels (sign XOR, matching the C++ fold).
+        let (ns3, r3) = parse_expr("- -7");
+        let n3 = ns3.get(r3);
+        assert_eq!(n3.tag, AstTag::NumberLit);
+        assert_eq!(n3.lhs, 7);
+        assert_eq!(n3.flags & 1, 0);
+
+        // Non-literal operand still gets a Neg unary op.
+        let (ns4, r4) = parse_expr("- x");
+        assert_eq!(ns4.get(r4).tag, AstTag::UnaryOp);
+        assert_eq!(ns4.get(r4).op, UnaryOp::Neg as u8);
+    }
+
+    #[test]
+    fn unary_minus_folds_through_as_cast() {
+        // `- 16 as i64` => AsCast(NumberLit(-16), i64), not Neg(AsCast(16)).
+        let (ns, root) = parse_expr("- 16 as i64");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::AsCast);
+        let lit = ns.get(NodeIdx::new(n.lhs));
+        assert_eq!(lit.tag, AstTag::NumberLit);
+        assert_eq!(lit.lhs, 16);
+        assert_eq!(lit.flags & 1, 1);
+    }
+
+    #[test]
+    fn float_fits_f64() {
+        let (ns, root) = parse_expr("0.5");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::NumberLit);
+        assert_eq!(n.flags & 2, 2); // float
+        assert_eq!(n.flags & 4, 0); // fits f64
+        let bits = (n.lhs as u64) | ((n.rhs as u64) << 32);
+        assert_eq!(f64::from_bits(bits), 0.5);
+    }
+
+    #[test]
+    fn call_and_member_and_index() {
+        // foo(a, b) -> Call, direct (foo), 2 args
+        let (ns, root) = parse_expr("foo(a, b)");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::Call);
+        assert_eq!(n.flags & 1, 0); // direct
+        assert_eq!(ns.get_extra(ExtraIdx::new(n.rhs)), 2); // arg count
+
+        // a.b -> MemberAccess
+        let (ns2, r2) = parse_expr("a.b");
+        assert_eq!(ns2.get(r2).tag, AstTag::MemberAccess);
+
+        // a[0] -> Index
+        let (ns3, r3) = parse_expr("a[0]");
+        assert_eq!(ns3.get(r3).tag, AstTag::Index);
+    }
+
+    /// Lex `src` and run one statement via parse_expression.
+    fn parse_stmt(src: &str) -> (NodeStore, NodeIdx) {
+        let mut lx = Lexer::new(src.as_bytes().to_vec());
+        lx.scan_tokens().unwrap();
+        let tokens = lx.tokens().to_vec();
+        let source = lx.source().to_vec();
+        let mut tp = TypePool::new();
+        let mut sp = StringPool::new();
+        let mut ns = NodeStore::new();
+        let mut diags = Diagnostics::new();
+        let root = {
+            let mut p = Parser::new(
+                tokens, source, &mut tp, &mut sp, &mut ns, &mut diags, "t.jam",
+            );
+            p.parse_expression().expect("parse stmt")
+        };
+        (ns, root)
+    }
+
+    #[test]
+    fn stmt_return_expr() {
+        let (ns, root) = parse_stmt("return a + b;");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::Return);
+        assert_eq!(ns.get(NodeIdx::new(n.lhs)).tag, AstTag::BinaryOp);
+    }
+
+    #[test]
+    fn stmt_var_and_const_decl() {
+        // var x: i32 = 5;  -> VarDecl, not const, type=i32, init=NumberLit
+        let (ns, root) = parse_stmt("var x: i32 = 5;");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::VarDecl);
+        assert_eq!(n.rhs & 1, 0); // not const
+        let e = ExtraIdx::new(n.lhs);
+        assert_eq!(ns.get_extra(ExtraIdx::new(e.raw() + 1)), builtin::I32.raw()); // type
+        let init = NodeIdx::new(ns.get_extra(ExtraIdx::new(e.raw() + 2)));
+        assert_eq!(ns.get(init).tag, AstTag::NumberLit);
+
+        // const y = 7;  -> VarDecl, const, type=kNoType
+        let (ns2, r2) = parse_stmt("const y = 7;");
+        let n2 = ns2.get(r2);
+        assert_eq!(n2.tag, AstTag::VarDecl);
+        assert_eq!(n2.rhs & 1, 1); // const
+        assert_eq!(ns2.get_extra(ExtraIdx::new(n2.lhs + 1)), 0); // kNoType
+    }
+
+    #[test]
+    fn stmt_if_else() {
+        // if (a) { return 1; } else { return 2; }
+        let (ns, root) = parse_stmt("if (a) { return 1; } else { return 2; }");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::IfNode);
+        assert_eq!(n.flags, 0); // plain (not comp)
+        assert_eq!(ns.get(NodeIdx::new(n.lhs)).tag, AstTag::Variable); // cond
+        let e = ExtraIdx::new(n.rhs);
+        assert_eq!(ns.get_extra(e), 1); // thenCount
+        assert_eq!(ns.get_extra(ExtraIdx::new(e.raw() + 1)), 1); // elseCount
+    }
+
+    #[test]
+    fn stmt_while_and_assign() {
+        let (ns, root) = parse_stmt("while (a) { x = 1; }");
+        assert_eq!(ns.get(root).tag, AstTag::WhileNode);
+        assert_eq!(ns.get(root).flags, 0);
+
+        let (ns2, r2) = parse_stmt("x = 1;");
+        assert_eq!(ns2.get(r2).tag, AstTag::Assign);
+    }
+
+    #[test]
+    fn stmt_loop_desugars_to_while_true() {
+        // loop { break; } -> WhileNode with a BoolLit(true) cond emitted first.
+        let (ns, root) = parse_stmt("loop { break; }");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::WhileNode);
+        assert_eq!(n.flags, 0); // not inline
+        let cond = ns.get(NodeIdx::new(n.lhs));
+        assert_eq!(cond.tag, AstTag::BoolLit);
+        assert_eq!(cond.lhs, 1); // true
+    }
+
+    fn parse_module(src: &str) -> crate::ast::ModuleAST {
+        let mut lx = Lexer::new(src.as_bytes().to_vec());
+        lx.scan_tokens().unwrap();
+        let tokens = lx.tokens().to_vec();
+        let source = lx.source().to_vec();
+        let mut tp = TypePool::new();
+        let mut sp = StringPool::new();
+        let mut ns = NodeStore::new();
+        let mut diags = Diagnostics::new();
+        let mut p = Parser::new(
+            tokens, source, &mut tp, &mut sp, &mut ns, &mut diags, "t.jam",
+        );
+        p.parse().expect("parse module")
+    }
+
+    #[test]
+    fn module_imports_struct_const_fn() {
+        let m = parse_module(
+            "const std = import(\"std\");\n\
+             pub const Point = struct { x: i32, y: i32 };\n\
+             const N = 10;\n\
+             pub fn main() i32 { return N; }\n",
+        );
+        assert_eq!(m.imports.len(), 1);
+        assert_eq!(m.imports[0].name, "std");
+        assert_eq!(m.imports[0].path, "std");
+        assert_eq!(m.structs.len(), 1);
+        assert_eq!(m.structs[0].name, "Point");
+        assert!(m.structs[0].is_pub);
+        assert_eq!(m.structs[0].fields.len(), 2);
+        assert_eq!(m.structs[0].fields[0], ("x".to_string(), builtin::I32));
+        assert_eq!(m.consts.len(), 1);
+        assert_eq!(m.consts[0].name, "N");
+        assert_eq!(m.functions.len(), 1);
+        assert_eq!(m.functions[0].name, "main");
+        assert!(m.functions[0].is_pub);
+        assert_eq!(m.functions[0].return_type, builtin::I32);
+        assert_eq!(m.functions[0].body.len(), 1);
+    }
+
+    #[test]
+    fn module_enum_discriminants() {
+        let m = parse_module("const Dir = enum { Up, Down(i32), Right = 5, Last };");
+        assert_eq!(m.enums.len(), 1);
+        let e = &m.enums[0];
+        assert_eq!(e.variants.len(), 4);
+        assert_eq!(e.variants[0].discriminant, 0); // Up
+        assert_eq!(e.variants[1].discriminant, 1); // Down(i32)
+        assert_eq!(e.variants[1].payload_types, vec![builtin::I32]);
+        assert_eq!(e.variants[2].discriminant, 5); // Right = 5
+        assert_eq!(e.variants[3].discriminant, 6); // Last resumes at 6
+    }
+
+    #[test]
+    fn module_enum_over_256_variants_rejected() {
+        // 257 variants exceeds the u8 tag; 256 is the last accepted count.
+        let variants = |n: usize| {
+            (0..n).map(|i| format!("V{i}")).collect::<Vec<_>>().join(", ")
+        };
+        let ok = format!("const Big = enum {{ {} }};", variants(256));
+        assert_eq!(parse_module(&ok).enums[0].variants.len(), 256);
+
+        let src = format!("const Big = enum {{ {} }};", variants(257));
+        let mut lx = Lexer::new(src.into_bytes());
+        lx.scan_tokens().unwrap();
+        let tokens = lx.tokens().to_vec();
+        let source = lx.source().to_vec();
+        let mut tp = TypePool::new();
+        let mut sp = StringPool::new();
+        let mut ns = NodeStore::new();
+        let mut diags = Diagnostics::new();
+        let mut p = Parser::new(
+            tokens, source, &mut tp, &mut sp, &mut ns, &mut diags, "t.jam",
+        );
+        assert!(p.parse().is_err());
+        assert!(diags.all().iter().any(|d| {
+            d.message
+                .contains("has more than 256 variants; M2 enums are u8-tagged")
+        }));
+    }
+
+    #[test]
+    fn module_fn_params_and_modes() {
+        // Mode keyword comes after the `:` (`name: mut Type`). `void` is not a
+        // lexer keyword, so an omitted return type (kNoType) is the void case.
+        let m = parse_module("fn f(a: i32, b: mut i64, c: move u8) i32 { return a; }");
+        let f = &m.functions[0];
+        assert_eq!(f.args.len(), 3);
+        assert_eq!(f.args[0].mode, jam_core::ParamMode::Let);
+        assert_eq!(f.args[1].mode, jam_core::ParamMode::Mut);
+        assert_eq!(f.args[2].mode, jam_core::ParamMode::Move);
+        assert_eq!(f.return_type, builtin::I32);
+    }
+
+    #[test]
+    fn stmt_for_range() {
+        // for i in 0:n { x = i; } -> ForNode, extra=[var,start,end,bodyCount,...]
+        let (ns, root) = parse_stmt("for i in 0:n { x = i; }");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::ForNode);
+        let e = ExtraIdx::new(n.lhs);
+        // start is NumberLit 0, end is Variable n
+        assert_eq!(
+            ns.get(NodeIdx::new(ns.get_extra(ExtraIdx::new(e.raw() + 1))))
+                .tag,
+            AstTag::NumberLit
+        );
+        assert_eq!(
+            ns.get(NodeIdx::new(ns.get_extra(ExtraIdx::new(e.raw() + 2))))
+                .tag,
+            AstTag::Variable
+        );
+        assert_eq!(ns.get_extra(ExtraIdx::new(e.raw() + 3)), 1); // bodyCount
+    }
+}
