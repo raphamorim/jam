@@ -185,3 +185,85 @@ impl<'a> Parser<'a> {
 
     // ---- number literal decode (ports parseNumLexeme) ----
 
+    /// Returns `(magnitude, is_neg, is_float)`. Errors (with the same messages)
+    /// on BigInt / malformed literals. The float bit pattern it would compute
+    /// is vestigial — `parse_primary` re-derives floats via `float128`.
+    fn parse_num_lexeme(&mut self, s: &[u8]) -> PResult<(u64, bool, bool)> {
+        let neg = !s.is_empty() && s[0] == b'-';
+        let abs = if neg { &s[1..] } else { s };
+        let r = parse_number_literal(abs);
+        match r.kind {
+            NumberResultKind::Int => Ok((r.int_value, neg, false)),
+            NumberResultKind::Float => Ok((r.float_value.to_bits(), neg, true)),
+            NumberResultKind::BigInt => {
+                let msg = format!(
+                    "integer literal `{}` exceeds u64 range",
+                    String::from_utf8_lossy(abs)
+                );
+                Err(self.parse_error(msg))
+            }
+            NumberResultKind::Failure => {
+                let kind = r.failure.expect("failure kind").kind;
+                let msg = format!(
+                    "invalid numeric literal `{}`: {}",
+                    String::from_utf8_lossy(abs),
+                    number_error_message(kind)
+                );
+                Err(self.parse_error(msg))
+            }
+        }
+    }
+
+    // ---- qualified-name chain helpers ----
+
+    fn qualified_name(&mut self, chain_root: NodeIdx) -> PResult<String> {
+        let n = *self.nodes.get(chain_root);
+        match n.tag {
+            AstTag::Variable => Ok(String::from_utf8_lossy(
+                &self.string_pool.get(StringIdx::new(n.lhs)),
+            )
+            .into_owned()),
+            AstTag::MemberAccess => {
+                let base = self.qualified_name(NodeIdx::new(n.lhs))?;
+                let member = String::from_utf8_lossy(&self.string_pool.get(StringIdx::new(n.rhs)))
+                    .into_owned();
+                Ok(format!("{base}.{member}"))
+            }
+            _ => Err(self.parse_error("Invalid member access chain")),
+        }
+    }
+
+    fn is_qualified_name_chain(&self, chain_root: NodeIdx) -> bool {
+        let n = self.nodes.get(chain_root);
+        match n.tag {
+            AstTag::Variable => true,
+            AstTag::MemberAccess => self.is_qualified_name_chain(NodeIdx::new(n.lhs)),
+            _ => false,
+        }
+    }
+
+    fn chain_root_name(&self, chain_root: NodeIdx) -> String {
+        let n = self.nodes.get(chain_root);
+        match n.tag {
+            AstTag::Variable => {
+                String::from_utf8_lossy(&self.string_pool.get(StringIdx::new(n.lhs))).into_owned()
+            }
+            AstTag::MemberAccess => self.chain_root_name(NodeIdx::new(n.lhs)),
+            _ => String::new(),
+        }
+    }
+
+    fn chain_dot_count(&self, chain_root: NodeIdx) -> i32 {
+        let n = self.nodes.get(chain_root);
+        if n.tag != AstTag::MemberAccess {
+            0
+        } else {
+            1 + self.chain_dot_count(NodeIdx::new(n.lhs))
+        }
+    }
+
+    // ===================================================================
+    // Binary-precedence ladder (lowest -> highest). Each level is a
+    // left-associative fold emitting BinaryOp nodes (lhs/rhs = NodeIdx).
+    // ===================================================================
+
