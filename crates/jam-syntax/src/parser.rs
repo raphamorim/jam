@@ -267,3 +267,127 @@ impl<'a> Parser<'a> {
     // left-associative fold emitting BinaryOp nodes (lhs/rhs = NodeIdx).
     // ===================================================================
 
+    fn parse_logical_or(&mut self) -> PResult<NodeIdx> {
+        let mut lhs = self.parse_logical_and()?;
+        while self.match_(TokenType::Or) {
+            let rhs = self.parse_logical_and()?;
+            lhs = self.emit_binop(BinOp::LogOr, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_logical_and(&mut self) -> PResult<NodeIdx> {
+        let mut lhs = self.parse_comparison()?;
+        while self.match_(TokenType::And) {
+            let rhs = self.parse_comparison()?;
+            lhs = self.emit_binop(BinOp::LogAnd, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    /// Comparisons are NON-associative: exactly one (`if`, not `while`).
+    fn parse_comparison(&mut self) -> PResult<NodeIdx> {
+        let lhs = self.parse_bitwise()?;
+        let op = match self.peek_type() {
+            TokenType::EqualEqual => Some(BinOp::Eq),
+            TokenType::NotEqual => Some(BinOp::Ne),
+            TokenType::Less => Some(BinOp::Lt),
+            TokenType::LessEqual => Some(BinOp::Le),
+            TokenType::Greater => Some(BinOp::Gt),
+            TokenType::GreaterEqual => Some(BinOp::Ge),
+            _ => None,
+        };
+        if let Some(k) = op {
+            self.advance();
+            let rhs = self.parse_bitwise()?;
+            Ok(self.emit_binop(k, lhs, rhs))
+        } else {
+            Ok(lhs)
+        }
+    }
+
+    fn parse_bitwise(&mut self) -> PResult<NodeIdx> {
+        let mut lhs = self.parse_shift()?;
+        loop {
+            let k = if self.match_(TokenType::Amp) {
+                BinOp::BitAnd
+            } else if self.match_(TokenType::Pipe) {
+                BinOp::BitOr
+            } else if self.match_(TokenType::Caret) {
+                BinOp::BitXor
+            } else {
+                break;
+            };
+            let rhs = self.parse_shift()?;
+            lhs = self.emit_binop(k, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_shift(&mut self) -> PResult<NodeIdx> {
+        let mut lhs = self.parse_addition()?;
+        loop {
+            let k = if self.match_(TokenType::Lshift) {
+                BinOp::Shl
+            } else if self.match_(TokenType::Rshift) {
+                BinOp::Shr
+            } else {
+                break;
+            };
+            let rhs = self.parse_addition()?;
+            lhs = self.emit_binop(k, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_addition(&mut self) -> PResult<NodeIdx> {
+        let mut lhs = self.parse_multiplication()?;
+        loop {
+            let k = if self.match_(TokenType::Plus) {
+                BinOp::Add
+            } else if self.match_(TokenType::Minus) {
+                BinOp::Sub
+            } else {
+                break;
+            };
+            let rhs = self.parse_multiplication()?;
+            lhs = self.emit_binop(k, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_multiplication(&mut self) -> PResult<NodeIdx> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let k = if self.match_(TokenType::Star) {
+                BinOp::Mul
+            } else if self.match_(TokenType::Slash) {
+                BinOp::Div
+            } else if self.match_(TokenType::Percent) {
+                BinOp::Mod
+            } else {
+                break;
+            };
+            let rhs = self.parse_unary()?;
+            lhs = self.emit_binop(k, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn emit_binop(&mut self, op: BinOp, lhs: NodeIdx, rhs: NodeIdx) -> NodeIdx {
+        self.emit(AstNode {
+            tag: AstTag::BinaryOp,
+            op: op as u8,
+            flags: 0,
+            main_token: 0,
+            lhs: lhs.raw(),
+            rhs: rhs.raw(),
+        })
+    }
+
+    // ===================================================================
+    // Statements (parse_expression is the STATEMENT entry, per the C++ name).
+    // Entry-level subtleties are load-bearing: init/cond use parse_logical_or;
+    // for-bounds and assign-target use parse_comparison.
+    // ===================================================================
+
