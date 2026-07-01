@@ -869,3 +869,241 @@ impl<'a> Parser<'a> {
         Ok(bindings)
     }
 
+    fn parse_pattern_atom(&mut self) -> PResult<NodeIdx> {
+        // (A) Generic-typed enum variant `Ident(typeArgs).Variant` —
+        // detected by a balanced-paren scan to `).Ident`.
+        if self.check(TokenType::Identifier) && self.prev_is_not_wildcard_peek() {
+            let peek_idx = self.current + 1;
+            if self.tokens.get(peek_idx).map(|t| t.ttype) == Some(TokenType::OpenParen) {
+                let mut depth = 1;
+                let mut scan = peek_idx + 1;
+                while scan < self.tokens.len() && depth > 0 {
+                    match self.tokens[scan].ttype {
+                        TokenType::OpenParen => depth += 1,
+                        TokenType::CloseParen => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                    scan += 1;
+                }
+                if depth == 0
+                    && scan + 2 < self.tokens.len()
+                    && self.tokens[scan].ttype == TokenType::CloseParen
+                    && self.tokens[scan + 1].ttype == TokenType::Dot
+                    && self.tokens[scan + 2].ttype == TokenType::Identifier
+                {
+                    let type_name = self.tokens[self.current].text(&self.source).to_vec();
+                    self.advance(); // IDENT
+                    self.advance(); // `(`
+                    let mut type_args = Vec::new();
+                    if !self.check(TokenType::CloseParen) {
+                        type_args.push(self.parse_type()?);
+                        while self.match_(TokenType::Comma) {
+                            type_args.push(self.parse_type()?);
+                        }
+                    }
+                    self.consume(
+                        TokenType::CloseParen,
+                        "Expected ')' after generic type arguments",
+                    )?;
+                    self.consume(TokenType::Dot, "Expected '.' after generic type")?;
+                    self.consume(TokenType::Identifier, "Expected variant name after `.`")?;
+                    let vn = self.prev_text().to_vec();
+                    let variant_name_id = self.intern_str(&vn);
+                    let tn = self.intern_str(&type_name);
+                    let receiver_ty = self.type_pool.intern_generic_call(tn, type_args);
+
+                    if self.match_(TokenType::OpenParen) {
+                        let bindings = self.parse_pattern_bindings()?;
+                        // flags = 3 (bit0 bindings | bit1 TypeIdx recv);
+                        // extra = [recvTy, variant, count, b...]
+                        let extra = self.nodes.reserve_extra(3 + bindings.len());
+                        self.nodes.set_extra(extra, receiver_ty.raw());
+                        self.nodes
+                            .set_extra(ExtraIdx::new(extra.raw() + 1), variant_name_id.raw());
+                        self.nodes
+                            .set_extra(ExtraIdx::new(extra.raw() + 2), bindings.len() as u32);
+                        for (i, b) in bindings.iter().enumerate() {
+                            self.nodes
+                                .set_extra(ExtraIdx::new(extra.raw() + 3 + i as u32), b.raw());
+                        }
+                        return Ok(self.emit(AstNode {
+                            tag: AstTag::PatEnumVariant,
+                            op: 0,
+                            flags: 3,
+                            main_token: 0,
+                            lhs: extra.raw(),
+                            rhs: 0,
+                        }));
+                    }
+                    // flags = 2 (TypeIdx recv, no bindings)
+                    return Ok(self.emit(AstNode {
+                        tag: AstTag::PatEnumVariant,
+                        op: 0,
+                        flags: 2,
+                        main_token: 0,
+                        lhs: receiver_ty.raw(),
+                        rhs: variant_name_id.raw(),
+                    }));
+                }
+            }
+        }
+
+        // (B) Qualified/bare enum variant.
+        if self.check(TokenType::Identifier) && self.prev_is_not_wildcard_peek() {
+            let saved = self.current;
+            self.advance(); // enum/variant name
+            if self.match_(TokenType::Dot) {
+                self.consume(TokenType::Identifier, "Expected variant name after `.`")?;
+                // `a.Status.Ok` → receiver `a.Status` + variant `Ok`.
+                let mut recv_name = self.tokens[saved].text(&self.source).to_vec();
+                let mut last_seg = self.prev_text().to_vec();
+                while self.match_(TokenType::Dot) {
+                    self.consume(TokenType::Identifier, "Expected variant name after `.`")?;
+                    recv_name.push(b'.');
+                    recv_name.extend_from_slice(&last_seg);
+                    last_seg = self.prev_text().to_vec();
+                }
+                let enum_name_id = self.intern_str(&recv_name);
+                let variant_name_id = self.intern_str(&last_seg);
+
+                if self.match_(TokenType::OpenParen) {
+                    let bindings = self.parse_pattern_bindings()?;
+                    // flags = 1; extra = [enum, variant, count, b...]
+                    let extra = self.nodes.reserve_extra(3 + bindings.len());
+                    self.nodes.set_extra(extra, enum_name_id.raw());
+                    self.nodes
+                        .set_extra(ExtraIdx::new(extra.raw() + 1), variant_name_id.raw());
+                    self.nodes
+                        .set_extra(ExtraIdx::new(extra.raw() + 2), bindings.len() as u32);
+                    for (i, b) in bindings.iter().enumerate() {
+                        self.nodes
+                            .set_extra(ExtraIdx::new(extra.raw() + 3 + i as u32), b.raw());
+                    }
+                    return Ok(self.emit(AstNode {
+                        tag: AstTag::PatEnumVariant,
+                        op: 0,
+                        flags: 1,
+                        main_token: 0,
+                        lhs: extra.raw(),
+                        rhs: 0,
+                    }));
+                }
+                // flags = 0; lhs = enum, rhs = variant
+                return Ok(self.emit(AstNode {
+                    tag: AstTag::PatEnumVariant,
+                    op: 0,
+                    flags: 0,
+                    main_token: 0,
+                    lhs: enum_name_id.raw(),
+                    rhs: variant_name_id.raw(),
+                }));
+            }
+            // Bare variant `Variant` / `Variant(bindings)` — receiver inferred.
+            let bare = self.tokens[saved].text(&self.source).to_vec();
+            let bare_variant_id = self.intern_str(&bare);
+            if self.match_(TokenType::OpenParen) {
+                let bindings = self.parse_pattern_bindings()?;
+                // flags = 5 (bit0 bindings | bit2 infer-recv);
+                // extra = [0, variant, count, b...]
+                let extra = self.nodes.reserve_extra(3 + bindings.len());
+                self.nodes.set_extra(extra, 0);
+                self.nodes
+                    .set_extra(ExtraIdx::new(extra.raw() + 1), bare_variant_id.raw());
+                self.nodes
+                    .set_extra(ExtraIdx::new(extra.raw() + 2), bindings.len() as u32);
+                for (i, b) in bindings.iter().enumerate() {
+                    self.nodes
+                        .set_extra(ExtraIdx::new(extra.raw() + 3 + i as u32), b.raw());
+                }
+                return Ok(self.emit(AstNode {
+                    tag: AstTag::PatEnumVariant,
+                    op: 0,
+                    flags: 5,
+                    main_token: 0,
+                    lhs: extra.raw(),
+                    rhs: 0,
+                }));
+            }
+            // flags = 4 (bit2 infer-recv, no bindings)
+            return Ok(self.emit(AstNode {
+                tag: AstTag::PatEnumVariant,
+                op: 0,
+                flags: 4,
+                main_token: 0,
+                lhs: 0,
+                rhs: bare_variant_id.raw(),
+            }));
+        }
+
+        // (C) Integer literal or inclusive range `lo..=hi`.
+        if self.match_(TokenType::Number) {
+            let lex = self.prev_text().to_vec();
+            let (lo, is_negative, is_float) = self.parse_num_lexeme(&lex)?;
+            if is_float {
+                return Err(self.parse_error(
+                    "Float literals are not allowed in `match` patterns \
+                     (use an integer literal or a `..=` range)",
+                ));
+            }
+            if self.match_(TokenType::DotDotEq) {
+                self.consume(TokenType::Number, "Expected upper bound after `..=`")?;
+                let hilex = self.prev_text().to_vec();
+                let (hi, _hineg, hifloat) = self.parse_num_lexeme(&hilex)?;
+                if hifloat {
+                    return Err(
+                        self.parse_error("Float literals are not allowed in `match` patterns")
+                    );
+                }
+                // bounds truncate to u32
+                return Ok(self.emit(AstNode {
+                    tag: AstTag::PatRange,
+                    op: 0,
+                    flags: 0,
+                    main_token: 0,
+                    lhs: (lo & 0xFFFF_FFFF) as u32,
+                    rhs: (hi & 0xFFFF_FFFF) as u32,
+                }));
+            }
+            let flags: u16 = if is_negative { 1 } else { 0 };
+            return Ok(self.emit(AstNode {
+                tag: AstTag::PatLit,
+                op: 0,
+                flags,
+                main_token: 0,
+                lhs: (lo & 0xFFFF_FFFF) as u32,
+                rhs: (lo >> 32) as u32,
+            }));
+        }
+
+        // (D) Char literal — not yet supported.
+        if self.match_(TokenType::StringLiteral) {
+            return Err(self.parse_error("Char literals in patterns are not yet supported"));
+        }
+
+        // (E) Wildcard `_`.
+        if self.check(TokenType::Identifier) && self.tokens[self.current].text(&self.source) == b"_"
+        {
+            self.advance();
+            return Ok(self.emit(AstNode {
+                tag: AstTag::PatWildcard,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: 0,
+                rhs: 0,
+            }));
+        }
+
+        Err(self.parse_error("Expected pattern (integer literal, range, or `_`)"))
+    }
+
+    /// True when the current token (an identifier) is not the `_` wildcard.
+    fn prev_is_not_wildcard_peek(&self) -> bool {
+        self.tokens[self.current].text(&self.source) != b"_"
+    }
+
+    // ---- unary prefixes + postfix `as` casts ----
+
