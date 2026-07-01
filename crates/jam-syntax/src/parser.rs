@@ -710,3 +710,162 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    /// Shared if/comp-if tail: parses `( cond ) { then } [else ...]`, returning
+    /// `(cond, then_body, else_body)`. `is_comp` controls the else-if guard
+    /// (`else comp if` chains too) and the error messages.
+    fn parse_if_tail(&mut self, is_comp: bool) -> PResult<(NodeIdx, Vec<NodeIdx>, Vec<NodeIdx>)> {
+        // The C++ writes the comp-if keyword as `` `comp if` `` but the plain
+        // keyword as `'if'`/bare `if`; match each message byte-for-byte.
+        let (kw_quoted, kw) = if is_comp {
+            ("`comp if`", "`comp if`")
+        } else {
+            ("'if'", "if")
+        };
+        self.consume(
+            TokenType::OpenParen,
+            &format!("Expected '(' after {kw_quoted}"),
+        )?;
+        let cond = self.parse_logical_or()?;
+        self.consume(
+            TokenType::CloseParen,
+            &format!("Expected ')' after {kw} condition"),
+        )?;
+        self.consume(
+            TokenType::OpenBrace,
+            &format!("Expected '{{' after {kw} condition"),
+        )?;
+        let then_body = self.parse_stmts_until_brace()?;
+        self.consume(
+            TokenType::CloseBrace,
+            &format!("Expected '}}' after {kw} body"),
+        )?;
+        let mut else_body = Vec::new();
+        if self.match_(TokenType::Else) {
+            let chains = self.check(TokenType::If) || (is_comp && self.check(TokenType::Comp));
+            if chains {
+                // `else if` / `else comp if`: the chained construct is one stmt.
+                else_body.push(self.parse_expression()?);
+            } else {
+                let msg = if is_comp {
+                    "Expected '{' or `if` / `comp if` after 'else'"
+                } else {
+                    "Expected '{' or 'if' after 'else'"
+                };
+                self.consume(TokenType::OpenBrace, msg)?;
+                else_body = self.parse_stmts_until_brace()?;
+                let close_msg = if is_comp {
+                    "Expected '}' after `comp if` else body"
+                } else {
+                    "Expected '}' after else body"
+                };
+                self.consume(TokenType::CloseBrace, close_msg)?;
+            }
+        }
+        Ok((cond, then_body, else_body))
+    }
+
+    fn parse_match(&mut self) -> PResult<NodeIdx> {
+        self.consume(TokenType::Match, "Expected `match`")?;
+        self.consume(TokenType::OpenParen, "Expected `(` after `match`")?;
+        let scrutinee = self.parse_logical_or()?;
+        self.consume(TokenType::CloseParen, "Expected `)` after match scrutinee")?;
+        self.consume(TokenType::OpenBrace, "Expected `{` to begin match body")?;
+
+        // Each arm: (pattern NodeIdx, body NodeIdx list).
+        let mut arms: Vec<(NodeIdx, Vec<NodeIdx>)> = Vec::new();
+        while !self.check(TokenType::CloseBrace) && !self.is_at_end() {
+            let pat = self.parse_pattern()?;
+            self.consume(TokenType::OpenBrace, "Expected `{` to begin arm body")?;
+            let mut body = Vec::new();
+            while !self.check(TokenType::CloseBrace) && !self.is_at_end() {
+                body.push(self.parse_expression()?);
+            }
+            self.consume(TokenType::CloseBrace, "Expected `}` to close arm body")?;
+            arms.push((pat, body));
+        }
+        self.consume(TokenType::CloseBrace, "Expected `}` to close match body")?;
+
+        // Pack arms: [armCount, (patIdx, bodyCount, body...)...]. The total
+        // precompute and fill loop must walk an identical slot count.
+        let mut total = 1usize; // armCount
+        for (_, body) in &arms {
+            total += 2 + body.len(); // patIdx + bodyCount + body...
+        }
+        let extra = self.nodes.reserve_extra(total);
+        let mut pos = 0u32;
+        self.nodes.set_extra(extra, arms.len() as u32);
+        pos += 1;
+        for (pat, body) in &arms {
+            self.nodes
+                .set_extra(ExtraIdx::new(extra.raw() + pos), pat.raw());
+            pos += 1;
+            self.nodes
+                .set_extra(ExtraIdx::new(extra.raw() + pos), body.len() as u32);
+            pos += 1;
+            for s in body {
+                self.nodes
+                    .set_extra(ExtraIdx::new(extra.raw() + pos), s.raw());
+                pos += 1;
+            }
+        }
+
+        Ok(self.emit(AstNode {
+            tag: AstTag::MatchNode,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: scrutinee.raw(),
+            rhs: extra.raw(),
+        }))
+    }
+
+    /// `atom (| atom)*` — a lone atom is returned unwrapped (no `PatOr`).
+    fn parse_pattern(&mut self) -> PResult<NodeIdx> {
+        let first = self.parse_pattern_atom()?;
+        if !self.check(TokenType::Pipe) {
+            return Ok(first);
+        }
+        let mut alternatives = vec![first];
+        while self.match_(TokenType::Pipe) {
+            alternatives.push(self.parse_pattern_atom()?);
+        }
+        let extra = self.nodes.reserve_extra(1 + alternatives.len());
+        self.nodes.set_extra(extra, alternatives.len() as u32);
+        for (i, a) in alternatives.iter().enumerate() {
+            self.nodes
+                .set_extra(ExtraIdx::new(extra.raw() + 1 + i as u32), a.raw());
+        }
+        Ok(self.emit(AstNode {
+            tag: AstTag::PatOr,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: extra.raw(),
+            rhs: 0,
+        }))
+    }
+
+    /// Parse a binding list `(name, name, ...)` after a consumed `(`. Empty
+    /// `()` is permitted. Returns the interned binding-name StringIdxs.
+    fn parse_pattern_bindings(&mut self) -> PResult<Vec<StringIdx>> {
+        let mut bindings = Vec::new();
+        if !self.check(TokenType::CloseParen) {
+            loop {
+                self.consume(
+                    TokenType::Identifier,
+                    "Expected binding name in variant payload",
+                )?;
+                let b = self.prev_text().to_vec();
+                bindings.push(self.intern_str(&b));
+                if !self.match_(TokenType::Comma) {
+                    break;
+                }
+            }
+        }
+        self.consume(
+            TokenType::CloseParen,
+            "Expected `)` to close payload bindings",
+        )?;
+        Ok(bindings)
+    }
+
