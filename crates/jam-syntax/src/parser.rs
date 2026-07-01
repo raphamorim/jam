@@ -1838,3 +1838,295 @@ impl<'a> Parser<'a> {
     // Types (core forms; full parse_type lands with installment 2)
     // ===================================================================
 
+    fn parse_type(&mut self) -> PResult<TypeIdx> {
+        // (1) `fn(T1, T2, ...) Ret` function type.
+        if self.match_(TokenType::Fn) {
+            self.consume(TokenType::OpenParen, "Expected `(` after `fn` in type")?;
+            let mut params = Vec::new();
+            if !self.check(TokenType::CloseParen) {
+                params.push(self.parse_type()?);
+                while self.match_(TokenType::Comma) {
+                    params.push(self.parse_type()?);
+                }
+            }
+            self.consume(
+                TokenType::CloseParen,
+                "Expected `)` after fn-type parameters",
+            )?;
+            let ret = self.parse_type()?;
+            return Ok(self.type_pool.intern_fn(ret, params));
+        }
+        // (2) `*const|*mut [optional []] T` pointer. Mutability is not encoded
+        // (*const and *mut intern to the same TypeIdx).
+        if self.match_(TokenType::Star) {
+            if !self.match_(TokenType::Const) {
+                let _ = self.match_(TokenType::Mut);
+            }
+            // Many-item only if `[` is immediately followed by `]`; otherwise
+            // the `[` belongs to a pointer-to-array element type.
+            let mut is_many = false;
+            if self.check(TokenType::OpenBracket) {
+                let saved = self.current;
+                self.advance(); // '['
+                if self.match_(TokenType::CloseBracket) {
+                    is_many = true;
+                } else {
+                    self.current = saved;
+                }
+            }
+            let elem = self.parse_type()?;
+            return Ok(if is_many {
+                self.type_pool.intern_ptr_many(elem)
+            } else {
+                self.type_pool.intern_ptr_single(elem)
+            });
+        }
+        // (3) `[]T` slice, `[N]T` literal array, or `[expr]T` deferred array.
+        if self.match_(TokenType::OpenBracket) {
+            if self.match_(TokenType::CloseBracket) {
+                let elem = self.parse_type()?;
+                return Ok(self.type_pool.intern_slice(elem));
+            }
+            // Literal fast-path: a plain `Number` immediately followed by `]`.
+            if self.check(TokenType::Number)
+                && self.tokens.get(self.current + 1).map(|t| t.ttype)
+                    == Some(TokenType::CloseBracket)
+            {
+                self.advance(); // number
+                let raw = self.prev_text().to_vec();
+                let (mag, _neg, _is_float) = self.parse_num_lexeme(&raw)?;
+                self.consume(TokenType::CloseBracket, "Expected `]` after array size")?;
+                let elem = self.parse_type()?;
+                return Ok(self.type_pool.intern_array(elem, mag as u32));
+            }
+            // Expression length -> ArrayExpr (folded later in codegen). Uses
+            // parse_logical_or (not parse_expression, which would want a `;`).
+            let len_expr = self.parse_logical_or()?;
+            self.consume(TokenType::CloseBracket, "Expected `]` after array size")?;
+            let elem = self.parse_type()?;
+            return Ok(self.type_pool.intern_array_expr(elem, len_expr));
+        }
+        // (4) builtin keyword. `str` is sugar for `[]u8`; everything else maps
+        // to a fixed BuiltinType index.
+        if self.match_(TokenType::Type) {
+            let name = self.prev_text().to_vec();
+            if name.as_slice() == b"str" {
+                return Ok(self.type_pool.intern_slice(builtin::U8));
+            }
+            return Ok(self.builtin_type(&name));
+        }
+        // (5) identifier: `Self`, a dotted qualified name, or a generic call.
+        if self.match_(TokenType::Identifier) {
+            let first = self.prev_text().to_vec();
+            // Build the (possibly dotted) name; `Self` resolves to the
+            // enclosing struct.
+            let mut dotted = if first.as_slice() == b"Self" {
+                match self.struct_context_stack.last() {
+                    Some(c) => c.clone(),
+                    None => {
+                        return Err(self.parse_error("`Self` is only valid inside a struct body"));
+                    }
+                }
+            } else {
+                String::from_utf8_lossy(&first).into_owned()
+            };
+            while self.match_(TokenType::Dot) {
+                self.consume(TokenType::Identifier, "Expected type name after `.`")?;
+                dotted.push('.');
+                dotted.push_str(&String::from_utf8_lossy(self.prev_text()));
+            }
+            // `Name(args)` generic-call type.
+            if self.check(TokenType::OpenParen) {
+                self.advance(); // '('
+                let mut args = Vec::new();
+                if !self.check(TokenType::CloseParen) {
+                    args.push(self.parse_type()?);
+                    while self.match_(TokenType::Comma) {
+                        args.push(self.parse_type()?);
+                    }
+                }
+                self.consume(
+                    TokenType::CloseParen,
+                    "Expected ')' after generic type arguments",
+                )?;
+                let nid = self.intern_str(dotted.as_bytes());
+                return Ok(self.type_pool.intern_generic_call(nid, args));
+            }
+            let nid = self.intern_str(dotted.as_bytes());
+            return Ok(self.type_pool.intern_named(nid));
+        }
+        Err(self.parse_error("Expected type"))
+    }
+
+    // ===================================================================
+    // Declarations + top-level parse()
+    // ===================================================================
+
+    fn parse_function(&mut self) -> PResult<FunctionAST> {
+        // Modifiers in any order, each at most once.
+        let mut is_extern = false;
+        let mut is_export = false;
+        let mut is_pub = false;
+        let mut is_test = false;
+        loop {
+            if !is_extern && self.match_(TokenType::Extern) {
+                is_extern = true;
+            } else if !is_export && self.match_(TokenType::Export) {
+                is_export = true;
+            } else if !is_pub && self.match_(TokenType::Pub) {
+                is_pub = true;
+            } else if !is_test && self.match_(TokenType::Tfn) {
+                is_test = true;
+            } else {
+                break;
+            }
+        }
+        let mut is_cfn = false;
+        if !is_test {
+            // `tfn` already consumed the keyword; otherwise expect fn/cfn.
+            if self.match_(TokenType::Cfn) {
+                is_cfn = true;
+            } else {
+                self.consume(TokenType::Fn, "Expected 'fn' or 'cfn' keyword")?;
+            }
+        }
+        self.consume(TokenType::Identifier, "Expected function name")?;
+        let name = String::from_utf8_lossy(self.prev_text()).into_owned();
+        self.consume(TokenType::OpenParen, "Expected '(' after function name")?;
+
+        let mut args: Vec<crate::ast::Param> = Vec::new();
+        let mut is_var_args = false;
+        if !self.check(TokenType::CloseParen) {
+            loop {
+                if self.check(TokenType::Ellipsis) {
+                    self.advance();
+                    if !is_extern {
+                        return Err(
+                            self.parse_error("`...` is only allowed in extern fn declarations")
+                        );
+                    }
+                    is_var_args = true;
+                    break;
+                }
+                let is_comp = self.match_(TokenType::Comp);
+                self.consume(TokenType::Identifier, "Expected parameter name")?;
+                let pname = String::from_utf8_lossy(self.prev_text()).into_owned();
+                self.consume(TokenType::Colon, "Expected ':' after parameter name")?;
+                let mode = if self.match_(TokenType::Mut) {
+                    jam_core::ParamMode::Mut
+                } else if self.match_(TokenType::Move) {
+                    jam_core::ParamMode::Move
+                } else {
+                    jam_core::ParamMode::Let
+                };
+                let pty = self.parse_type()?;
+                args.push(crate::ast::Param {
+                    name: pname,
+                    ty: pty,
+                    mode,
+                    is_comp,
+                });
+                if !self.match_(TokenType::Comma) {
+                    break;
+                }
+            }
+        }
+        self.consume(TokenType::CloseParen, "Expected ')' after parameters")?;
+
+        // Return type only when the next token can start one.
+        let return_type = if matches!(
+            self.peek_type(),
+            TokenType::Type
+                | TokenType::OpenBracket
+                | TokenType::Const
+                | TokenType::Identifier
+                | TokenType::Star
+        ) {
+            self.parse_type()?
+        } else {
+            TypeIdx::NONE
+        };
+
+        if is_extern {
+            self.consume(
+                TokenType::Semi,
+                "Expected ';' after extern function declaration",
+            )?;
+            let mut f = FunctionAST::new(name, args, return_type, Vec::new());
+            f.is_extern = true;
+            f.is_export = is_export;
+            f.is_pub = is_pub;
+            f.is_test = false; // forced (matches C++)
+            f.is_var_args = is_var_args;
+            f.is_cfn = is_cfn;
+            return Ok(f);
+        }
+        self.consume(TokenType::OpenBrace, "Expected '{' before function body")?;
+        let mut body = Vec::new();
+        while !self.check(TokenType::CloseBrace) && !self.is_at_end() {
+            body.push(self.parse_expression()?);
+        }
+        self.consume(TokenType::CloseBrace, "Expected '}' after function body")?;
+        let mut f = FunctionAST::new(name, args, return_type, body);
+        f.is_export = is_export;
+        f.is_pub = is_pub;
+        f.is_test = is_test;
+        f.is_var_args = false; // forced (matches C++)
+        f.is_cfn = is_cfn;
+        Ok(f)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn parse_struct_body(&mut self) -> PResult<(Vec<(String, TypeIdx)>, Vec<FunctionAST>)> {
+        let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        while !self.check(TokenType::CloseBrace) && !self.is_at_end() {
+            if matches!(
+                self.peek_type(),
+                TokenType::Fn
+                    | TokenType::Cfn
+                    | TokenType::Pub
+                    | TokenType::Extern
+                    | TokenType::Export
+                    | TokenType::Tfn
+            ) {
+                let mut m = self.parse_function()?;
+                if let Some(ctx) = self.struct_context_stack.last() {
+                    m.parent_struct = ctx.clone();
+                }
+                methods.push(m);
+                self.match_(TokenType::Comma); // optional trailing comma
+            } else {
+                self.consume(TokenType::Identifier, "Expected field name or 'fn'")?;
+                let fname = String::from_utf8_lossy(self.prev_text()).into_owned();
+                self.consume(TokenType::Colon, "Expected ':' after field name")?;
+                let fty = self.parse_type()?;
+                fields.push((fname, fty));
+                if !self.check(TokenType::CloseBrace) {
+                    self.consume(TokenType::Comma, "Expected ',' or '}' after struct field")?;
+                }
+            }
+        }
+        self.consume(
+            TokenType::CloseBrace,
+            "Expected '}' to close struct definition",
+        )?;
+        Ok((fields, methods))
+    }
+
+    fn parse_struct_decl(&mut self) -> PResult<StructDeclAST> {
+        self.consume(TokenType::Const, "Expected 'const' for struct declaration")?;
+        self.consume(TokenType::Identifier, "Expected struct name")?;
+        let name = String::from_utf8_lossy(self.prev_text()).into_owned();
+        self.consume(TokenType::Equal, "Expected '=' after struct name")?;
+        self.consume(TokenType::Struct, "Expected 'struct' keyword")?;
+        self.consume(TokenType::OpenBrace, "Expected '{' after 'struct'")?;
+        self.struct_context_stack.push(name.clone());
+        let (fields, methods) = self.parse_struct_body()?;
+        self.struct_context_stack.pop();
+        self.consume(TokenType::Semi, "Expected ';' after struct declaration")?;
+        let mut s = StructDeclAST::new(name, fields);
+        s.methods = methods;
+        Ok(s)
+    }
+
