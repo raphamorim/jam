@@ -1647,3 +1647,194 @@ impl<'a> Parser<'a> {
         Err(self.parse_error("Expected primary expression"))
     }
 
+    /// Balanced-paren lookahead from a `(` at `current`: classify `name(...)` as
+    /// a generic struct literal (`)` then `{`), a generic type-method-call (`)`
+    /// then `.id(`), or neither (a plain call).
+    fn typecall_lookahead(&self) -> TcShape {
+        let mut peek_idx = self.current + 1;
+        let mut depth = 1;
+        while peek_idx < self.tokens.len() && depth > 0 {
+            match self.tokens[peek_idx].ttype {
+                TokenType::OpenParen => depth += 1,
+                TokenType::CloseParen => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+            peek_idx += 1;
+        }
+        if depth != 0 {
+            return TcShape::None;
+        }
+        let after = self.tokens.get(peek_idx + 1).map(|t| t.ttype);
+        if self.allow_struct_lit && after == Some(TokenType::OpenBrace) {
+            return TcShape::GenericStructLit;
+        }
+        if after == Some(TokenType::Dot)
+            && self.tokens.get(peek_idx + 2).map(|t| t.ttype) == Some(TokenType::Identifier)
+            && self.tokens.get(peek_idx + 3).map(|t| t.ttype) == Some(TokenType::OpenParen)
+        {
+            TcShape::TypeMethodCall
+        } else {
+            TcShape::None
+        }
+    }
+
+    /// Struct-literal body: `{ ident : expr (, ident : expr)* ,? }` with the
+    /// opening `{` already consumed. Emits `StructLit` with `lhs = kNoType`
+    /// (the caller patches it to the receiver type).
+    fn parse_struct_literal(&mut self) -> PResult<NodeIdx> {
+        let mut fields: Vec<(StringIdx, NodeIdx)> = Vec::new();
+        while !self.check(TokenType::CloseBrace) && !self.is_at_end() {
+            self.consume(
+                TokenType::Identifier,
+                "Expected field name in struct literal",
+            )?;
+            let fname = self.prev_text().to_vec();
+            let fid = self.intern_str(&fname);
+            self.consume(TokenType::Colon, "Expected ':' after field name")?;
+            let value = self.parse_logical_or()?;
+            fields.push((fid, value));
+            if !self.match_(TokenType::Comma) {
+                break;
+            }
+        }
+        self.consume(
+            TokenType::CloseBrace,
+            "Expected '}' to close struct literal",
+        )?;
+        let extra = self.nodes.reserve_extra(1 + fields.len() * 2);
+        self.nodes.set_extra(extra, fields.len() as u32);
+        for (i, (fid, val)) in fields.iter().enumerate() {
+            self.nodes
+                .set_extra(ExtraIdx::new(extra.raw() + 1 + (i * 2) as u32), fid.raw());
+            self.nodes
+                .set_extra(ExtraIdx::new(extra.raw() + 2 + (i * 2) as u32), val.raw());
+        }
+        Ok(self.emit(AstNode {
+            tag: AstTag::StructLit,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: 0, // kNoType — patched by the caller
+            rhs: extra.raw(),
+        }))
+    }
+
+    /// Emit a `Call` node, choosing the direct (StringIdx callee) vs indirect
+    /// (NodeIdx receiver, flags bit 0) encoding exactly as the C++ does.
+    fn emit_call(&mut self, expr: NodeIdx, bare_name: &[u8], args_extra: ExtraIdx) -> NodeIdx {
+        if self.is_qualified_name_chain(expr) {
+            let dot_count = self.chain_dot_count(expr);
+            let root = self.chain_root_name(expr);
+            let root_is_import = self.import_handles.contains(&root);
+            let is_multi_dot_local = dot_count >= 2 && !root_is_import;
+            if is_multi_dot_local {
+                return self.emit(AstNode {
+                    tag: AstTag::Call,
+                    op: 0,
+                    flags: 1,
+                    main_token: 0,
+                    lhs: expr.raw(),
+                    rhs: args_extra.raw(),
+                });
+            }
+            let callee = if self.nodes.get(expr).tag == AstTag::MemberAccess {
+                self.qualified_name(expr).unwrap_or_default()
+            } else {
+                String::from_utf8_lossy(bare_name).into_owned()
+            };
+            let callee_id = self.intern_str(callee.as_bytes());
+            self.emit(AstNode {
+                tag: AstTag::Call,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: callee_id.raw(),
+                rhs: args_extra.raw(),
+            })
+        } else {
+            self.emit(AstNode {
+                tag: AstTag::Call,
+                op: 0,
+                flags: 1,
+                main_token: 0,
+                lhs: expr.raw(),
+                rhs: args_extra.raw(),
+            })
+        }
+    }
+
+    /// `[count, item0, item1, ...]` in the extra pool; returns the start index.
+    fn push_count_list(&mut self, items: &[NodeIdx]) -> ExtraIdx {
+        let e = self.nodes.reserve_extra(1 + items.len());
+        self.nodes.set_extra(e, items.len() as u32);
+        for (i, it) in items.iter().enumerate() {
+            self.nodes
+                .set_extra(ExtraIdx::new(e.raw() + 1 + i as u32), it.raw());
+        }
+        e
+    }
+
+    fn parse_array_literal(&mut self) -> PResult<NodeIdx> {
+        // `[` already consumed. Empty: `]`.
+        if self.match_(TokenType::CloseBracket) {
+            let e = self.nodes.reserve_extra(1);
+            self.nodes.set_extra(e, 0);
+            return Ok(self.emit(AstNode {
+                tag: AstTag::ArrayLit,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: 0, // kNoType
+                rhs: e.raw(),
+            }));
+        }
+        let first = self.parse_logical_or()?;
+        if self.match_(TokenType::Semi) {
+            // `[expr; N]` repeat.
+            let count = self.parse_logical_or()?;
+            self.consume(
+                TokenType::CloseBracket,
+                "Expected `]` after array repeat count",
+            )?;
+            let e = self.nodes.reserve_extra(2);
+            self.nodes.set_extra(e, first.raw());
+            self.nodes
+                .set_extra(ExtraIdx::new(e.raw() + 1), count.raw());
+            return Ok(self.emit(AstNode {
+                tag: AstTag::ArrayRepeat,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: 0,
+                rhs: e.raw(),
+            }));
+        }
+        let mut elems = vec![first];
+        while self.match_(TokenType::Comma) {
+            if self.check(TokenType::CloseBracket) {
+                break; // trailing comma
+            }
+            elems.push(self.parse_logical_or()?);
+        }
+        self.consume(
+            TokenType::CloseBracket,
+            "Expected `]` or `,` in array literal",
+        )?;
+        let e = self.push_count_list(&elems);
+        Ok(self.emit(AstNode {
+            tag: AstTag::ArrayLit,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: 0,
+            rhs: e.raw(),
+        }))
+    }
+
+    // ===================================================================
+    // Types (core forms; full parse_type lands with installment 2)
+    // ===================================================================
+
