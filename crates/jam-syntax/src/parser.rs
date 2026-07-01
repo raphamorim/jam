@@ -1261,3 +1261,389 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    fn parse_primary(&mut self) -> PResult<NodeIdx> {
+        // `match` used as an expression.
+        if self.check(TokenType::Match) {
+            return self.parse_match();
+        }
+
+        // `@name(...)` compiler intrinsic.
+        if self.match_(TokenType::At) {
+            self.consume(TokenType::Identifier, "Expected intrinsic name after '@'")?;
+            let name = self.prev_text().to_vec();
+            let name_id = self.intern_str(&name);
+            self.consume(TokenType::OpenParen, "Expected '(' after '@name'")?;
+            // Names starting with "emit" are the @-emit family; they take
+            // expression args, as does `@dropInPlace(ptr)`. Everything else
+            // (sizeOf, alignOf) stays on the legacy type-arg path. The test
+            // order matches the C++: the emit-family/expr-intrinsic decision
+            // comes FIRST, so a zero-arg emit intrinsic still encodes as the
+            // expr-arg multi-form (flags=1, extra=[argCount=0]).
+            let is_emit_family = name.starts_with(b"emit");
+            let is_expr_intrinsic = is_emit_family || name.as_slice() == b"dropInPlace";
+            if is_expr_intrinsic {
+                let mut args = Vec::new();
+                if !self.check(TokenType::CloseParen) {
+                    args.push(self.parse_logical_or()?);
+                    while self.match_(TokenType::Comma) {
+                        args.push(self.parse_logical_or()?);
+                    }
+                }
+                self.consume(
+                    TokenType::CloseParen,
+                    "Expected ')' after '@' intrinsic arguments",
+                )?;
+                let e = self.push_count_list(&args);
+                let node = self.emit(AstNode {
+                    tag: AstTag::AtCall,
+                    op: 0,
+                    flags: 1,
+                    main_token: 0,
+                    lhs: name_id.raw(),
+                    rhs: e.raw(),
+                });
+                return Ok(node);
+            }
+            // No-arg form (`@isMacOS()`, `@isLinux()`, ...): empty parens.
+            // rhs is unused — astgen dispatches purely by name.
+            if self.check(TokenType::CloseParen) {
+                self.consume(
+                    TokenType::CloseParen,
+                    "Expected ')' after '@' intrinsic name",
+                )?;
+                return Ok(self.emit(AstNode {
+                    tag: AstTag::AtCall,
+                    op: 0,
+                    flags: 0,
+                    main_token: 0,
+                    lhs: name_id.raw(),
+                    rhs: 0,
+                }));
+            }
+            let ty = self.parse_type()?;
+            self.consume(
+                TokenType::CloseParen,
+                "Expected ')' after '@' intrinsic argument",
+            )?;
+            return Ok(self.emit(AstNode {
+                tag: AstTag::AtCall,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: name_id.raw(),
+                rhs: ty.raw(),
+            }));
+        }
+
+        if self.match_(TokenType::Number) {
+            return self.parse_number();
+        }
+        if self.match_(TokenType::True) {
+            return Ok(self.emit(AstNode {
+                tag: AstTag::BoolLit,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: 1,
+                rhs: 0,
+            }));
+        }
+        if self.match_(TokenType::False) {
+            return Ok(self.emit(AstNode {
+                tag: AstTag::BoolLit,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: 0,
+                rhs: 0,
+            }));
+        }
+        if self.match_(TokenType::StringLiteral) {
+            let lex = self.prev_lexeme().to_vec();
+            let s = self.intern_str(&lex);
+            return Ok(self.emit(AstNode {
+                tag: AstTag::StringLit,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: s.raw(),
+                rhs: 0,
+            }));
+        }
+        if self.match_(TokenType::Import) {
+            self.consume(TokenType::OpenParen, "Expected '(' after 'import'")?;
+            self.consume(
+                TokenType::StringLiteral,
+                "Expected string literal for import path",
+            )?;
+            let lex = self.prev_lexeme().to_vec();
+            let path = self.intern_str(&lex);
+            self.consume(TokenType::CloseParen, "Expected ')' after import path")?;
+            return Ok(self.emit(AstNode {
+                tag: AstTag::ImportLit,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: path.raw(),
+                rhs: 0,
+            }));
+        }
+        if self.match_(TokenType::OpenParen) {
+            let inner = self.parse_logical_or()?;
+            self.consume(TokenType::CloseParen, "Expected ')' after expression")?;
+            return Ok(inner); // parens are transparent
+        }
+        if self.check(TokenType::OpenBrace) {
+            return Err(self.parse_error(
+                "Struct literals must name their type: write `TypeName { ... }` \
+                 (or `Self { ... }` inside a struct body)",
+            ));
+        }
+        if self.match_(TokenType::OpenBracket) {
+            return self.parse_array_literal();
+        }
+
+        // Anonymous `struct { ... }` in expression position (the generic-type
+        // factory pattern `fn Box(T: type) type { return struct {...}; }`).
+        if self.match_(TokenType::Struct) {
+            return self.parse_struct_expression();
+        }
+        // Same shape for tagged sum types: `enum { V1, V2(T), ... }`.
+        if self.match_(TokenType::Enum) {
+            return self.parse_enum_expression();
+        }
+
+        // Identifier / builtin-type-name: a Variable, optionally followed by a
+        // postfix chain of `.member` / `[index]` / `(call)`.
+        if self.match_(TokenType::Identifier) || self.match_(TokenType::Type) {
+            let name = self.prev_text().to_vec();
+            let name_id = self.intern_str(&name);
+            let name_str = String::from_utf8_lossy(&name).into_owned();
+            // Typed struct literal: `Foo { ... }` (or `Self { ... }`).
+            if self.allow_struct_lit && self.check(TokenType::OpenBrace) {
+                self.advance(); // '{'
+                let lit = self.parse_struct_literal()?;
+                let type_name_id = if name.as_slice() == b"Self" {
+                    match self.struct_context_stack.last() {
+                        Some(ctx) => {
+                            let c = ctx.clone();
+                            self.intern_str(c.as_bytes())
+                        }
+                        None => {
+                            return Err(
+                                self.parse_error("`Self` is only valid inside a struct body")
+                            );
+                        }
+                    }
+                } else {
+                    name_id
+                };
+                let named_ty = self.type_pool.intern_named(type_name_id);
+                self.nodes.get_mut(lit).lhs = named_ty.raw();
+                return Ok(lit);
+            }
+            let mut expr = self.emit(AstNode {
+                tag: AstTag::Variable,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: name_id.raw(),
+                rhs: 0,
+            });
+            let mut chain_started = false;
+            loop {
+                if self.match_(TokenType::Dot) {
+                    chain_started = true;
+                    if self.match_(TokenType::Star) {
+                        expr = self.emit(AstNode {
+                            tag: AstTag::Deref,
+                            op: 0,
+                            flags: 0,
+                            main_token: 0,
+                            lhs: expr.raw(),
+                            rhs: 0,
+                        });
+                    } else {
+                        self.consume(TokenType::Identifier, "Expected member name after '.'")?;
+                        let m = self.prev_text().to_vec();
+                        let mem = self.intern_str(&m);
+                        expr = self.emit(AstNode {
+                            tag: AstTag::MemberAccess,
+                            op: 0,
+                            flags: 0,
+                            main_token: 0,
+                            lhs: expr.raw(),
+                            rhs: mem.raw(),
+                        });
+                    }
+                } else if self.match_(TokenType::OpenBracket) {
+                    chain_started = true;
+                    let start = self.parse_logical_or()?;
+                    if self.match_(TokenType::DotDot) {
+                        let end = self.parse_logical_or()?;
+                        self.consume(TokenType::CloseBracket, "Expected ']' after slice range")?;
+                        let sx = self.nodes.reserve_extra(2);
+                        self.nodes.set_extra(sx, start.raw());
+                        self.nodes.set_extra(ExtraIdx::new(sx.raw() + 1), end.raw());
+                        expr = self.emit(AstNode {
+                            tag: AstTag::Slice,
+                            op: 0,
+                            flags: 0,
+                            main_token: 0,
+                            lhs: expr.raw(),
+                            rhs: sx.raw(),
+                        });
+                    } else {
+                        self.consume(TokenType::CloseBracket, "Expected ']' after index")?;
+                        expr = self.emit(AstNode {
+                            tag: AstTag::Index,
+                            op: 0,
+                            flags: 0,
+                            main_token: 0,
+                            lhs: expr.raw(),
+                            rhs: start.raw(),
+                        });
+                    }
+                } else if self.check(TokenType::OpenParen) {
+                    let is_namespaced_typecall =
+                        chain_started && self.import_handles.contains(&name_str);
+                    if !chain_started || is_namespaced_typecall {
+                        match self.typecall_lookahead() {
+                            TcShape::GenericStructLit => {
+                                // `Vec(i32) { ... }` — a generic struct literal.
+                                self.advance(); // '('
+                                let mut type_args = Vec::new();
+                                if !self.check(TokenType::CloseParen) {
+                                    type_args.push(self.parse_type()?);
+                                    while self.match_(TokenType::Comma) {
+                                        type_args.push(self.parse_type()?);
+                                    }
+                                }
+                                self.consume(
+                                    TokenType::CloseParen,
+                                    "Expected ')' after type arguments",
+                                )?;
+                                self.consume(
+                                    TokenType::OpenBrace,
+                                    "Expected '{' after generic type arguments",
+                                )?;
+                                let receiver = if is_namespaced_typecall {
+                                    self.qualified_name(expr)?
+                                } else {
+                                    name_str.clone()
+                                };
+                                let rid = self.intern_str(receiver.as_bytes());
+                                let generic_ty = self.type_pool.intern_generic_call(rid, type_args);
+                                let lit = self.parse_struct_literal()?;
+                                self.nodes.get_mut(lit).lhs = generic_ty.raw();
+                                return Ok(lit);
+                            }
+                            TcShape::TypeMethodCall => {
+                                // `Vec(i32).empty(args)` — a static method call
+                                // on a generic-call receiver type.
+                                self.advance(); // '('
+                                let mut type_args = Vec::new();
+                                if !self.check(TokenType::CloseParen) {
+                                    type_args.push(self.parse_type()?);
+                                    while self.match_(TokenType::Comma) {
+                                        type_args.push(self.parse_type()?);
+                                    }
+                                }
+                                self.consume(
+                                    TokenType::CloseParen,
+                                    "Expected ')' after type arguments",
+                                )?;
+                                self.consume(TokenType::Dot, "Expected '.' after generic call")?;
+                                self.consume(
+                                    TokenType::Identifier,
+                                    "Expected method name after '.'",
+                                )?;
+                                let mname = self.prev_text().to_vec();
+                                let mid = self.intern_str(&mname);
+                                self.consume(
+                                    TokenType::OpenParen,
+                                    "Expected '(' after method name",
+                                )?;
+                                let mut margs = Vec::new();
+                                if !self.check(TokenType::CloseParen) {
+                                    margs.push(self.parse_comparison()?);
+                                    while self.match_(TokenType::Comma) {
+                                        margs.push(self.parse_comparison()?);
+                                    }
+                                }
+                                self.consume(
+                                    TokenType::CloseParen,
+                                    "Expected ')' after method arguments",
+                                )?;
+                                let receiver = if is_namespaced_typecall {
+                                    self.qualified_name(expr)?
+                                } else {
+                                    name_str.clone()
+                                };
+                                let rid = self.intern_str(receiver.as_bytes());
+                                let receiver_ty =
+                                    self.type_pool.intern_generic_call(rid, type_args);
+                                let extra = self.nodes.reserve_extra(2 + margs.len());
+                                self.nodes.set_extra(extra, mid.raw());
+                                self.nodes
+                                    .set_extra(ExtraIdx::new(extra.raw() + 1), margs.len() as u32);
+                                for (i, a) in margs.iter().enumerate() {
+                                    self.nodes.set_extra(
+                                        ExtraIdx::new(extra.raw() + 2 + i as u32),
+                                        a.raw(),
+                                    );
+                                }
+                                expr = self.emit(AstNode {
+                                    tag: AstTag::TypeMethodCall,
+                                    op: 0,
+                                    flags: 0,
+                                    main_token: 0,
+                                    lhs: receiver_ty.raw(),
+                                    rhs: extra.raw(),
+                                });
+                                chain_started = true;
+                                continue;
+                            }
+                            TcShape::None => {}
+                        }
+                    }
+                    self.advance(); // consume '('
+                    let mut args = Vec::new();
+                    if !self.check(TokenType::CloseParen) {
+                        args.push(self.parse_comparison()?);
+                        while self.match_(TokenType::Comma) {
+                            args.push(self.parse_comparison()?);
+                        }
+                    }
+                    self.consume(
+                        TokenType::CloseParen,
+                        "Expected ')' after function arguments",
+                    )?;
+                    let e = self.push_count_list(&args);
+                    expr = self.emit_call(expr, &name, e);
+                    chain_started = true;
+                } else {
+                    break;
+                }
+            }
+            // Qualified-name struct literal: `a.b { ... }` (only for a
+            // MemberAccess chain).
+            if self.allow_struct_lit
+                && self.check(TokenType::OpenBrace)
+                && self.is_qualified_name_chain(expr)
+                && self.nodes.get(expr).tag == AstTag::MemberAccess
+            {
+                self.advance(); // '{'
+                let qname = self.qualified_name(expr)?;
+                let nid = self.intern_str(qname.as_bytes());
+                let named_ty = self.type_pool.intern_named(nid);
+                let lit = self.parse_struct_literal()?;
+                self.nodes.get_mut(lit).lhs = named_ty.raw();
+                return Ok(lit);
+            }
+            return Ok(expr);
+        }
+
+        Err(self.parse_error("Expected primary expression"))
+    }
+
