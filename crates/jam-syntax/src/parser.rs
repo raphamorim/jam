@@ -493,3 +493,220 @@ impl<'a> Parser<'a> {
         Ok((cond, body))
     }
 
+    fn parse_expression(&mut self) -> PResult<NodeIdx> {
+        // `comp` prefix: comp const/var decl or comp if.
+        if self.match_(TokenType::Comp) {
+            if self.match_(TokenType::Const) {
+                return self.parse_var_decl(1 | 2);
+            }
+            if self.match_(TokenType::Var) {
+                return self.parse_var_decl(2);
+            }
+            if self.check(TokenType::If) {
+                self.advance(); // consume `if`
+                let (cond, then_body, else_body) = self.parse_if_tail(true)?;
+                let e = self.push_if_extra(&then_body, &else_body);
+                return Ok(self.emit(AstNode {
+                    tag: AstTag::IfNode,
+                    op: 0,
+                    flags: 1, // comp
+                    main_token: 0,
+                    lhs: cond.raw(),
+                    rhs: e.raw(),
+                }));
+            }
+            return Err(self.parse_error("`comp` must be followed by `const`, `var`, or `if`"));
+        }
+
+        // `inline while`.
+        if self.match_(TokenType::Inline) {
+            self.consume(TokenType::While, "Expected `while` after `inline`")?;
+            let (cond, body) = self.parse_paren_cond_block("`inline while`", "`inline while`")?;
+            let e = self.push_body_extra(&body);
+            return Ok(self.emit(AstNode {
+                tag: AstTag::WhileNode,
+                op: 0,
+                flags: 1, // inline
+                main_token: 0,
+                lhs: cond.raw(),
+                rhs: e.raw(),
+            }));
+        }
+
+        if self.match_(TokenType::Return) {
+            if self.match_(TokenType::Semi) {
+                return Ok(self.emit(AstNode {
+                    tag: AstTag::Return,
+                    op: 0,
+                    flags: 0,
+                    main_token: 0,
+                    lhs: NodeIdx::NONE.raw(),
+                    rhs: 0,
+                }));
+            }
+            let expr = self.parse_logical_or()?;
+            self.consume(TokenType::Semi, "Expected ';' after return statement")?;
+            return Ok(self.emit(AstNode {
+                tag: AstTag::Return,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: expr.raw(),
+                rhs: 0,
+            }));
+        }
+
+        if self.match_(TokenType::Const) {
+            return self.parse_var_decl(1);
+        }
+        if self.match_(TokenType::Var) {
+            return self.parse_var_decl(0);
+        }
+
+        // `match` — delegate (leaves the token for parse_match). Not yet ported.
+        if self.check(TokenType::Match) {
+            return self.parse_match();
+        }
+
+        if self.match_(TokenType::If) {
+            let (cond, then_body, else_body) = self.parse_if_tail(false)?;
+            let e = self.push_if_extra(&then_body, &else_body);
+            return Ok(self.emit(AstNode {
+                tag: AstTag::IfNode,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: cond.raw(),
+                rhs: e.raw(),
+            }));
+        }
+
+        if self.match_(TokenType::While) {
+            let (cond, body) = self.parse_paren_cond_block("'while'", "while")?;
+            let e = self.push_body_extra(&body);
+            return Ok(self.emit(AstNode {
+                tag: AstTag::WhileNode,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: cond.raw(),
+                rhs: e.raw(),
+            }));
+        }
+
+        if self.match_(TokenType::Loop) {
+            // Desugars to while(true). Emit the BoolLit cond FIRST (node-id
+            // ordering must match the C++).
+            let cond = self.emit(AstNode {
+                tag: AstTag::BoolLit,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: 1,
+                rhs: 0,
+            });
+            self.consume(TokenType::OpenBrace, "Expected '{' after 'loop'")?;
+            let body = self.parse_stmts_until_brace()?;
+            self.consume(TokenType::CloseBrace, "Expected '}' after loop body")?;
+            let e = self.push_body_extra(&body);
+            return Ok(self.emit(AstNode {
+                tag: AstTag::WhileNode,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: cond.raw(),
+                rhs: e.raw(),
+            }));
+        }
+
+        if self.match_(TokenType::For) {
+            self.consume(TokenType::Identifier, "Expected variable name after 'for'")?;
+            let var = self.prev_text().to_vec();
+            let var_id = self.intern_str(&var);
+            self.consume(TokenType::In, "Expected 'in' after for variable")?;
+            // Bounds use parse_comparison (no ||/&&) with struct-lit disabled.
+            let prev_allow = self.allow_struct_lit;
+            self.allow_struct_lit = false;
+            let start = self.parse_comparison()?;
+            self.consume(TokenType::Colon, "Expected ':' in for range")?;
+            let end = self.parse_comparison()?;
+            self.allow_struct_lit = prev_allow;
+            self.consume(TokenType::OpenBrace, "Expected '{' after for range")?;
+            let body = self.parse_stmts_until_brace()?;
+            self.consume(TokenType::CloseBrace, "Expected '}' after for body")?;
+            let e = self.nodes.reserve_extra(4 + body.len());
+            self.nodes.set_extra(e, var_id.raw());
+            self.nodes
+                .set_extra(ExtraIdx::new(e.raw() + 1), start.raw());
+            self.nodes.set_extra(ExtraIdx::new(e.raw() + 2), end.raw());
+            self.nodes
+                .set_extra(ExtraIdx::new(e.raw() + 3), body.len() as u32);
+            for (i, b) in body.iter().enumerate() {
+                self.nodes
+                    .set_extra(ExtraIdx::new(e.raw() + 4 + i as u32), b.raw());
+            }
+            return Ok(self.emit(AstNode {
+                tag: AstTag::ForNode,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: e.raw(),
+                rhs: 0,
+            }));
+        }
+
+        if self.match_(TokenType::Break) {
+            self.consume(TokenType::Semi, "Expected ';' after break")?;
+            return Ok(self.emit(AstNode {
+                tag: AstTag::Break,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: 0,
+                rhs: 0,
+            }));
+        }
+        if self.match_(TokenType::Continue) {
+            self.consume(TokenType::Semi, "Expected ';' after continue")?;
+            return Ok(self.emit(AstNode {
+                tag: AstTag::Continue,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: 0,
+                rhs: 0,
+            }));
+        }
+
+        // Leading identifier: assignment, call-statement, or bare expr value.
+        if self.check(TokenType::Identifier) {
+            let target = self.parse_comparison()?;
+            if self.match_(TokenType::Equal) {
+                let value = self.parse_logical_or()?;
+                self.consume(TokenType::Semi, "Expected ';' after assignment")?;
+                return Ok(self.emit(AstNode {
+                    tag: AstTag::Assign,
+                    op: 0,
+                    flags: 0,
+                    main_token: 0,
+                    lhs: target.raw(),
+                    rhs: value.raw(),
+                }));
+            }
+            // Call-statement consumes `;`; a bare Variable/MemberAccess value
+            // (e.g. a block's final expression) does not.
+            if self.nodes.get(target).tag == AstTag::Call {
+                self.consume(TokenType::Semi, "Expected ';' after function call")?;
+            }
+            return Ok(target);
+        }
+
+        // Bare non-identifier expression (e.g. `@call(...)`). `@`-call statements
+        // consume `;`.
+        let expr = self.parse_logical_or()?;
+        if self.nodes.get(expr).tag == AstTag::AtCall {
+            self.consume(TokenType::Semi, "Expected ';' after `@`-call statement")?;
+        }
+        Ok(expr)
+    }
+
