@@ -2130,3 +2130,290 @@ impl<'a> Parser<'a> {
         Ok(s)
     }
 
+    fn parse_enum_decl(&mut self) -> PResult<EnumDeclAST> {
+        use crate::ast::EnumVariantAST;
+        self.consume(TokenType::Const, "Expected 'const' for enum declaration")?;
+        self.consume(TokenType::Identifier, "Expected enum name")?;
+        let name = String::from_utf8_lossy(self.prev_text()).into_owned();
+        self.consume(TokenType::Equal, "Expected '=' after enum name")?;
+        self.consume(TokenType::Enum, "Expected 'enum' keyword")?;
+        self.consume(TokenType::OpenBrace, "Expected '{' after 'enum'")?;
+        let mut variants = Vec::new();
+        let mut next_discrim: u32 = 0;
+        while !self.check(TokenType::CloseBrace) && !self.is_at_end() {
+            self.consume(TokenType::Identifier, "Expected enum variant name")?;
+            let vname = String::from_utf8_lossy(self.prev_text()).into_owned();
+            let mut payload_types = Vec::new();
+            if self.match_(TokenType::OpenParen) {
+                if !self.check(TokenType::CloseParen) {
+                    payload_types.push(self.parse_type()?);
+                    while self.match_(TokenType::Comma) {
+                        payload_types.push(self.parse_type()?);
+                    }
+                }
+                self.consume(
+                    TokenType::CloseParen,
+                    "Expected `)` to close variant payload list",
+                )?;
+            }
+            let discriminant = if self.match_(TokenType::Equal) {
+                self.consume(
+                    TokenType::Number,
+                    "Expected integer literal after `=` in enum variant",
+                )?;
+                let raw = self.prev_text().to_vec();
+                // Use the validator directly: a negative literal must fail
+                // (not have its sign stripped).
+                let r = parse_number_literal(&raw);
+                if r.kind != NumberResultKind::Int {
+                    return Err(
+                        self.parse_error("Enum discriminant must be a non-negative integer")
+                    );
+                }
+                let mag = r.int_value;
+                if mag > 255 {
+                    return Err(self.parse_error(format!(
+                        "Enum discriminant {mag} is out of range; M2 enums are u8-tagged"
+                    )));
+                }
+                let d = mag as u32;
+                next_discrim = d + 1;
+                d
+            } else {
+                let d = next_discrim;
+                next_discrim += 1;
+                d
+            };
+            variants.push(EnumVariantAST {
+                name: vname,
+                payload_types,
+                discriminant,
+            });
+            if !self.match_(TokenType::Comma) {
+                break;
+            }
+        }
+        self.consume(
+            TokenType::CloseBrace,
+            "Expected '}' to close enum definition",
+        )?;
+        self.consume(TokenType::Semi, "Expected ';' after enum declaration")?;
+        if variants.is_empty() {
+            return Err(
+                self.parse_error(format!("Enum `{name}` must declare at least one variant"))
+            );
+        }
+        if variants.len() > 256 {
+            return Err(self.parse_error(format!(
+                "Enum `{name}` has more than 256 variants; M2 enums are u8-tagged"
+            )));
+        }
+        Ok(EnumDeclAST::new(name, variants))
+    }
+
+    /// Anonymous `struct { ... }` in expression position (caller consumed
+    /// `struct`). Pushes a synthetic `__anon_struct_N` decl and emits a
+    /// `StructExpr` node whose `lhs` is the side-table index. The index is
+    /// taken *before* parsing the body (mirrors the C++ ordering exactly).
+    fn parse_struct_expression(&mut self) -> PResult<NodeIdx> {
+        self.consume(TokenType::OpenBrace, "Expected '{' after 'struct'")?;
+        // `lhs` (the side-table index) stays LOCAL to this module; the synthetic
+        // NAME is GLOBAL across all module parses (shared-pool numbering) so the
+        // interned `__anon_struct_N` strings match the C++ oracle's shared
+        // anon-struct registry.
+        let idx = self.anon_structs.len() as u32;
+        let name = format!("__anon_struct_{}", self.anon_base + idx);
+        self.struct_context_stack.push(name.clone());
+        let (fields, methods) = self.parse_struct_body()?;
+        self.struct_context_stack.pop();
+        let mut s = StructDeclAST::new(name, fields);
+        s.methods = methods;
+        self.anon_structs.push(s);
+        Ok(self.emit(AstNode {
+            tag: AstTag::StructExpr,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: idx,
+            rhs: 0,
+        }))
+    }
+
+    /// Anonymous `enum { V1, V2(T), ... }` in expression position (caller
+    /// consumed `enum`). No discriminant `=` and no methods — sequential
+    /// discriminants from 0; emits an `EnumExpr` carrying the table index.
+    fn parse_enum_expression(&mut self) -> PResult<NodeIdx> {
+        use crate::ast::EnumVariantAST;
+        self.consume(TokenType::OpenBrace, "Expected '{' after 'enum'")?;
+        let idx = self.anon_enums.len() as u32;
+        let name = format!("__anon_enum_{idx}");
+        let mut variants = Vec::new();
+        let mut next_discrim: u32 = 0;
+        while !self.check(TokenType::CloseBrace) && !self.is_at_end() {
+            self.consume(TokenType::Identifier, "Expected enum variant name")?;
+            let vname = String::from_utf8_lossy(self.prev_text()).into_owned();
+            let mut payload_types = Vec::new();
+            if self.match_(TokenType::OpenParen) {
+                if !self.check(TokenType::CloseParen) {
+                    payload_types.push(self.parse_type()?);
+                    while self.match_(TokenType::Comma) {
+                        payload_types.push(self.parse_type()?);
+                    }
+                }
+                self.consume(
+                    TokenType::CloseParen,
+                    "Expected `)` to close variant payload list",
+                )?;
+            }
+            let discriminant = next_discrim;
+            next_discrim += 1;
+            variants.push(EnumVariantAST {
+                name: vname,
+                payload_types,
+                discriminant,
+            });
+            if !self.match_(TokenType::Comma) {
+                break;
+            }
+        }
+        self.consume(TokenType::CloseBrace, "Expected '}' to close enum body")?;
+        self.anon_enums.push(EnumDeclAST::new(name, variants));
+        Ok(self.emit(AstNode {
+            tag: AstTag::EnumExpr,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: idx,
+            rhs: 0,
+        }))
+    }
+
+    fn parse_union_decl(&mut self) -> PResult<UnionDeclAST> {
+        self.consume(TokenType::Const, "Expected 'const' for union declaration")?;
+        self.consume(TokenType::Identifier, "Expected union name")?;
+        let name = String::from_utf8_lossy(self.prev_text()).into_owned();
+        self.consume(TokenType::Equal, "Expected '=' after union name")?;
+        self.consume(TokenType::Union, "Expected 'union' keyword")?;
+        self.consume(TokenType::OpenBrace, "Expected '{' after 'union'")?;
+        let mut fields = Vec::new();
+        while !self.check(TokenType::CloseBrace) && !self.is_at_end() {
+            self.consume(TokenType::Identifier, "Expected union field name")?;
+            let fname = String::from_utf8_lossy(self.prev_text()).into_owned();
+            self.consume(TokenType::Colon, "Expected ':' after field name")?;
+            let fty = self.parse_type()?;
+            fields.push((fname, fty));
+            if !self.match_(TokenType::Comma) {
+                break;
+            }
+        }
+        self.consume(
+            TokenType::CloseBrace,
+            "Expected '}' to close union definition",
+        )?;
+        self.consume(TokenType::Semi, "Expected ';' after union declaration")?;
+        Ok(UnionDeclAST::new(name, fields))
+    }
+
+    fn parse_const_decl(&mut self) -> PResult<crate::ast::ConstDeclAST> {
+        self.consume(
+            TokenType::Const,
+            "Expected 'const' for module-scope constant",
+        )?;
+        self.consume(
+            TokenType::Identifier,
+            "Expected identifier for constant name",
+        )?;
+        let name = String::from_utf8_lossy(self.prev_text()).into_owned();
+        let declared = if self.match_(TokenType::Colon) {
+            self.parse_type()?
+        } else {
+            TypeIdx::NONE
+        };
+        self.consume(
+            TokenType::Equal,
+            "Expected '=' in module-scope const declaration",
+        )?;
+        let init = self.parse_logical_or()?;
+        self.consume(
+            TokenType::Semi,
+            "Expected ';' after module-scope const declaration",
+        )?;
+        Ok(crate::ast::ConstDeclAST::new(name, declared, init))
+    }
+
+    fn parse_import_decl(&mut self) -> PResult<crate::ast::ImportDeclAST> {
+        self.consume(TokenType::Const, "Expected 'const' for import declaration")?;
+        self.consume(TokenType::Identifier, "Expected identifier for import name")?;
+        let name = String::from_utf8_lossy(self.prev_text()).into_owned();
+        self.consume(TokenType::Equal, "Expected '=' after import name")?;
+        self.consume(TokenType::Import, "Expected 'import' keyword")?;
+        self.consume(TokenType::OpenParen, "Expected '(' after 'import'")?;
+        self.consume(
+            TokenType::StringLiteral,
+            "Expected string literal for import path",
+        )?;
+        let path = String::from_utf8_lossy(self.prev_lexeme()).into_owned();
+        self.consume(TokenType::CloseParen, "Expected ')' after import path")?;
+        let mut decl = crate::ast::ImportDeclAST::new(name.clone(), path);
+        while self.match_(TokenType::Dot) {
+            self.consume(
+                TokenType::Identifier,
+                "Expected identifier after `.` in import chain",
+            )?;
+            decl.chain
+                .push(String::from_utf8_lossy(self.prev_text()).into_owned());
+        }
+        self.consume(TokenType::Semi, "Expected ';' after import declaration")?;
+        self.import_handles.insert(name);
+        Ok(decl)
+    }
+
+    fn parse_destructuring_import(&mut self) -> PResult<crate::ast::DestructuringImportDeclAST> {
+        self.consume(
+            TokenType::Const,
+            "Expected 'const' for destructuring import",
+        )?;
+        self.consume(
+            TokenType::OpenBrace,
+            "Expected '{' for destructuring import",
+        )?;
+        let mut names = Vec::new();
+        loop {
+            self.consume(
+                TokenType::Identifier,
+                "Expected identifier in destructuring import",
+            )?;
+            names.push(String::from_utf8_lossy(self.prev_text()).into_owned());
+            if !self.match_(TokenType::Comma) {
+                break;
+            }
+        }
+        self.consume(
+            TokenType::CloseBrace,
+            "Expected '}' after destructuring names",
+        )?;
+        self.consume(TokenType::Equal, "Expected '=' after destructuring")?;
+        self.consume(TokenType::Import, "Expected 'import' keyword")?;
+        self.consume(TokenType::OpenParen, "Expected '(' after 'import'")?;
+        self.consume(
+            TokenType::StringLiteral,
+            "Expected string literal for import path",
+        )?;
+        let path = String::from_utf8_lossy(self.prev_lexeme()).into_owned();
+        self.consume(TokenType::CloseParen, "Expected ')' after import path")?;
+        let mut decl = crate::ast::DestructuringImportDeclAST::new(names, path);
+        while self.match_(TokenType::Dot) {
+            self.consume(
+                TokenType::Identifier,
+                "Expected identifier after `.` in import chain",
+            )?;
+            decl.chain
+                .push(String::from_utf8_lossy(self.prev_text()).into_owned());
+        }
+        self.consume(TokenType::Semi, "Expected ';' after import declaration")?;
+        for n in &decl.names {
+            self.import_handles.insert(n.clone());
+        }
+        Ok(decl)
+    }
+
