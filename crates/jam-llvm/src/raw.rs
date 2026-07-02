@@ -228,3 +228,160 @@ unsafe extern "C" {
     pub fn LLVMInitializeX86AsmParser();
     pub fn LLVMInitializeX86AsmPrinter();
 
+    // ---- context / module / builder ----
+    pub fn LLVMContextCreate() -> LLVMContextRef;
+    pub fn LLVMContextDispose(C: LLVMContextRef);
+    pub fn LLVMContextSetDiscardValueNames(C: LLVMContextRef, Discard: LLVMBool);
+    pub fn LLVMModuleCreateWithNameInContext(
+        ModuleID: *const c_char,
+        C: LLVMContextRef,
+    ) -> LLVMModuleRef;
+    pub fn LLVMDisposeModule(M: LLVMModuleRef);
+    pub fn LLVMSetTarget(M: LLVMModuleRef, Triple: *const c_char);
+    pub fn LLVMSetModuleDataLayout(M: LLVMModuleRef, DL: LLVMTargetDataRef);
+    pub fn LLVMGetModuleContext(M: LLVMModuleRef) -> LLVMContextRef;
+    pub fn LLVMGetNamedFunction(M: LLVMModuleRef, Name: *const c_char) -> LLVMValueRef;
+    pub fn LLVMPrintModuleToString(M: LLVMModuleRef) -> *mut c_char;
+    pub fn LLVMDisposeMessage(Message: *mut c_char);
+    pub fn LLVMAddModuleFlag(
+        M: LLVMModuleRef,
+        Behavior: LLVMModuleFlagBehavior,
+        Key: *const c_char,
+        KeyLen: size_t,
+        Val: LLVMMetadataRef,
+    );
+    pub fn LLVMValueAsMetadata(Val: LLVMValueRef) -> LLVMMetadataRef;
+    pub fn LLVMCreateBuilderInContext(C: LLVMContextRef) -> LLVMBuilderRef;
+    pub fn LLVMDisposeBuilder(Builder: LLVMBuilderRef);
+    pub fn LLVMPositionBuilderAtEnd(Builder: LLVMBuilderRef, Block: LLVMBasicBlockRef);
+    pub fn LLVMPositionBuilder(
+        Builder: LLVMBuilderRef,
+        Block: LLVMBasicBlockRef,
+        Instr: LLVMValueRef,
+    );
+    pub fn LLVMPositionBuilderBefore(Builder: LLVMBuilderRef, Instr: LLVMValueRef);
+    pub fn LLVMGetInsertBlock(Builder: LLVMBuilderRef) -> LLVMBasicBlockRef;
+
+    // ---- types ----
+    pub fn LLVMInt1TypeInContext(C: LLVMContextRef) -> LLVMTypeRef;
+    pub fn LLVMInt8TypeInContext(C: LLVMContextRef) -> LLVMTypeRef;
+    pub fn LLVMInt16TypeInContext(C: LLVMContextRef) -> LLVMTypeRef;
+    pub fn LLVMInt32TypeInContext(C: LLVMContextRef) -> LLVMTypeRef;
+    pub fn LLVMInt64TypeInContext(C: LLVMContextRef) -> LLVMTypeRef;
+    pub fn LLVMFloatTypeInContext(C: LLVMContextRef) -> LLVMTypeRef;
+    pub fn LLVMDoubleTypeInContext(C: LLVMContextRef) -> LLVMTypeRef;
+    pub fn LLVMVoidTypeInContext(C: LLVMContextRef) -> LLVMTypeRef;
+    pub fn LLVMPointerTypeInContext(C: LLVMContextRef, AddressSpace: c_uint) -> LLVMTypeRef;
+    pub fn LLVMStructTypeInContext(
+        C: LLVMContextRef,
+        ElementTypes: *mut LLVMTypeRef,
+        ElementCount: c_uint,
+        Packed: LLVMBool,
+    ) -> LLVMTypeRef;
+    pub fn LLVMStructCreateNamed(C: LLVMContextRef, Name: *const c_char) -> LLVMTypeRef;
+    pub fn LLVMStructSetBody(
+        StructTy: LLVMTypeRef,
+        ElementTypes: *mut LLVMTypeRef,
+        ElementCount: c_uint,
+        Packed: LLVMBool,
+    );
+    pub fn LLVMFunctionType(
+        ReturnType: LLVMTypeRef,
+        ParamTypes: *mut LLVMTypeRef,
+        ParamCount: c_uint,
+        IsVarArg: LLVMBool,
+    ) -> LLVMTypeRef;
+    pub fn LLVMArrayType2(ElementType: LLVMTypeRef, ElementCount: u64) -> LLVMTypeRef;
+    pub fn LLVMGetTypeKind(Ty: LLVMTypeRef) -> LLVMTypeKind;
+    pub fn LLVMGetIntTypeWidth(IntegerTy: LLVMTypeRef) -> c_uint;
+    pub fn LLVMGetElementType(Ty: LLVMTypeRef) -> LLVMTypeRef;
+    pub fn LLVMGetTypeContext(Ty: LLVMTypeRef) -> LLVMContextRef;
+    pub fn LLVMIsFunctionVarArg(FunctionTy: LLVMTypeRef) -> LLVMBool;
+    pub fn LLVMGlobalGetValueType(Global: LLVMValueRef) -> LLVMTypeRef;
+    pub fn LLVMGetReturnType(FunctionTy: LLVMTypeRef) -> LLVMTypeRef;
+    pub fn LLVMTypeOf(Val: LLVMValueRef) -> LLVMTypeRef;
+    pub fn LLVMGetAllocatedType(Alloca: LLVMValueRef) -> LLVMTypeRef;
+
+    // ---- constants / globals ----
+    pub fn LLVMConstInt(IntTy: LLVMTypeRef, N: c_ulonglong, SignExtend: LLVMBool) -> LLVMValueRef;
+    pub fn LLVMConstReal(RealTy: LLVMTypeRef, N: f64) -> LLVMValueRef;
+    pub fn LLVMConstNull(Ty: LLVMTypeRef) -> LLVMValueRef;
+    pub fn LLVMConstStringInContext(
+        C: LLVMContextRef,
+        Str: *const c_char,
+        Length: c_uint,
+        DontNullTerminate: LLVMBool,
+    ) -> LLVMValueRef;
+    pub fn LLVMConstArray2(
+        ElementTy: LLVMTypeRef,
+        ConstantVals: *mut LLVMValueRef,
+        Length: u64,
+    ) -> LLVMValueRef;
+    pub fn LLVMGetUndef(Ty: LLVMTypeRef) -> LLVMValueRef;
+    pub fn LLVMAddGlobal(M: LLVMModuleRef, Ty: LLVMTypeRef, Name: *const c_char) -> LLVMValueRef;
+    pub fn LLVMSetInitializer(GlobalVar: LLVMValueRef, ConstantVal: LLVMValueRef);
+    pub fn LLVMSetGlobalConstant(GlobalVar: LLVMValueRef, IsConstant: LLVMBool);
+    pub fn LLVMSetSection(Global: LLVMValueRef, Section: *const c_char);
+    pub fn LLVMSetLinkage(Global: LLVMValueRef, Linkage: LLVMLinkage);
+    pub fn LLVMSetUnnamedAddress(Global: LLVMValueRef, UnnamedAddr: LLVMUnnamedAddr);
+    pub fn LLVMGetNamedGlobal(M: LLVMModuleRef, Name: *const c_char) -> LLVMValueRef;
+    pub fn LLVMGetInitializer(GlobalVar: LLVMValueRef) -> LLVMValueRef;
+
+    // ---- functions / attributes ----
+    pub fn LLVMAddFunction(
+        M: LLVMModuleRef,
+        Name: *const c_char,
+        FunctionTy: LLVMTypeRef,
+    ) -> LLVMValueRef;
+    pub fn LLVMSetFunctionCallConv(Fn: LLVMValueRef, CC: c_uint);
+    pub fn LLVMCountParams(Fn: LLVMValueRef) -> c_uint;
+    pub fn LLVMGetParam(Fn: LLVMValueRef, Index: c_uint) -> LLVMValueRef;
+    pub fn LLVMSetValueName2(Val: LLVMValueRef, Name: *const c_char, NameLen: size_t);
+    pub fn LLVMGetValueName2(Val: LLVMValueRef, Length: *mut size_t) -> *const c_char;
+    pub fn LLVMGetEnumAttributeKindForName(Name: *const c_char, SLen: size_t) -> c_uint;
+    pub fn LLVMCreateEnumAttribute(C: LLVMContextRef, KindID: c_uint, Val: u64)
+    -> LLVMAttributeRef;
+    pub fn LLVMCreateTypeAttribute(
+        C: LLVMContextRef,
+        KindID: c_uint,
+        type_ref: LLVMTypeRef,
+    ) -> LLVMAttributeRef;
+    pub fn LLVMCreateStringAttribute(
+        C: LLVMContextRef,
+        K: *const c_char,
+        KLength: c_uint,
+        V: *const c_char,
+        VLength: c_uint,
+    ) -> LLVMAttributeRef;
+    pub fn LLVMAddAttributeAtIndex(F: LLVMValueRef, Idx: LLVMAttributeIndex, A: LLVMAttributeRef);
+    pub fn LLVMGetEnumAttributeAtIndex(
+        F: LLVMValueRef,
+        Idx: LLVMAttributeIndex,
+        KindID: c_uint,
+    ) -> LLVMAttributeRef;
+    pub fn LLVMGetTypeAttributeValue(A: LLVMAttributeRef) -> LLVMTypeRef;
+
+    // ---- basic blocks / iteration / misc ----
+    pub fn LLVMCreateBasicBlockInContext(
+        C: LLVMContextRef,
+        Name: *const c_char,
+    ) -> LLVMBasicBlockRef;
+    pub fn LLVMAppendBasicBlockInContext(
+        C: LLVMContextRef,
+        Fn: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMBasicBlockRef;
+    pub fn LLVMGetBasicBlockParent(BB: LLVMBasicBlockRef) -> LLVMValueRef;
+    pub fn LLVMGetBasicBlockTerminator(BB: LLVMBasicBlockRef) -> LLVMValueRef;
+    pub fn LLVMGetEntryBasicBlock(Fn: LLVMValueRef) -> LLVMBasicBlockRef;
+    pub fn LLVMGetFirstInstruction(BB: LLVMBasicBlockRef) -> LLVMValueRef;
+    pub fn LLVMGetFirstFunction(M: LLVMModuleRef) -> LLVMValueRef;
+    pub fn LLVMGetNextFunction(Fn: LLVMValueRef) -> LLVMValueRef;
+    pub fn LLVMGetFirstGlobal(M: LLVMModuleRef) -> LLVMValueRef;
+    pub fn LLVMGetNextGlobal(GlobalVar: LLVMValueRef) -> LLVMValueRef;
+    pub fn LLVMGetNumOperands(Val: LLVMValueRef) -> c_int;
+    pub fn LLVMGetOperand(Val: LLVMValueRef, Index: c_uint) -> LLVMValueRef;
+    pub fn LLVMSetAlignment(V: LLVMValueRef, Bytes: c_uint);
+    pub fn LLVMIsDeclaration(Global: LLVMValueRef) -> LLVMBool;
+    pub fn LLVMDeleteGlobal(GlobalVar: LLVMValueRef);
+
