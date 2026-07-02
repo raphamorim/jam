@@ -685,3 +685,94 @@ unsafe extern "C" {
     // ---- verifier (Analysis.h) ----
     pub fn LLVMVerifyFunction(Fn: LLVMValueRef, Action: LLVMVerifierFailureAction) -> LLVMBool;
 
+    // ---- target machine (TargetMachine.h) ----
+    pub fn LLVMGetTargetFromTriple(
+        Triple: *const c_char,
+        T: *mut LLVMTargetRef,
+        ErrorMessage: *mut *mut c_char,
+    ) -> LLVMBool;
+    pub fn LLVMCreateTargetMachine(
+        T: LLVMTargetRef,
+        Triple: *const c_char,
+        CPU: *const c_char,
+        Features: *const c_char,
+        Level: LLVMCodeGenOptLevel,
+        Reloc: LLVMRelocMode,
+        CodeModel: LLVMCodeModel,
+    ) -> LLVMTargetMachineRef;
+    pub fn LLVMDisposeTargetMachine(T: LLVMTargetMachineRef);
+    pub fn LLVMCreateTargetDataLayout(T: LLVMTargetMachineRef) -> LLVMTargetDataRef;
+    pub fn LLVMTargetMachineEmitToFile(
+        T: LLVMTargetMachineRef,
+        M: LLVMModuleRef,
+        Filename: *const c_char,
+        codegen: LLVMCodeGenFileType,
+        ErrorMessage: *mut *mut c_char,
+    ) -> LLVMBool;
+    pub fn LLVMGetDefaultTargetTriple() -> *mut c_char;
+    pub fn LLVMGetHostCPUName() -> *mut c_char;
+    pub fn LLVMGetHostCPUFeatures() -> *mut c_char;
+
+    // ---- new-PM pass pipeline (Transforms/PassBuilder.h) ----
+    pub fn LLVMRunPasses(
+        M: LLVMModuleRef,
+        Passes: *const c_char,
+        TM: LLVMTargetMachineRef,
+        Options: LLVMPassBuilderOptionsRef,
+    ) -> LLVMErrorRef;
+    pub fn LLVMCreatePassBuilderOptions() -> LLVMPassBuilderOptionsRef;
+    pub fn LLVMDisposePassBuilderOptions(Options: LLVMPassBuilderOptionsRef);
+    pub fn LLVMPassBuilderOptionsSetLoopUnrolling(
+        Options: LLVMPassBuilderOptionsRef,
+        LoopUnrolling: LLVMBool,
+    );
+    pub fn LLVMPassBuilderOptionsSetLoopVectorization(
+        Options: LLVMPassBuilderOptionsRef,
+        LoopVectorization: LLVMBool,
+    );
+    pub fn LLVMPassBuilderOptionsSetSLPVectorization(
+        Options: LLVMPassBuilderOptionsRef,
+        SLPVectorization: LLVMBool,
+    );
+    pub fn LLVMPassBuilderOptionsSetLoopInterleaving(
+        Options: LLVMPassBuilderOptionsRef,
+        LoopInterleaving: LLVMBool,
+    );
+    pub fn LLVMPassBuilderOptionsSetMergeFunctions(
+        Options: LLVMPassBuilderOptionsRef,
+        MergeFunctions: LLVMBool,
+    );
+
+    // ---- bitcode (BitWriter.h) ----
+    pub fn LLVMWriteBitcodeToFile(M: LLVMModuleRef, Path: *const c_char) -> c_int;
+
+    // ---- error handling (Error.h) ----
+    pub fn LLVMGetErrorMessage(Err: LLVMErrorRef) -> *mut c_char;
+    pub fn LLVMDisposeErrorMessage(ErrMsg: *mut c_char);
+}
+
+// jam C++ shim — compiled by build.rs from `shim/jam_shim.cpp`, NOT part of
+// libLLVM. Sets `TargetOptions` fields (FunctionSections/DataSections) that the
+// LLVM-C API does not expose, and runs the new-PM optimization pipeline copied
+// verbatim from the C++ facade (so the pass pipeline is provably identical to
+// the oracle's).
+unsafe extern "C" {
+    pub fn jam_set_target_machine_sections(
+        TM: LLVMTargetMachineRef,
+        FunctionSections: c_int,
+        DataSections: c_int,
+    );
+
+    /// Run the module optimization pipeline (PassBuilder + the pre-pipeline
+    /// internalize/globaldce + size attrs), exactly as the C++ facade does.
+    /// `optLevel` matches the `OptLevel` enum discriminants
+    /// (None=0,Less=1,Default=2,Aggressive=3,Size=4,Small=5); `lto` matches the
+    /// `Lto` enum (Off=0,Thin=1,Fat=2).
+    pub fn jam_shim_optimize(
+        M: LLVMModuleRef,
+        TM: LLVMTargetMachineRef,
+        optLevel: c_int,
+        isDebug: c_int,
+        lto: c_int,
+    );
+}
