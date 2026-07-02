@@ -90,3 +90,109 @@ fn link_token(tok: &str, default_kind: &str) {
     }
 }
 
+fn main() {
+    for var in [
+        "LLVM_CONFIG",
+        LLVM_SYS_PREFIX,
+        "CXXSTDLIB",
+        "JAM_LLVM_LINK_SHARED",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    println!("cargo:rerun-if-changed=build.rs");
+
+    let lc = locate_llvm_config();
+
+    let version = run(&lc, &["--version"]).unwrap_or_default();
+    if !version.starts_with("22.") {
+        println!("cargo:warning=jam_llvm targets LLVM 22.x; llvm-config reports {version}");
+    }
+
+    // Prefer the monolithic shared libLLVM (what the jam toolchain links). Fall
+    // back to a static link if this LLVM was built static-only. Override with
+    // JAM_LLVM_LINK_SHARED=0.
+    let want_shared = std::env::var("JAM_LLVM_LINK_SHARED")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let shared_ok = want_shared
+        && run(&lc, &["--link-shared", "--libs"])
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+    let (link_flag, kind) = if shared_ok {
+        ("--link-shared", "dylib")
+    } else {
+        ("--link-static", "static")
+    };
+
+    // All three queries pinned to the chosen mode so their answers agree.
+    let libdir = run(&lc, &[link_flag, "--libdir"])
+        .or_else(|| run(&lc, &["--libdir"]))
+        .expect("llvm-config --libdir failed");
+    println!("cargo:rustc-link-search=native={libdir}");
+
+    let mut linked_any = false;
+    if let Some(libs) = run(&lc, &[link_flag, "--libs"]) {
+        for tok in libs.split_whitespace() {
+            link_token(tok, kind);
+            linked_any = true;
+        }
+    }
+    if !linked_any {
+        println!("cargo:rustc-link-lib=dylib=LLVM");
+    }
+
+    // System libraries libLLVM depends on (zlib, zstd, curses, libxml2, …).
+    // Empty for a stock shared build; populated for static / Linux.
+    if let Some(sys) = run(&lc, &[link_flag, "--system-libs"]) {
+        for tok in sys.split_whitespace() {
+            link_token(tok, "dylib");
+        }
+    }
+
+    // The C++ runtime. A shared libLLVM carries this in its own load commands,
+    // so it is only our responsibility for a static link. Choice is by platform
+    // (matching llvm-sys/rustc), overridable via CXXSTDLIB.
+    if kind == "static" {
+        if let Some(cxx) = cxx_stdlib() {
+            println!("cargo:rustc-link-lib=dylib={cxx}");
+        }
+    }
+
+    // Make a shared libLLVM discoverable at runtime without
+    // DYLD_LIBRARY_PATH / LD_LIBRARY_PATH. Harmless for a static link.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
+
+    // Compile the one C++ shim (sets TargetOptions fields the C API can't).
+    // This is the only C++ in the build; cc(true) also emits the C++-stdlib
+    // link directive. We pass llvm-config's own --cxxflags so the shim is built
+    // with the same include path, language std, and defines LLVM itself uses.
+    let cxxflags = run(&lc, &["--cxxflags"]).unwrap_or_default();
+    let mut shim = cc::Build::new();
+    // Don't add -Wall/-Wextra: we'd only be warned about LLVM's own headers.
+    shim.cpp(true).warnings(false).file("shim/jam_shim.cpp");
+    for tok in cxxflags.split_whitespace() {
+        shim.flag(tok);
+    }
+    shim.compile("jam_shim");
+    println!("cargo:rerun-if-changed=shim/jam_shim.cpp");
+}
+
+/// The C++ standard library to link against a static libLLVM. `None` on MSVC,
+/// where it is implicit.
+fn cxx_stdlib() -> Option<String> {
+    if let Ok(over) = std::env::var("CXXSTDLIB") {
+        return if over.is_empty() { None } else { Some(over) };
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.contains("msvc") {
+        None
+    } else if target.contains("apple")
+        || target.contains("darwin")
+        || target.contains("freebsd")
+        || target.contains("openbsd")
+    {
+        Some("c++".to_string())
+    } else {
+        Some("stdc++".to_string())
+    }
+}
