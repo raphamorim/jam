@@ -385,3 +385,303 @@ unsafe extern "C" {
     pub fn LLVMIsDeclaration(Global: LLVMValueRef) -> LLVMBool;
     pub fn LLVMDeleteGlobal(GlobalVar: LLVMValueRef);
 
+    // ---- builder: arithmetic / bitwise (lhs, rhs, name) ----
+    pub fn LLVMBuildAdd(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildSub(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildMul(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildUDiv(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildSDiv(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildURem(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildSRem(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildAnd(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildOr(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildXor(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildShl(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildLShr(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildAShr(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildFAdd(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildFSub(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildFMul(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildFDiv(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildFRem(
+        B: LLVMBuilderRef,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildFNeg(B: LLVMBuilderRef, V: LLVMValueRef, Name: *const c_char) -> LLVMValueRef;
+
+    pub fn LLVMBuildNot(B: LLVMBuilderRef, V: LLVMValueRef, Name: *const c_char) -> LLVMValueRef;
+
+    pub fn LLVMBuildTrunc(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+
+    pub fn LLVMBuildICmp(
+        B: LLVMBuilderRef,
+        Op: LLVMIntPredicate,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildFCmp(
+        B: LLVMBuilderRef,
+        Op: LLVMRealPredicate,
+        LHS: LLVMValueRef,
+        RHS: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+
+    // ---- builder: casts (val, destTy, name) ----
+    pub fn LLVMBuildZExt(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildSExt(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildBitCast(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildPtrToInt(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildIntToPtr(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildSIToFP(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildUIToFP(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildFPCast(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildFPToSI(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildFPToUI(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildIntCast2(
+        B: LLVMBuilderRef,
+        Val: LLVMValueRef,
+        DestTy: LLVMTypeRef,
+        IsSigned: LLVMBool,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+
+    // ---- builder: memory ----
+    pub fn LLVMBuildAlloca(B: LLVMBuilderRef, Ty: LLVMTypeRef, Name: *const c_char)
+    -> LLVMValueRef;
+    pub fn LLVMBuildLoad2(
+        B: LLVMBuilderRef,
+        Ty: LLVMTypeRef,
+        PointerVal: LLVMValueRef,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildStore(B: LLVMBuilderRef, Val: LLVMValueRef, Ptr: LLVMValueRef) -> LLVMValueRef;
+    pub fn LLVMBuildMemCpy(
+        B: LLVMBuilderRef,
+        Dst: LLVMValueRef,
+        DstAlign: c_uint,
+        Src: LLVMValueRef,
+        SrcAlign: c_uint,
+        Size: LLVMValueRef,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildMemSet(
+        B: LLVMBuilderRef,
+        Ptr: LLVMValueRef,
+        Val: LLVMValueRef,
+        Len: LLVMValueRef,
+        Align: c_uint,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildInBoundsGEP2(
+        B: LLVMBuilderRef,
+        Ty: LLVMTypeRef,
+        Pointer: LLVMValueRef,
+        Indices: *mut LLVMValueRef,
+        NumIndices: c_uint,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildStructGEP2(
+        B: LLVMBuilderRef,
+        Ty: LLVMTypeRef,
+        Pointer: LLVMValueRef,
+        Idx: c_uint,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+
+    // ---- builder: control flow / calls / aggregates ----
+    pub fn LLVMBuildBr(B: LLVMBuilderRef, Dest: LLVMBasicBlockRef) -> LLVMValueRef;
+    pub fn LLVMBuildCondBr(
+        B: LLVMBuilderRef,
+        If: LLVMValueRef,
+        Then: LLVMBasicBlockRef,
+        Else: LLVMBasicBlockRef,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildSwitch(
+        B: LLVMBuilderRef,
+        V: LLVMValueRef,
+        Else: LLVMBasicBlockRef,
+        NumCases: c_uint,
+    ) -> LLVMValueRef;
+    pub fn LLVMAddCase(Switch: LLVMValueRef, OnVal: LLVMValueRef, Dest: LLVMBasicBlockRef);
+    pub fn LLVMBuildRet(B: LLVMBuilderRef, V: LLVMValueRef) -> LLVMValueRef;
+    pub fn LLVMBuildRetVoid(B: LLVMBuilderRef) -> LLVMValueRef;
+    pub fn LLVMBuildUnreachable(B: LLVMBuilderRef) -> LLVMValueRef;
+    pub fn LLVMBuildCall2(
+        B: LLVMBuilderRef,
+        Ty: LLVMTypeRef,
+        Fn: LLVMValueRef,
+        Args: *mut LLVMValueRef,
+        NumArgs: c_uint,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildPhi(B: LLVMBuilderRef, Ty: LLVMTypeRef, Name: *const c_char) -> LLVMValueRef;
+    pub fn LLVMAddIncoming(
+        PhiNode: LLVMValueRef,
+        IncomingValues: *mut LLVMValueRef,
+        IncomingBlocks: *mut LLVMBasicBlockRef,
+        Count: c_uint,
+    );
+    pub fn LLVMBuildGlobalStringPtr(
+        B: LLVMBuilderRef,
+        Str: *const c_char,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildInsertValue(
+        B: LLVMBuilderRef,
+        AggVal: LLVMValueRef,
+        EltVal: LLVMValueRef,
+        Index: c_uint,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+    pub fn LLVMBuildExtractValue(
+        B: LLVMBuilderRef,
+        AggVal: LLVMValueRef,
+        Index: c_uint,
+        Name: *const c_char,
+    ) -> LLVMValueRef;
+
+    // ---- verifier (Analysis.h) ----
+    pub fn LLVMVerifyFunction(Fn: LLVMValueRef, Action: LLVMVerifierFailureAction) -> LLVMBool;
+
