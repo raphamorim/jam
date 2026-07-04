@@ -272,3 +272,115 @@ impl Target {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_linux_gnu_four_field() {
+        let t = Target::from_triple_str("x86_64-unknown-linux-gnu");
+        assert_eq!(t.arch, Arch::X86_64);
+        assert_eq!(t.os, Os::Linux);
+        assert_eq!(t.abi, Abi::Gnu);
+        assert_eq!(t.name(), "x86_64-linux-gnu");
+    }
+
+    #[test]
+    fn parses_linux_gnu_three_field() {
+        // Vendor omitted: content-based scan still finds the OS + env.
+        let t = Target::from_triple_str("x86_64-linux-gnu");
+        assert_eq!(t.arch, Arch::X86_64);
+        assert_eq!(t.os, Os::Linux);
+        assert_eq!(t.abi, Abi::Gnu);
+    }
+
+    #[test]
+    fn parses_macos_arm64() {
+        // macOS spells the arch `arm64` (not `aarch64`) and carries a darwin
+        // version suffix; the abi has no environment field -> None.
+        let t = Target::from_triple_str("arm64-apple-darwin23.6.0");
+        assert_eq!(t.arch, Arch::AArch64);
+        assert_eq!(t.os, Os::MacOs);
+        assert_eq!(t.abi, Abi::None);
+        assert!(t.requires_pie());
+        assert!(t.requires_libc());
+        assert_eq!(t.name(), "aarch64-macos");
+        assert_eq!(t.to_llvm_triple(), "aarch64-unknown-darwin");
+        assert_eq!(t.libc_name(), "darwin");
+    }
+
+    #[test]
+    fn parses_aarch64_linux_musl() {
+        let t = Target::from_triple_str("aarch64-unknown-linux-musl");
+        assert_eq!(t.arch, Arch::AArch64);
+        assert_eq!(t.os, Os::Linux);
+        assert_eq!(t.abi, Abi::Musl);
+        assert_eq!(t.libc_name(), "musl");
+        assert!(!t.requires_pic()); // musl, not gnu
+    }
+
+    #[test]
+    fn parses_windows_msvc_and_gnu() {
+        let msvc = Target::from_triple_str("x86_64-pc-windows-msvc");
+        assert_eq!(msvc.os, Os::Windows);
+        assert_eq!(msvc.abi, Abi::Msvc);
+        assert!(msvc.requires_pic());
+        assert_eq!(msvc.libc_name(), "mingw"); // os arm wins over abi
+
+        // `-windows-gnu` is GNU env (not MinGW); MinGW only when env absent.
+        let gnu = Target::from_triple_str("x86_64-pc-windows-gnu");
+        assert_eq!(gnu.abi, Abi::Gnu);
+        let bare = Target::from_triple_str("x86_64-pc-windows");
+        assert_eq!(bare.abi, Abi::MinGw);
+    }
+
+    #[test]
+    fn pointer_sizes_by_arch() {
+        assert_eq!(
+            Target::new(Arch::X86_64, Os::Linux, Abi::Gnu).pointer_size(),
+            8
+        );
+        assert_eq!(
+            Target::new(Arch::AArch64, Os::MacOs, Abi::None).pointer_size(),
+            8
+        );
+        assert_eq!(
+            Target::new(Arch::Riscv64, Os::Linux, Abi::Gnu).pointer_size(),
+            8
+        );
+        assert_eq!(
+            Target::new(Arch::Arm, Os::Linux, Abi::Gnu).pointer_size(),
+            4
+        );
+        // Unknown defaults to 64-bit.
+        assert_eq!(Target::default().pointer_size(), 8);
+        assert_eq!(
+            Target::new(Arch::X86_64, Os::Linux, Abi::Gnu).pointer_alignment(),
+            8
+        );
+    }
+
+    #[test]
+    fn arm_string_variants_classify_as_arm() {
+        assert_eq!(parse_arch("armv7"), Arch::Arm);
+        assert_eq!(parse_arch("thumbv7m"), Arch::Arm);
+        assert_eq!(parse_arch("armeb"), Arch::Arm);
+        // arm64 is AArch64, must not fall into the arm arm.
+        assert_eq!(parse_arch("arm64"), Arch::AArch64);
+    }
+
+    #[test]
+    fn default_cc_is_c() {
+        assert_eq!(Target::default().default_cc(), CallingConvention::C);
+        assert!(Target::default().can_dynamic_link());
+        assert!(Target::default().uses_cabi());
+    }
+
+    #[test]
+    fn unknown_triple_is_all_unknown() {
+        let t = Target::from_triple_str("wat-wat-wat");
+        assert_eq!(t.arch, Arch::Unknown);
+        assert_eq!(t.os, Os::Unknown);
+        assert_eq!(t.abi, Abi::Unknown);
+    }
+}
