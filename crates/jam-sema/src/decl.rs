@@ -234,3 +234,73 @@ impl<'a> DeclTable<'a> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sentinel_occupies_index_zero() {
+        let t = DeclTable::new();
+        assert_eq!(t.len(), 0);
+        assert!(t.is_empty());
+        assert_eq!(t.all().len(), 1);
+        assert_eq!(t.all()[0].kind, DeclKind::Invalid);
+        assert!(t.find_by_name("anything").is_none());
+    }
+
+    #[test]
+    fn create_and_lookup() {
+        let mut t = DeclTable::new();
+        let f = t.create(DeclKind::Function, "main");
+        let s = t.create(DeclKind::Struct, "Point");
+        assert_eq!(f, DeclIndex::new(1));
+        assert_eq!(s, DeclIndex::new(2));
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.find_by_name("main"), f);
+        assert_eq!(t.find_by_name("Point"), s);
+        assert_eq!(t.get(f).kind, DeclKind::Function);
+        assert_eq!(t.get(s).name, "Point");
+    }
+
+    #[test]
+    fn first_registration_wins_by_name() {
+        let mut t = DeclTable::new();
+        let first = t.create(DeclKind::Function, "dup");
+        let _second = t.create(DeclKind::Struct, "dup");
+        // by_name keeps the first; kind-filtered lookup finds each.
+        assert_eq!(t.find_by_name("dup"), first);
+        assert_eq!(t.find_by_name_and_kind("dup", DeclKind::Function), first);
+        assert_eq!(
+            t.find_by_name_and_kind("dup", DeclKind::Struct),
+            DeclIndex::new(2)
+        );
+        assert!(t.find_by_name_and_kind("dup", DeclKind::Enum).is_none());
+    }
+
+    #[test]
+    fn dependency_edges_are_symmetric_and_idempotent() {
+        let mut t = DeclTable::new();
+        let a = t.create(DeclKind::Function, "a");
+        let b = t.create(DeclKind::Struct, "b");
+        t.declare_dependency(a, b);
+        t.declare_dependency(a, b); // idempotent
+        assert_eq!(t.get(a).dependencies, vec![b]);
+        assert_eq!(t.get(b).dependants, vec![a]);
+        // self / sentinel edges ignored.
+        t.declare_dependency(a, a);
+        t.declare_dependency(a, DeclIndex::NONE);
+        assert_eq!(t.get(a).dependencies, vec![b]);
+    }
+
+    #[test]
+    fn get_mut_mutates_lifecycle_state() {
+        let mut t = DeclTable::new();
+        let s = t.create(DeclKind::Struct, "S");
+        t.get_mut(s).struct_status = StructStatus::HaveLayout;
+        t.get_mut(s).analysis = DeclAnalysis::Complete;
+        t.get_mut(s).value = DeclValue::Type(jam_syntax::ast_flat::builtin::I32);
+        assert_eq!(t.get(s).struct_status, StructStatus::HaveLayout);
+        assert_eq!(t.get(s).analysis, DeclAnalysis::Complete);
+        assert!(matches!(t.get(s).value, DeclValue::Type(_)));
+    }
+}
