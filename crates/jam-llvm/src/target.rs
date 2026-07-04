@@ -339,3 +339,41 @@ impl Drop for TargetMachine {
     }
 }
 
+/// Append `func` to the module's `@llvm.used` so whole-module internalization
+/// never strips it (used for `export fn`). Rebuilds the `@llvm.used` appending
+/// global with the new entry — the C API has no `appendToUsed`.
+pub fn append_to_used(module: &Module<'_>, func: Function<'_>) {
+    unsafe {
+        let m = module.as_ptr();
+        let ctx = raw::LLVMGetModuleContext(m);
+        let ptr_ty = raw::LLVMPointerTypeInContext(ctx, 0);
+
+        // Gather existing entries, then drop the old global.
+        let mut entries: Vec<raw::LLVMValueRef> = Vec::new();
+        let used_name = cstr("llvm.used");
+        let old = raw::LLVMGetNamedGlobal(m, used_name.as_ptr());
+        if !old.is_null() {
+            let init = raw::LLVMGetInitializer(old);
+            if !init.is_null() {
+                let n = raw::LLVMGetNumOperands(init);
+                for i in 0..n {
+                    entries.push(raw::LLVMGetOperand(init, i as c_uint));
+                }
+            }
+            raw::LLVMDeleteGlobal(old);
+        }
+        // Avoid duplicate entries.
+        let fv = func.raw_value();
+        if !entries.contains(&fv) {
+            entries.push(fv);
+        }
+
+        let arr = raw::LLVMConstArray2(ptr_ty, entries.as_mut_ptr(), entries.len() as u64);
+        let arr_ty = raw::LLVMArrayType2(ptr_ty, entries.len() as u64);
+        let g = raw::LLVMAddGlobal(m, arr_ty, used_name.as_ptr());
+        raw::LLVMSetLinkage(g, raw::LLVMLinkage::Appending);
+        raw::LLVMSetInitializer(g, arr);
+        let section = cstr("llvm.metadata");
+        raw::LLVMSetSection(g, section.as_ptr());
+    }
+}
