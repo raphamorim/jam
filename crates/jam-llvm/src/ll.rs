@@ -852,3 +852,260 @@ impl<'ctx> Type<'ctx> {
 // Value
 // ===========================================================================
 
+#[derive(Copy, Clone)]
+pub struct Value<'ctx>(raw::LLVMValueRef, PhantomData<&'ctx Context>);
+
+impl<'ctx> Value<'ctx> {
+    unsafe fn new(p: raw::LLVMValueRef) -> Value<'ctx> {
+        Value(p, PhantomData)
+    }
+
+    pub fn type_of(self) -> Type<'ctx> {
+        unsafe { Type::new(raw::LLVMTypeOf(self.0)) }
+    }
+
+    /// The allocated type of an `alloca` value.
+    pub fn allocated_type(self) -> Type<'ctx> {
+        unsafe { Type::new(raw::LLVMGetAllocatedType(self.0)) }
+    }
+
+    pub fn set_name(self, name: &str) {
+        unsafe { raw::LLVMSetValueName2(self.0, name.as_ptr() as *const _, name.len()) }
+    }
+
+    pub fn set_global_constant(self, is_constant: bool) {
+        unsafe { raw::LLVMSetGlobalConstant(self.0, is_constant as raw::LLVMBool) }
+    }
+
+    pub fn set_initializer(self, constant: Value<'ctx>) {
+        unsafe { raw::LLVMSetInitializer(self.0, constant.0) }
+    }
+
+    pub fn set_linkage(self, linkage: Linkage) {
+        unsafe { raw::LLVMSetLinkage(self.0, linkage.to_raw()) }
+    }
+
+    /// Add `(values[i], blocks[i])` incoming edges to a phi node.
+    pub fn add_incoming(self, values: &[Value<'ctx>], blocks: &[BasicBlock<'ctx>]) {
+        debug_assert_eq!(values.len(), blocks.len());
+        let mut raw_vals: Vec<raw::LLVMValueRef> = values.iter().map(|v| v.0).collect();
+        let mut raw_bbs: Vec<raw::LLVMBasicBlockRef> = blocks.iter().map(|b| b.0).collect();
+        unsafe {
+            raw::LLVMAddIncoming(
+                self.0,
+                raw_vals.as_mut_ptr(),
+                raw_bbs.as_mut_ptr(),
+                raw_vals.len() as c_uint,
+            )
+        }
+    }
+
+    /// Add a `case`: `on_val => dest` to a `switch` instruction.
+    pub fn add_case(self, on_val: Value<'ctx>, dest: BasicBlock<'ctx>) {
+        unsafe { raw::LLVMAddCase(self.0, on_val.0, dest.0) }
+    }
+}
+
+// ===========================================================================
+// Function (a Value known to be a function)
+// ===========================================================================
+
+#[derive(Copy, Clone)]
+pub struct Function<'ctx>(Value<'ctx>);
+
+impl<'ctx> Function<'ctx> {
+    pub fn as_value(self) -> Value<'ctx> {
+        self.0
+    }
+
+    pub fn set_call_conv(self, cc: CallConv) {
+        unsafe { raw::LLVMSetFunctionCallConv(self.0.0, cc.to_raw()) }
+    }
+
+    pub fn set_linkage(self, linkage: Linkage) {
+        self.0.set_linkage(linkage)
+    }
+
+    pub fn count_params(self) -> u32 {
+        unsafe { raw::LLVMCountParams(self.0.0) }
+    }
+
+    pub fn param(self, index: u32) -> Value<'ctx> {
+        unsafe { Value::new(raw::LLVMGetParam(self.0.0, index)) }
+    }
+
+    pub fn return_type(self) -> Type<'ctx> {
+        unsafe {
+            Type::new(raw::LLVMGetReturnType(raw::LLVMGlobalGetValueType(
+                self.0.0,
+            )))
+        }
+    }
+
+    pub fn is_var_arg(self) -> bool {
+        unsafe { raw::LLVMIsFunctionVarArg(raw::LLVMGlobalGetValueType(self.0.0)) != 0 }
+    }
+
+    /// Append a fresh basic block to this function.
+    pub fn append_basic_block(self, name: &str) -> BasicBlock<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            let ctx = value_context(self.0.0);
+            BasicBlock::new(raw::LLVMAppendBasicBlockInContext(
+                ctx,
+                self.0.0,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    /// Run LLVM's function verifier; returns `true` when the function is valid
+    /// (the C++ facade's polarity). Failures are printed to stderr.
+    pub fn verify(self) -> bool {
+        unsafe {
+            raw::LLVMVerifyFunction(self.0.0, raw::LLVMVerifierFailureAction::PrintMessage) == 0
+        }
+    }
+
+    // ---- attributes ----
+
+    fn add_enum_attr(self, index: raw::LLVMAttributeIndex, name: &str, val: u64) {
+        unsafe {
+            let ctx = value_context(self.0.0);
+            let kind = raw::LLVMGetEnumAttributeKindForName(name.as_ptr() as *const _, name.len());
+            let attr = raw::LLVMCreateEnumAttribute(ctx, kind, val);
+            raw::LLVMAddAttributeAtIndex(self.0.0, index, attr);
+        }
+    }
+
+    fn add_string_attr(self, index: raw::LLVMAttributeIndex, key: &str, value: &str) {
+        unsafe {
+            let ctx = value_context(self.0.0);
+            let attr = raw::LLVMCreateStringAttribute(
+                ctx,
+                key.as_ptr() as *const _,
+                key.len() as c_uint,
+                value.as_ptr() as *const _,
+                value.len() as c_uint,
+            );
+            raw::LLVMAddAttributeAtIndex(self.0.0, index, attr);
+        }
+    }
+
+    /// `zeroext` on parameter `arg_idx` (C ABI for i1 bool).
+    pub fn add_param_attr_zeroext(self, arg_idx: u32) {
+        self.add_enum_attr(attr_param_index(arg_idx), "zeroext", 0);
+    }
+
+    /// `zeroext` on the return slot.
+    pub fn add_ret_attr_zeroext(self) {
+        self.add_enum_attr(ATTR_RETURN_INDEX, "zeroext", 0);
+    }
+
+    pub fn set_no_return(self) {
+        self.add_enum_attr(ATTR_FUNCTION_INDEX, "noreturn", 0);
+    }
+
+    /// `alwaysinline` function attribute (the `inline` hint for C interop).
+    pub fn set_always_inline(self) {
+        self.add_enum_attr(ATTR_FUNCTION_INDEX, "alwaysinline", 0);
+    }
+
+    /// Mark parameter `arg_idx` as the `sret(<pointee>) align <a> noalias` slot.
+    pub fn add_param_attr_sret(self, arg_idx: u32, pointee: Type<'ctx>, align: u32) {
+        let idx = attr_param_index(arg_idx);
+        unsafe {
+            let ctx = value_context(self.0.0);
+            let sret_kind = raw::LLVMGetEnumAttributeKindForName("sret".as_ptr() as *const _, 4);
+            let sret = raw::LLVMCreateTypeAttribute(ctx, sret_kind, pointee.as_ptr());
+            raw::LLVMAddAttributeAtIndex(self.0.0, idx, sret);
+        }
+        self.add_enum_attr(idx, "noalias", 0);
+        self.add_enum_attr(idx, "align", align as u64);
+    }
+
+    /// True if parameter 0 carries `sret`.
+    pub fn uses_sret(self) -> bool {
+        if self.count_params() == 0 {
+            return false;
+        }
+        unsafe {
+            let kind = raw::LLVMGetEnumAttributeKindForName("sret".as_ptr() as *const _, 4);
+            !raw::LLVMGetEnumAttributeAtIndex(self.0.0, attr_param_index(0), kind).is_null()
+        }
+    }
+
+    /// The pointee type of parameter 0's `sret`, if any.
+    pub fn sret_pointee_type(self) -> Option<Type<'ctx>> {
+        if self.count_params() == 0 {
+            return None;
+        }
+        unsafe {
+            let kind = raw::LLVMGetEnumAttributeKindForName("sret".as_ptr() as *const _, 4);
+            let attr = raw::LLVMGetEnumAttributeAtIndex(self.0.0, attr_param_index(0), kind);
+            if attr.is_null() {
+                None
+            } else {
+                Some(Type::new(raw::LLVMGetTypeAttributeValue(attr)))
+            }
+        }
+    }
+
+    /// Default function attributes jam stamps on every definition. Non-extern
+    /// functions also get `nounwind` + a sync unwind table; all get a frame
+    /// pointer and the host CPU/feature strings.
+    pub fn apply_default_attrs(self, is_extern: bool) {
+        if !is_extern {
+            self.add_enum_attr(ATTR_FUNCTION_INDEX, "nounwind", 0);
+            self.add_enum_attr(ATTR_FUNCTION_INDEX, "uwtable", UWTABLE_SYNC);
+        }
+        self.add_string_attr(ATTR_FUNCTION_INDEX, "frame-pointer", "all");
+        let cpu = crate::target::host_cpu_name();
+        if !cpu.is_empty() {
+            self.add_string_attr(ATTR_FUNCTION_INDEX, "target-cpu", &cpu);
+        }
+        let feats = crate::target::host_cpu_features();
+        if !feats.is_empty() {
+            self.add_string_attr(ATTR_FUNCTION_INDEX, "target-features", &feats);
+        }
+    }
+
+    /// View the function as a generic `Value` pointer (for `ptrtoint` of a
+    /// function address, etc.).
+    pub fn as_value_ptr(self) -> Value<'ctx> {
+        self.0
+    }
+
+    pub(crate) fn raw_value(self) -> raw::LLVMValueRef {
+        self.0.0
+    }
+}
+
+// ===========================================================================
+// BasicBlock
+// ===========================================================================
+
+#[derive(Copy, Clone)]
+pub struct BasicBlock<'ctx>(raw::LLVMBasicBlockRef, PhantomData<&'ctx Context>);
+
+impl<'ctx> BasicBlock<'ctx> {
+    unsafe fn new(p: raw::LLVMBasicBlockRef) -> BasicBlock<'ctx> {
+        BasicBlock(p, PhantomData)
+    }
+
+    pub fn parent(self) -> Function<'ctx> {
+        unsafe { Function(Value::new(raw::LLVMGetBasicBlockParent(self.0))) }
+    }
+
+    /// The block's terminator instruction, if it has one.
+    pub fn terminator(self) -> Option<Value<'ctx>> {
+        unsafe {
+            let t = raw::LLVMGetBasicBlockTerminator(self.0);
+            if t.is_null() {
+                None
+            } else {
+                Some(Value::new(t))
+            }
+        }
+    }
+}
