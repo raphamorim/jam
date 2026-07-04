@@ -316,3 +316,99 @@ impl<'a> ComptimeEvaluator<'a> {
         v
     }
 
+    fn eval_number_lit(&self, n: &AstNode) -> ComptimeValue {
+        let is_neg = n.flags & 1 != 0;
+        let is_float = n.flags & 2 != 0;
+        if is_float {
+            let mut v = if n.flags & 4 != 0 {
+                let ei = n.lhs;
+                let quad = [
+                    self.nodes.get_extra(ExtraIdx::new(ei)),
+                    self.nodes.get_extra(ExtraIdx::new(ei + 1)),
+                    self.nodes.get_extra(ExtraIdx::new(ei + 2)),
+                    self.nodes.get_extra(ExtraIdx::new(ei + 3)),
+                ];
+                quad_to_target_as_double(&quad, false)
+            } else {
+                let bits = (n.lhs as u64) | ((n.rhs as u64) << 32);
+                f64::from_bits(bits)
+            };
+            if is_neg {
+                v = -v;
+            }
+            return ComptimeValue::Float {
+                value: v,
+                width: 64,
+            };
+        }
+        let bits = (n.lhs as u64) | ((n.rhs as u64) << 32);
+        // Default integer width: u64 (or i64 if negative); kept full-width to
+        // preserve precision during folding.
+        if is_neg {
+            let signed_bits = (bits as i64).wrapping_neg() as u64;
+            ComptimeValue::Int {
+                bits: signed_bits,
+                width: 64,
+                is_signed: true,
+            }
+        } else {
+            ComptimeValue::Int {
+                bits,
+                width: 64,
+                is_signed: false,
+            }
+        }
+    }
+
+    fn eval_variable(&self, n: &AstNode, scope: &ComptimeScope) -> ComptimeValue {
+        let name = self.str_text(n.lhs);
+        scope.lookup(&name).cloned().unwrap_or(ComptimeValue::None)
+    }
+
+    fn eval_unary_op(
+        &self,
+        n: &AstNode,
+        scope: &ComptimeScope,
+        ctx: &mut CompCtx,
+    ) -> ComptimeValue {
+        let v = self.eval(NodeIdx::new(n.lhs), scope, ctx);
+        if v.is_none() {
+            return v;
+        }
+        let op = unary_op_from_u8(n.op);
+        match op {
+            UnaryOp::Neg => match v {
+                ComptimeValue::Int { width, .. } => {
+                    let neg = (v.as_u64() as i64).wrapping_neg() as u64;
+                    ComptimeValue::Int {
+                        bits: neg,
+                        width,
+                        is_signed: true,
+                    }
+                }
+                ComptimeValue::Float { value, width } => ComptimeValue::Float {
+                    value: -value,
+                    width,
+                },
+                _ => ComptimeValue::None,
+            },
+            UnaryOp::LogNot => match v {
+                ComptimeValue::Bool(b) => ComptimeValue::Bool(!b),
+                _ => ComptimeValue::None,
+            },
+            UnaryOp::BitNot => match v {
+                ComptimeValue::Int {
+                    bits,
+                    width,
+                    is_signed,
+                } => ComptimeValue::Int {
+                    bits: !bits,
+                    width,
+                    is_signed,
+                },
+                _ => ComptimeValue::None,
+            },
+            UnaryOp::Invalid => ComptimeValue::None,
+        }
+    }
+
