@@ -556,3 +556,82 @@ impl<'c, 'ctx> Analyzer<'c, 'ctx> {
         result
     }
 
+    fn analyze_const(&mut self, idx: DeclIndex) -> DeclValue<'ctx> {
+        // `aliased_type` is set when the const's RHS is a type expression
+        // (`const Box = Vec(i32)`); surface it as a Type-kind value. Value
+        // consts (`const PI = 3.14`) stay `None` here — the module-const path
+        // handles their runtime value.
+        let d = self.decls.get(idx);
+        if let Some(c) = d.const_ast
+            && !c.aliased_type.is_none()
+        {
+            return DeclValue::Type(c.aliased_type);
+        }
+        DeclValue::None
+    }
+
+    fn loc_of(&self, idx: DeclIndex) -> SrcLoc {
+        let d = self.decls.get(idx);
+        SrcLoc::new(d.file.clone(), d.line.max(0) as u32)
+    }
+
+    /// Push a "<kind> `X` depends on itself" diagnostic, with a reference trace
+    /// from the matching body-fill stack (ancestors that led here).
+    fn push_body_cycle_error(&mut self, idx: DeclIndex, kind_word: &str, kind: BodyKind) {
+        let stack: &[DeclIndex] = match kind {
+            BodyKind::Struct => &self.struct_fill_stack,
+            BodyKind::Enum => &self.enum_fill_stack,
+            BodyKind::Union => &self.union_fill_stack,
+        };
+        let traces: Vec<Trace> = stack
+            .iter()
+            .filter(|&&a| a != idx)
+            .map(|&a| {
+                let ad = self.decls.get(a);
+                Trace::new(
+                    SrcLoc::new(ad.file.clone(), ad.line.max(0) as u32),
+                    ad.name.clone(),
+                    TraceKind::Reference,
+                )
+            })
+            .collect();
+        let name = self.decls.get(idx).name.clone();
+        let loc = self.loc_of(idx);
+        let msg = format!("{kind_word} `{name}` depends on itself");
+        if traces.is_empty() {
+            self.ctx.push_error(loc, msg);
+        } else {
+            self.ctx.push_error_with_trace(loc, msg, traces);
+        }
+    }
+
+    /// Push a "dependency loop detected: A -> B -> A" diagnostic, using the
+    /// current analysis stack (from the first occurrence of `repeated`).
+    fn push_cycle_error(&mut self, repeated: DeclIndex) {
+        let first = self
+            .analysis_stack
+            .iter()
+            .position(|&i| i == repeated)
+            .unwrap_or(0);
+        let names: Vec<String> = self.analysis_stack[first..]
+            .iter()
+            .map(|&i| self.decls.get(i).name.clone())
+            .collect();
+        let repeated_name = self.decls.get(repeated).name.clone();
+        let mut chain = String::from("dependency loop detected: ");
+        for (n, name) in names.iter().enumerate() {
+            if n != 0 {
+                chain.push_str(" -> ");
+            }
+            chain.push('`');
+            chain.push_str(name);
+            chain.push('`');
+        }
+        chain.push_str(" -> `");
+        chain.push_str(&repeated_name);
+        chain.push('`');
+        let loc = self.loc_of(repeated);
+        self.ctx.push_error(loc, chain);
+    }
+}
+
