@@ -180,3 +180,139 @@ impl ComptimeScope {
     }
 }
 
+/// Outcome of executing a statement or block.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ExecResult {
+    /// Executed normally; keep going.
+    Continue,
+    /// A `return` was hit; caller propagates upward.
+    Returned,
+    /// A loop / recursive call exceeded the iteration cap.
+    IterationCap,
+    /// Unrecoverable failure (diagnostic already pushed).
+    Error,
+}
+
+/// Sink for `@`-emit intrinsics inside a `cfn` body.
+pub trait CompEmitter {
+    fn handle_at_call(
+        &mut self,
+        name: &str,
+        args: &[ComptimeValue],
+        diags: &mut Diagnostics,
+        loc: &SrcLoc,
+    ) -> ExecResult;
+}
+
+/// Resolves a comptime call `name(args)` to a value (how one `cfn` calls
+/// another, and how a `cfn` appears in a `[N]u8` length position). Returns
+/// `None` when `name` isn't comptime-evaluable or the body fails to fold.
+pub trait CompCallResolver {
+    fn resolve_call(
+        &mut self,
+        name: &str,
+        args: &[ComptimeValue],
+        diags: &mut Diagnostics,
+        loc: &SrcLoc,
+    ) -> ComptimeValue;
+}
+
+/// The call context threaded through evaluation: optional emit/resolve hooks,
+/// the diagnostics sink, the call-site location, and the host OS for target
+/// predicates. Replaces the C++ evaluator's `mutable` context fields.
+pub struct CompCtx<'c> {
+    pub resolver: Option<&'c mut dyn CompCallResolver>,
+    pub emitter: Option<&'c mut dyn CompEmitter>,
+    pub diags: Option<&'c mut Diagnostics>,
+    pub loc: SrcLoc,
+    pub host_os: Os,
+}
+
+impl<'c> CompCtx<'c> {
+    /// A context with no hooks and no diagnostics sink (peephole folding).
+    pub fn bare(host_os: Os) -> CompCtx<'c> {
+        CompCtx {
+            resolver: None,
+            emitter: None,
+            diags: None,
+            loc: SrcLoc::new("", 0),
+            host_os,
+        }
+    }
+
+    fn push_err(&mut self, msg: impl Into<String>) {
+        let loc = self.loc.clone();
+        if let Some(d) = self.diags.as_deref_mut() {
+            d.error(loc, msg);
+        }
+    }
+}
+
+/// Default iteration cap for `comp while` / recursive `cfn`.
+pub const DEFAULT_ITER_CAP: u32 = 10_000;
+
+/// Folds AST expression nodes to compile-time values and interprets `comp`
+/// statement bodies. Captures the shared pools at construction; reads bindings
+/// from a caller-supplied scope per invocation.
+pub struct ComptimeEvaluator<'a> {
+    nodes: &'a NodeStore,
+    strings: &'a StringPool,
+    #[allow(dead_code)] // reserved for type-aware folding (parity with C++)
+    types: &'a TypePool,
+}
+
+impl<'a> ComptimeEvaluator<'a> {
+    pub fn new(
+        nodes: &'a NodeStore,
+        strings: &'a StringPool,
+        types: &'a TypePool,
+    ) -> ComptimeEvaluator<'a> {
+        ComptimeEvaluator {
+            nodes,
+            strings,
+            types,
+        }
+    }
+
+    fn str_text(&self, id: u32) -> String {
+        String::from_utf8_lossy(&self.strings.get(StringIdx::new(id))).into_owned()
+    }
+
+    /// Try to fold `expr` to a value. Returns `None` on any failure.
+    pub fn eval(&self, expr: NodeIdx, scope: &ComptimeScope, ctx: &mut CompCtx) -> ComptimeValue {
+        if expr.is_none() {
+            return ComptimeValue::None;
+        }
+        let n = *self.nodes.get(expr);
+        match n.tag {
+            AstTag::NumberLit => self.eval_number_lit(&n),
+            AstTag::BoolLit => ComptimeValue::Bool(n.lhs != 0),
+            AstTag::StringLit => ComptimeValue::Str(StringIdx::new(n.lhs)),
+            AstTag::Variable => self.eval_variable(&n, scope),
+            AstTag::UnaryOp => self.eval_unary_op(&n, scope, ctx),
+            AstTag::BinaryOp => self.eval_binary_op(&n, scope, ctx),
+            AstTag::Index => self.eval_index(&n, scope, ctx),
+            AstTag::MemberAccess => self.eval_member_access(&n, scope, ctx),
+            AstTag::AtCall => self.eval_at_call(&n, scope, ctx),
+            AstTag::Call => self.eval_call(&n, scope, ctx),
+            // Operator/construct we don't fold yet — None keeps optional-fold
+            // callers silent; eval_required turns it into a diagnostic.
+            _ => ComptimeValue::None,
+        }
+    }
+
+    /// Same, but pushes a diagnostic + returns `None` when the expression can't
+    /// be folded.
+    pub fn eval_required(
+        &self,
+        expr: NodeIdx,
+        scope: &ComptimeScope,
+        ctx: &mut CompCtx,
+    ) -> ComptimeValue {
+        let v = self.eval(expr, scope, ctx);
+        if v.is_none() {
+            ctx.push_err("expression cannot be evaluated at compile time");
+        }
+        v
+    }
+
