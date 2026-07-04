@@ -916,3 +916,376 @@ fn unary_op_from_u8(op: u8) -> UnaryOp {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jam_syntax::ast_flat::NodeStore;
+
+    fn num(s: &mut NodeStore, val: u64, neg: bool) -> NodeIdx {
+        s.add_node(AstNode {
+            tag: AstTag::NumberLit,
+            op: 0,
+            flags: if neg { 1 } else { 0 },
+            main_token: 0,
+            lhs: (val & 0xFFFF_FFFF) as u32,
+            rhs: (val >> 32) as u32,
+        })
+    }
+    fn boollit(s: &mut NodeStore, b: bool) -> NodeIdx {
+        s.add_node(AstNode {
+            tag: AstTag::BoolLit,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: if b { 1 } else { 0 },
+            rhs: 0,
+        })
+    }
+    fn var(s: &mut NodeStore, name_id: u32) -> NodeIdx {
+        s.add_node(AstNode {
+            tag: AstTag::Variable,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: name_id,
+            rhs: 0,
+        })
+    }
+    fn binop(s: &mut NodeStore, op: BinOp, l: NodeIdx, r: NodeIdx) -> NodeIdx {
+        s.add_node(AstNode {
+            tag: AstTag::BinaryOp,
+            op: op as u8,
+            flags: 0,
+            main_token: 0,
+            lhs: l.raw(),
+            rhs: r.raw(),
+        })
+    }
+
+    fn eval1(store: &NodeStore, node: NodeIdx) -> ComptimeValue {
+        let sp = StringPool::new();
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(store, &sp, &tp);
+        let scope = ComptimeScope::new();
+        let mut ctx = CompCtx::bare(Os::Linux);
+        ev.eval(node, &scope, &mut ctx)
+    }
+
+    #[test]
+    fn unsigned_add_and_mul() {
+        let mut s = NodeStore::new();
+        let (a, b) = (num(&mut s, 2, false), num(&mut s, 3, false));
+        let add = binop(&mut s, BinOp::Add, a, b);
+        let (c, d) = (num(&mut s, 6, false), num(&mut s, 7, false));
+        let mul = binop(&mut s, BinOp::Mul, c, d);
+        assert_eq!(
+            eval1(&s, add),
+            ComptimeValue::Int {
+                bits: 5,
+                width: 64,
+                is_signed: false
+            }
+        );
+        assert_eq!(
+            eval1(&s, mul),
+            ComptimeValue::Int {
+                bits: 42,
+                width: 64,
+                is_signed: false
+            }
+        );
+    }
+
+    #[test]
+    fn unsigned_subtraction_wraps() {
+        // 7 - 10 on u64 wraps to 2^64 - 3 (matches C++ unsigned wraparound;
+        // would panic with a plain `-` in Rust debug).
+        let mut s = NodeStore::new();
+        let (a, b) = (num(&mut s, 7, false), num(&mut s, 10, false));
+        let sub = binop(&mut s, BinOp::Sub, a, b);
+        let v = eval1(&s, sub);
+        assert_eq!(
+            v,
+            ComptimeValue::Int {
+                bits: 7u64.wrapping_sub(10),
+                width: 64,
+                is_signed: false
+            }
+        );
+        assert_eq!(v.as_i64(), -3);
+    }
+
+    #[test]
+    fn unsigned_division() {
+        let mut s = NodeStore::new();
+        let (a, b) = (num(&mut s, 10, false), num(&mut s, 3, false));
+        let div = binop(&mut s, BinOp::Div, a, b);
+        assert_eq!(
+            eval1(&s, div),
+            ComptimeValue::Int {
+                bits: 3,
+                width: 64,
+                is_signed: false
+            }
+        );
+    }
+
+    #[test]
+    fn division_by_zero_is_none() {
+        let mut s = NodeStore::new();
+        let (a, b) = (num(&mut s, 10, false), num(&mut s, 0, false));
+        let div = binop(&mut s, BinOp::Div, a, b);
+        assert!(eval1(&s, div).is_none());
+    }
+
+    #[test]
+    fn signed_negative_add_and_compare() {
+        let mut s = NodeStore::new();
+        let (a, b) = (num(&mut s, 6, true), num(&mut s, 2, true)); // -6, -2 (signed)
+        let add = binop(&mut s, BinOp::Add, a, b);
+        let r = eval1(&s, add);
+        assert!(matches!(
+            r,
+            ComptimeValue::Int {
+                is_signed: true,
+                ..
+            }
+        ));
+        assert_eq!(r.as_i64(), -8);
+
+        let (c, d) = (num(&mut s, 6, true), num(&mut s, 2, true));
+        let lt = binop(&mut s, BinOp::Lt, c, d); // -6 < -2 (signed) => true
+        assert_eq!(eval1(&s, lt), ComptimeValue::Bool(true));
+    }
+
+    #[test]
+    fn unsigned_comparison() {
+        let mut s = NodeStore::new();
+        let (a, b) = (num(&mut s, 5, false), num(&mut s, 10, false));
+        let lt = binop(&mut s, BinOp::Lt, a, b);
+        assert_eq!(eval1(&s, lt), ComptimeValue::Bool(true));
+    }
+
+    #[test]
+    fn mixed_signedness_arithmetic_is_none() {
+        // unsigned + signed (different signedness) => None for arithmetic.
+        let mut s = NodeStore::new();
+        let (a, b) = (num(&mut s, 5, false), num(&mut s, 6, true));
+        let add = binop(&mut s, BinOp::Add, a, b);
+        assert!(eval1(&s, add).is_none());
+    }
+
+    #[test]
+    fn logor_short_circuits_without_evaluating_rhs() {
+        // `true || <unbound var>` folds to true without touching the rhs
+        // (which would otherwise be None).
+        let sp = StringPool::new();
+        let xid = sp.intern(b"missing").raw();
+        let mut s = NodeStore::new();
+        let lhs = boollit(&mut s, true);
+        let rhs = var(&mut s, xid);
+        let or = binop(&mut s, BinOp::LogOr, lhs, rhs);
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let scope = ComptimeScope::new();
+        let mut ctx = CompCtx::bare(Os::Linux);
+        assert_eq!(ev.eval(or, &scope, &mut ctx), ComptimeValue::Bool(true));
+    }
+
+    #[test]
+    fn exec_if_then_returns() {
+        let mut s = NodeStore::new();
+        let val = num(&mut s, 42, false);
+        let ret = s.add_node(AstNode {
+            tag: AstTag::Return,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: val.raw(),
+            rhs: 0,
+        });
+        let cond = boollit(&mut s, true);
+        // IfNode extra: [thenCount, elseCount, then0...]
+        let extra = s.reserve_extra(3);
+        s.set_extra(extra, 1);
+        s.set_extra(ExtraIdx::new(extra.raw() + 1), 0);
+        s.set_extra(ExtraIdx::new(extra.raw() + 2), ret.raw());
+        let if_node = s.add_node(AstNode {
+            tag: AstTag::IfNode,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: cond.raw(),
+            rhs: extra.raw(),
+        });
+
+        let sp = StringPool::new();
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let mut scope = ComptimeScope::new();
+        let mut counter = 0u32;
+        let mut out = ComptimeValue::None;
+        let mut ctx = CompCtx::bare(Os::Linux);
+        let r = ev.exec_stmt(
+            if_node,
+            &mut scope,
+            &mut counter,
+            DEFAULT_ITER_CAP,
+            &mut out,
+            &mut ctx,
+        );
+        assert_eq!(r, ExecResult::Returned);
+        assert_eq!(
+            out,
+            ComptimeValue::Int {
+                bits: 42,
+                width: 64,
+                is_signed: false
+            }
+        );
+    }
+
+    #[test]
+    fn exec_while_loop_counts_to_three() {
+        // comp var i = 0; while (i < 3) { i = i + 1; }  -> i == 3
+        let sp = StringPool::new();
+        let iid = sp.intern(b"i").raw();
+        let mut s = NodeStore::new();
+
+        // var i = 0
+        let zero = num(&mut s, 0, false);
+        let vd_extra = s.reserve_extra(3);
+        s.set_extra(vd_extra, iid); // name
+        s.set_extra(ExtraIdx::new(vd_extra.raw() + 1), 0); // type slot (ignored)
+        s.set_extra(ExtraIdx::new(vd_extra.raw() + 2), zero.raw()); // init
+        let vardecl = s.add_node(AstNode {
+            tag: AstTag::VarDecl,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: vd_extra.raw(),
+            rhs: 0,
+        });
+
+        // while cond: i < 3
+        let vi_c = var(&mut s, iid);
+        let three = num(&mut s, 3, false);
+        let cond = binop(&mut s, BinOp::Lt, vi_c, three);
+        // body: i = i + 1
+        let vi_b = var(&mut s, iid);
+        let one = num(&mut s, 1, false);
+        let inc = binop(&mut s, BinOp::Add, vi_b, one);
+        let vi_t = var(&mut s, iid);
+        let assign = s.add_node(AstNode {
+            tag: AstTag::Assign,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: vi_t.raw(),
+            rhs: inc.raw(),
+        });
+        let w_extra = s.reserve_extra(2);
+        s.set_extra(w_extra, 1); // bodyCount
+        s.set_extra(ExtraIdx::new(w_extra.raw() + 1), assign.raw());
+        let while_node = s.add_node(AstNode {
+            tag: AstTag::WhileNode,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: cond.raw(),
+            rhs: w_extra.raw(),
+        });
+
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let mut scope = ComptimeScope::new();
+        let mut counter = 0u32;
+        let mut out = ComptimeValue::None;
+        let mut ctx = CompCtx::bare(Os::Linux);
+        assert_eq!(
+            ev.exec_stmt(
+                vardecl,
+                &mut scope,
+                &mut counter,
+                DEFAULT_ITER_CAP,
+                &mut out,
+                &mut ctx
+            ),
+            ExecResult::Continue
+        );
+        assert_eq!(
+            ev.exec_stmt(
+                while_node,
+                &mut scope,
+                &mut counter,
+                DEFAULT_ITER_CAP,
+                &mut out,
+                &mut ctx
+            ),
+            ExecResult::Continue
+        );
+        assert_eq!(
+            scope.lookup("i"),
+            Some(&ComptimeValue::Int {
+                bits: 3,
+                width: 64,
+                is_signed: false
+            })
+        );
+        assert_eq!(counter, 3);
+    }
+
+    #[test]
+    fn scope_bind_set_lookup_with_nesting() {
+        let mut s = ComptimeScope::new();
+        s.bind("x", ComptimeValue::Bool(true));
+        assert_eq!(s.lookup("x"), Some(&ComptimeValue::Bool(true)));
+        s.push();
+        s.bind("y", ComptimeValue::Bool(false)); // inner local
+        assert!(s.set("x", ComptimeValue::Bool(false))); // mutates outer
+        assert_eq!(s.lookup("x"), Some(&ComptimeValue::Bool(false)));
+        assert!(!s.set("z", ComptimeValue::Bool(true))); // unbound
+        s.pop();
+        assert!(s.lookup("y").is_none()); // inner local gone
+    }
+
+    #[test]
+    fn as_i64_sign_extends_narrow_widths() {
+        let v = ComptimeValue::Int {
+            bits: 0xFF,
+            width: 8,
+            is_signed: true,
+        };
+        assert_eq!(v.as_i64(), -1);
+        assert_eq!(v.as_u64(), 0xFF);
+        let u = ComptimeValue::Int {
+            bits: 0xFF,
+            width: 8,
+            is_signed: false,
+        };
+        assert_eq!(u.as_i64(), 0xFF);
+    }
+
+    #[test]
+    fn at_call_os_predicate_uses_injected_host_os() {
+        // @isLinux() folds to true under host_os = Linux, false under MacOs.
+        let sp = StringPool::new();
+        let id = sp.intern(b"isLinux").raw();
+        let mut s = NodeStore::new();
+        let at = s.add_node(AstNode {
+            tag: AstTag::AtCall,
+            op: 0,
+            flags: 0, // bit0 clear = no-arg intrinsic
+            main_token: 0,
+            lhs: id,
+            rhs: 0,
+        });
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let scope = ComptimeScope::new();
+        let mut linux = CompCtx::bare(Os::Linux);
+        assert_eq!(ev.eval(at, &scope, &mut linux), ComptimeValue::Bool(true));
+        let mut mac = CompCtx::bare(Os::MacOs);
+        assert_eq!(ev.eval(at, &scope, &mut mac), ComptimeValue::Bool(false));
+    }
+}
