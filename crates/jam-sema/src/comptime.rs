@@ -720,3 +720,199 @@ impl<'a> ComptimeEvaluator<'a> {
         ComptimeValue::None
     }
 
+    /// Execute a statement, mutating `scope` for var-decls/assignments and
+    /// recursing for control flow. `iter_counter` is incremented per loop
+    /// iteration; exceeding `iter_cap` returns [`ExecResult::IterationCap`].
+    /// `out_return` receives a `return EXPR;` value if one fires.
+    #[allow(clippy::too_many_arguments)]
+    pub fn exec_stmt(
+        &self,
+        stmt: NodeIdx,
+        scope: &mut ComptimeScope,
+        iter_counter: &mut u32,
+        iter_cap: u32,
+        out_return: &mut ComptimeValue,
+        ctx: &mut CompCtx,
+    ) -> ExecResult {
+        if stmt.is_none() {
+            return ExecResult::Continue;
+        }
+        let n = *self.nodes.get(stmt);
+        match n.tag {
+            AstTag::VarDecl => {
+                // extra: [name StringIdx, type TypeIdx, init NodeIdx]
+                let extra = n.lhs;
+                let name_id = self.nodes.get_extra(ExtraIdx::new(extra));
+                let init_idx = NodeIdx::new(self.nodes.get_extra(ExtraIdx::new(extra + 2)));
+                let v = self.eval(init_idx, scope, ctx);
+                if v.is_none() {
+                    ctx.push_err("comp var-decl initializer must be a compile-time-known value");
+                    return ExecResult::Error;
+                }
+                scope.bind(self.str_text(name_id), v);
+                ExecResult::Continue
+            }
+            AstTag::Assign => {
+                let target = *self.nodes.get(NodeIdx::new(n.lhs));
+                if target.tag != AstTag::Variable {
+                    ctx.push_err(
+                        "comp assignment target must be a bare variable (member-access / index \
+                         targets are not supported in v1)",
+                    );
+                    return ExecResult::Error;
+                }
+                let name = self.str_text(target.lhs);
+                let v = self.eval(NodeIdx::new(n.rhs), scope, ctx);
+                if v.is_none() {
+                    ctx.push_err("comp assignment value must be a compile-time-known value");
+                    return ExecResult::Error;
+                }
+                if !scope.set(&name, v) {
+                    ctx.push_err(format!(
+                        "assignment to undeclared variable `{name}` (declare with `var` first)"
+                    ));
+                    return ExecResult::Error;
+                }
+                ExecResult::Continue
+            }
+            AstTag::IfNode => {
+                let extra = n.rhs;
+                let then_count = self.nodes.get_extra(ExtraIdx::new(extra));
+                let else_count = self.nodes.get_extra(ExtraIdx::new(extra + 1));
+                let c = self.eval(NodeIdx::new(n.lhs), scope, ctx);
+                let cb = match c {
+                    ComptimeValue::Bool(b) => b,
+                    _ => {
+                        ctx.push_err("comp `if` condition must fold to bool");
+                        return ExecResult::Error;
+                    }
+                };
+                let stmts: Vec<NodeIdx> = if cb {
+                    (0..then_count)
+                        .map(|i| NodeIdx::new(self.nodes.get_extra(ExtraIdx::new(extra + 2 + i))))
+                        .collect()
+                } else {
+                    (0..else_count)
+                        .map(|i| {
+                            NodeIdx::new(
+                                self.nodes
+                                    .get_extra(ExtraIdx::new(extra + 2 + then_count + i)),
+                            )
+                        })
+                        .collect()
+                };
+                scope.push();
+                let r = self.exec_block(&stmts, scope, iter_counter, iter_cap, out_return, ctx);
+                scope.pop();
+                r
+            }
+            AstTag::WhileNode => {
+                let extra = n.rhs;
+                let body_count = self.nodes.get_extra(ExtraIdx::new(extra));
+                let body: Vec<NodeIdx> = (0..body_count)
+                    .map(|i| NodeIdx::new(self.nodes.get_extra(ExtraIdx::new(extra + 1 + i))))
+                    .collect();
+                loop {
+                    let c = self.eval(NodeIdx::new(n.lhs), scope, ctx);
+                    let cb = match c {
+                        ComptimeValue::Bool(b) => b,
+                        _ => {
+                            ctx.push_err("comp `while` condition must fold to bool");
+                            return ExecResult::Error;
+                        }
+                    };
+                    if !cb {
+                        break;
+                    }
+                    *iter_counter += 1;
+                    if *iter_counter > iter_cap {
+                        ctx.push_err(format!(
+                            "comp evaluation iteration cap ({iter_cap}) exceeded — possible \
+                             infinite loop"
+                        ));
+                        return ExecResult::IterationCap;
+                    }
+                    scope.push();
+                    let r = self.exec_block(&body, scope, iter_counter, iter_cap, out_return, ctx);
+                    scope.pop();
+                    if r != ExecResult::Continue {
+                        return r;
+                    }
+                }
+                ExecResult::Continue
+            }
+            AstTag::Return => {
+                let val_idx = NodeIdx::new(n.lhs);
+                if val_idx.is_none() {
+                    *out_return = ComptimeValue::None;
+                } else {
+                    *out_return = self.eval(val_idx, scope, ctx);
+                    if out_return.is_none() {
+                        ctx.push_err("comp `return` expression must fold to a value");
+                        return ExecResult::Error;
+                    }
+                }
+                ExecResult::Returned
+            }
+            _ => {
+                // Expression statement: evaluate and discard.
+                let _ = self.eval(stmt, scope, ctx);
+                ExecResult::Continue
+            }
+        }
+    }
+
+    /// Execute a sequence of statements; returns the first non-`Continue` result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn exec_block(
+        &self,
+        stmts: &[NodeIdx],
+        scope: &mut ComptimeScope,
+        iter_counter: &mut u32,
+        iter_cap: u32,
+        out_return: &mut ComptimeValue,
+        ctx: &mut CompCtx,
+    ) -> ExecResult {
+        for &s in stmts {
+            let r = self.exec_stmt(s, scope, iter_counter, iter_cap, out_return, ctx);
+            if r != ExecResult::Continue {
+                return r;
+            }
+        }
+        ExecResult::Continue
+    }
+}
+
+fn bin_op_from_u8(op: u8) -> BinOp {
+    match op {
+        1 => BinOp::Add,
+        2 => BinOp::Sub,
+        3 => BinOp::Mul,
+        4 => BinOp::Div,
+        5 => BinOp::Mod,
+        6 => BinOp::BitAnd,
+        7 => BinOp::BitOr,
+        8 => BinOp::BitXor,
+        9 => BinOp::Shl,
+        10 => BinOp::Shr,
+        11 => BinOp::LogAnd,
+        12 => BinOp::LogOr,
+        13 => BinOp::Eq,
+        14 => BinOp::Ne,
+        15 => BinOp::Lt,
+        16 => BinOp::Le,
+        17 => BinOp::Gt,
+        18 => BinOp::Ge,
+        _ => BinOp::Invalid,
+    }
+}
+
+fn unary_op_from_u8(op: u8) -> UnaryOp {
+    match op {
+        1 => UnaryOp::Neg,
+        2 => UnaryOp::LogNot,
+        3 => UnaryOp::BitNot,
+        _ => UnaryOp::Invalid,
+    }
+}
+
