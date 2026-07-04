@@ -299,3 +299,153 @@ impl JirTag {
     }
 }
 
+/// A single JIR instruction. Trivially copyable so dense instruction arrays
+/// stay cache-friendly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct JirInst {
+    pub tag: JirTag,
+    /// Tag-specific flags.
+    pub flags: u16,
+    /// For diagnostics: `file:line:`.
+    pub src_line: u32,
+    pub a: JirRef,
+    pub b: JirRef,
+    /// Result type (`TypeIdx::NONE` for void / control).
+    pub ty: TypeIdx,
+}
+
+impl Default for JirInst {
+    fn default() -> Self {
+        JirInst {
+            tag: JirTag::Invalid,
+            flags: 0,
+            src_line: 0,
+            a: NO_JIR_REF,
+            b: NO_JIR_REF,
+            ty: TypeIdx::NONE,
+        }
+    }
+}
+
+/// A basic block within a [`JirFunction`]: a list of [`JirRef`] instruction
+/// indices into the function's `insts` array.
+#[derive(Clone, Debug, Default)]
+pub struct JirBlock {
+    /// Diagnostic label.
+    pub name: String,
+    pub insts: Vec<JirRef>,
+}
+
+/// A single function lowered to JIR. Self-contained: its `insts` array holds
+/// every instruction in the body (across all blocks), and the blocks reference
+/// instructions by index. Variable-width payloads live in `extra`.
+#[derive(Clone, Debug)]
+pub struct JirFunction {
+    pub name: String,
+    pub insts: Vec<JirInst>,
+    pub extra: Vec<u32>,
+    pub blocks: Vec<JirBlock>,
+    pub param_types: Vec<TypeIdx>,
+    /// Parallel to `param_types`: the source-level parameter mode. The backend
+    /// decides the ABI from this rather than baking the by-pointer decision in.
+    pub param_modes: Vec<ParamMode>,
+    pub return_type: TypeIdx,
+    /// Owning module's identity (`FunctionAST::module_path`). The JIR-consuming
+    /// passes push this as the body module so bare body-level type references
+    /// resolve to their owning module.
+    pub module_path: String,
+    pub is_extern: bool,
+    pub is_export: bool,
+    pub is_pub: bool,
+    pub is_test: bool,
+    pub is_var_args: bool,
+}
+
+impl Default for JirFunction {
+    fn default() -> Self {
+        JirFunction::new()
+    }
+}
+
+impl JirFunction {
+    /// A fresh function with the slot-0 sentinels installed: `insts[0]` is the
+    /// invalid instruction and `blocks[0]` is `<sentinel>`, so `NO_JIR_REF` /
+    /// `NO_JIR_BLOCK` (both `0`) read as null.
+    pub fn new() -> Self {
+        JirFunction {
+            name: String::new(),
+            insts: vec![JirInst::default()],
+            extra: Vec::new(),
+            blocks: vec![JirBlock {
+                name: "<sentinel>".to_string(),
+                insts: Vec::new(),
+            }],
+            param_types: Vec::new(),
+            param_modes: Vec::new(),
+            return_type: TypeIdx::NONE,
+            module_path: String::new(),
+            is_extern: false,
+            is_export: false,
+            is_pub: false,
+            is_test: false,
+            is_var_args: false,
+        }
+    }
+
+    /// Append an instruction; returns its ref (1-based, 0 reserved).
+    pub fn push_inst(&mut self, inst: JirInst) -> JirRef {
+        let r = self.insts.len() as JirRef;
+        self.insts.push(inst);
+        r
+    }
+
+    /// Append a basic block; returns its ref.
+    pub fn push_block(&mut self, label: impl Into<String>) -> JirBlockRef {
+        let r = self.blocks.len() as JirBlockRef;
+        self.blocks.push(JirBlock {
+            name: label.into(),
+            insts: Vec::new(),
+        });
+        r
+    }
+
+    /// Append `data` to the extra pool; returns the start index.
+    pub fn push_extra(&mut self, data: &[u32]) -> JirExtraIdx {
+        let start = self.extra.len() as JirExtraIdx;
+        self.extra.extend_from_slice(data);
+        start
+    }
+
+    /// Reserve `len` zero-filled u32 slots; returns the start index.
+    pub fn reserve_extra(&mut self, len: usize) -> JirExtraIdx {
+        let start = self.extra.len() as JirExtraIdx;
+        self.extra.resize(self.extra.len() + len, 0);
+        start
+    }
+
+    pub fn get_inst(&self, r: JirRef) -> &JirInst {
+        &self.insts[r as usize]
+    }
+    pub fn get_inst_mut(&mut self, r: JirRef) -> &mut JirInst {
+        &mut self.insts[r as usize]
+    }
+    pub fn get_block(&self, r: JirBlockRef) -> &JirBlock {
+        &self.blocks[r as usize]
+    }
+    pub fn get_block_mut(&mut self, r: JirBlockRef) -> &mut JirBlock {
+        &mut self.blocks[r as usize]
+    }
+    pub fn get_extra(&self, i: JirExtraIdx) -> u32 {
+        self.extra[i as usize]
+    }
+    pub fn set_extra(&mut self, i: JirExtraIdx, v: u32) {
+        self.extra[i as usize] = v;
+    }
+}
+
+/// A whole-program JIR module: a collection of [`JirFunction`]s.
+#[derive(Clone, Debug, Default)]
+pub struct JirModule {
+    pub functions: Vec<JirFunction>,
+}
+
