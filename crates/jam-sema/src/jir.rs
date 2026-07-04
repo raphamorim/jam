@@ -449,3 +449,92 @@ pub struct JirModule {
     pub functions: Vec<JirFunction>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The data-structure invariants mirror the C++ `test_jir_skeleton`
+    // coverage: slot-0 sentinels, 1-based push refs, and extra-pool growth.
+    // (End-to-end JIR validation waits for the full AstGen path — there is no
+    // intermediate JIR-dump oracle.)
+
+    #[test]
+    fn sentinels_occupy_slot_zero() {
+        let f = JirFunction::new();
+        assert_eq!(f.insts.len(), 1);
+        assert_eq!(f.insts[0].tag, JirTag::Invalid);
+        assert_eq!(f.blocks.len(), 1);
+        assert_eq!(f.blocks[0].name, "<sentinel>");
+        assert_eq!(NO_JIR_REF, 0);
+        assert_eq!(NO_JIR_BLOCK, 0);
+    }
+
+    #[test]
+    fn push_inst_returns_one_based_refs() {
+        let mut f = JirFunction::new();
+        let r1 = f.push_inst(JirInst {
+            tag: JirTag::Bool,
+            a: 1,
+            ty: TypeIdx::NONE,
+            ..Default::default()
+        });
+        let r2 = f.push_inst(JirInst {
+            tag: JirTag::Ret,
+            a: r1,
+            ..Default::default()
+        });
+        assert_eq!(r1, 1);
+        assert_eq!(r2, 2);
+        assert_ne!(r1, NO_JIR_REF);
+        assert_eq!(f.get_inst(r1).tag, JirTag::Bool);
+        assert_eq!(f.get_inst(r2).a, r1);
+    }
+
+    #[test]
+    fn push_block_returns_one_based_refs() {
+        let mut f = JirFunction::new();
+        let entry = f.push_block("entry");
+        let exit = f.push_block("exit");
+        assert_eq!(entry, 1);
+        assert_eq!(exit, 2);
+        assert_eq!(f.get_block(entry).name, "entry");
+    }
+
+    #[test]
+    fn extra_pool_push_and_reserve() {
+        let mut f = JirFunction::new();
+        let start = f.push_extra(&[3, 10, 20, 30]);
+        assert_eq!(start, 0);
+        assert_eq!(f.get_extra(start), 3);
+        assert_eq!(f.get_extra(start + 3), 30);
+        let r = f.reserve_extra(2);
+        assert_eq!(r, 4);
+        assert_eq!(f.get_extra(r), 0);
+        f.set_extra(r, 99);
+        assert_eq!(f.get_extra(r), 99);
+        assert_eq!(f.extra.len(), 6);
+    }
+
+    #[test]
+    fn jir_tag_discriminants_match_cpp_order() {
+        // A handful of anchor points pinned against `src/jir.h` ordering.
+        assert_eq!(JirTag::Invalid as u8, 0);
+        assert_eq!(JirTag::Int as u8, 1);
+        assert_eq!(JirTag::MakeSlice as u8, 5);
+        assert_eq!(JirTag::Alloca as u8, 6);
+        assert_eq!(JirTag::Add as u8, 9);
+        assert_eq!(JirTag::IntToPtr as u8, 57);
+        assert_eq!(JirTag::Call as u8, 63);
+        assert_eq!(JirTag::DropBinding as u8, 79);
+        assert_eq!(JirTag::Poison as u8, 80);
+    }
+
+    #[test]
+    fn jir_inst_default_is_invalid_null() {
+        let i = JirInst::default();
+        assert_eq!(i.tag, JirTag::Invalid);
+        assert_eq!(i.a, NO_JIR_REF);
+        assert_eq!(i.b, NO_JIR_REF);
+        assert_eq!(i.ty, TypeIdx::NONE);
+    }
+}
