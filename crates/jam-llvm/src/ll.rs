@@ -741,3 +741,114 @@ impl Drop for Builder<'_> {
 // Type
 // ===========================================================================
 
+// LLVM interns types, so pointer identity is type identity — `PartialEq`/`Eq`
+// compare the underlying `LLVMTypeRef`, and `Debug` prints it.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Type<'ctx>(raw::LLVMTypeRef, PhantomData<&'ctx Context>);
+
+impl<'ctx> Type<'ctx> {
+    unsafe fn new(p: raw::LLVMTypeRef) -> Type<'ctx> {
+        Type(p, PhantomData)
+    }
+
+    /// `[count x self]`.
+    pub fn array_type(self, count: u64) -> Type<'ctx> {
+        unsafe { Type::new(raw::LLVMArrayType2(self.0, count)) }
+    }
+
+    /// A function type returning `self` with the given parameter types.
+    pub fn fn_type(self, params: &[Type<'ctx>], is_var_arg: bool) -> Type<'ctx> {
+        let mut raw_params: Vec<raw::LLVMTypeRef> = params.iter().map(|t| t.0).collect();
+        unsafe {
+            Type::new(raw::LLVMFunctionType(
+                self.0,
+                raw_params.as_mut_ptr(),
+                raw_params.len() as c_uint,
+                is_var_arg as raw::LLVMBool,
+            ))
+        }
+    }
+
+    /// Set the body of an opaque named struct created by [`Context::named_struct`].
+    pub fn set_body(self, fields: &[Type<'ctx>], packed: bool) {
+        let mut raw_fields: Vec<raw::LLVMTypeRef> = fields.iter().map(|t| t.0).collect();
+        unsafe {
+            raw::LLVMStructSetBody(
+                self.0,
+                raw_fields.as_mut_ptr(),
+                raw_fields.len() as c_uint,
+                packed as raw::LLVMBool,
+            )
+        }
+    }
+
+    fn kind(self) -> raw::LLVMTypeKind {
+        unsafe { raw::LLVMGetTypeKind(self.0) }
+    }
+    pub fn is_void(self) -> bool {
+        self.kind() == raw::LLVMTypeKind::Void
+    }
+    pub fn is_struct(self) -> bool {
+        self.kind() == raw::LLVMTypeKind::Struct
+    }
+    pub fn is_integer(self) -> bool {
+        self.kind() == raw::LLVMTypeKind::Integer
+    }
+    pub fn is_float(self) -> bool {
+        matches!(
+            self.kind(),
+            raw::LLVMTypeKind::Half
+                | raw::LLVMTypeKind::Float
+                | raw::LLVMTypeKind::Double
+                | raw::LLVMTypeKind::X86_FP80
+                | raw::LLVMTypeKind::FP128
+                | raw::LLVMTypeKind::PPC_FP128
+                | raw::LLVMTypeKind::BFloat
+        )
+    }
+    pub fn is_pointer(self) -> bool {
+        self.kind() == raw::LLVMTypeKind::Pointer
+    }
+    pub fn is_array(self) -> bool {
+        self.kind() == raw::LLVMTypeKind::Array
+    }
+
+    /// Bit width of an integer type.
+    pub fn int_width(self) -> u32 {
+        unsafe { raw::LLVMGetIntTypeWidth(self.0) }
+    }
+
+    /// Element type of an array type (`[N x T] -> T`).
+    pub fn array_element_type(self) -> Type<'ctx> {
+        unsafe { Type::new(raw::LLVMGetElementType(self.0)) }
+    }
+
+    // ---- constants of this type ----
+    pub fn const_int(self, val: u64, sign_extend: bool) -> Value<'ctx> {
+        unsafe {
+            Value::new(raw::LLVMConstInt(
+                self.0,
+                val as c_ulonglong,
+                sign_extend as raw::LLVMBool,
+            ))
+        }
+    }
+    pub fn const_real(self, val: f64) -> Value<'ctx> {
+        unsafe { Value::new(raw::LLVMConstReal(self.0, val)) }
+    }
+    pub fn const_null(self) -> Value<'ctx> {
+        unsafe { Value::new(raw::LLVMConstNull(self.0)) }
+    }
+    pub fn undef(self) -> Value<'ctx> {
+        unsafe { Value::new(raw::LLVMGetUndef(self.0)) }
+    }
+
+    pub(crate) fn as_ptr(self) -> raw::LLVMTypeRef {
+        self.0
+    }
+}
+
+// ===========================================================================
+// Value
+// ===========================================================================
+
