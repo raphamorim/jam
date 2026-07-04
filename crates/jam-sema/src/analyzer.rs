@@ -196,3 +196,363 @@ impl<'c, 'ctx> Analyzer<'c, 'ctx> {
         DeclValue::Type(self.ctx.type_pool.intern_named(sid))
     }
 
+    fn analyze_struct(&mut self, idx: DeclIndex) -> DeclValue<'ctx> {
+        // Body fill is part of the struct's own analysis: ensure_decl_analyzed
+        // is the single entry point that both proves cycle-free status AND
+        // materialises the LLVM body.
+        self.resolve_type_fields_struct(idx);
+        self.type_named_value(idx)
+    }
+
+    fn analyze_enum(&mut self, idx: DeclIndex) -> DeclValue<'ctx> {
+        self.resolve_type_fields_enum(idx);
+        self.type_named_value(idx)
+    }
+
+    fn analyze_union(&mut self, idx: DeclIndex) -> DeclValue<'ctx> {
+        self.resolve_type_fields_union(idx);
+        self.type_named_value(idx)
+    }
+
+    // ---- body fill ----
+
+    /// Resolve a `(field name -> TypeKey)` leaf to a registry name when it's a
+    /// direct named type (Named/Struct/Enum/Union), or `None` for indirections
+    /// (ptr/slice/array) — pointer fields don't make the aggregate
+    /// size-dependent on itself, so they skip the cycle check.
+    fn direct_named_type(&self, ty: TypeIdx) -> Option<String> {
+        let k = self.ctx.type_pool.get(ty);
+        if matches!(
+            k.kind,
+            TypeKind::Named | TypeKind::Struct | TypeKind::Enum | TypeKind::Union
+        ) {
+            Some(
+                String::from_utf8_lossy(&self.ctx.string_pool.get(StringIdx::new(k.a)))
+                    .into_owned(),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Ensure a direct-named field/payload's body is filled (routing to the
+    /// matching registry). Returns true on success / not-a-known-type.
+    fn ensure_nested_body(&mut self, name: &str) -> bool {
+        if self.ctx.is_struct_name_registered(name) {
+            self.ensure_struct_body(name)
+        } else if self.ctx.is_enum_name_registered(name) {
+            self.ensure_enum_body(name)
+        } else if self.ctx.is_union_name_registered(name) {
+            self.ensure_union_body(name)
+        } else {
+            true
+        }
+    }
+
+    pub fn ensure_struct_body(&mut self, name: &str) -> bool {
+        let idx = self.decls.find_by_name_and_kind(name, DeclKind::Struct);
+        if idx.is_none() {
+            return false;
+        }
+        self.resolve_type_fields_struct(idx)
+    }
+    pub fn ensure_enum_body(&mut self, name: &str) -> bool {
+        let idx = self.decls.find_by_name_and_kind(name, DeclKind::Enum);
+        if idx.is_none() {
+            return false;
+        }
+        self.resolve_type_fields_enum(idx)
+    }
+    pub fn ensure_union_body(&mut self, name: &str) -> bool {
+        let idx = self.decls.find_by_name_and_kind(name, DeclKind::Union);
+        if idx.is_none() {
+            return false;
+        }
+        self.resolve_type_fields_union(idx)
+    }
+
+    /// Materialise a struct's LLVM body. `FieldTypesWip` re-entry = self-cycle.
+    pub fn resolve_type_fields_struct(&mut self, idx: DeclIndex) -> bool {
+        use crate::decl::StructStatus as S;
+        if idx.is_none() || self.decls.get(idx).kind != DeclKind::Struct {
+            return false;
+        }
+        let module = self
+            .decls
+            .get(idx)
+            .struct_ast
+            .map(|s| s.module_path.clone())
+            .unwrap_or_default();
+        self.ctx.push_body_module(module);
+
+        let result = (|| {
+            match self.decls.get(idx).struct_status {
+                S::HaveFieldTypes | S::HaveLayout | S::LayoutWip => return true,
+                S::FieldTypesWip => {
+                    self.push_body_cycle_error(idx, "struct", BodyKind::Struct);
+                    return false;
+                }
+                S::None => {}
+            }
+            self.decls.get_mut(idx).struct_status = S::FieldTypesWip;
+            self.struct_fill_stack.push(idx);
+
+            let struct_ast = self.decls.get(idx).struct_ast;
+            let name = self.decls.get(idx).name.clone();
+            let fields = match struct_ast {
+                Some(s) => s.fields.clone(),
+                None => {
+                    self.decls.get_mut(idx).struct_status = S::HaveFieldTypes;
+                    self.struct_fill_stack.pop();
+                    return true;
+                }
+            };
+
+            let mut field_llvm = Vec::with_capacity(fields.len());
+            let mut failed = false;
+            for (_, fty) in &fields {
+                // Fill a directly-named nested type's body BEFORE sizing the
+                // field. A payloaded-enum (or struct/union) field needs its body
+                // filled before `get_llvm_type` can resolve its aggregate type;
+                // querying first errored and stubbed the whole struct to `{ i8 }`
+                // (which then GEP'd out of bounds -> LLVM abort). The C++ ensures
+                // the nested body the same way (analyzer.cpp:208-234) and only a
+                // genuine cycle marks the fill failed.
+                if let Some(fname) = self.direct_named_type(*fty)
+                    && !self.ensure_nested_body(&fname)
+                {
+                    failed = true;
+                }
+                match self.ctx.get_llvm_type(*fty) {
+                    Ok(t) => field_llvm.push(t),
+                    Err(_) => {
+                        failed = true;
+                        field_llvm.push(self.ctx.context().i8_type());
+                    }
+                }
+            }
+
+            if let Some(named) = self.ctx.struct_named_type(&name) {
+                if failed {
+                    named.set_body(&[self.ctx.context().i8_type()], false);
+                } else {
+                    named.set_body(&field_llvm, false);
+                }
+            }
+            self.decls.get_mut(idx).struct_status = S::HaveFieldTypes;
+            self.struct_fill_stack.pop();
+            !failed
+        })();
+        self.ctx.pop_body_module();
+        result
+    }
+
+    /// Materialise a payloaded enum's `{ i8 tag, alignDriver, [extra x i8] }`
+    /// body. Unit-only enums need no struct (they lower to `i8`).
+    pub fn resolve_type_fields_enum(&mut self, idx: DeclIndex) -> bool {
+        use crate::decl::EnumStatus as E;
+        if idx.is_none() || self.decls.get(idx).kind != DeclKind::Enum {
+            return false;
+        }
+        let module = self
+            .decls
+            .get(idx)
+            .enum_ast
+            .map(|e| e.module_path.clone())
+            .unwrap_or_default();
+        self.ctx.push_body_module(module);
+        let result = (|| {
+            match self.decls.get(idx).enum_status {
+                E::HaveBody => return true,
+                E::BodyWip => {
+                    self.push_body_cycle_error(idx, "enum", BodyKind::Enum);
+                    return false;
+                }
+                E::None => {}
+            }
+            self.decls.get_mut(idx).enum_status = E::BodyWip;
+            self.enum_fill_stack.push(idx);
+
+            let name = self.decls.get(idx).name.clone();
+            let has_payload = self.ctx.enum_has_payload_by_name(&name).unwrap_or(false);
+            if !has_payload {
+                // Unit-only enum lowers to i8; nothing to materialise.
+                self.decls.get_mut(idx).enum_status = E::HaveBody;
+                self.enum_fill_stack.pop();
+                return true;
+            }
+            let variants = self.ctx.enum_variants_by_name(&name).unwrap_or_default();
+
+            let mut max_size = 0u64;
+            let mut max_align = 1u64;
+            let mut failed = false;
+            'outer: for v in &variants {
+                let mut off = 0u64;
+                let mut var_align = 1u64;
+                for &t in &v.payload_types {
+                    if let Some(pname) = self.direct_named_type(t)
+                        && !self.ensure_nested_body(&pname)
+                    {
+                        failed = true;
+                        break 'outer;
+                    }
+                    let (s, a) = match (self.ctx.type_size(t), self.ctx.type_align(t)) {
+                        (Ok(s), Ok(a)) => (s, a),
+                        _ => {
+                            failed = true;
+                            break 'outer;
+                        }
+                    };
+                    off = round_up(off, a) + s;
+                    if a > var_align {
+                        var_align = a;
+                    }
+                }
+                if var_align > 1 {
+                    off = round_up(off, var_align);
+                }
+                if off > max_size {
+                    max_size = off;
+                }
+                if var_align > max_align {
+                    max_align = var_align;
+                }
+            }
+
+            // The enum's LLVM named struct uses the bare enum name (the C++
+            // names it `%Op`, not `%enum.Op`); instantiated generic enums
+            // already use the bare inst_name.
+            let named = self.ctx.context().named_struct(&name);
+            if failed {
+                let i8 = self.ctx.context().i8_type();
+                named.set_body(&[i8, i8], false);
+                self.ctx.set_enum_llvm_type(&name, named, 0, 1, true);
+                self.decls.get_mut(idx).enum_status = E::HaveBody;
+                self.enum_fill_stack.pop();
+                return false;
+            }
+            let (align_driver, driver_size) = match max_align {
+                1 => (self.ctx.context().i8_type(), 1u64),
+                2 => (self.ctx.context().i16_type(), 2),
+                4 => (self.ctx.context().i32_type(), 4),
+                8 => (self.ctx.context().i64_type(), 8),
+                _ => {
+                    let loc = self.loc_of(idx);
+                    self.ctx.push_error(
+                        loc,
+                        format!("enum `{name}` requires alignment > 8, which is not yet supported"),
+                    );
+                    self.decls.get_mut(idx).enum_status = E::HaveBody;
+                    self.enum_fill_stack.pop();
+                    return false;
+                }
+            };
+            let padded = round_up(max_size, max_align);
+            let extra = padded.saturating_sub(driver_size);
+            let i8 = self.ctx.context().i8_type();
+            let mut body = vec![i8, align_driver];
+            if extra > 0 {
+                body.push(i8.array_type(extra));
+            }
+            named.set_body(&body, false);
+            self.ctx
+                .set_enum_llvm_type(&name, named, max_size, max_align, true);
+
+            self.decls.get_mut(idx).enum_status = E::HaveBody;
+            self.enum_fill_stack.pop();
+            true
+        })();
+        self.ctx.pop_body_module();
+        result
+    }
+
+    /// Materialise a union's `{ alignedField, [padding x i8] }` body.
+    pub fn resolve_type_fields_union(&mut self, idx: DeclIndex) -> bool {
+        use crate::decl::UnionStatus as U;
+        if idx.is_none() || self.decls.get(idx).kind != DeclKind::Union {
+            return false;
+        }
+        let module = self
+            .decls
+            .get(idx)
+            .union_ast
+            .map(|u| u.module_path.clone())
+            .unwrap_or_default();
+        self.ctx.push_body_module(module);
+        let result = (|| {
+            match self.decls.get(idx).union_status {
+                U::HaveBody => return true,
+                U::BodyWip => {
+                    self.push_body_cycle_error(idx, "union", BodyKind::Union);
+                    return false;
+                }
+                U::None => {}
+            }
+            self.decls.get_mut(idx).union_status = U::BodyWip;
+            self.union_fill_stack.push(idx);
+
+            let name = self.decls.get(idx).name.clone();
+            let fields = self.ctx.union_fields_by_name(&name).unwrap_or_default();
+            if fields.is_empty() {
+                let loc = self.loc_of(idx);
+                self.ctx
+                    .push_error(loc, format!("union `{name}` must have at least one field"));
+                self.decls.get_mut(idx).union_status = U::HaveBody;
+                self.union_fill_stack.pop();
+                return false;
+            }
+
+            let mut max_size = 0u64;
+            let mut max_align = 1u64;
+            let mut align_field = 0usize;
+            let mut failed = false;
+            for (i, (_, t)) in fields.iter().enumerate() {
+                if let Some(fname) = self.direct_named_type(*t)
+                    && !self.ensure_nested_body(&fname)
+                {
+                    failed = true;
+                    break;
+                }
+                let (s, a) = match (self.ctx.type_size(*t), self.ctx.type_align(*t)) {
+                    (Ok(s), Ok(a)) => (s, a),
+                    _ => {
+                        failed = true;
+                        break;
+                    }
+                };
+                if s > max_size {
+                    max_size = s;
+                }
+                if a > max_align {
+                    max_align = a;
+                    align_field = i;
+                }
+            }
+            let named = self.ctx.union_named_type(&name);
+            if failed {
+                if let Some(named) = named {
+                    named.set_body(&[self.ctx.context().i8_type()], false);
+                }
+                self.decls.get_mut(idx).union_status = U::HaveBody;
+                self.union_fill_stack.pop();
+                return false;
+            }
+            let alloc_size = round_up(max_size, max_align);
+            let aligned_ty = self.ctx.get_llvm_type(fields[align_field].1).ok();
+            let aligned_sz = self.ctx.type_size(fields[align_field].1).unwrap_or(0);
+            let padding = alloc_size.saturating_sub(aligned_sz);
+            if let (Some(named), Some(aligned_ty)) = (named, aligned_ty) {
+                let mut body = vec![aligned_ty];
+                if padding > 0 {
+                    body.push(self.ctx.context().i8_type().array_type(padding));
+                }
+                named.set_body(&body, false);
+            }
+            self.decls.get_mut(idx).union_status = U::HaveBody;
+            self.union_fill_stack.pop();
+            true
+        })();
+        self.ctx.pop_body_module();
+        result
+    }
+
