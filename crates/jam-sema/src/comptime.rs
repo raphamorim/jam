@@ -577,3 +577,146 @@ impl<'a> ComptimeEvaluator<'a> {
         ComptimeValue::None
     }
 
+    fn eval_member_access(
+        &self,
+        n: &AstNode,
+        scope: &ComptimeScope,
+        ctx: &mut CompCtx,
+    ) -> ComptimeValue {
+        let member = self.str_text(n.rhs);
+        let base = self.eval(NodeIdx::new(n.lhs), scope, ctx);
+        if base.is_none() {
+            return base;
+        }
+        if let ComptimeValue::Str(s) = base
+            && member == "length"
+        {
+            let len = self.strings.get(s).len() as u64;
+            return ComptimeValue::Int {
+                bits: len,
+                width: 64,
+                is_signed: false,
+            };
+        }
+        ComptimeValue::None
+    }
+
+    fn eval_index(&self, n: &AstNode, scope: &ComptimeScope, ctx: &mut CompCtx) -> ComptimeValue {
+        let base = self.eval(NodeIdx::new(n.lhs), scope, ctx);
+        if base.is_none() {
+            return base;
+        }
+        let idx = self.eval(NodeIdx::new(n.rhs), scope, ctx);
+        if !idx.is_int() {
+            return ComptimeValue::None;
+        }
+        let i = idx.as_u64();
+        match base {
+            ComptimeValue::Str(s) => {
+                let bytes = self.strings.get(s);
+                if i as usize >= bytes.len() {
+                    return ComptimeValue::None;
+                }
+                ComptimeValue::Int {
+                    bits: bytes[i as usize] as u64,
+                    width: 8,
+                    is_signed: false,
+                }
+            }
+            ComptimeValue::Aggregate(fields) => {
+                if i as usize >= fields.len() {
+                    return ComptimeValue::None;
+                }
+                fields[i as usize].clone()
+            }
+            _ => ComptimeValue::None,
+        }
+    }
+
+    fn eval_call(&self, n: &AstNode, scope: &ComptimeScope, ctx: &mut CompCtx) -> ComptimeValue {
+        // Only direct calls fold (flags bit 0 = indirect method on a runtime
+        // value). Direct form: lhs = callee StringIdx, rhs = ExtraIdx ->
+        // [argCount, arg0, ...].
+        if n.flags & 1 != 0 {
+            return ComptimeValue::None;
+        }
+        if ctx.resolver.is_none() {
+            return ComptimeValue::None;
+        }
+        let name = self.str_text(n.lhs);
+        let extra = n.rhs;
+        let arg_count = self.nodes.get_extra(ExtraIdx::new(extra));
+        let mut arg_vals = Vec::with_capacity(arg_count as usize);
+        for i in 0..arg_count {
+            let arg_idx = NodeIdx::new(self.nodes.get_extra(ExtraIdx::new(extra + 1 + i)));
+            let v = self.eval(arg_idx, scope, ctx);
+            if v.is_none() {
+                ctx.push_err(format!(
+                    "argument #{i} to comptime call `{name}` is not a compile-time constant"
+                ));
+                return ComptimeValue::None;
+            }
+            arg_vals.push(v);
+        }
+        // Now invoke the resolver with disjoint borrows of resolver + diags.
+        let loc = ctx.loc.clone();
+        let mut dummy = Diagnostics::new();
+        let resolver = ctx.resolver.as_deref_mut().expect("resolver present");
+        let diags = ctx.diags.as_deref_mut().unwrap_or(&mut dummy);
+        resolver.resolve_call(&name, &arg_vals, diags, &loc)
+    }
+
+    fn eval_at_call(&self, n: &AstNode, scope: &ComptimeScope, ctx: &mut CompCtx) -> ComptimeValue {
+        // No-arg / type-arg intrinsics (flags bit 0 clear). The target-OS
+        // predicates fold to a comptime bool so `comp if (@isDarwin())` works.
+        if n.flags & 1 == 0 {
+            let iname = self.str_text(n.lhs);
+            if iname == "isDarwin"
+                || iname == "isLinux"
+                || iname == "isWindows"
+                || iname == "isUnix"
+            {
+                let os = ctx.host_os;
+                let v = match iname.as_str() {
+                    "isDarwin" => os == Os::MacOs,
+                    "isLinux" => os == Os::Linux,
+                    "isWindows" => os == Os::Windows,
+                    // isUnix
+                    _ => os == Os::MacOs || os == Os::Linux || os == Os::FreeBsd,
+                };
+                return ComptimeValue::Bool(v);
+            }
+            return ComptimeValue::None;
+        }
+
+        // Expr-arg multi-form: rhs = ExtraIdx -> [argCount, arg0, ...].
+        let extra = n.rhs;
+        let arg_count = self.nodes.get_extra(ExtraIdx::new(extra));
+        let mut arg_vals = Vec::with_capacity(arg_count as usize);
+        for i in 0..arg_count {
+            let arg_idx = NodeIdx::new(self.nodes.get_extra(ExtraIdx::new(extra + 1 + i)));
+            let v = self.eval(arg_idx, scope, ctx);
+            if v.is_none() {
+                ctx.push_err(format!(
+                    "@-emit argument must be a compile-time constant (arg #{i})"
+                ));
+                return ComptimeValue::None;
+            }
+            arg_vals.push(v);
+        }
+
+        if ctx.emitter.is_none() {
+            // No emitter installed — running outside a cfn dispatcher context.
+            return ComptimeValue::None;
+        }
+        let name = self.str_text(n.lhs);
+        let loc = ctx.loc.clone();
+        let mut dummy = Diagnostics::new();
+        let emitter = ctx.emitter.as_deref_mut().expect("emitter present");
+        let diags = ctx.diags.as_deref_mut().unwrap_or(&mut dummy);
+        // Emit-style intrinsics return Continue on success; errors surface via
+        // pushed diagnostics. @-emit produces side effects, not values.
+        let _ = emitter.handle_at_call(&name, &arg_vals, diags, &loc);
+        ComptimeValue::None
+    }
+
