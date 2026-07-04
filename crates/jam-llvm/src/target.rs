@@ -118,3 +118,224 @@ pub fn host_cpu_features() -> String {
     FEATS.clone()
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OptLevel {
+    None,       // -O0
+    Less,       // -O1
+    Default,    // -O2
+    Aggressive, // -O3
+    Size,       // -Os
+    Small,      // -Oz
+}
+
+impl OptLevel {
+    fn codegen_level(self) -> raw::LLVMCodeGenOptLevel {
+        use raw::LLVMCodeGenOptLevel as L;
+        match self {
+            OptLevel::None => L::None,
+            OptLevel::Less => L::Less,
+            OptLevel::Default => L::Default,
+            OptLevel::Aggressive | OptLevel::Size | OptLevel::Small => L::Aggressive,
+        }
+    }
+
+    /// The integer discriminant the C++ shim's `jam_shim_optimize` switches on.
+    /// Matches the declaration order (None=0 … Small=5) and the C++ facade's
+    /// `JamOptLevel` enum, so the shim selects the identical `OptimizationLevel`.
+    fn shim_discriminant(self) -> c_int {
+        match self {
+            OptLevel::None => 0,
+            OptLevel::Less => 1,
+            OptLevel::Default => 2,
+            OptLevel::Aggressive => 3,
+            OptLevel::Size => 4,
+            OptLevel::Small => 5,
+        }
+    }
+
+    fn is_debug(self) -> bool {
+        self == OptLevel::None
+    }
+}
+
+impl Lto {
+    /// The integer discriminant the C++ shim expects (Off=0, Thin=1, Fat=2).
+    fn shim_discriminant(self) -> c_int {
+        match self {
+            Lto::Off => 0,
+            Lto::Thin => 1,
+            Lto::Fat => 2,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Lto {
+    Off,
+    Thin,
+    Fat,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Strip {
+    None,
+    DebugInfo,
+    Symbols,
+}
+
+pub struct TargetMachine {
+    ptr: raw::LLVMTargetMachineRef,
+    opt: OptLevel,
+    lto: Lto,
+    pic: bool,
+}
+
+impl TargetMachine {
+    pub fn new(
+        triple: &str,
+        cpu: &str,
+        features: &str,
+        is_pic: bool,
+        opt: OptLevel,
+        lto: Lto,
+    ) -> Option<TargetMachine> {
+        let ctriple = cstr(triple);
+        // Match the C++ facade: a missing CPU falls back to "generic"
+        // (`cpu ? cpu : "generic"`). An empty feature string is left as-is.
+        let ccpu = cstr(if cpu.is_empty() { "generic" } else { cpu });
+        let cfeat = cstr(features);
+        unsafe {
+            let mut target: raw::LLVMTargetRef = std::ptr::null_mut();
+            let mut err: *mut c_char = std::ptr::null_mut();
+            if raw::LLVMGetTargetFromTriple(ctriple.as_ptr(), &mut target, &mut err) != 0 {
+                let _ = take_message(err);
+                return None;
+            }
+            let reloc = if is_pic {
+                raw::LLVMRelocMode::PIC
+            } else {
+                raw::LLVMRelocMode::Static
+            };
+            let tm = raw::LLVMCreateTargetMachine(
+                target,
+                ctriple.as_ptr(),
+                ccpu.as_ptr(),
+                cfeat.as_ptr(),
+                opt.codegen_level(),
+                reloc,
+                raw::LLVMCodeModel::Default,
+            );
+            if tm.is_null() {
+                return None;
+            }
+            // Mirror the C++ facade: enable per-function/-data sections when
+            // optimizing. TargetOptions is not in the LLVM-C API, so this goes
+            // through the C++ shim (see `shim/jam_shim.cpp`).
+            if opt != OptLevel::None {
+                raw::jam_set_target_machine_sections(tm, 1, 1);
+            }
+            Some(TargetMachine {
+                ptr: tm,
+                opt,
+                lto,
+                pic: is_pic,
+            })
+        }
+    }
+
+    /// Stamp the module's data layout from this machine, plus the PIC/PIE level
+    /// module flags when relocation is PIC (so the emitted object advertises PIC
+    /// and a linker building a PIE binary accepts it).
+    pub fn configure_module(&self, module: &Module<'_>) {
+        unsafe {
+            let dl = raw::LLVMCreateTargetDataLayout(self.ptr);
+            raw::LLVMSetModuleDataLayout(module.as_ptr(), dl);
+            if self.pic {
+                // PICLevel::BigPIC == 2, PIELevel::Large == 2. The C++ uses the
+                // `Max` merge behavior, which the C enum lacks; `Override` is
+                // codegen-inert for jam's single, never-IR-linked module.
+                self.add_u32_module_flag(module, "PIC Level", 2);
+                self.add_u32_module_flag(module, "PIE Level", 2);
+            }
+        }
+    }
+
+    unsafe fn add_u32_module_flag(&self, module: &Module<'_>, key: &str, val: u64) {
+        unsafe {
+            let ctx = raw::LLVMGetModuleContext(module.as_ptr());
+            let i32ty = raw::LLVMInt32TypeInContext(ctx);
+            let v = raw::LLVMConstInt(i32ty, val, 0);
+            let md = raw::LLVMValueAsMetadata(v);
+            raw::LLVMAddModuleFlag(
+                module.as_ptr(),
+                raw::LLVMModuleFlagBehavior::Override,
+                key.as_ptr() as *const c_char,
+                key.len(),
+                md,
+            );
+        }
+    }
+
+    /// Run the new-PM optimization pipeline against `module` in place. This is
+    /// the C++ facade's pipeline copied verbatim into the shim
+    /// (`shim/jam_shim.cpp`, `jam_shim_optimize`): the size-favoring function
+    /// attrs (Os/Oz), the pre-pipeline internalize+globaldce (keeping `main` and
+    /// `llvm.used` members, skipped under LTO), and the OptimizationLevel switch
+    /// driving `buildO0DefaultPipeline` / `buildLTOPreLinkDefaultPipeline` /
+    /// `buildPerModuleDefaultPipeline`. Running the identical pipeline on the
+    /// same LLVM gives byte-identical optimized IR to the oracle.
+    ///
+    /// A no-op at `OptLevel::None` is still well-defined (the shim runs the O0
+    /// default pipeline); callers skip it at `None` to match the oracle, which
+    /// only invokes the optimizer when emitting an object/bitcode at any level.
+    pub fn run_optimization(&self, module: &Module<'_>) {
+        unsafe {
+            raw::jam_shim_optimize(
+                module.as_ptr(),
+                self.ptr,
+                self.opt.shim_discriminant(),
+                self.opt.is_debug() as c_int,
+                self.lto.shim_discriminant(),
+            );
+        }
+    }
+
+    /// Emit an object file (LTO off) or LLVM bitcode (LTO on) to `filename`. The
+    /// optimization pipeline is NOT run here — callers invoke
+    /// [`run_optimization`] first (the C++ facade runs the pipeline as part of
+    /// its emit; we split it so `--emit-ir` can print the UNoptimized module,
+    /// matching the oracle's pre-optimization `--emit-ir`). Returns the LLVM
+    /// error text on failure.
+    pub fn emit_to_file(&self, module: &Module<'_>, filename: &str) -> Result<(), String> {
+        unsafe {
+            // Emit.
+            let cfile = cstr(filename);
+            if self.lto != Lto::Off {
+                if raw::LLVMWriteBitcodeToFile(module.as_ptr(), cfile.as_ptr()) != 0 {
+                    return Err("failed to write bitcode".to_string());
+                }
+                Ok(())
+            } else {
+                let mut err: *mut c_char = std::ptr::null_mut();
+                let failed = raw::LLVMTargetMachineEmitToFile(
+                    self.ptr,
+                    module.as_ptr(),
+                    cfile.as_ptr(),
+                    raw::LLVMCodeGenFileType::ObjectFile,
+                    &mut err,
+                );
+                if failed != 0 {
+                    return Err(take_message(err));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Drop for TargetMachine {
+    fn drop(&mut self) {
+        unsafe { raw::LLVMDisposeTargetMachine(self.ptr) }
+    }
+}
+
