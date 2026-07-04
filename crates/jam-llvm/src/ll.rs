@@ -253,3 +253,491 @@ impl Drop for Module<'_> {
 // Builder
 // ===========================================================================
 
+pub struct Builder<'ctx> {
+    ptr: raw::LLVMBuilderRef,
+    _ctx: PhantomData<&'ctx Context>,
+}
+
+macro_rules! bin_op {
+    ($(#[$m:meta])* $name:ident => $raw:ident) => {
+        $(#[$m])*
+        pub fn $name(&self, lhs: Value<'ctx>, rhs: Value<'ctx>, name: &str) -> Value<'ctx> {
+            let c = cstr(name);
+            unsafe { Value::new(raw::$raw(self.ptr, lhs.0, rhs.0, c.as_ptr())) }
+        }
+    };
+}
+
+macro_rules! cast_op {
+    ($(#[$m:meta])* $name:ident => $raw:ident) => {
+        $(#[$m])*
+        pub fn $name(&self, val: Value<'ctx>, dest: Type<'ctx>, name: &str) -> Value<'ctx> {
+            let c = cstr(name);
+            unsafe { Value::new(raw::$raw(self.ptr, val.0, dest.0, c.as_ptr())) }
+        }
+    };
+}
+
+impl<'ctx> Builder<'ctx> {
+    pub fn position_at_end(&self, block: BasicBlock<'ctx>) {
+        unsafe { raw::LLVMPositionBuilderAtEnd(self.ptr, block.0) }
+    }
+
+    pub fn insert_block(&self) -> Option<BasicBlock<'ctx>> {
+        unsafe {
+            let b = raw::LLVMGetInsertBlock(self.ptr);
+            if b.is_null() {
+                None
+            } else {
+                Some(BasicBlock::new(b))
+            }
+        }
+    }
+
+    /// Position immediately before `block`'s terminator (to insert peer-type
+    /// promotions after an arm already emitted its branch). Falls back to the
+    /// block end if there is no terminator yet.
+    pub fn position_before_terminator(&self, block: BasicBlock<'ctx>) {
+        unsafe {
+            let term = raw::LLVMGetBasicBlockTerminator(block.0);
+            if term.is_null() {
+                raw::LLVMPositionBuilderAtEnd(self.ptr, block.0);
+            } else {
+                raw::LLVMPositionBuilderBefore(self.ptr, term);
+            }
+        }
+    }
+
+    // ---- integer / bitwise ----
+    bin_op!(/// `add`
+        add => LLVMBuildAdd);
+    bin_op!(/// `sub`
+        sub => LLVMBuildSub);
+    bin_op!(/// `mul`
+        mul => LLVMBuildMul);
+    bin_op!(/// `udiv`
+        udiv => LLVMBuildUDiv);
+    bin_op!(/// `sdiv`
+        sdiv => LLVMBuildSDiv);
+    bin_op!(/// `urem`
+        urem => LLVMBuildURem);
+    bin_op!(/// `srem`
+        srem => LLVMBuildSRem);
+    bin_op!(/// `and`
+        and => LLVMBuildAnd);
+    bin_op!(/// `or`
+        or => LLVMBuildOr);
+    bin_op!(/// `xor`
+        xor => LLVMBuildXor);
+    bin_op!(/// `shl`
+        shl => LLVMBuildShl);
+    bin_op!(/// `lshr`
+        lshr => LLVMBuildLShr);
+    bin_op!(/// `ashr`
+        ashr => LLVMBuildAShr);
+
+    // ---- floating point ----
+    bin_op!(/// `fadd`
+        fadd => LLVMBuildFAdd);
+    bin_op!(/// `fsub`
+        fsub => LLVMBuildFSub);
+    bin_op!(/// `fmul`
+        fmul => LLVMBuildFMul);
+    bin_op!(/// `fdiv`
+        fdiv => LLVMBuildFDiv);
+    bin_op!(/// `frem`
+        frem => LLVMBuildFRem);
+
+    pub fn fneg(&self, val: Value<'ctx>, name: &str) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe { Value::new(raw::LLVMBuildFNeg(self.ptr, val.0, c.as_ptr())) }
+    }
+
+    /// `not` — bitwise complement (`BitNot`; also `LogNot` on i1).
+    pub fn not(&self, val: Value<'ctx>, name: &str) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe { Value::new(raw::LLVMBuildNot(self.ptr, val.0, c.as_ptr())) }
+    }
+
+    pub fn icmp(
+        &self,
+        pred: IntPredicate,
+        lhs: Value<'ctx>,
+        rhs: Value<'ctx>,
+        name: &str,
+    ) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            Value::new(raw::LLVMBuildICmp(
+                self.ptr,
+                pred.to_raw(),
+                lhs.0,
+                rhs.0,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn fcmp(
+        &self,
+        pred: RealPredicate,
+        lhs: Value<'ctx>,
+        rhs: Value<'ctx>,
+        name: &str,
+    ) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            Value::new(raw::LLVMBuildFCmp(
+                self.ptr,
+                pred.to_raw(),
+                lhs.0,
+                rhs.0,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    // ---- casts ----
+    cast_op!(/// `zext`
+        zext => LLVMBuildZExt);
+    cast_op!(/// `sext`
+        sext => LLVMBuildSExt);
+    cast_op!(/// `bitcast`
+        bitcast => LLVMBuildBitCast);
+    cast_op!(/// `ptrtoint`
+        ptr_to_int => LLVMBuildPtrToInt);
+    cast_op!(/// `inttoptr`
+        int_to_ptr => LLVMBuildIntToPtr);
+    cast_op!(/// `sitofp`
+        si_to_fp => LLVMBuildSIToFP);
+    cast_op!(/// `uitofp`
+        ui_to_fp => LLVMBuildUIToFP);
+    cast_op!(/// `fpcast` (fptrunc/fpext as needed)
+        fp_cast => LLVMBuildFPCast);
+    cast_op!(/// `fptosi`
+        fp_to_si => LLVMBuildFPToSI);
+    cast_op!(/// `fptoui`
+        fp_to_ui => LLVMBuildFPToUI);
+    cast_op!(/// `trunc` (integer truncation)
+        trunc => LLVMBuildTrunc);
+
+    /// Width-changing integer cast, sign-aware (zext/sext/trunc as needed).
+    pub fn int_cast(
+        &self,
+        val: Value<'ctx>,
+        dest: Type<'ctx>,
+        is_signed: bool,
+        name: &str,
+    ) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            Value::new(raw::LLVMBuildIntCast2(
+                self.ptr,
+                val.0,
+                dest.0,
+                is_signed as raw::LLVMBool,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    /// Allocate `ty` on the stack, always in the function's entry block.
+    ///
+    /// Emitting an alloca at the current insertion point inside a loop would
+    /// allocate fresh stack every iteration (allocas only release at function
+    /// return) until the stack overflows. So — like the C++ facade — we hoist
+    /// every alloca to the entry block. `align_bytes == 0` defers to LLVM's
+    /// datalayout-derived alignment.
+    pub fn alloca(&self, ty: Type<'ctx>, align_bytes: u64, name: &str) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            let cur = raw::LLVMGetInsertBlock(self.ptr);
+            let inst = if cur.is_null() {
+                raw::LLVMBuildAlloca(self.ptr, ty.0, c.as_ptr())
+            } else {
+                let parent = raw::LLVMGetBasicBlockParent(cur);
+                let entry = raw::LLVMGetEntryBasicBlock(parent);
+                if entry == cur {
+                    // Common case: laying out params/locals at the top of the body.
+                    raw::LLVMBuildAlloca(self.ptr, ty.0, c.as_ptr())
+                } else {
+                    // Hoist: position in the entry block, build, then restore.
+                    // Codegen always appends at the end of `cur`, so restoring
+                    // with PositionBuilderAtEnd is exact.
+                    let first = raw::LLVMGetFirstInstruction(entry);
+                    if first.is_null() {
+                        raw::LLVMPositionBuilderAtEnd(self.ptr, entry);
+                    } else {
+                        raw::LLVMPositionBuilderBefore(self.ptr, first);
+                    }
+                    let inst = raw::LLVMBuildAlloca(self.ptr, ty.0, c.as_ptr());
+                    raw::LLVMPositionBuilderAtEnd(self.ptr, cur);
+                    inst
+                }
+            };
+            if align_bytes != 0 {
+                raw::LLVMSetAlignment(inst, align_bytes as c_uint);
+            }
+            Value::new(inst)
+        }
+    }
+
+    pub fn load(&self, ty: Type<'ctx>, ptr: Value<'ctx>, name: &str) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe { Value::new(raw::LLVMBuildLoad2(self.ptr, ty.0, ptr.0, c.as_ptr())) }
+    }
+
+    pub fn store(&self, val: Value<'ctx>, ptr: Value<'ctx>) -> Value<'ctx> {
+        unsafe { Value::new(raw::LLVMBuildStore(self.ptr, val.0, ptr.0)) }
+    }
+
+    /// `@llvm.memcpy` of `size` bytes. The C API takes the size as a value, so
+    /// we materialize an i64 constant (the C++ facade took a `uint64_t`).
+    pub fn memcpy(
+        &self,
+        dst: Value<'ctx>,
+        dst_align: u64,
+        src: Value<'ctx>,
+        src_align: u64,
+        size: u64,
+    ) -> Value<'ctx> {
+        unsafe {
+            let i64ty = raw::LLVMInt64TypeInContext(value_context(dst.0));
+            let size_v = raw::LLVMConstInt(i64ty, size as c_ulonglong, 0);
+            Value::new(raw::LLVMBuildMemCpy(
+                self.ptr,
+                dst.0,
+                dst_align as c_uint,
+                src.0,
+                src_align as c_uint,
+                size_v,
+            ))
+        }
+    }
+
+    pub fn memset(
+        &self,
+        dst: Value<'ctx>,
+        value: Value<'ctx>,
+        size: u64,
+        align: u64,
+    ) -> Value<'ctx> {
+        unsafe {
+            let i64ty = raw::LLVMInt64TypeInContext(value_context(dst.0));
+            let len_v = raw::LLVMConstInt(i64ty, size as c_ulonglong, 0);
+            Value::new(raw::LLVMBuildMemSet(
+                self.ptr,
+                dst.0,
+                value.0,
+                len_v,
+                align as c_uint,
+            ))
+        }
+    }
+
+    /// In-bounds GEP into a fixed array: `gep [N x T], ptr, 0, idx`.
+    pub fn array_gep(
+        &self,
+        array_ty: Type<'ctx>,
+        ptr: Value<'ctx>,
+        idx: Value<'ctx>,
+        name: &str,
+    ) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            let i32ty = raw::LLVMInt32TypeInContext(value_context(ptr.0));
+            let zero = raw::LLVMConstInt(i32ty, 0, 0);
+            let mut indices = [zero, idx.0];
+            Value::new(raw::LLVMBuildInBoundsGEP2(
+                self.ptr,
+                array_ty.0,
+                ptr.0,
+                indices.as_mut_ptr(),
+                2,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    /// Struct field GEP: pointer to field `field_idx` of `*struct_ty`.
+    pub fn struct_gep(
+        &self,
+        struct_ty: Type<'ctx>,
+        ptr: Value<'ctx>,
+        field_idx: u32,
+        name: &str,
+    ) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            Value::new(raw::LLVMBuildStructGEP2(
+                self.ptr,
+                struct_ty.0,
+                ptr.0,
+                field_idx,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    /// Single-index `gep elem_ty, ptr, idx` for many-item pointer stepping.
+    pub fn ptr_gep(
+        &self,
+        elem_ty: Type<'ctx>,
+        ptr: Value<'ctx>,
+        idx: Value<'ctx>,
+        name: &str,
+    ) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            let mut indices = [idx.0];
+            Value::new(raw::LLVMBuildInBoundsGEP2(
+                self.ptr,
+                elem_ty.0,
+                ptr.0,
+                indices.as_mut_ptr(),
+                1,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    // ---- control flow ----
+    pub fn br(&self, dest: BasicBlock<'ctx>) -> Value<'ctx> {
+        unsafe { Value::new(raw::LLVMBuildBr(self.ptr, dest.0)) }
+    }
+
+    pub fn cond_br(
+        &self,
+        cond: Value<'ctx>,
+        then_bb: BasicBlock<'ctx>,
+        else_bb: BasicBlock<'ctx>,
+    ) -> Value<'ctx> {
+        unsafe { Value::new(raw::LLVMBuildCondBr(self.ptr, cond.0, then_bb.0, else_bb.0)) }
+    }
+
+    pub fn switch(
+        &self,
+        scrutinee: Value<'ctx>,
+        default_bb: BasicBlock<'ctx>,
+        num_cases_hint: u32,
+    ) -> Value<'ctx> {
+        unsafe {
+            Value::new(raw::LLVMBuildSwitch(
+                self.ptr,
+                scrutinee.0,
+                default_bb.0,
+                num_cases_hint,
+            ))
+        }
+    }
+
+    pub fn ret(&self, val: Value<'ctx>) -> Value<'ctx> {
+        unsafe { Value::new(raw::LLVMBuildRet(self.ptr, val.0)) }
+    }
+    pub fn ret_void(&self) -> Value<'ctx> {
+        unsafe { Value::new(raw::LLVMBuildRetVoid(self.ptr)) }
+    }
+    pub fn unreachable(&self) -> Value<'ctx> {
+        unsafe { Value::new(raw::LLVMBuildUnreachable(self.ptr)) }
+    }
+
+    /// Direct call to a function value (the function type is read from `func`).
+    pub fn call(&self, func: Function<'ctx>, args: &[Value<'ctx>], name: &str) -> Value<'ctx> {
+        let c = cstr(name);
+        let mut raw_args: Vec<raw::LLVMValueRef> = args.iter().map(|v| v.0).collect();
+        unsafe {
+            let fn_ty = raw::LLVMGlobalGetValueType(func.0.0);
+            Value::new(raw::LLVMBuildCall2(
+                self.ptr,
+                fn_ty,
+                func.0.0,
+                raw_args.as_mut_ptr(),
+                raw_args.len() as c_uint,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    /// Indirect call through a function-typed value; `fn_ty` is the explicit
+    /// `FunctionType` built from the callee's Jam-level signature.
+    pub fn indirect_call(
+        &self,
+        fn_ty: Type<'ctx>,
+        callee: Value<'ctx>,
+        args: &[Value<'ctx>],
+        name: &str,
+    ) -> Value<'ctx> {
+        let c = cstr(name);
+        let mut raw_args: Vec<raw::LLVMValueRef> = args.iter().map(|v| v.0).collect();
+        unsafe {
+            Value::new(raw::LLVMBuildCall2(
+                self.ptr,
+                fn_ty.0,
+                callee.0,
+                raw_args.as_mut_ptr(),
+                raw_args.len() as c_uint,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn phi(&self, ty: Type<'ctx>, name: &str) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe { Value::new(raw::LLVMBuildPhi(self.ptr, ty.0, c.as_ptr())) }
+    }
+
+    /// A string global plus a pointer to its first element.
+    pub fn global_string_ptr(&self, s: &str, name: &str) -> Value<'ctx> {
+        let cs = cstr(s);
+        let cn = cstr(name);
+        unsafe {
+            Value::new(raw::LLVMBuildGlobalStringPtr(
+                self.ptr,
+                cs.as_ptr(),
+                cn.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn insert_value(
+        &self,
+        agg: Value<'ctx>,
+        elt: Value<'ctx>,
+        index: u32,
+        name: &str,
+    ) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            Value::new(raw::LLVMBuildInsertValue(
+                self.ptr,
+                agg.0,
+                elt.0,
+                index,
+                c.as_ptr(),
+            ))
+        }
+    }
+
+    pub fn extract_value(&self, agg: Value<'ctx>, index: u32, name: &str) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            Value::new(raw::LLVMBuildExtractValue(
+                self.ptr,
+                agg.0,
+                index,
+                c.as_ptr(),
+            ))
+        }
+    }
+}
+
+impl Drop for Builder<'_> {
+    fn drop(&mut self) {
+        unsafe { raw::LLVMDisposeBuilder(self.ptr) }
+    }
+}
+
+// ===========================================================================
+// Type
+// ===========================================================================
+
