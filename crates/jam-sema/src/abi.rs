@@ -177,3 +177,117 @@ pub fn classify_return<'ctx>(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen_context::EnumVariantInfo;
+    use jam_llvm::Context;
+    use jam_syntax::ast_flat::builtin;
+
+    #[test]
+    fn scalars_pointers_slices_are_byval() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        assert!(!is_by_ref(builtin::I32, &cg));
+        assert!(!is_by_ref(builtin::F64, &cg));
+        assert!(!is_by_ref(builtin::BOOL, &cg));
+        let p = cg.type_pool.intern_ptr_single(builtin::I32);
+        assert!(!is_by_ref(p, &cg));
+        let s = cg.type_pool.intern_slice(builtin::U8);
+        assert!(!is_by_ref(s, &cg));
+    }
+
+    #[test]
+    fn arrays_and_structs_are_byref() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let a = cg.type_pool.intern_array(builtin::I32, 4);
+        assert!(is_by_ref(a, &cg));
+
+        let nid = cg.string_pool.intern(b"Point");
+        let sty = cg.type_pool.intern_struct(nid);
+        let llvm = ctx.struct_type(&[ctx.i32_type(), ctx.i32_type()], false);
+        cg.register_struct("Point", llvm, vec![("x".into(), builtin::I32)]);
+        assert!(is_by_ref(sty, &cg));
+        // Named referencing the same struct also classifies byref.
+        let named = cg.type_pool.intern_named(nid);
+        assert!(is_by_ref(named, &cg));
+    }
+
+    #[test]
+    fn unit_enum_byval_payload_enum_byref() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        // unit-only enum -> byval
+        let uid = cg.string_pool.intern(b"Color");
+        let unamed = cg.type_pool.intern_named(uid);
+        cg.register_enum(
+            "Color",
+            vec![EnumVariantInfo {
+                name: "Red".into(),
+                payload_types: vec![],
+                discriminant: 0,
+            }],
+        );
+        assert!(!is_by_ref(unamed, &cg));
+
+        // payloaded enum -> byref
+        let pid = cg.string_pool.intern(b"Opt");
+        let pnamed = cg.type_pool.intern_named(pid);
+        cg.register_enum(
+            "Opt",
+            vec![EnumVariantInfo {
+                name: "Some".into(),
+                payload_types: vec![builtin::I32],
+                discriminant: 1,
+            }],
+        );
+        let payload_llvm = ctx.struct_type(&[ctx.i8_type(), ctx.i32_type()], false);
+        cg.set_enum_llvm_type("Opt", payload_llvm, 4, 4, true);
+        assert!(is_by_ref(pnamed, &cg));
+    }
+
+    #[test]
+    fn classify_param_byvalue_bypointer() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        // let i32 -> ByValue with the i32 LLVM type
+        let p = classify_param(ParamMode::Let, builtin::I32, &cg).unwrap();
+        assert_eq!(p.kind, ParamAbiKind::ByValue);
+        assert!(p.llvm_type.unwrap().is_integer());
+        // mut i32 -> ByPointer, align 4
+        let m = classify_param(ParamMode::Mut, builtin::I32, &cg).unwrap();
+        assert_eq!(m.kind, ParamAbiKind::ByPointer);
+        assert_eq!(m.pointer_align, 4);
+        // let <struct> -> ByPointer (byref)
+        let nid = cg.string_pool.intern(b"S");
+        let sty = cg.type_pool.intern_struct(nid);
+        let llvm = ctx.struct_type(&[ctx.i64_type()], false);
+        cg.register_struct("S", llvm, vec![("a".into(), builtin::I64)]);
+        let s = classify_param(ParamMode::Let, sty, &cg).unwrap();
+        assert_eq!(s.kind, ParamAbiKind::ByPointer);
+        assert_eq!(s.pointer_align, 8);
+    }
+
+    #[test]
+    fn classify_return_direct_void_indirect() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        // void
+        let v = classify_return(TypeIdx::NONE, &cg).unwrap();
+        assert_eq!(v.kind, ReturnAbiKind::Direct);
+        assert!(v.direct_type.unwrap().is_void());
+        // i32 direct
+        let d = classify_return(builtin::I32, &cg).unwrap();
+        assert_eq!(d.kind, ReturnAbiKind::Direct);
+        assert!(d.direct_type.unwrap().is_integer());
+        // struct -> indirect sret
+        let nid = cg.string_pool.intern(b"S");
+        let sty = cg.type_pool.intern_struct(nid);
+        let llvm = ctx.struct_type(&[ctx.i64_type()], false);
+        cg.register_struct("S", llvm, vec![("a".into(), builtin::I64)]);
+        let s = classify_return(sty, &cg).unwrap();
+        assert_eq!(s.kind, ReturnAbiKind::Indirect);
+        assert_eq!(s.sret_align, 8);
+    }
+}
