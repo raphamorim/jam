@@ -412,3 +412,168 @@ impl<'a> ComptimeEvaluator<'a> {
         }
     }
 
+    fn eval_binary_op(
+        &self,
+        n: &AstNode,
+        scope: &ComptimeScope,
+        ctx: &mut CompCtx,
+    ) -> ComptimeValue {
+        let op = bin_op_from_u8(n.op);
+        let lhs = NodeIdx::new(n.lhs);
+        let rhs = NodeIdx::new(n.rhs);
+
+        // Short-circuit LogAnd / LogOr.
+        if op == BinOp::LogAnd || op == BinOp::LogOr {
+            let l = self.eval(lhs, scope, ctx);
+            let lb = match l {
+                ComptimeValue::Bool(b) => b,
+                _ => return ComptimeValue::None,
+            };
+            if op == BinOp::LogAnd && !lb {
+                return ComptimeValue::Bool(false);
+            }
+            if op == BinOp::LogOr && lb {
+                return ComptimeValue::Bool(true);
+            }
+            let r = self.eval(rhs, scope, ctx);
+            return match r {
+                ComptimeValue::Bool(b) => ComptimeValue::Bool(b),
+                _ => ComptimeValue::None,
+            };
+        }
+
+        let l = self.eval(lhs, scope, ctx);
+        if l.is_none() {
+            return l;
+        }
+        let r = self.eval(rhs, scope, ctx);
+        if r.is_none() {
+            return r;
+        }
+
+        // Integer arithmetic / bitwise / comparison.
+        if let (
+            ComptimeValue::Int {
+                bits: a,
+                width: lw0,
+                is_signed: ls,
+            },
+            ComptimeValue::Int {
+                bits: b,
+                width: rw0,
+                is_signed: rs,
+            },
+        ) = (&l, &r)
+        {
+            let (a, b) = (*a, *b);
+            let (mut lw, mut rw) = (*lw0, *rw0);
+            let (ls, rs) = (*ls, *rs);
+            let is_comparison = matches!(
+                op,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            );
+            if lw != rw {
+                if !is_comparison || ls != rs {
+                    return ComptimeValue::None;
+                }
+                // Widen the narrower operand (comparisons only).
+                if lw < rw {
+                    lw = rw;
+                } else {
+                    rw = lw;
+                }
+            }
+            if ls != rs {
+                return ComptimeValue::None;
+            }
+            let _ = rw;
+            let w = lw;
+            let sgn = ls;
+            let mk = |bits: u64| ComptimeValue::Int {
+                bits,
+                width: w,
+                is_signed: sgn,
+            };
+            return match op {
+                BinOp::Add => mk(a.wrapping_add(b)),
+                BinOp::Sub => mk(a.wrapping_sub(b)),
+                BinOp::Mul => mk(a.wrapping_mul(b)),
+                BinOp::Div => {
+                    if b == 0 {
+                        ComptimeValue::None
+                    } else if sgn {
+                        mk((a as i64).wrapping_div(b as i64) as u64)
+                    } else {
+                        mk(a.wrapping_div(b))
+                    }
+                }
+                BinOp::Mod => {
+                    if b == 0 {
+                        ComptimeValue::None
+                    } else if sgn {
+                        mk((a as i64).wrapping_rem(b as i64) as u64)
+                    } else {
+                        mk(a.wrapping_rem(b))
+                    }
+                }
+                BinOp::BitAnd => mk(a & b),
+                BinOp::BitOr => mk(a | b),
+                BinOp::BitXor => mk(a ^ b),
+                BinOp::Shl => mk(a.wrapping_shl(b as u32)),
+                BinOp::Shr => {
+                    if sgn {
+                        mk((a as i64).wrapping_shr(b as u32) as u64)
+                    } else {
+                        mk(a.wrapping_shr(b as u32))
+                    }
+                }
+                BinOp::Eq => ComptimeValue::Bool(a == b),
+                BinOp::Ne => ComptimeValue::Bool(a != b),
+                BinOp::Lt => ComptimeValue::Bool(if sgn { (a as i64) < (b as i64) } else { a < b }),
+                BinOp::Le => ComptimeValue::Bool(if sgn {
+                    (a as i64) <= (b as i64)
+                } else {
+                    a <= b
+                }),
+                BinOp::Gt => ComptimeValue::Bool(if sgn { (a as i64) > (b as i64) } else { a > b }),
+                BinOp::Ge => ComptimeValue::Bool(if sgn {
+                    (a as i64) >= (b as i64)
+                } else {
+                    a >= b
+                }),
+                _ => ComptimeValue::None,
+            };
+        }
+
+        // String equality (format-string field-name matching).
+        if let (ComptimeValue::Str(ls), ComptimeValue::Str(rs)) = (&l, &r) {
+            let eq = ls == rs;
+            return match op {
+                BinOp::Eq => ComptimeValue::Bool(eq),
+                BinOp::Ne => ComptimeValue::Bool(!eq),
+                _ => ComptimeValue::None,
+            };
+        }
+
+        // Bool equality.
+        if let (ComptimeValue::Bool(lb), ComptimeValue::Bool(rb)) = (&l, &r) {
+            return match op {
+                BinOp::Eq => ComptimeValue::Bool(lb == rb),
+                BinOp::Ne => ComptimeValue::Bool(lb != rb),
+                _ => ComptimeValue::None,
+            };
+        }
+
+        // Type equality — the linchpin of `comp if (@TypeOf(arg) == i32)`.
+        if let (ComptimeValue::Type(lt), ComptimeValue::Type(rt)) = (&l, &r) {
+            let eq = lt == rt;
+            return match op {
+                BinOp::Eq => ComptimeValue::Bool(eq),
+                BinOp::Ne => ComptimeValue::Bool(!eq),
+                _ => ComptimeValue::None,
+            };
+        }
+
+        ComptimeValue::None
+    }
+
