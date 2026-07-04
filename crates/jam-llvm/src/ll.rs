@@ -162,3 +162,94 @@ impl Drop for Context {
 // Module
 // ===========================================================================
 
+pub struct Module<'ctx> {
+    ptr: raw::LLVMModuleRef,
+    _ctx: PhantomData<&'ctx Context>,
+}
+
+impl<'ctx> Module<'ctx> {
+    pub(crate) fn as_ptr(&self) -> raw::LLVMModuleRef {
+        self.ptr
+    }
+
+    pub fn set_target_triple(&self, triple: &str) {
+        let c = cstr(triple);
+        unsafe { raw::LLVMSetTarget(self.ptr, c.as_ptr()) }
+    }
+
+    pub fn get_function(&self, name: &str) -> Option<Function<'ctx>> {
+        let c = cstr(name);
+        unsafe {
+            let f = raw::LLVMGetNamedFunction(self.ptr, c.as_ptr());
+            if f.is_null() {
+                None
+            } else {
+                Some(Function(Value::new(f)))
+            }
+        }
+    }
+
+    pub fn add_function(&self, name: &str, fn_type: Type<'ctx>) -> Function<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            Function(Value::new(raw::LLVMAddFunction(
+                self.ptr,
+                c.as_ptr(),
+                fn_type.0,
+            )))
+        }
+    }
+
+    /// Add a private, uninitialized global of `ty`. Set constness/initializer
+    /// separately via [`Value::set_global_constant`] / [`Value::set_initializer`].
+    pub fn add_global(&self, ty: Type<'ctx>, name: &str) -> Value<'ctx> {
+        let c = cstr(name);
+        unsafe {
+            let g = raw::LLVMAddGlobal(self.ptr, ty.0, c.as_ptr());
+            raw::LLVMSetLinkage(g, raw::LLVMLinkage::Private);
+            Value::new(g)
+        }
+    }
+
+    /// A private, constant, NUL-terminated string global (like the C++
+    /// `JamLLVMAddGlobalString`).
+    pub fn add_global_string(&self, s: &[u8], name: &str) -> Value<'ctx> {
+        unsafe {
+            let ctx = raw::LLVMGetModuleContext(self.ptr);
+            let init = raw::LLVMConstStringInContext(
+                ctx,
+                s.as_ptr() as *const _,
+                s.len() as c_uint,
+                0, // null-terminate
+            );
+            let ty = raw::LLVMTypeOf(init);
+            let c = cstr(name);
+            let g = raw::LLVMAddGlobal(self.ptr, ty, c.as_ptr());
+            raw::LLVMSetGlobalConstant(g, 1);
+            raw::LLVMSetLinkage(g, raw::LLVMLinkage::Private);
+            raw::LLVMSetInitializer(g, init);
+            Value::new(g)
+        }
+    }
+
+    /// Render the module's IR to a `String` (mirrors `LLVMPrintModuleToString`).
+    pub fn print_to_string(&self) -> String {
+        unsafe {
+            let raw_str = raw::LLVMPrintModuleToString(self.ptr);
+            let s = CStr::from_ptr(raw_str).to_string_lossy().into_owned();
+            raw::LLVMDisposeMessage(raw_str);
+            s
+        }
+    }
+}
+
+impl Drop for Module<'_> {
+    fn drop(&mut self) {
+        unsafe { raw::LLVMDisposeModule(self.ptr) }
+    }
+}
+
+// ===========================================================================
+// Builder
+// ===========================================================================
+
