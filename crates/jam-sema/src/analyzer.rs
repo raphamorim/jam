@@ -635,3 +635,171 @@ impl<'c, 'ctx> Analyzer<'c, 'ctx> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi::{ParamAbiKind, ReturnAbiKind};
+    use crate::decl::DeclKind;
+    use jam_core::param_mode::ParamMode;
+    use jam_llvm::Context;
+    use jam_syntax::ast::{ConstDeclAST, FunctionAST, Param};
+    use jam_syntax::ast_flat::builtin;
+
+    #[test]
+    fn analyze_function_caches_abi_signature() {
+        // The AST data must outlive the (invariant) CodegenContext, so declare
+        // it before `ctx`.
+        // fn add(a: i32, b: mut i32) i32
+        let mut a = Param::new("a", builtin::I32);
+        a.mode = ParamMode::Let;
+        let mut b = Param::new("b", builtin::I32);
+        b.mode = ParamMode::Mut;
+        let func = FunctionAST::new("add", vec![a, b], builtin::I32, Vec::new());
+
+        let ctx = Context::new();
+        let mut cg = CodegenContext::new(&ctx, "m");
+        let mut decls = DeclTable::new();
+        let idx = decls.create(DeclKind::Function, "add");
+        decls.get_mut(idx).fn_ast = Some(&func);
+
+        {
+            let mut az = Analyzer::new(&mut cg, &mut decls);
+            let v = az.ensure_decl_analyzed(idx);
+            assert!(matches!(v, DeclValue::Function(_)));
+            // Idempotent second call hits Complete.
+            assert!(matches!(
+                az.ensure_decl_analyzed(idx),
+                DeclValue::Function(_)
+            ));
+        }
+        let sig = &decls.get(idx).signature;
+        assert!(sig.computed);
+        assert_eq!(sig.params.len(), 2);
+        assert_eq!(sig.params[0].kind, ParamAbiKind::ByValue); // let i32
+        assert_eq!(sig.params[1].kind, ParamAbiKind::ByPointer); // mut i32
+        assert_eq!(sig.params[1].pointer_align, 4);
+        assert_eq!(sig.return_abi.kind, ReturnAbiKind::Direct); // i32
+    }
+
+    #[test]
+    fn analyze_struct_resolves_to_named_type() {
+        let ctx = Context::new();
+        let mut cg = CodegenContext::new(&ctx, "m");
+        let mut decls = DeclTable::new();
+        let idx = decls.create(DeclKind::Struct, "Point");
+        let mut az = Analyzer::new(&mut cg, &mut decls);
+        let v = az.ensure_decl_analyzed(idx);
+        assert!(matches!(v, DeclValue::Type(_)));
+    }
+
+    #[test]
+    fn analyze_const_alias_vs_value() {
+        // AST data before `ctx` (outlives the invariant CodegenContext).
+        // alias const: aliased_type set
+        let mut alias = ConstDeclAST::new("Box", builtin::I32, jam_core::index::NodeIdx::NONE);
+        alias.aliased_type = builtin::I32;
+        // value const: aliased_type NONE
+        let value = ConstDeclAST::new("PI", builtin::F64, jam_core::index::NodeIdx::NONE);
+
+        let ctx = Context::new();
+        let mut cg = CodegenContext::new(&ctx, "m");
+        let mut decls = DeclTable::new();
+        let ai = decls.create(DeclKind::TypeAlias, "Box");
+        decls.get_mut(ai).const_ast = Some(&alias);
+        let vi = decls.create(DeclKind::Const, "PI");
+        decls.get_mut(vi).const_ast = Some(&value);
+
+        let mut az = Analyzer::new(&mut cg, &mut decls);
+        assert!(matches!(az.ensure_decl_analyzed(ai), DeclValue::Type(_)));
+        assert!(matches!(az.ensure_decl_analyzed(vi), DeclValue::None));
+    }
+
+    #[test]
+    fn struct_body_fill_sets_layout_and_size() {
+        use jam_syntax::ast::StructDeclAST;
+        // AST before ctx (invariant CodegenContext).
+        let s_ast = StructDeclAST::new(
+            "Pt",
+            vec![("x".into(), builtin::I32), ("y".into(), builtin::I32)],
+        );
+
+        let ctx = Context::new();
+        let mut cg = CodegenContext::new(&ctx, "m");
+        // Register the named (opaque) struct type up front (driver register pass).
+        let named = ctx.named_struct("Pt");
+        cg.register_struct(
+            "Pt",
+            named,
+            vec![("x".into(), builtin::I32), ("y".into(), builtin::I32)],
+        );
+
+        let mut decls = DeclTable::new();
+        let idx = decls.create(DeclKind::Struct, "Pt");
+        decls.get_mut(idx).struct_ast = Some(&s_ast);
+
+        {
+            let mut az = Analyzer::new(&mut cg, &mut decls);
+            assert!(matches!(az.ensure_decl_analyzed(idx), DeclValue::Type(_)));
+        }
+        assert_eq!(
+            decls.get(idx).struct_status,
+            crate::decl::StructStatus::HaveFieldTypes
+        );
+        // {i32, i32} -> size 8, align 4.
+        let sty = cg.type_pool.intern_struct(cg.string_pool.intern(b"Pt"));
+        assert_eq!(cg.type_size(sty).unwrap(), 8);
+        assert!(!cg.has_errors());
+    }
+
+    #[test]
+    fn self_referential_struct_trips_cycle() {
+        use jam_syntax::ast::StructDeclAST;
+        use jam_syntax::ast_flat::{StringPool, TypePool};
+        // `Bad { me: Bad }` (direct self-reference) must trip the WIP cycle.
+        // Mint the Named("Bad") TypeIdx via a scratch pool so the AST (which
+        // must outlive the invariant CodegenContext) can precede `ctx`; a fresh
+        // pool interns deterministically, so cg yields the same TypeIdx.
+        let bad_named = {
+            let tp = TypePool::new();
+            let sp = StringPool::new();
+            tp.intern_named(sp.intern(b"Bad"))
+        };
+        let bad_ast = StructDeclAST::new("Bad", vec![("me".into(), bad_named)]);
+
+        let ctx = Context::new();
+        let mut cg = CodegenContext::new(&ctx, "m");
+        let nid = cg.string_pool.intern(b"Bad");
+        let named_ty = cg.type_pool.intern_named(nid);
+        assert_eq!(named_ty, bad_named); // deterministic interning
+        let bad_llvm = ctx.named_struct("Bad");
+        cg.register_struct("Bad", bad_llvm, vec![("me".into(), bad_named)]);
+
+        let mut decls = DeclTable::new();
+        let bad_idx = decls.create(DeclKind::Struct, "Bad");
+        decls.get_mut(bad_idx).struct_ast = Some(&bad_ast);
+
+        {
+            let mut az = Analyzer::new(&mut cg, &mut decls);
+            // Direct self-reference -> body fill fails (self-cycle).
+            assert!(!az.resolve_type_fields_struct(bad_idx));
+        }
+        assert!(cg.has_errors());
+    }
+
+    #[test]
+    fn in_progress_decl_triggers_cycle_error() {
+        let ctx = Context::new();
+        let mut cg = CodegenContext::new(&ctx, "m");
+        let mut decls = DeclTable::new();
+        let idx = decls.create(DeclKind::Struct, "Loop");
+        // Simulate mid-analysis re-entry.
+        decls.get_mut(idx).analysis = DeclAnalysis::InProgress;
+        {
+            let mut az = Analyzer::new(&mut cg, &mut decls);
+            az.analysis_stack.push(idx);
+            let v = az.ensure_decl_analyzed(idx);
+            assert!(matches!(v, DeclValue::None));
+        }
+        assert!(cg.has_errors());
+    }
+}
