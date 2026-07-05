@@ -490,3 +490,222 @@ impl<'a> Verifier<'a> {
     }
 }
 
+/// Verify a finished [`JirFunction`]. Returns the (possibly empty) list of
+/// structural diagnostics. Each diagnostic's `loc.line` carries the offending
+/// instruction's `src_line` (file left empty for the caller to stamp).
+pub fn verify_jir_function(
+    jfn: &JirFunction,
+    types: Option<&TypePool>,
+    strings: Option<&StringPool>,
+    resolver: Option<JirVerifyResolver>,
+) -> Vec<Diagnostic> {
+    let mut v = Verifier::new(jfn, types, strings, resolver);
+    v.run();
+    v.diags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jir::{JirInst, JirTag};
+
+    /// Build a minimal well-formed function: entry block with `ret void`.
+    fn ret_void_fn() -> JirFunction {
+        let mut f = JirFunction::new();
+        f.name = "f".to_string();
+        let entry = f.push_block("entry");
+        let ret = f.push_inst(JirInst {
+            tag: JirTag::Ret,
+            ..Default::default()
+        });
+        f.get_block_mut(entry).insts.push(ret);
+        f
+    }
+
+    #[test]
+    fn well_formed_function_has_no_diagnostics() {
+        let f = ret_void_fn();
+        let d = verify_jir_function(&f, None, None, None);
+        assert!(d.is_empty(), "unexpected: {:?}", d);
+    }
+
+    #[test]
+    fn empty_block_is_rejected() {
+        let mut f = JirFunction::new();
+        f.name = "f".to_string();
+        f.push_block("entry"); // left empty
+        let d = verify_jir_function(&f, None, None, None);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].message.contains("empty block (no terminator)"));
+        assert!(d[0].message.contains("fn `f`"));
+    }
+
+    #[test]
+    fn block_without_terminator_is_rejected() {
+        let mut f = JirFunction::new();
+        f.name = "f".to_string();
+        let entry = f.push_block("entry");
+        // A non-terminator as the last (and only) instruction.
+        let b = f.push_inst(JirInst {
+            tag: JirTag::Bool,
+            a: 1,
+            ..Default::default()
+        });
+        f.get_block_mut(entry).insts.push(b);
+        let d = verify_jir_function(&f, None, None, None);
+        assert!(
+            d.iter()
+                .any(|x| x.message.contains("block ends with non-terminator Bool"))
+        );
+    }
+
+    #[test]
+    fn terminator_not_last_is_rejected() {
+        let mut f = JirFunction::new();
+        f.name = "f".to_string();
+        let entry = f.push_block("entry");
+        let r1 = f.push_inst(JirInst {
+            tag: JirTag::Ret,
+            ..Default::default()
+        });
+        let r2 = f.push_inst(JirInst {
+            tag: JirTag::Ret,
+            ..Default::default()
+        });
+        f.get_block_mut(entry).insts.extend([r1, r2]);
+        let d = verify_jir_function(&f, None, None, None);
+        assert!(
+            d.iter()
+                .any(|x| x.message.contains("terminator Ret is not last in block"))
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_operand_ref_is_rejected() {
+        let mut f = JirFunction::new();
+        f.name = "f".to_string();
+        let entry = f.push_block("entry");
+        // Load from a ref far past the end of `insts`.
+        let load = f.push_inst(JirInst {
+            tag: JirTag::Load,
+            a: 999,
+            ..Default::default()
+        });
+        let ret = f.push_inst(JirInst {
+            tag: JirTag::Ret,
+            ..Default::default()
+        });
+        f.get_block_mut(entry).insts.extend([load, ret]);
+        let d = verify_jir_function(&f, None, None, None);
+        assert!(d.iter().any(|x| x.message.contains("out of bounds")));
+    }
+
+    #[test]
+    fn use_before_def_across_blocks_is_rejected() {
+        // Entry uses a value defined only in a later block.
+        let mut f = JirFunction::new();
+        f.name = "f".to_string();
+        let entry = f.push_block("entry");
+        let later = f.push_block("later");
+        // value defined in `later`
+        let val = f.push_inst(JirInst {
+            tag: JirTag::Bool,
+            a: 1,
+            ty: TypeIdx::NONE,
+            ..Default::default()
+        });
+        // entry: Load uses `val` (defined later), then Br to later
+        let load = f.push_inst(JirInst {
+            tag: JirTag::Load,
+            a: val,
+            ..Default::default()
+        });
+        let br = f.push_inst(JirInst {
+            tag: JirTag::Br,
+            a: later,
+            ..Default::default()
+        });
+        f.get_block_mut(entry).insts.extend([load, br]);
+        // later: define val, then ret
+        let ret = f.push_inst(JirInst {
+            tag: JirTag::Ret,
+            ..Default::default()
+        });
+        f.get_block_mut(later).insts.extend([val, ret]);
+        let d = verify_jir_function(&f, None, None, None);
+        assert!(
+            d.iter()
+                .any(|x| x.message.contains("used before its defining block"))
+        );
+    }
+
+    #[test]
+    fn alloca_outside_entry_block_is_rejected() {
+        let mut f = JirFunction::new();
+        f.name = "f".to_string();
+        let entry = f.push_block("entry");
+        let other = f.push_block("other");
+        let br = f.push_inst(JirInst {
+            tag: JirTag::Br,
+            a: other,
+            ..Default::default()
+        });
+        f.get_block_mut(entry).insts.push(br);
+        let alloca = f.push_inst(JirInst {
+            tag: JirTag::Alloca,
+            ..Default::default()
+        });
+        let ret = f.push_inst(JirInst {
+            tag: JirTag::Ret,
+            ..Default::default()
+        });
+        f.get_block_mut(other).insts.extend([alloca, ret]);
+        let d = verify_jir_function(&f, None, None, None);
+        assert!(
+            d.iter()
+                .any(|x| x.message.contains("Alloca outside entry block"))
+        );
+    }
+
+    #[test]
+    fn br_to_missing_block_is_rejected() {
+        let mut f = JirFunction::new();
+        f.name = "f".to_string();
+        let entry = f.push_block("entry");
+        let br = f.push_inst(JirInst {
+            tag: JirTag::Br,
+            a: 42,
+            ..Default::default()
+        });
+        f.get_block_mut(entry).insts.push(br);
+        let d = verify_jir_function(&f, None, None, None);
+        assert!(d.iter().any(
+            |x| x.message.contains("block ref `target`") && x.message.contains("out of bounds")
+        ));
+    }
+
+    #[test]
+    fn call_arg_slice_overflow_is_rejected() {
+        let mut f = JirFunction::new();
+        f.name = "f".to_string();
+        let entry = f.push_block("entry");
+        // extra = [argCount=3] but no actual args -> slice overflow.
+        let ex = f.push_extra(&[3]);
+        let call = f.push_inst(JirInst {
+            tag: JirTag::Call,
+            a: 1,
+            b: ex,
+            ..Default::default()
+        });
+        let ret = f.push_inst(JirInst {
+            tag: JirTag::Ret,
+            ..Default::default()
+        });
+        f.get_block_mut(entry).insts.extend([call, ret]);
+        let d = verify_jir_function(&f, None, None, None);
+        assert!(
+            d.iter()
+                .any(|x| x.message.contains("call-args") && x.message.contains("overflows"))
+        );
+    }
+}
