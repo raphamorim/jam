@@ -88,3 +88,72 @@ impl ModuleResolver {
         .clone()
     }
 
+    /// Resolve `spelling` (imported from `from_dir`) to a canonical `.jam` path.
+    /// `None` for the `test` builtin, unresolvable spellings, and any error.
+    fn resolve_uncached(&self, spelling: &str, from_dir: &Path) -> Option<PathBuf> {
+        if spelling == "test" {
+            return None;
+        }
+        let explicit_relative = spelling.starts_with("./") || spelling.starts_with("../");
+        let path = spelling.strip_prefix("./").unwrap_or(spelling);
+
+        let direct = from_dir.join(format!("{path}.jam"));
+        if direct.is_file() {
+            return std::fs::canonicalize(&direct).ok();
+        }
+        let index = from_dir.join(path).join("mod.jam");
+        if index.is_file() {
+            return std::fs::canonicalize(&index).ok();
+        }
+        if explicit_relative {
+            return None;
+        }
+
+        // Standard library: strip a leading `std/`, then probe the env root and
+        // the in-tree dev fallback.
+        let std_path = path.strip_prefix("std/").unwrap_or(path);
+        if let Some(root) = Self::std_root() {
+            let fc = root.join(format!("{std_path}.jam"));
+            if fc.is_file() {
+                return std::fs::canonicalize(&fc).ok();
+            }
+            let ic = root.join(std_path).join("mod.jam");
+            if ic.is_file() {
+                return std::fs::canonicalize(&ic).ok();
+            }
+        }
+        let dev = Path::new("std").join(format!("{std_path}.jam"));
+        if dev.is_file() {
+            return std::fs::canonicalize(&dev).ok();
+        }
+        let dev_idx = Path::new("std").join(std_path).join("mod.jam");
+        if dev_idx.is_file() {
+            return std::fs::canonicalize(&dev_idx).ok();
+        }
+        None
+    }
+
+    /// Stable identity of a resolved file: entry-relative, `std/<name>`, or the
+    /// absolute path (`.jam` stripped). Doubles as the cache key and the
+    /// `module_path` mangling prefix.
+    fn module_identity(&self, resolved: &Path) -> String {
+        if let Some(base) = &self.base_abs
+            && let Some(id) = identity_under(resolved, base)
+        {
+            return id;
+        }
+        if let Some(root) = Self::std_root()
+            && let Ok(root_abs) = std::fs::canonicalize(&root)
+            && let Some(id) = identity_under(resolved, &root_abs)
+        {
+            return format!("std/{id}");
+        }
+        if let Ok(dev_abs) = std::fs::canonicalize("std")
+            && let Some(id) = identity_under(resolved, &dev_abs)
+        {
+            return format!("std/{id}");
+        }
+        let s = resolved.to_string_lossy();
+        s.strip_suffix(".jam").unwrap_or(&s).to_string()
+    }
+
