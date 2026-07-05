@@ -428,3 +428,70 @@ fn stamp_module_path(module: &mut ModuleAST, key: &str) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &[u8], tp: &mut TypePool, sp: &mut StringPool, ns: &mut NodeStore) -> ModuleAST {
+        let mut lexer = Lexer::new(src.to_vec());
+        lexer.scan_tokens().expect("lex");
+        let tokens = lexer.tokens().to_vec();
+        let source = lexer.source().to_vec();
+        let mut diags = Diagnostics::new();
+        let mut p = Parser::new(tokens, source, tp, sp, ns, &mut diags, "entry.jam");
+        let m = p.parse().expect("parse");
+        assert!(!diags.has_errors());
+        m
+    }
+
+    #[test]
+    fn loads_sibling_import_and_stamps_module_path() {
+        // A temp dir with a leaf module the entry imports by sibling name.
+        let dir = std::env::temp_dir().join(format!("jam_res_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("leaf.jam"), b"pub fn leafFn() u32 { return 7; }").unwrap();
+
+        let mut tp = TypePool::new();
+        let mut sp = StringPool::new();
+        let mut ns = NodeStore::new();
+        let entry = parse(
+            b"const l = import(\"leaf\"); fn useIt() u32 { return 0; }",
+            &mut tp,
+            &mut sp,
+            &mut ns,
+        );
+
+        let mut r = ModuleResolver::new(dir.to_str().unwrap());
+        r.load_all(&entry, &mut tp, &mut sp, &mut ns);
+
+        assert_eq!(r.loaded.len(), 1, "the sibling `leaf` module should load");
+        assert_eq!(r.loaded[0].0, "leaf", "identity is the entry-relative name");
+        // Its function carries the stamped module_path (the mangling prefix).
+        assert_eq!(r.loaded[0].1.functions[0].name, "leafFn");
+        assert_eq!(r.loaded[0].1.functions[0].module_path, "leaf");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_builtin_and_unresolvable_are_skipped() {
+        let dir = std::env::temp_dir().join(format!("jam_res_test2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tp = TypePool::new();
+        let mut sp = StringPool::new();
+        let mut ns = NodeStore::new();
+        let entry = parse(
+            b"const t = import(\"test\"); const x = import(\"does_not_exist\"); fn f() u32 { return 0; }",
+            &mut tp,
+            &mut sp,
+            &mut ns,
+        );
+        let mut r = ModuleResolver::new(dir.to_str().unwrap());
+        r.load_all(&entry, &mut tp, &mut sp, &mut ns);
+        assert!(
+            r.loaded.is_empty(),
+            "`test` is a builtin and the other is unresolvable"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
