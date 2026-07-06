@@ -513,3 +513,399 @@ impl<'ctx> CodegenContext<'ctx> {
             .insert(module_path.into(), enums);
     }
 
+    /// Resolve a `GenericCall` type (e.g. `Pair(u64)`) to its monomorphized
+    /// `Named` struct, instantiating it on first use: register the struct with
+    /// substituted fields + clone each method's signature under `Inst.method`
+    /// (resolution-only — method bodies are NOT lowered here, matching the
+    /// `--emit-jir` cut before `jirDefineBody`). Caches `GenericCall -> Named`.
+    /// Returns `ty` unchanged for non-`GenericCall` inputs.
+    /// Instantiate the generic underlying `ty` when it is a GenericCall or a
+    /// type-alias chain that bottoms out in one (`CounterI32 -> Counter(i32)`),
+    /// so its fields/layout resolve. `ty`'s own spelling is left unchanged.
+    pub fn resolve_alias_generic_instantiate(&self, ty: TypeIdx) -> Result<(), String> {
+        let mut probe = ty;
+        for _ in 0..8 {
+            let k = self.type_pool.get(probe);
+            let (kind, a) = (k.kind, k.a);
+            if kind == TypeKind::GenericCall {
+                self.resolve_generic_call_instantiate(probe)?;
+                return Ok(());
+            }
+            if kind == TypeKind::Named {
+                let aliased = self.lookup_type_alias(&self.str_name(a));
+                if !aliased.is_none() && aliased != probe {
+                    probe = aliased;
+                    continue;
+                }
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    pub fn resolve_generic_call_instantiate(&self, ty: TypeIdx) -> Result<TypeIdx, String> {
+        // Inside an instantiated body, apply the active substitution to the call's
+        // type args (`Option(T)` -> `Option(u8)`) so we instantiate the concrete
+        // type, not a `__T` garbage instance. No-op when no frame is active.
+        let ty = if self.has_active_subst() {
+            let frame = self
+                .current_subst
+                .borrow()
+                .last()
+                .cloned()
+                .unwrap_or_default();
+            substitute_type(ty, &frame, &self.type_pool, &self.string_pool)
+        } else {
+            ty
+        };
+        let key = (self.current_body_module(), ty);
+        let cached = self.generic_resolutions.borrow().get(&key).copied();
+        if let Some(r) = cached {
+            return Ok(r);
+        }
+        let (callee, args) = {
+            let k = self.type_pool.get(ty);
+            if k.kind != TypeKind::GenericCall {
+                return Ok(ty);
+            }
+            (
+                self.str_name(k.a),
+                self.type_pool.generic_args_at(k.b).to_vec(),
+            )
+        };
+        // Canonicalize a handle-qualified callee (`c.Vec` -> `std/collections.Vec`)
+        // so it resolves via get_function_ast AND its monomorph name (`Vec__i32`)
+        // dedups with the bare/canonical spelling — the C++ resolves these through
+        // its scoped handle-fn table (main.cpp:1609-1660). A canonical dotted callee
+        // (`std/collections.Vec`), whose prefix is a module path not a handle, is
+        // left unchanged.
+        let callee = match callee.split_once('.') {
+            Some((prefix, rest)) => match self.import_handle_module(prefix) {
+                Some(module) => format!("{module}.{rest}"),
+                None => callee,
+            },
+            None => callee,
+        };
+        // Resolve the CURRENT module's generic first (two modules may define the
+        // same-named generic, e.g. mod_gen_a.Pair vs mod_gen_b.Pair).
+        let bm = self.current_body_module();
+        // Requalify each type arg against the body module so a bare arg written
+        // in a module's own body (`Option(File).Some(..)` inside std/fs) gets the
+        // qualified monomorph name (`Option__std/fs.File`, not a duplicate bare
+        // `Option__File`). Idempotent for builtins / already-qualified args. This
+        // is the body-level half of the C++ bindDeclTypes requalification.
+        let args: Vec<TypeIdx> = args.iter().map(|&a| self.requalify_type(a, &bm)).collect();
+        let generic = if !callee.contains('.') && !bm.is_empty() {
+            self.get_function_ast(&format!("{bm}.{callee}"))
+                .or_else(|| self.get_function_ast(&callee))
+        } else {
+            self.get_function_ast(&callee)
+        }
+        .ok_or_else(|| format!("astgen: unknown generic `{callee}`"))?;
+        if !generic.is_generic() {
+            return Err(format!("astgen: `{callee}` is not a generic"));
+        }
+        // Mirror the C++ `requalifyType(GenericCall)` side effect: intern the
+        // qualified callee name at lookup time (keeps later StringIdxs aligned).
+        // (Generics with RECURSIVE generic method signatures — Vec.pop ->
+        // Option(T) — are deferred inside instantiate_struct_expr until the full
+        // Pass-1 intern order lands; non-recursive ones instantiate cleanly.)
+        if !generic.module_path.is_empty() {
+            let qcallee = format!("{}.{}", generic.module_path, generic.name);
+            self.string_pool.intern(qcallee.as_bytes());
+        }
+        if args.len() != generic.args.len() {
+            return Err(format!(
+                "astgen: generic `{callee}` expects {} type arg(s), got {}",
+                generic.args.len(),
+                args.len()
+            ));
+        }
+        let mut subst: HashMap<String, TypeIdx> = HashMap::new();
+        for (i, p) in generic.args.iter().enumerate() {
+            subst.insert(p.name.clone(), args[i]);
+        }
+
+        // Walk the body for the `return` (return-T forwarding or return-struct).
+        for &stmt in &generic.body {
+            let n = *self.node_store.get(stmt);
+            if n.tag != AstTag::Return {
+                continue;
+            }
+            let v = *self.node_store.get(NodeIdx::new(n.lhs));
+            let resolved = match v.tag {
+                AstTag::Variable => {
+                    let name = self.str_name(v.lhs);
+                    if let Some(&c) = subst.get(&name) {
+                        c
+                    } else {
+                        let sid = self.string_pool.intern(name.as_bytes());
+                        let as_named = self.type_pool.intern_named(sid);
+                        substitute_type(as_named, &subst, &self.type_pool, &self.string_pool)
+                    }
+                }
+                AstTag::StructExpr => {
+                    // The instance name starts from the generic's OWNER-qualified
+                    // identity (`std/collections.Vec__u8`), not the call spelling,
+                    // so cross-module instantiations carry their defining module.
+                    let qbase = if generic.module_path.is_empty() {
+                        generic.name.clone()
+                    } else {
+                        format!("{}.{}", generic.module_path, generic.name)
+                    };
+                    self.instantiate_struct_expr(
+                        v.lhs,
+                        &qbase,
+                        &args,
+                        &subst,
+                        &generic.module_path,
+                    )?
+                }
+                AstTag::EnumExpr => {
+                    let qbase = if generic.module_path.is_empty() {
+                        generic.name.clone()
+                    } else {
+                        format!("{}.{}", generic.module_path, generic.name)
+                    };
+                    self.instantiate_enum_expr(v.lhs, &qbase, &args, &subst, &generic.module_path)?
+                }
+                _ => {
+                    return Err(format!(
+                        "astgen: generic `{callee}` return shape not yet ported"
+                    ));
+                }
+            };
+            self.generic_resolutions.borrow_mut().insert(key, resolved);
+            return Ok(resolved);
+        }
+        Err(format!("astgen: generic `{callee}` has no `return`"))
+    }
+
+    /// Instantiate a `return struct {...}` anon body for concrete `args`:
+    /// register the monomorphized struct (substituted + requalified fields,
+    /// `set_body`) and clone each method's *signature* under `Inst.method`.
+    fn instantiate_struct_expr(
+        &self,
+        anon_idx: u32,
+        callee: &str,
+        args: &[TypeIdx],
+        subst: &HashMap<String, TypeIdx>,
+        defining_module: &str,
+    ) -> Result<TypeIdx, String> {
+        let anon = self
+            .anon_struct(defining_module, anon_idx)
+            .ok_or_else(|| format!("astgen: missing anon struct for generic `{callee}`"))?;
+
+        let mut inst_name = callee.to_string();
+        for &a in args {
+            inst_name.push_str("__");
+            inst_name.push_str(&generic_arg_spelling(a, &self.type_pool, &self.string_pool));
+        }
+        // Memoize on the instantiated struct name.
+        if self.is_struct_name_registered(&inst_name) {
+            let sid = self.string_pool.intern(inst_name.as_bytes());
+            return Ok(self.type_pool.intern_named(sid));
+        }
+        let sid = self.string_pool.intern(inst_name.as_bytes());
+        let inst_named = self.type_pool.intern_named(sid);
+
+        // bodySubst = params + the anon's synthetic name + `Self` -> the instance.
+        let mut body_subst = subst.clone();
+        body_subst.insert(anon.name.clone(), inst_named);
+        body_subst.insert("Self".to_string(), inst_named);
+
+        // Fields: substitute, then requalify against the DEFINING module.
+        let mut inst_fields: Vec<(String, TypeIdx)> = Vec::with_capacity(anon.fields.len());
+        for (fname, fty) in &anon.fields {
+            let subbed = substitute_type(*fty, &body_subst, &self.type_pool, &self.string_pool);
+            inst_fields.push((fname.clone(), self.requalify_type(subbed, defining_module)));
+        }
+        let named = self.context().named_struct(&inst_name);
+        self.register_struct(inst_name.clone(), named, inst_fields.clone());
+
+        // Fill the LLVM body in the defining module's scope (sibling field types
+        // resolve there). Best-effort: a field that can't lower leaves the body
+        // unset (the struct is still registered for field-index resolution).
+        self.push_body_module(defining_module.to_string());
+        let mut field_llvm = Vec::with_capacity(inst_fields.len());
+        let mut ok = true;
+        for (_, fty) in &inst_fields {
+            match self.get_llvm_type(*fty) {
+                Ok(t) => field_llvm.push(t),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            named.set_body(&field_llvm, false);
+        }
+        self.pop_body_module();
+
+        // Pass-1: clone each method's SIGNATURE under `Inst.method` (substitute +
+        // requalify params/return; a GenericCall sig like `Option(T)` -> the
+        // qualified-and-instantiated `std/option.Option__u8` so the recursive
+        // type is interned here, before any body). Method NAMES are NOT interned
+        // here — they intern lazily at the Pass-2 emit_call site, matching the
+        // oracle (jirDeclarePrototype does not touch the string pool).
+        let mut clones: Vec<FunctionAST> = Vec::with_capacity(anon.methods.len());
+        for m in &anon.methods {
+            let mut clone = m.clone();
+            clone.name = format!("{inst_name}.{}", m.name);
+            clone.module_path = String::new();
+            clone.parent_struct = String::new();
+            for p in &mut clone.args {
+                p.ty = self.instantiate_sig_type(p.ty, &body_subst, defining_module)?;
+            }
+            if !clone.return_type.is_none() {
+                clone.return_type =
+                    self.instantiate_sig_type(clone.return_type, &body_subst, defining_module)?;
+            }
+            let is_drop = m.name == "drop"
+                && m.args.len() == 1
+                && m.args[0].name == "self"
+                && m.args[0].mode == jam_core::param_mode::ParamMode::Mut;
+            if is_drop {
+                self.register_drop_fn(inst_name.clone(), clone.name.clone());
+            }
+            self.register_function_ast(clone.name.clone(), clone.clone());
+            clones.push(clone);
+        }
+
+        // Pass-2: lower each method body (interns call-site method names +
+        // recursive instantiations) via the astgen hook, under the body subst.
+        // The early bindDeclTypes pass DEFERS this (type-only instantiation) so the
+        // method names intern later (the method pre-pass), matching the oracle.
+        if self.defer_method_lowering.get() {
+            let bm = self.current_body_module();
+            self.pending_method_lowering
+                .borrow_mut()
+                .push((clones, body_subst, bm));
+        } else if let Some(lower) = self.method_instantiator() {
+            lower(self, &clones, &body_subst)?;
+        }
+        Ok(inst_named)
+    }
+
+    /// Substitute + requalify a method signature type, and if the result is a
+    /// GenericCall (`Option(T)` -> `Option(u8)`), qualify its callee and
+    /// instantiate it so the nested type is interned at Pass-1 (the C++ ABI
+    /// consultation order).
+    fn instantiate_sig_type(
+        &self,
+        ty: TypeIdx,
+        body_subst: &HashMap<String, TypeIdx>,
+        defining_module: &str,
+    ) -> Result<TypeIdx, String> {
+        let subbed = substitute_type(ty, body_subst, &self.type_pool, &self.string_pool);
+        let rq = self.requalify_type(subbed, defining_module);
+        if self.type_pool.get(rq).kind == TypeKind::GenericCall {
+            let q = self.qualify_generic_callee(rq, defining_module);
+            self.resolve_generic_call_instantiate(q)?;
+            return Ok(q);
+        }
+        Ok(rq)
+    }
+
+    /// Instantiate a `return enum {...}` anon body for concrete `args`: register
+    /// the monomorphized enum with substituted + requalified variant payloads.
+    fn instantiate_enum_expr(
+        &self,
+        anon_idx: u32,
+        callee: &str,
+        args: &[TypeIdx],
+        subst: &HashMap<String, TypeIdx>,
+        defining_module: &str,
+    ) -> Result<TypeIdx, String> {
+        let anon = self
+            .anon_enum(defining_module, anon_idx)
+            .ok_or_else(|| format!("astgen: missing anon enum for generic `{callee}`"))?;
+
+        let mut inst_name = callee.to_string();
+        for &a in args {
+            inst_name.push_str("__");
+            inst_name.push_str(&generic_arg_spelling(a, &self.type_pool, &self.string_pool));
+        }
+        if self.enums.borrow().contains_key(&inst_name) {
+            let sid = self.string_pool.intern(inst_name.as_bytes());
+            return Ok(self.type_pool.intern_named(sid));
+        }
+        let sid = self.string_pool.intern(inst_name.as_bytes());
+        let inst_named = self.type_pool.intern_named(sid);
+
+        let mut body_subst = subst.clone();
+        body_subst.insert(anon.name.clone(), inst_named);
+        body_subst.insert("Self".to_string(), inst_named);
+
+        let mut variants: Vec<EnumVariantInfo> = Vec::with_capacity(anon.variants.len());
+        for v in &anon.variants {
+            let mut payload_types: Vec<TypeIdx> = Vec::with_capacity(v.payload_types.len());
+            for &ty in &v.payload_types {
+                let subbed = substitute_type(ty, &body_subst, &self.type_pool, &self.string_pool);
+                payload_types.push(self.requalify_type(subbed, defining_module));
+            }
+            variants.push(EnumVariantInfo {
+                name: v.name.clone(),
+                payload_types,
+                discriminant: v.discriminant,
+            });
+        }
+        // Payload layout (max over variants; each payload field aligned), the
+        // analyzer's `fillEnumBodies` equivalent for an instantiated enum.
+        let has_payload = variants.iter().any(|v| !v.payload_types.is_empty());
+        let (mut max_size, mut max_align) = (0u64, 1u64);
+        if has_payload {
+            for v in &variants {
+                let (mut off, mut var_align) = (0u64, 1u64);
+                for &t in &v.payload_types {
+                    let s = self.type_size(t)?;
+                    let a = self.type_align(t)?;
+                    off = off.div_ceil(a) * a + s;
+                    var_align = var_align.max(a);
+                }
+                if var_align > 1 {
+                    off = off.div_ceil(var_align) * var_align;
+                }
+                max_size = max_size.max(off);
+                max_align = max_align.max(var_align);
+            }
+        }
+        self.register_enum(inst_name.clone(), variants);
+        if has_payload {
+            let named = self.context().named_struct(&inst_name);
+            // Fill the LLVM struct body `{i8 tag, alignDriver, [extra x i8]}` so the
+            // instantiated enum is not left `opaque` in --emit-ir — the analyzer's
+            // enum-body layout (analyzer.rs:423-446) for an instantiated enum.
+            let (align_driver, driver_size) = match max_align {
+                1 => (self.context().i8_type(), 1u64),
+                2 => (self.context().i16_type(), 2),
+                4 => (self.context().i32_type(), 4),
+                8 => (self.context().i64_type(), 8),
+                _ => {
+                    return Err(format!(
+                        "enum `{inst_name}` requires alignment > 8, which is not yet supported"
+                    ));
+                }
+            };
+            let padded = max_size.div_ceil(max_align) * max_align;
+            let extra = padded.saturating_sub(driver_size);
+            let i8 = self.context().i8_type();
+            let mut body = vec![i8, align_driver];
+            if extra > 0 {
+                body.push(i8.array_type(extra));
+            }
+            named.set_body(&body, false);
+            self.set_enum_llvm_type(&inst_name, named, max_size, max_align, true);
+        }
+        Ok(inst_named)
+    }
+
+    /// A clone of `module_path`'s anonymous enum at `idx`, if registered.
+    fn anon_enum(&self, module_path: &str, idx: u32) -> Option<EnumDeclAST> {
+        self.anon_enums
+            .borrow()
+            .get(module_path)
+            .and_then(|v| v.get(idx as usize).cloned())
+    }
+
