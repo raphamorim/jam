@@ -859,3 +859,119 @@ fn emit_inst_impl<'ctx>(
     }
 }
 
+fn icmp<'ctx>(
+    lctx: &mut JirCodegenCtx<'_, 'ctx>,
+    inst: &JirInst,
+    pred: IntPredicate,
+    name: &str,
+) -> Result<Option<Value<'ctx>>, String> {
+    let (a, b) = binop_operands(lctx, inst)?;
+    Ok(Some(lctx.ctx.builder().icmp(pred, a, b, name)))
+}
+
+fn fcmp<'ctx>(
+    lctx: &mut JirCodegenCtx<'_, 'ctx>,
+    inst: &JirInst,
+    pred: RealPredicate,
+    name: &str,
+) -> Result<Option<Value<'ctx>>, String> {
+    let (a, b) = binop_operands(lctx, inst)?;
+    Ok(Some(lctx.ctx.builder().fcmp(pred, a, b, name)))
+}
+
+fn cast<'ctx, F>(
+    lctx: &mut JirCodegenCtx<'_, 'ctx>,
+    inst: &JirInst,
+    what: &str,
+    build: F,
+) -> Result<Option<Value<'ctx>>, String>
+where
+    F: FnOnce(&jam_llvm::Builder<'ctx>, Value<'ctx>, jam_llvm::Type<'ctx>) -> Value<'ctx>,
+{
+    let v = emit_inst(lctx, inst.a)?.ok_or_else(|| format!("{what} operand"))?;
+    let ty = lctx.ctx.get_llvm_type(inst.ty)?;
+    Ok(Some(build(lctx.ctx.builder(), v, ty)))
+}
+
+fn emit_switch<'ctx>(
+    lctx: &mut JirCodegenCtx<'_, 'ctx>,
+    inst: &JirInst,
+) -> Result<Option<Value<'ctx>>, String> {
+    let scrut = emit_inst(lctx, inst.a)?.ok_or("Switch scrut")?;
+    let scrut_ty = lctx.jfn.get_inst(inst.a).ty;
+    let scrut_llvm = lctx.ctx.get_llvm_type(scrut_ty)?;
+    let extra = inst.b;
+    let default_b = lctx.jfn.get_extra(extra);
+    let case_count = lctx.jfn.get_extra(extra + 1);
+    let default_bb = *lctx
+        .block_map
+        .get(&default_b)
+        .ok_or("Switch default block")?;
+
+    let read_case = |i: u32| -> Result<(Value<'ctx>, BasicBlock<'ctx>), String> {
+        let base = extra + 2 + i * 4;
+        let lo = lctx.jfn.get_extra(base) as u64;
+        let hi = lctx.jfn.get_extra(base + 1) as u64;
+        let signed = lctx.jfn.get_extra(base + 2) != 0;
+        let case_b = lctx.jfn.get_extra(base + 3);
+        let bits = lo | (hi << 32);
+        let case_val = scrut_llvm.const_int(bits, signed);
+        let case_bb = *lctx.block_map.get(&case_b).ok_or("Switch case block")?;
+        Ok((case_val, case_bb))
+    };
+
+    // 1 case + default collapses to icmp + cond_br.
+    if case_count == 1 {
+        let (case_val, case_bb) = read_case(0)?;
+        let cmp = lctx
+            .ctx
+            .builder()
+            .icmp(IntPredicate::Eq, scrut, case_val, "match.eq");
+        lctx.ctx.builder().cond_br(cmp, case_bb, default_bb);
+        return Ok(None);
+    }
+    let sw = lctx.ctx.builder().switch(scrut, default_bb, case_count);
+    for i in 0..case_count {
+        let (case_val, case_bb) = read_case(i)?;
+        sw.add_case(case_val, case_bb);
+    }
+    Ok(None)
+}
+
+fn emit_ret<'ctx>(
+    lctx: &mut JirCodegenCtx<'_, 'ctx>,
+    inst: &JirInst,
+) -> Result<Option<Value<'ctx>>, String> {
+    if jir_return_is_sret(lctx.jfn, lctx.ctx) {
+        let f = lctx
+            .ctx
+            .module()
+            .get_function(&lctx.jfn.name)
+            .ok_or("Ret: function missing")?;
+        let sret_slot = f.param(0);
+        if inst.a != NO_JIR_REF {
+            let vty = lctx.jfn.get_inst(inst.a).ty;
+            if is_by_ref(vty, lctx.ctx) {
+                let src = emit_inst(lctx, inst.a)?.ok_or("Ret src")?;
+                let size = lctx.ctx.type_size(vty)?;
+                let align = lctx.ctx.type_align(vty)?;
+                lctx.ctx
+                    .builder()
+                    .memcpy(sret_slot, align, src, align, size);
+            } else {
+                let v = emit_inst(lctx, inst.a)?.ok_or("Ret value")?;
+                lctx.ctx.builder().store(v, sret_slot);
+            }
+        }
+        lctx.ctx.builder().ret_void();
+        return Ok(None);
+    }
+    if inst.a == NO_JIR_REF {
+        lctx.ctx.builder().ret_void();
+    } else {
+        let v = emit_inst(lctx, inst.a)?.ok_or("Ret value")?;
+        lctx.ctx.builder().ret(v);
+    }
+    Ok(None)
+}
+
