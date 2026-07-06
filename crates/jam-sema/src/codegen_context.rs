@@ -1691,3 +1691,109 @@ impl<'ctx> CodegenContext<'ctx> {
     // for non-generic, non-aliased types (the common case) they are never the
     // deciding path.
 
+    /// Resolve a `GenericCall` TypeIdx to its instantiated concrete TypeIdx.
+    /// DEFERRED — returns `NONE`.
+    pub fn resolve_generic_call(&self, ty: TypeIdx) -> TypeIdx {
+        let cached = self.lookup_generic_resolution(ty);
+        if !cached.is_none() {
+            return cached;
+        }
+        // ON-DEMAND INSTANTIATION (the C++ `const resolveGenericCall`): the pools +
+        // registries are interior-mutable, so a `&self` layout query instantiates
+        // an uninstantiated GenericCall on the spot.
+        self.resolve_generic_call_instantiate(ty)
+            .unwrap_or(TypeIdx::NONE)
+    }
+    /// Register a type alias (`const Foo = Bar` / destructuring import name).
+    pub fn register_type_alias(&self, name: impl Into<String>, target: TypeIdx) {
+        self.type_aliases.borrow_mut().insert(name.into(), target);
+    }
+    /// Register an import handle (`const lib = import("m")`) -> module identity.
+    pub fn register_import_handle(&self, name: impl Into<String>, module: impl Into<String>) {
+        self.import_handles
+            .borrow_mut()
+            .insert(name.into(), module.into());
+    }
+    /// The module identity an import-handle name resolves to, if any.
+    pub fn import_handle_module(&self, name: &str) -> Option<String> {
+        self.import_handles.borrow().get(name).cloned()
+    }
+    /// Format a qualified-name lookup miss the way the C++
+    /// `JamCodegenContext::formatNamespaceLookupError` does (codegen.cpp:819).
+    /// `qualified` is the dotted spelling that failed to resolve (`fmt.println`),
+    /// `kind` is what we were looking for (`function`, `user-defined type`, ...).
+    /// Splits at the FIRST dot: the leading segment is an import handle; if it
+    /// resolves to a module, the trailing segment didn't exist there. The C++
+    /// also distinguishes a PRIVATE trailing symbol ("is not exported"), but the
+    /// Rust import-handle table carries only `handle -> modulePath` (no private-
+    /// name set), and no corpus path exercises that branch, so it is omitted.
+    pub fn format_namespace_lookup_error(&self, kind: &str, qualified: &str) -> String {
+        let Some(dot_pos) = qualified.find('.') else {
+            return format!("Unknown {kind}: {qualified}");
+        };
+        let handle = &qualified[..dot_pos];
+        let bare = &qualified[dot_pos + 1..];
+        match self.import_handle_module(handle) {
+            None => format!("unknown module handle `{handle}` in `{qualified}`"),
+            Some(module_path) => {
+                format!("symbol `{bare}` does not exist in module `{module_path}`")
+            }
+        }
+    }
+    /// Register a loaded module's public namespace (keyed by its identity).
+    pub fn register_module_namespace(&self, module: impl Into<String>, ns: ModuleNamespace) {
+        self.module_namespaces
+            .borrow_mut()
+            .insert(module.into(), ns);
+    }
+
+    /// Walk a 3+-segment dotted access (`w.leaf.Point`): the first segment is an
+    /// import handle, each intermediate segment a pub re-export module alias.
+    /// Returns `(leaf module identity, last segment)`. The C++ `walkChain`.
+    fn walk_chain(&self, dotted: &str) -> Option<(String, String)> {
+        let segs: Vec<&str> = dotted.split('.').collect();
+        if segs.len() < 3 {
+            return None;
+        }
+        let mut cur = self.import_handle_module(segs[0])?;
+        for seg in &segs[1..segs.len() - 1] {
+            let next = self
+                .module_namespaces
+                .borrow()
+                .get(&cur)
+                .and_then(|ns| ns.module_aliases.get(*seg).cloned())?;
+            cur = next;
+        }
+        Some((cur, segs[segs.len() - 1].to_string()))
+    }
+
+    /// Resolve a chained TYPE access (`w.leaf.Point`) to the leaf module's
+    /// canonical `Named` TypeIdx, or NONE. The C++ `resolveChainedType`.
+    pub fn resolve_chained_type(&self, dotted: &str) -> TypeIdx {
+        let Some((leaf, last)) = self.walk_chain(dotted) else {
+            return TypeIdx::NONE;
+        };
+        self.module_namespaces
+            .borrow()
+            .get(&leaf)
+            .and_then(|ns| ns.types.get(&last).copied())
+            .unwrap_or(TypeIdx::NONE)
+    }
+
+    /// Resolve a chained FUNCTION access (`w.leaf.makePoint`) to the leaf
+    /// module's function. The C++ `resolveChainedFunction`.
+    pub fn resolve_chained_function(&self, dotted: &str) -> Option<FunctionAST> {
+        let (leaf, last) = self.walk_chain(dotted)?;
+        self.get_function_ast(&format!("{leaf}.{last}"))
+    }
+    /// Resolve a type-alias name to its target TypeIdx, or `NONE`.
+    pub fn lookup_type_alias(&self, name: &str) -> TypeIdx {
+        self.type_aliases
+            .borrow()
+            .get(name)
+            .copied()
+            .unwrap_or(TypeIdx::NONE)
+    }
+
+    // ---- type lowering ----
+
