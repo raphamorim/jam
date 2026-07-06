@@ -975,3 +975,102 @@ fn emit_ret<'ctx>(
     Ok(None)
 }
 
+/// Mark blocks reachable from entry (block 1) by walking terminator successors.
+/// Unreachable blocks (orphaned by constant-folded branches) are skipped in
+/// codegen — frontend DCE that keeps their instructions (incl. extern calls)
+/// out of the LLVM module.
+fn compute_reachable_blocks(jfn: &JirFunction) -> Vec<bool> {
+    let mut reachable = vec![false; jfn.blocks.len()];
+    if jfn.blocks.len() <= 1 {
+        return reachable;
+    }
+    reachable[1] = true;
+    let mut stack = vec![1u32];
+    while let Some(b) = stack.pop() {
+        let blk = jfn.get_block(b);
+        if blk.insts.is_empty() {
+            continue;
+        }
+        let last = *jfn.get_inst(*blk.insts.last().unwrap());
+        let mut visit = |t: u32| {
+            if t >= 1 && (t as usize) < jfn.blocks.len() && !reachable[t as usize] {
+                reachable[t as usize] = true;
+                stack.push(t);
+            }
+        };
+        match last.tag {
+            JirTag::Br => visit(last.a),
+            JirTag::CondBr => {
+                let ex = last.b;
+                if ex as usize + 2 <= jfn.extra.len() {
+                    visit(jfn.get_extra(ex));
+                    visit(jfn.get_extra(ex + 1));
+                }
+            }
+            JirTag::Switch => {
+                let ex = last.b;
+                if ex as usize + 2 <= jfn.extra.len() {
+                    visit(jfn.get_extra(ex)); // default
+                    let case_count = jfn.get_extra(ex + 1);
+                    for i in 0..case_count {
+                        let slot = ex + 2 + i * 4 + 3;
+                        if (slot as usize) < jfn.extra.len() {
+                            visit(jfn.get_extra(slot));
+                        }
+                    }
+                }
+            }
+            _ => {} // Ret / Unreachable: no successors
+        }
+    }
+    reachable
+}
+
+/// Lower a function body to LLVM IR. The prototype must already exist
+/// ([`jir_declare_prototype`]). `extern` functions have no body.
+pub fn jir_define_body<'ctx>(jfn: &JirFunction, ctx: &CodegenContext<'ctx>) -> Result<(), String> {
+    if jfn.is_extern {
+        return Ok(());
+    }
+    let f = ctx
+        .module()
+        .get_function(&jfn.name)
+        .ok_or_else(|| format!("jir_define_body: prototype missing for `{}`", jfn.name))?;
+
+    let mut lctx = JirCodegenCtx {
+        jfn,
+        ctx,
+        value_map: HashMap::new(),
+        block_map: HashMap::new(),
+    };
+
+    let reachable = compute_reachable_blocks(jfn);
+
+    // Create LLVM blocks first so terminators resolve forward references; skip
+    // the sentinel (0) and dead blocks.
+    for (b, &live) in reachable.iter().enumerate().skip(1) {
+        if !live {
+            continue;
+        }
+        let bb = f.append_basic_block(&jfn.get_block(b as JirBlockRef).name);
+        lctx.block_map.insert(b as JirBlockRef, bb);
+    }
+
+    // Emit instructions block-by-block.
+    for (b, &live) in reachable.iter().enumerate().skip(1) {
+        if !live {
+            continue;
+        }
+        let bb = lctx.block_map[&(b as JirBlockRef)];
+        ctx.builder().position_at_end(bb);
+        let insts = jfn.get_block(b as JirBlockRef).insts.clone();
+        for r in insts {
+            let v = emit_inst(&mut lctx, r)?;
+            if let Some(val) = v {
+                lctx.value_map.insert(r, val);
+            }
+        }
+    }
+    Ok(())
+}
+
