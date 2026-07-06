@@ -1484,3 +1484,210 @@ impl<'ctx> CodegenContext<'ctx> {
         }
     }
 
+    // ---- struct registry ----
+    pub fn register_struct(
+        &self,
+        name: impl Into<String>,
+        ty: Type<'ctx>,
+        fields: Vec<(String, TypeIdx)>,
+    ) {
+        let name = name.into();
+        self.structs
+            .borrow_mut()
+            .insert(name.clone(), StructInfo { name, ty, fields });
+    }
+    /// LLVM type of the struct a `Struct`/`Named` TypeIdx resolves to.
+    pub fn struct_llvm_type(&self, ty: TypeIdx) -> Option<Type<'ctx>> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Struct, TypeKind::Named])?;
+        self.structs.borrow().get(&name).map(|s| s.ty)
+    }
+    /// (name, type) fields of the struct a TypeIdx resolves to.
+    pub fn struct_fields(&self, ty: TypeIdx) -> Option<Vec<(String, TypeIdx)>> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Struct, TypeKind::Named])?;
+        self.structs.borrow().get(&name).map(|s| s.fields.clone())
+    }
+    /// Is the struct a `Struct`/`Named` TypeIdx names registered?
+    pub fn is_struct_registered(&self, ty: TypeIdx) -> bool {
+        self.name_for_kinds(ty, &[TypeKind::Struct, TypeKind::Named])
+            .is_some_and(|n| self.structs.borrow().contains_key(&n))
+    }
+    /// Index of `field_name` within `struct_name`, or -1 if absent.
+    pub fn field_index(&self, struct_name: &str, field_name: &str) -> i32 {
+        match self.structs.borrow().get(struct_name) {
+            Some(s) => s
+                .fields
+                .iter()
+                .position(|(n, _)| n == field_name)
+                .map(|i| i as i32)
+                .unwrap_or(-1),
+            None => -1,
+        }
+    }
+
+    // ---- union registry ----
+    pub fn register_union(
+        &self,
+        name: impl Into<String>,
+        ty: Type<'ctx>,
+        fields: Vec<(String, TypeIdx)>,
+    ) {
+        let name = name.into();
+        self.unions
+            .borrow_mut()
+            .insert(name.clone(), UnionInfo { name, ty, fields });
+    }
+    pub fn union_llvm_type(&self, ty: TypeIdx) -> Option<Type<'ctx>> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Union, TypeKind::Named])?;
+        self.unions.borrow().get(&name).map(|u| u.ty)
+    }
+    pub fn union_fields(&self, ty: TypeIdx) -> Option<Vec<(String, TypeIdx)>> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Union, TypeKind::Named])?;
+        self.unions.borrow().get(&name).map(|u| u.fields.clone())
+    }
+    pub fn is_union_registered(&self, ty: TypeIdx) -> bool {
+        self.name_for_kinds(ty, &[TypeKind::Union, TypeKind::Named])
+            .is_some_and(|n| self.unions.borrow().contains_key(&n))
+    }
+    pub fn union_field_type(&self, union_name: &str, field_name: &str) -> TypeIdx {
+        match self.unions.borrow().get(union_name) {
+            Some(u) => u
+                .fields
+                .iter()
+                .find(|(n, _)| n == field_name)
+                .map(|(_, t)| *t)
+                .unwrap_or(TypeIdx::NONE),
+            None => TypeIdx::NONE,
+        }
+    }
+
+    // ---- enum registry ----
+    pub fn register_enum(&self, name: impl Into<String>, variants: Vec<EnumVariantInfo>) {
+        let name = name.into();
+        // An enum is payloaded if any variant carries payload types; this gates
+        // the by-ref classification and the LLVM-body fill (analyzer). The
+        // analyzer recomputes the layout but reads this flag to decide whether
+        // a body is needed at all.
+        let has_payload_variant = variants.iter().any(|v| !v.payload_types.is_empty());
+        self.enums.borrow_mut().insert(
+            name.clone(),
+            EnumInfo {
+                name,
+                ty: None,
+                variants,
+                has_payload_variant,
+                max_payload_size: 0,
+                max_payload_align: 1,
+            },
+        );
+    }
+    /// Fill an enum's lowered LLVM type + payload layout (the analyzer computes
+    /// these once the field types are known).
+    pub fn set_enum_llvm_type(
+        &self,
+        name: &str,
+        llvm_type: Type<'ctx>,
+        max_payload_size: u64,
+        max_payload_align: u64,
+        has_payload_variant: bool,
+    ) {
+        if let Some(e) = self.enums.borrow_mut().get_mut(name) {
+            e.ty = Some(llvm_type);
+            e.max_payload_size = max_payload_size;
+            e.max_payload_align = max_payload_align;
+            e.has_payload_variant = has_payload_variant;
+        }
+    }
+    /// Whether the enum a `Enum`/`Named` TypeIdx names carries any payload
+    /// variant (`None` if the enum isn't registered).
+    pub fn enum_has_payload(&self, ty: TypeIdx) -> Option<bool> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Enum, TypeKind::Named])?;
+        self.enums
+            .borrow()
+            .get(&name)
+            .map(|e| e.has_payload_variant)
+    }
+    /// The enum's lowered LLVM type (only set for payloaded enums, post-fill).
+    pub fn enum_llvm_type(&self, ty: TypeIdx) -> Option<Type<'ctx>> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Enum, TypeKind::Named])?;
+        self.enums.borrow().get(&name).and_then(|e| e.ty)
+    }
+    /// `(max_payload_size, max_payload_align)` for the enum, or `None`.
+    pub fn enum_payload_layout(&self, ty: TypeIdx) -> Option<(u64, u64)> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Enum, TypeKind::Named])?;
+        self.enums
+            .borrow()
+            .get(&name)
+            .map(|e| (e.max_payload_size, e.max_payload_align))
+    }
+    /// The registered enum name a `Enum`/`Named` TypeIdx resolves to, or `None`
+    /// when it isn't a registered enum. (The `lookupEnum(ty)->name` of the C++.)
+    pub fn enum_name_of(&self, ty: TypeIdx) -> Option<String> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Enum, TypeKind::Named])?;
+        if self.enums.borrow().contains_key(&name) {
+            Some(name)
+        } else {
+            None
+        }
+    }
+    /// The registered struct name a `Struct`/`Named`/instantiated-`GenericCall`
+    /// TypeIdx resolves to, or `None` (the `lookupStruct(ty)->name` of the C++).
+    pub fn struct_name_of(&self, ty: TypeIdx) -> Option<String> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Struct, TypeKind::Named])?;
+        if self.structs.borrow().contains_key(&name) {
+            Some(name)
+        } else {
+            None
+        }
+    }
+    /// Index of `variant_name` within `enum_name`, or -1.
+    pub fn enum_variant_index(&self, enum_name: &str, variant_name: &str) -> i32 {
+        match self.enums.borrow().get(enum_name) {
+            Some(e) => e
+                .variants
+                .iter()
+                .position(|v| v.name == variant_name)
+                .map(|i| i as i32)
+                .unwrap_or(-1),
+            None => -1,
+        }
+    }
+
+    // ---- by-name registry accessors (for the analyzer's body fill) ----
+    pub fn struct_named_type(&self, name: &str) -> Option<Type<'ctx>> {
+        self.structs.borrow().get(name).map(|s| s.ty)
+    }
+    pub fn is_struct_name_registered(&self, name: &str) -> bool {
+        self.structs.borrow().contains_key(name)
+    }
+    pub fn union_named_type(&self, name: &str) -> Option<Type<'ctx>> {
+        self.unions.borrow().get(name).map(|u| u.ty)
+    }
+    pub fn union_fields_by_name(&self, name: &str) -> Option<Vec<(String, TypeIdx)>> {
+        self.unions.borrow().get(name).map(|u| u.fields.clone())
+    }
+    pub fn is_union_name_registered(&self, name: &str) -> bool {
+        self.unions.borrow().contains_key(name)
+    }
+    pub fn enum_named_type(&self, name: &str) -> Option<Type<'ctx>> {
+        self.enums.borrow().get(name).and_then(|e| e.ty)
+    }
+    pub fn enum_variants_by_name(&self, name: &str) -> Option<Vec<EnumVariantInfo>> {
+        self.enums.borrow().get(name).map(|e| e.variants.clone())
+    }
+    pub fn enum_has_payload_by_name(&self, name: &str) -> Option<bool> {
+        self.enums.borrow().get(name).map(|e| e.has_payload_variant)
+    }
+    pub fn is_enum_name_registered(&self, name: &str) -> bool {
+        self.enums.borrow().contains_key(name)
+    }
+
+    fn str_name(&self, id: u32) -> String {
+        String::from_utf8_lossy(&self.string_pool.get(StringIdx::new(id))).into_owned()
+    }
+
+    // ---- deferred resolution hooks ----
+    // These return `NONE` until the analyzer + substitution engine land. They
+    // exist now so `abi`'s classifiers can be ported against a stable surface;
+    // for non-generic, non-aliased types (the common case) they are never the
+    // deciding path.
+
