@@ -171,3 +171,691 @@ struct JirCodegenCtx<'a, 'ctx> {
     block_map: HashMap<JirBlockRef, BasicBlock<'ctx>>,
 }
 
+/// Look up the cached LLVM value for `r`, or emit it (recursing for
+/// subexpressions) and cache. The CACHE-BEFORE-RETURN here is load-bearing: a
+/// JirRef referenced across out-of-order block walks must lower to exactly one
+/// LLVM value, or reads split from writes (see project_jir_codegen_caching).
+fn emit_inst<'ctx>(
+    lctx: &mut JirCodegenCtx<'_, 'ctx>,
+    r: JirRef,
+) -> Result<Option<Value<'ctx>>, String> {
+    if r == NO_JIR_REF {
+        return Ok(None);
+    }
+    if let Some(&v) = lctx.value_map.get(&r) {
+        return Ok(Some(v));
+    }
+    let v = emit_inst_impl(lctx, r)?;
+    if let Some(val) = v {
+        lctx.value_map.insert(r, val);
+    }
+    Ok(v)
+}
+
+/// Emit both operands of a binary instruction (each must produce a value).
+fn binop_operands<'ctx>(
+    lctx: &mut JirCodegenCtx<'_, 'ctx>,
+    inst: &JirInst,
+) -> Result<(Value<'ctx>, Value<'ctx>), String> {
+    let a = emit_inst(lctx, inst.a)?.ok_or("binop lhs produced no value")?;
+    let b = emit_inst(lctx, inst.b)?.ok_or("binop rhs produced no value")?;
+    Ok((a, b))
+}
+
+fn emit_inst_impl<'ctx>(
+    lctx: &mut JirCodegenCtx<'_, 'ctx>,
+    r: JirRef,
+) -> Result<Option<Value<'ctx>>, String> {
+    let inst = *lctx.jfn.get_inst(r);
+    match inst.tag {
+        JirTag::Poison => {
+            let ty = if inst.ty.is_none() {
+                lctx.ctx.context().void_type()
+            } else {
+                lctx.ctx.get_llvm_type(inst.ty)?
+            };
+            Ok(Some(ty.undef()))
+        }
+        JirTag::Int => {
+            let val = (inst.a as u64) | ((inst.b as u64) << 32);
+            let is_neg = inst.flags & 1 != 0;
+            let ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            let materialized = if is_neg {
+                (val as i64).wrapping_neg() as u64
+            } else {
+                val
+            };
+            Ok(Some(ty.const_int(materialized, is_neg)))
+        }
+        JirTag::Float => {
+            let bits = (inst.a as u64) | ((inst.b as u64) << 32);
+            let mut d = f64::from_bits(bits);
+            if inst.flags & 1 != 0 {
+                d = -d;
+            }
+            Ok(Some(lctx.ctx.get_llvm_type(inst.ty)?.const_real(d)))
+        }
+        JirTag::Bool => Ok(Some(
+            lctx.ctx
+                .context()
+                .i1_type()
+                .const_int(if inst.a != 0 { 1 } else { 0 }, false),
+        )),
+
+        // Integer arithmetic.
+        JirTag::Add => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().add(a, b, "add")))
+        }
+        JirTag::Sub => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().sub(a, b, "sub")))
+        }
+        JirTag::Mul => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().mul(a, b, "mul")))
+        }
+        JirTag::SDiv => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().sdiv(a, b, "sdiv")))
+        }
+        JirTag::UDiv => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().udiv(a, b, "udiv")))
+        }
+        JirTag::SRem => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().srem(a, b, "srem")))
+        }
+        JirTag::URem => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().urem(a, b, "urem")))
+        }
+
+        // Float arithmetic.
+        JirTag::FAdd => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().fadd(a, b, "fadd")))
+        }
+        JirTag::FSub => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().fsub(a, b, "fsub")))
+        }
+        JirTag::FMul => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().fmul(a, b, "fmul")))
+        }
+        JirTag::FDiv => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().fdiv(a, b, "fdiv")))
+        }
+        JirTag::FRem => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().frem(a, b, "frem")))
+        }
+        JirTag::FNeg => {
+            let a = emit_inst(lctx, inst.a)?.ok_or("FNeg operand")?;
+            Ok(Some(lctx.ctx.builder().fneg(a, "fneg")))
+        }
+
+        // Integer comparison.
+        JirTag::ICmpEq => icmp(lctx, &inst, IntPredicate::Eq, "eq"),
+        JirTag::ICmpNe => icmp(lctx, &inst, IntPredicate::Ne, "ne"),
+        JirTag::ICmpSlt => icmp(lctx, &inst, IntPredicate::Slt, "slt"),
+        JirTag::ICmpSle => icmp(lctx, &inst, IntPredicate::Sle, "sle"),
+        JirTag::ICmpSgt => icmp(lctx, &inst, IntPredicate::Sgt, "sgt"),
+        JirTag::ICmpSge => icmp(lctx, &inst, IntPredicate::Sge, "sge"),
+        JirTag::ICmpUlt => icmp(lctx, &inst, IntPredicate::Ult, "ult"),
+        JirTag::ICmpUle => icmp(lctx, &inst, IntPredicate::Ule, "ule"),
+        JirTag::ICmpUgt => icmp(lctx, &inst, IntPredicate::Ugt, "ugt"),
+        JirTag::ICmpUge => icmp(lctx, &inst, IntPredicate::Uge, "uge"),
+
+        // Float comparison (ordered; `FCmpOne` maps to LLVM `une`, matching C++).
+        JirTag::FCmpOeq => fcmp(lctx, &inst, RealPredicate::Oeq, "oeq"),
+        JirTag::FCmpOne => fcmp(lctx, &inst, RealPredicate::Une, "one"),
+        JirTag::FCmpOlt => fcmp(lctx, &inst, RealPredicate::Olt, "olt"),
+        JirTag::FCmpOle => fcmp(lctx, &inst, RealPredicate::Ole, "ole"),
+        JirTag::FCmpOgt => fcmp(lctx, &inst, RealPredicate::Ogt, "ogt"),
+        JirTag::FCmpOge => fcmp(lctx, &inst, RealPredicate::Oge, "oge"),
+
+        // Bitwise / shift.
+        JirTag::BitAnd => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().and(a, b, "and")))
+        }
+        JirTag::BitOr => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().or(a, b, "or")))
+        }
+        JirTag::BitXor => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().xor(a, b, "xor")))
+        }
+        JirTag::Shl => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().shl(a, b, "shl")))
+        }
+        JirTag::AShr => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().ashr(a, b, "ashr")))
+        }
+        JirTag::LShr => {
+            let (a, b) = binop_operands(lctx, &inst)?;
+            Ok(Some(lctx.ctx.builder().lshr(a, b, "lshr")))
+        }
+        JirTag::BitNot => {
+            // LLVM has no NOT; xor with all-ones of the operand's type (the C++
+            // shape, named "not").
+            let v = emit_inst(lctx, inst.a)?.ok_or("BitNot operand")?;
+            let ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            let ones = ty.const_int(!0u64, true);
+            Ok(Some(lctx.ctx.builder().xor(v, ones, "not")))
+        }
+        JirTag::LogNot => {
+            // Boolean inversion: xor with i1 1 (operand is already i1).
+            let v = emit_inst(lctx, inst.a)?.ok_or("LogNot operand")?;
+            let one = lctx.ctx.context().i1_type().const_int(1, false);
+            Ok(Some(lctx.ctx.builder().xor(v, one, "lnot")))
+        }
+
+        // Type conversions.
+        JirTag::ZExt => cast(lctx, &inst, "zext", |b, v, t| b.zext(v, t, "zext")),
+        JirTag::SExt => cast(lctx, &inst, "sext", |b, v, t| b.sext(v, t, "sext")),
+        JirTag::Trunc => cast(lctx, &inst, "trunc", |b, v, t| b.trunc(v, t, "trunc")),
+        JirTag::SIToFP => cast(lctx, &inst, "si2fp", |b, v, t| b.si_to_fp(v, t, "si2fp")),
+        JirTag::UIToFP => cast(lctx, &inst, "ui2fp", |b, v, t| b.ui_to_fp(v, t, "ui2fp")),
+        JirTag::FPToSI => cast(lctx, &inst, "fp2si", |b, v, t| b.fp_to_si(v, t, "fp2si")),
+        JirTag::FPToUI => cast(lctx, &inst, "fp2ui", |b, v, t| b.fp_to_ui(v, t, "fp2ui")),
+        JirTag::FPExt | JirTag::FPTrunc => {
+            cast(lctx, &inst, "fpcast", |b, v, t| b.fp_cast(v, t, "fpcast"))
+        }
+        JirTag::BitCast => cast(lctx, &inst, "bitcast", |b, v, t| b.bitcast(v, t, "bitcast")),
+        JirTag::PtrToInt => cast(lctx, &inst, "p2i", |b, v, t| b.ptr_to_int(v, t, "p2i")),
+        JirTag::IntToPtr => cast(lctx, &inst, "i2p", |b, v, t| b.int_to_ptr(v, t, "i2p")),
+
+        // Control flow.
+        JirTag::Br => {
+            let bb = *lctx
+                .block_map
+                .get(&inst.a)
+                .ok_or("Br: missing target block")?;
+            lctx.ctx.builder().br(bb);
+            Ok(None)
+        }
+        JirTag::CondBr => {
+            let cond = emit_inst(lctx, inst.a)?.ok_or("CondBr cond")?;
+            let then_b = lctx.jfn.get_extra(inst.b);
+            let else_b = lctx.jfn.get_extra(inst.b + 1);
+            let then_bb = *lctx.block_map.get(&then_b).ok_or("CondBr then block")?;
+            let else_bb = *lctx.block_map.get(&else_b).ok_or("CondBr else block")?;
+            lctx.ctx.builder().cond_br(cond, then_bb, else_bb);
+            Ok(None)
+        }
+        JirTag::Switch => emit_switch(lctx, &inst),
+        JirTag::Ret => emit_ret(lctx, &inst),
+        JirTag::Unreachable => {
+            lctx.ctx.builder().unreachable();
+            Ok(None)
+        }
+
+        // ---- function parameters ----
+        JirTag::Param => {
+            // When the function uses sret, source param `i` is LLVM arg `i+1`.
+            let f = lctx
+                .ctx
+                .module()
+                .get_function(&lctx.jfn.name)
+                .ok_or("Param: fn missing")?;
+            let arg_offset = if jir_return_is_sret(lctx.jfn, lctx.ctx) {
+                1
+            } else {
+                0
+            };
+            Ok(Some(f.param(inst.a + arg_offset)))
+        }
+        JirTag::SretArg => {
+            let f = lctx
+                .ctx
+                .module()
+                .get_function(&lctx.jfn.name)
+                .ok_or("SretArg: fn missing")?;
+            Ok(Some(f.param(0)))
+        }
+
+        // ---- storage ----
+        JirTag::Alloca => {
+            let ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            let align = lctx.ctx.alloca_align(inst.ty)?;
+            Ok(Some(lctx.ctx.builder().alloca(ty, align, &format!("v{r}"))))
+        }
+        JirTag::Load => {
+            let ptr = emit_inst(lctx, inst.a)?.ok_or("Load ptr")?;
+            // Byref aggregate: the value IS the storage pointer (no SSA load).
+            if is_by_ref(inst.ty, lctx.ctx) {
+                return Ok(Some(ptr));
+            }
+            let ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            Ok(Some(lctx.ctx.builder().load(ty, ptr, "load")))
+        }
+        JirTag::Store => {
+            let ptr = emit_inst(lctx, inst.a)?.ok_or("Store ptr")?;
+            let val = emit_inst(lctx, inst.b)?.ok_or("Store val")?;
+            let val_ty = lctx.jfn.get_inst(inst.b).ty;
+            if is_by_ref(val_ty, lctx.ctx) {
+                // `val` is a pointer to a byref aggregate — memcpy, don't store.
+                let size = lctx.ctx.type_size(val_ty)?;
+                let align = lctx.ctx.alloca_align(val_ty)?;
+                lctx.ctx.builder().memcpy(ptr, align, val, align, size);
+            } else {
+                lctx.ctx.builder().store(val, ptr);
+            }
+            Ok(None)
+        }
+        JirTag::AddrOf => emit_inst(lctx, inst.a),
+        JirTag::Deref => {
+            let ptr = emit_inst(lctx, inst.a)?.ok_or("Deref ptr")?;
+            let ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            Ok(Some(lctx.ctx.builder().load(ty, ptr, "deref")))
+        }
+
+        // ---- aggregates ----
+        JirTag::FieldAccess | JirTag::ExtractValue => {
+            let base = emit_inst(lctx, inst.a)?.ok_or("FieldAccess base")?;
+            let base_ty = lctx.jfn.get_inst(inst.a).ty;
+            if is_by_ref(base_ty, lctx.ctx) {
+                let struct_ty = lctx.ctx.get_llvm_type(base_ty)?;
+                let fp = lctx.ctx.builder().struct_gep(struct_ty, base, inst.b, "fa");
+                if is_by_ref(inst.ty, lctx.ctx) {
+                    return Ok(Some(fp));
+                }
+                let field_ty = lctx.ctx.get_llvm_type(inst.ty)?;
+                return Ok(Some(lctx.ctx.builder().load(field_ty, fp, "field")));
+            }
+            Ok(Some(
+                lctx.ctx.builder().extract_value(base, inst.b, "field"),
+            ))
+        }
+        JirTag::StructLit => {
+            let ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            let extra = inst.b;
+            let count = lctx.jfn.get_extra(extra);
+            if is_by_ref(inst.ty, lctx.ctx) {
+                let align = lctx.ctx.type_align(inst.ty)?;
+                let slot = lctx.ctx.builder().alloca(ty, align, "lit");
+                for i in 0..count {
+                    let fr = lctx.jfn.get_extra(extra + 1 + i);
+                    let fv = emit_inst(lctx, fr)?.ok_or("StructLit field")?;
+                    let fp = lctx.ctx.builder().struct_gep(ty, slot, i, "lit.f");
+                    let ft = lctx.jfn.get_inst(fr).ty;
+                    if is_by_ref(ft, lctx.ctx) {
+                        let (fsz, fal) = (lctx.ctx.type_size(ft)?, lctx.ctx.type_align(ft)?);
+                        lctx.ctx.builder().memcpy(fp, fal, fv, fal, fsz);
+                    } else {
+                        lctx.ctx.builder().store(fv, fp);
+                    }
+                }
+                return Ok(Some(slot));
+            }
+            let mut agg = ty.undef();
+            for i in 0..count {
+                let fr = lctx.jfn.get_extra(extra + 1 + i);
+                let fv = emit_inst(lctx, fr)?.ok_or("StructLit field")?;
+                agg = lctx.ctx.builder().insert_value(agg, fv, i, "field");
+            }
+            Ok(Some(agg))
+        }
+        JirTag::ArrayLit => {
+            let ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            let extra = inst.b;
+            let count = lctx.jfn.get_extra(extra);
+            if is_by_ref(inst.ty, lctx.ctx) {
+                let align = lctx.ctx.type_align(inst.ty)?;
+                let slot = lctx.ctx.builder().alloca(ty, align, "alit");
+                let i64ty = lctx.ctx.context().i64_type();
+                for i in 0..count {
+                    let er = lctx.jfn.get_extra(extra + 1 + i);
+                    let ev = emit_inst(lctx, er)?.ok_or("ArrayLit elem")?;
+                    let idx_val = i64ty.const_int(i as u64, false);
+                    let ep = lctx.ctx.builder().array_gep(ty, slot, idx_val, "alit.e");
+                    let et = lctx.jfn.get_inst(er).ty;
+                    if is_by_ref(et, lctx.ctx) {
+                        let (esz, eal) = (lctx.ctx.type_size(et)?, lctx.ctx.type_align(et)?);
+                        lctx.ctx.builder().memcpy(ep, eal, ev, eal, esz);
+                    } else {
+                        lctx.ctx.builder().store(ev, ep);
+                    }
+                }
+                return Ok(Some(slot));
+            }
+            let mut agg = ty.undef();
+            for i in 0..count {
+                let er = lctx.jfn.get_extra(extra + 1 + i);
+                let ev = emit_inst(lctx, er)?.ok_or("ArrayLit elem")?;
+                agg = lctx.ctx.builder().insert_value(agg, ev, i, "elem");
+            }
+            Ok(Some(agg))
+        }
+        JirTag::Index => {
+            let base_ty = lctx.jfn.get_inst(inst.a).ty;
+            let basek = lctx.ctx.type_pool.get(base_ty).kind;
+            let mut idx_val = emit_inst(lctx, inst.b)?.ok_or("Index idx")?;
+            let i64ty = lctx.ctx.context().i64_type();
+            if idx_val.type_of() != i64ty {
+                idx_val = lctx
+                    .ctx
+                    .builder()
+                    .int_cast(idx_val, i64ty, false, "idx.cast");
+            }
+            let elem_llvm = lctx.ctx.get_llvm_type(inst.ty)?;
+            let elem_byref = is_by_ref(inst.ty, lctx.ctx);
+            match basek {
+                TypeKind::Slice => {
+                    let base = emit_inst(lctx, inst.a)?.ok_or("Index base")?;
+                    let ptr = lctx.ctx.builder().extract_value(base, 0, "slice.ptr");
+                    let gep = lctx
+                        .ctx
+                        .builder()
+                        .ptr_gep(elem_llvm, ptr, idx_val, "idx.gep");
+                    if elem_byref {
+                        return Ok(Some(gep));
+                    }
+                    Ok(Some(lctx.ctx.builder().load(elem_llvm, gep, "idx")))
+                }
+                TypeKind::PtrMany => {
+                    let base = emit_inst(lctx, inst.a)?.ok_or("Index base")?;
+                    let gep = lctx
+                        .ctx
+                        .builder()
+                        .ptr_gep(elem_llvm, base, idx_val, "idx.gep");
+                    if elem_byref {
+                        return Ok(Some(gep));
+                    }
+                    Ok(Some(lctx.ctx.builder().load(elem_llvm, gep, "idx")))
+                }
+                _ => {
+                    // Array: byref base is already a pointer; a by-value
+                    // aggregate base must be spilled to a temp alloca first.
+                    let base_llvm = lctx.ctx.get_llvm_type(base_ty)?;
+                    let base = emit_inst(lctx, inst.a)?.ok_or("Index base")?;
+                    let storage = if !is_by_ref(base_ty, lctx.ctx) {
+                        let align = lctx.ctx.type_align(base_ty)?;
+                        let st = lctx.ctx.builder().alloca(base_llvm, align, "arr.tmp");
+                        lctx.ctx.builder().store(base, st);
+                        st
+                    } else {
+                        base
+                    };
+                    let gep = lctx
+                        .ctx
+                        .builder()
+                        .array_gep(base_llvm, storage, idx_val, "idx.gep");
+                    if elem_byref {
+                        return Ok(Some(gep));
+                    }
+                    Ok(Some(lctx.ctx.builder().load(elem_llvm, gep, "idx")))
+                }
+            }
+        }
+        JirTag::FieldAddr => {
+            let base_ptr = emit_inst(lctx, inst.a)?.ok_or("FieldAddr base")?;
+            let base_inst = *lctx.jfn.get_inst(inst.a);
+            let alloca_like = base_inst.tag == JirTag::Alloca
+                || (base_inst.tag == JirTag::Param && base_inst.flags & 1 != 0);
+            let pointee_ty = if alloca_like {
+                base_inst.ty
+            } else {
+                let k = lctx.ctx.type_pool.get(base_inst.ty);
+                if k.kind != TypeKind::PtrSingle && k.kind != TypeKind::PtrMany {
+                    return Err("FieldAddr base must be a pointer".into());
+                }
+                TypeIdx::new(k.a)
+            };
+            let struct_ty = lctx.ctx.get_llvm_type(pointee_ty)?;
+            Ok(Some(
+                lctx.ctx
+                    .builder()
+                    .struct_gep(struct_ty, base_ptr, inst.b, "fieldp"),
+            ))
+        }
+        JirTag::IndexAddr => {
+            let base_ptr = emit_inst(lctx, inst.a)?.ok_or("IndexAddr base")?;
+            let base_inst = *lctx.jfn.get_inst(inst.a);
+            let alloca_like = base_inst.tag == JirTag::Alloca
+                || (base_inst.tag == JirTag::Param && base_inst.flags & 1 != 0);
+            let pointee_ty = if alloca_like {
+                base_inst.ty
+            } else {
+                let k = lctx.ctx.type_pool.get(base_inst.ty);
+                if k.kind == TypeKind::PtrSingle || k.kind == TypeKind::PtrMany {
+                    TypeIdx::new(k.a)
+                } else {
+                    base_inst.ty
+                }
+            };
+            let pk = lctx.ctx.type_pool.get(pointee_ty).kind;
+            let mut idx_val = emit_inst(lctx, inst.b)?.ok_or("IndexAddr idx")?;
+            let i64ty = lctx.ctx.context().i64_type();
+            if idx_val.type_of() != i64ty {
+                idx_val = lctx
+                    .ctx
+                    .builder()
+                    .int_cast(idx_val, i64ty, false, "idx.cast");
+            }
+            let elem_ty = TypeIdx::new(lctx.ctx.type_pool.get(inst.ty).a);
+            let elem_llvm = lctx.ctx.get_llvm_type(elem_ty)?;
+            if pk == TypeKind::Array {
+                let arr_llvm = lctx.ctx.get_llvm_type(pointee_ty)?;
+                return Ok(Some(
+                    lctx.ctx
+                        .builder()
+                        .array_gep(arr_llvm, base_ptr, idx_val, "idx.addr"),
+                ));
+            }
+            Ok(Some(
+                lctx.ctx
+                    .builder()
+                    .ptr_gep(elem_llvm, base_ptr, idx_val, "idx.addr"),
+            ))
+        }
+        JirTag::EnumPayload => {
+            let enum_ptr = emit_inst(lctx, inst.a)?.ok_or("EnumPayload base")?;
+            let base_ty = lctx.jfn.get_inst(inst.a).ty;
+            let enum_ty = lctx.ctx.get_llvm_type(base_ty)?;
+            let payload_area = lctx
+                .ctx
+                .builder()
+                .struct_gep(enum_ty, enum_ptr, 1, "enum.payload");
+            let field_ptr = if inst.b != 0 {
+                let off = lctx
+                    .ctx
+                    .context()
+                    .i64_type()
+                    .const_int(inst.b as u64, false);
+                let i8 = lctx.ctx.context().i8_type();
+                lctx.ctx
+                    .builder()
+                    .ptr_gep(i8, payload_area, off, "enum.payload.off")
+            } else {
+                payload_area
+            };
+            if is_by_ref(inst.ty, lctx.ctx) {
+                return Ok(Some(field_ptr));
+            }
+            let field_ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            Ok(Some(lctx.ctx.builder().load(
+                field_ty,
+                field_ptr,
+                "enum.payload.val",
+            )))
+        }
+
+        // ---- slices / strings / fills ----
+        JirTag::MakeSlice => {
+            let ptr_v = emit_inst(lctx, inst.a)?.ok_or("MakeSlice ptr")?;
+            let len_v = emit_inst(lctx, inst.b)?.ok_or("MakeSlice len")?;
+            let slice_ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            let mut slice = slice_ty.undef();
+            slice = lctx
+                .ctx
+                .builder()
+                .insert_value(slice, ptr_v, 0, "slice.ptr");
+            slice = lctx
+                .ctx
+                .builder()
+                .insert_value(slice, len_v, 1, "slice.len");
+            Ok(Some(slice))
+        }
+        JirTag::MemSet => {
+            let ptr = emit_inst(lctx, inst.a)?.ok_or("MemSet dst")?;
+            let byte_val = lctx
+                .ctx
+                .context()
+                .i8_type()
+                .const_int(inst.flags as u64, false);
+            lctx.ctx.builder().memset(ptr, byte_val, inst.b as u64, 1);
+            Ok(None)
+        }
+        JirTag::Str => {
+            let bytes = lctx.ctx.string_pool.get(StringIdx::new(inst.a)).to_vec();
+            let str_const = lctx.ctx.context().const_string(&bytes, true);
+            let arr_ty = lctx
+                .ctx
+                .context()
+                .i8_type()
+                .array_type(bytes.len() as u64 + 1);
+            let str_global = lctx.ctx.module().add_global(arr_ty, "str");
+            str_global.set_global_constant(true);
+            str_global.set_initializer(str_const);
+            let i8ptr = lctx.ctx.context().pointer_type(0);
+            let str_ptr = lctx.ctx.builder().bitcast(str_global, i8ptr, "str_ptr");
+            // Pointer decay: a pointer-typed Str yields the bare address.
+            let strk = lctx.ctx.type_pool.get(inst.ty).kind;
+            if strk == TypeKind::PtrMany || strk == TypeKind::PtrSingle {
+                return Ok(Some(str_ptr));
+            }
+            let slice_ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            let mut slice = slice_ty.undef();
+            slice = lctx
+                .ctx
+                .builder()
+                .insert_value(slice, str_ptr, 0, "slice_ptr");
+            let len = lctx
+                .ctx
+                .context()
+                .i64_type()
+                .const_int(bytes.len() as u64, false);
+            slice = lctx.ctx.builder().insert_value(slice, len, 1, "slice_len");
+            Ok(Some(slice))
+        }
+
+        // ---- function references / calls / drops ----
+        JirTag::FnRef => {
+            let name = String::from_utf8_lossy(&lctx.ctx.string_pool.get(StringIdx::new(inst.a)))
+                .into_owned();
+            let f = lctx
+                .ctx
+                .module()
+                .get_function(&name)
+                .ok_or_else(|| format!("unknown fn-ref `{name}`"))?;
+            let fn_val = f.as_value();
+            if lctx.ctx.type_pool.get(inst.ty).kind == TypeKind::Fn {
+                return Ok(Some(fn_val)); // typed fn-pointer: already a ptr value
+            }
+            let ty = lctx.ctx.get_llvm_type(inst.ty)?;
+            Ok(Some(lctx.ctx.builder().ptr_to_int(fn_val, ty, "fnref.u64")))
+        }
+        JirTag::DropBinding => {
+            let binding_ptr = emit_inst(lctx, inst.a)?.ok_or("DropBinding ptr")?;
+            let symbol = String::from_utf8_lossy(&lctx.ctx.string_pool.get(StringIdx::new(inst.b)))
+                .into_owned();
+            let f = lctx
+                .ctx
+                .module()
+                .get_function(&symbol)
+                .ok_or_else(|| format!("drop callee `{symbol}` not declared"))?;
+            lctx.ctx.builder().call(f, &[binding_ptr], "");
+            Ok(None)
+        }
+        JirTag::Call => {
+            let symbol = String::from_utf8_lossy(&lctx.ctx.string_pool.get(StringIdx::new(inst.a)))
+                .into_owned();
+            let f = lctx
+                .ctx
+                .module()
+                .get_function(&symbol)
+                .ok_or_else(|| format!("unknown callee `{symbol}`"))?;
+            let extra = inst.b;
+            let arg_count = lctx.jfn.get_extra(extra);
+            let callee_uses_sret = f.uses_sret();
+            let mut args = Vec::with_capacity(arg_count as usize);
+            for i in 0..arg_count {
+                let ar = lctx.jfn.get_extra(extra + 1 + i);
+                args.push(emit_inst(lctx, ar)?.ok_or("call arg")?);
+            }
+            if callee_uses_sret {
+                // LLVM call returns void; the result is in args[0] (the sret
+                // slot) — hand that pointer back for byref consumers.
+                lctx.ctx.builder().call(f, &args, "");
+                return Ok(Some(args[0]));
+            }
+            let name = if inst.ty.is_none() { "" } else { "call" };
+            Ok(Some(lctx.ctx.builder().call(f, &args, name)))
+        }
+        JirTag::CallIndirect => {
+            let callee_val = emit_inst(lctx, inst.a)?.ok_or("CallIndirect callee")?;
+            let callee_ty = lctx.jfn.get_inst(inst.a).ty;
+            let k = lctx.ctx.type_pool.get(callee_ty);
+            if k.kind != TypeKind::Fn {
+                return Err("CallIndirect callee is not of Fn type".into());
+            }
+            let ret_ty = TypeIdx::new(k.a);
+            let param_tys: Vec<TypeIdx> = lctx.ctx.type_pool.fn_params_at(k.b).to_vec();
+            let mut llvm_params = Vec::with_capacity(param_tys.len());
+            for &pt in &param_tys {
+                llvm_params.push(lctx.ctx.get_llvm_type(pt)?);
+            }
+            let llvm_ret = if ret_ty.is_none() {
+                lctx.ctx.context().void_type()
+            } else {
+                lctx.ctx.get_llvm_type(ret_ty)?
+            };
+            let llvm_fn_ty = llvm_ret.fn_type(&llvm_params, false);
+            let extra = inst.b;
+            let arg_count = lctx.jfn.get_extra(extra);
+            let mut args = Vec::with_capacity(arg_count as usize);
+            for i in 0..arg_count {
+                let ar = lctx.jfn.get_extra(extra + 1 + i);
+                let mut av = emit_inst(lctx, ar)?.ok_or("CallIndirect arg")?;
+                // The indirect signature passes aggregates by value, but a
+                // byref aggregate is a pointer in our SSA model — load it.
+                if (i as usize) < param_tys.len() && is_by_ref(param_tys[i as usize], lctx.ctx) {
+                    let agg_ty = lctx.ctx.get_llvm_type(param_tys[i as usize])?;
+                    av = lctx.ctx.builder().load(agg_ty, av, "arg.byval");
+                }
+                args.push(av);
+            }
+            let name = if inst.ty.is_none() {
+                ""
+            } else {
+                "call.indirect"
+            };
+            let result = lctx
+                .ctx
+                .builder()
+                .indirect_call(llvm_fn_ty, callee_val, &args, name);
+            // A byref aggregate return arrives as an SSA value; spill to a slot
+            // and hand back the pointer to match the byref model.
+            if !inst.ty.is_none() && is_by_ref(inst.ty, lctx.ctx) {
+                let agg_ty = lctx.ctx.get_llvm_type(inst.ty)?;
+                let align = lctx.ctx.type_align(inst.ty)?;
+                let slot = lctx.ctx.builder().alloca(agg_ty, align, "ret.byval");
+                lctx.ctx.builder().store(result, slot);
+                return Ok(Some(slot));
+            }
+            Ok(Some(result))
+        }
+
+        JirTag::Invalid => Err("jir_codegen: Invalid tag in instruction stream".into()),
+    }
+}
+
