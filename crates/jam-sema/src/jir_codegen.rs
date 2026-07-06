@@ -95,3 +95,79 @@ fn jir_classify_param<'ctx>(
     classify_param(mode, t, ctx)
 }
 
+/// Emit the LLVM function declaration (signature + linkage + ABI attributes).
+/// Run before any body so cross-function forward references resolve.
+pub fn jir_declare_prototype<'ctx>(
+    jfn: &JirFunction,
+    ctx: &CodegenContext<'ctx>,
+) -> Result<Function<'ctx>, String> {
+    let rabi = jir_classify_return(jfn, ctx)?;
+    let sret = rabi.kind == ReturnAbiKind::Indirect;
+
+    let mut arg_types = Vec::with_capacity(jfn.param_types.len() + sret as usize);
+    if sret {
+        // Leading `ptr` carries the caller-owned return slot (sret attr below).
+        arg_types.push(ctx.context().pointer_type(0));
+    }
+    for i in 0..jfn.param_types.len() {
+        let pabi = jir_classify_param(jfn, i, ctx)?;
+        match pabi.kind {
+            ParamAbiKind::ByPointer => arg_types.push(ctx.context().pointer_type(0)),
+            ParamAbiKind::ByValue => {
+                arg_types.push(pabi.llvm_type.ok_or("ByValue param missing LLVM type")?)
+            }
+        }
+    }
+
+    let ret_type = if sret {
+        ctx.context().void_type()
+    } else {
+        rabi.direct_type.ok_or("Direct return missing LLVM type")?
+    };
+    let ft = ret_type.fn_type(&arg_types, jfn.is_var_args);
+    let f = ctx.module().add_function(&jfn.name, ft);
+    f.apply_default_attrs(jfn.is_extern);
+    if jfn.return_type == builtin::NORETURN {
+        f.set_no_return();
+    }
+    if sret {
+        f.add_param_attr_sret(0, ctx.get_llvm_type(jfn.return_type)?, rabi.sret_align);
+    }
+
+    let external_linkage = jfn.is_extern || jfn.is_export || jfn.name == "main";
+    if external_linkage {
+        f.set_linkage(Linkage::External);
+        // `export` symbols exist for C callers the optimizer can't see — pin
+        // them in llvm.used so the internalize/global-DCE pass spares them.
+        if jfn.is_export {
+            append_to_used(ctx.module(), f);
+        }
+        f.set_call_conv(CallConv::C);
+        // C ABI requires bool args/returns to be zero-extended to the register
+        // width. Internal-linkage callers use our own ABI, so we skip zext.
+        let arg_offset = if sret { 1u32 } else { 0 };
+        for i in 0..jfn.param_types.len() {
+            if jfn.param_types[i] == builtin::BOOL {
+                f.add_param_attr_zeroext(i as u32 + arg_offset);
+            }
+        }
+        if !sret && jfn.return_type == builtin::BOOL {
+            f.add_ret_attr_zeroext();
+        }
+    } else {
+        f.set_linkage(Linkage::Internal);
+    }
+    Ok(f)
+}
+
+// ---- body lowering ----
+
+/// Per-function lowering state: `JirRef -> LLVM Value` (dataflow) and
+/// `JirBlockRef -> LLVM BasicBlock` (terminators).
+struct JirCodegenCtx<'a, 'ctx> {
+    jfn: &'a JirFunction,
+    ctx: &'a CodegenContext<'ctx>,
+    value_map: HashMap<JirRef, Value<'ctx>>,
+    block_map: HashMap<JirBlockRef, BasicBlock<'ctx>>,
+}
+
