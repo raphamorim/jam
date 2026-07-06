@@ -441,3 +441,75 @@ impl<'ctx> CodegenContext<'ctx> {
         Ok(ret)
     }
 
+    /// Resolve an `ArrayExpr` (`[lenExpr]T`) to a concrete `Array(T, n)`,
+    /// instantiating on first use by folding the length expression. Caches the
+    /// result; returns `ty` unchanged for non-`ArrayExpr` inputs, and errors
+    /// when the length isn't a comptime non-negative integer.
+    pub fn resolve_array_expr_instantiate(&self, ty: TypeIdx) -> Result<TypeIdx, String> {
+        if let Some(&r) = self.array_expr_resolutions.borrow().get(&ty) {
+            return Ok(r);
+        }
+        let k = self.type_pool.get(ty);
+        if k.kind != TypeKind::ArrayExpr {
+            return Ok(ty);
+        }
+        let elem = TypeIdx::new(k.a);
+        let len_node = NodeIdx::new(k.b);
+        let len = self.fold_comptime_expr(len_node);
+        if !len.is_int() {
+            return Err("astgen: array length must be comptime-known".into());
+        }
+        let n = len.as_u64();
+        if n > u32::MAX as u64 {
+            return Err("astgen: array size out of range".into());
+        }
+        let resolved = self.type_pool.intern_array(elem, n as u32);
+        self.array_expr_resolutions
+            .borrow_mut()
+            .insert(ty, resolved);
+        Ok(resolved)
+    }
+
+    /// The resolved `Array` for an `ArrayExpr` TypeIdx, or `NONE` (pure lookup).
+    pub fn resolve_array_expr(&self, ty: TypeIdx) -> TypeIdx {
+        self.array_expr_resolutions
+            .borrow()
+            .get(&ty)
+            .copied()
+            .unwrap_or(TypeIdx::NONE)
+    }
+
+    // ---- module consts ----
+    /// Register a module-scope const under `name` (the bare or qualified key).
+    pub fn register_module_const(&self, name: impl Into<String>, info: ModuleConstInfo) {
+        self.module_consts.borrow_mut().insert(name.into(), info);
+    }
+    /// The const registered under `name`, if any (cloned).
+    pub fn get_module_const(&self, name: &str) -> Option<ModuleConstInfo> {
+        self.module_consts.borrow().get(name).cloned()
+    }
+    /// Is a const already registered under the (bare or qualified) `name`?
+    pub fn has_module_const(&self, name: &str) -> bool {
+        self.module_consts.borrow().contains_key(name)
+    }
+
+    // ---- generic instantiation ----
+    /// Register a module's anonymous struct bodies (its generic factories'
+    /// `return struct {...}`), keyed by the module's identity (empty = entry).
+    pub fn register_anon_structs(
+        &self,
+        module_path: impl Into<String>,
+        structs: Vec<StructDeclAST>,
+    ) {
+        self.anon_structs
+            .borrow_mut()
+            .insert(module_path.into(), structs);
+    }
+    /// Register a module's anonymous enum bodies (its generic factories'
+    /// `return enum {...}`), keyed by the module's identity.
+    pub fn register_anon_enums(&self, module_path: impl Into<String>, enums: Vec<EnumDeclAST>) {
+        self.anon_enums
+            .borrow_mut()
+            .insert(module_path.into(), enums);
+    }
+
