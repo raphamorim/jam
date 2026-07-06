@@ -2197,3 +2197,197 @@ impl CompCallResolver for CfnResolver<'_, '_> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jam_syntax::ast_flat::builtin;
+
+    #[test]
+    fn qualify_type_name_entry_vs_module() {
+        assert_eq!(qualify_type_name("", "Thing"), "Thing");
+        assert_eq!(qualify_type_name("lib/a", "Thing"), "lib/a.Thing");
+    }
+
+    #[test]
+    fn body_module_stack_and_type_owner() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        assert_eq!(cg.current_body_module(), "");
+        cg.push_body_module("lib/a");
+        cg.push_body_module("lib/b");
+        assert_eq!(cg.current_body_module(), "lib/b");
+        cg.pop_body_module();
+        assert_eq!(cg.current_body_module(), "lib/a");
+        cg.pop_body_module();
+        assert_eq!(cg.current_body_module(), "");
+
+        cg.register_type_owner("main", "Thing", "lib/a");
+        assert_eq!(cg.type_owner("main", "Thing").as_deref(), Some("lib/a"));
+        assert!(cg.type_owner("main", "Other").is_none());
+    }
+
+    #[test]
+    fn diagnostics_accumulate_through_shared_ref() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        assert!(!cg.has_errors());
+        cg.push_error(jam_core::diag::SrcLoc::new("f.jam", 3), "boom");
+        assert!(cg.has_errors());
+        assert_eq!(cg.error_count(), 1);
+    }
+
+    #[test]
+    fn lowers_primitive_types() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        assert!(cg.get_llvm_type(builtin::BOOL).unwrap().is_integer());
+        assert_eq!(cg.get_llvm_type(builtin::BOOL).unwrap().int_width(), 1);
+        assert_eq!(cg.get_llvm_type(builtin::I32).unwrap().int_width(), 32);
+        assert_eq!(cg.get_llvm_type(builtin::I8).unwrap().int_width(), 8);
+        assert_eq!(cg.get_llvm_type(builtin::I64).unwrap().int_width(), 64);
+        assert!(cg.get_llvm_type(builtin::F64).unwrap().is_float());
+        assert!(cg.get_llvm_type(builtin::F32).unwrap().is_float());
+        assert!(cg.get_llvm_type(builtin::VOID).unwrap().is_void());
+    }
+
+    #[test]
+    fn lowers_pointer_slice_array() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let p = cg.type_pool.intern_ptr_single(builtin::I32);
+        assert!(cg.get_llvm_type(p).unwrap().is_pointer());
+
+        let s = cg.type_pool.intern_slice(builtin::U8);
+        assert!(cg.get_llvm_type(s).unwrap().is_struct()); // { ptr, i64 }
+
+        let a = cg.type_pool.intern_array(builtin::I32, 4);
+        let at = cg.get_llvm_type(a).unwrap();
+        assert!(at.is_array());
+        assert!(at.array_element_type().is_integer());
+    }
+
+    #[test]
+    fn lowers_registered_struct() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        // Intern the name + a Struct TypeIdx, register its LLVM body.
+        let nid = cg.string_pool.intern(b"Point");
+        let sty = cg.type_pool.intern_struct(nid);
+        let llvm_st = ctx.struct_type(&[ctx.i32_type(), ctx.i32_type()], false);
+        cg.register_struct(
+            "Point",
+            llvm_st,
+            vec![("x".into(), builtin::I32), ("y".into(), builtin::I32)],
+        );
+
+        let lowered = cg.get_llvm_type(sty).unwrap();
+        assert!(lowered.is_struct());
+        assert_eq!(cg.field_index("Point", "y"), 1);
+        assert_eq!(cg.field_index("Point", "z"), -1);
+        assert!(cg.is_struct_registered(sty));
+    }
+
+    #[test]
+    fn unregistered_struct_errors() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let nid = cg.string_pool.intern(b"Ghost");
+        let sty = cg.type_pool.intern_struct(nid);
+        let err = cg.get_llvm_type(sty).unwrap_err();
+        assert!(err.contains("Unknown struct type: Ghost"));
+    }
+
+    #[test]
+    fn type_cache_is_memoized() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let a = cg.get_llvm_type(builtin::I32).unwrap();
+        let b = cg.get_llvm_type(builtin::I32).unwrap();
+        // Same handle returned (cache hit).
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn primitive_sizes_and_aligns() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        assert_eq!(cg.type_size(builtin::I32).unwrap(), 4);
+        assert_eq!(cg.type_size(builtin::BOOL).unwrap(), 1);
+        assert_eq!(cg.type_size(builtin::F64).unwrap(), 8);
+        assert_eq!(cg.type_align(builtin::I64).unwrap(), 8);
+        let p = cg.type_pool.intern_ptr_single(builtin::I32);
+        assert_eq!(cg.type_size(p).unwrap(), 8);
+        let s = cg.type_pool.intern_slice(builtin::U8);
+        assert_eq!(cg.type_size(s).unwrap(), 16); // { ptr, len }
+        let a = cg.type_pool.intern_array(builtin::I32, 4);
+        assert_eq!(cg.type_size(a).unwrap(), 16);
+        assert_eq!(cg.type_align(a).unwrap(), 4);
+    }
+
+    #[test]
+    fn struct_layout_matches_llvm_padding() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let nid = cg.string_pool.intern(b"S");
+        let sty = cg.type_pool.intern_struct(nid);
+        let llvm = ctx.struct_type(&[ctx.i64_type(), ctx.i8_type()], false);
+        cg.register_struct(
+            "S",
+            llvm,
+            vec![("a".into(), builtin::I64), ("b".into(), builtin::I8)],
+        );
+        // {i64, i8} => 16 (padded to align), NOT 9. align 8.
+        assert_eq!(cg.type_size(sty).unwrap(), 16);
+        assert_eq!(cg.type_align(sty).unwrap(), 8);
+
+        // {i32, i8} => i32 at 0 (size 4), i8 at 4 (size 1) => 5, padded to
+        // align 4 => 8.
+        let nid2 = cg.string_pool.intern(b"S2");
+        let sty2 = cg.type_pool.intern_struct(nid2);
+        let llvm2 = ctx.struct_type(&[ctx.i32_type(), ctx.i8_type()], false);
+        cg.register_struct(
+            "S2",
+            llvm2,
+            vec![("a".into(), builtin::I32), ("b".into(), builtin::I8)],
+        );
+        assert_eq!(cg.type_size(sty2).unwrap(), 8);
+        assert_eq!(cg.type_align(sty2).unwrap(), 4);
+    }
+
+    #[test]
+    fn union_size_is_max_field() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let nid = cg.string_pool.intern(b"U");
+        let uty = cg.type_pool.intern_named(nid); // Named "U" resolves via union registry
+        let llvm = ctx.i64_type();
+        cg.register_union(
+            "U",
+            llvm,
+            vec![("a".into(), builtin::I64), ("b".into(), builtin::I8)],
+        );
+        assert_eq!(cg.type_size(uty).unwrap(), 8); // max(8, 1) padded to align 8
+        assert_eq!(cg.type_align(uty).unwrap(), 8);
+    }
+
+    #[test]
+    fn unit_enum_named_lowers_to_i8() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let nid = cg.string_pool.intern(b"Color");
+        let nty = cg.type_pool.intern_named(nid);
+        cg.register_enum(
+            "Color",
+            vec![EnumVariantInfo {
+                name: "Red".into(),
+                payload_types: vec![],
+                discriminant: 0,
+            }],
+        );
+        // No payload variant -> i8.
+        let lowered = cg.get_llvm_type(nty).unwrap();
+        assert!(lowered.is_integer());
+        assert_eq!(lowered.int_width(), 8);
+        assert_eq!(cg.enum_variant_index("Color", "Red"), 0);
+    }
+}
