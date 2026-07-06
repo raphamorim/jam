@@ -1287,3 +1287,200 @@ impl<'ctx> CodegenContext<'ctx> {
         );
     }
 
+    /// Rewrite a bare user-type `Named` leaf to its module-qualified TypeIdx as
+    /// seen from `ctx_module` (a pure lookup into the pre-interned map; no-op for
+    /// the entry module, already-qualified names, and non-`Named` types).
+    /// Recursive requalification through ptr/array element types is deferred.
+    pub fn requalify_type(&self, ty: TypeIdx, ctx_module: &str) -> TypeIdx {
+        let k = self.type_pool.get(ty);
+        // A GenericCall requalifies its callee + args (`Option(File)` ->
+        // `std/option.Option(std/fs.File)`) so the monomorph name matches the
+        // oracle's qualified spelling.
+        if k.kind == TypeKind::GenericCall {
+            return self.qualify_generic_callee(ty, ctx_module);
+        }
+        // Wrapper kinds carry the element TypeIdx in `a`; recurse into it so a
+        // qualified element (`[3]timer.TimerChannel`, `*mut bus.Bus`) surfaces
+        // through the wrapper. `b` (length / length-expr) is preserved. Mirrors
+        // the C++ `requalifyTypeUncached` wrapper arm (src/codegen.cpp:430-442);
+        // without this an array/pointer/slice field of an imported struct keeps
+        // a bare element name that can't requalify under a foreign body module.
+        match k.kind {
+            TypeKind::PtrSingle
+            | TypeKind::PtrMany
+            | TypeKind::Slice
+            | TypeKind::Array
+            | TypeKind::ArrayExpr => {
+                let elem = self.requalify_type(TypeIdx::new(k.a), ctx_module);
+                if elem == TypeIdx::new(k.a) {
+                    return ty;
+                }
+                let mut nk = k;
+                nk.a = elem.raw();
+                return self.type_pool.intern(nk);
+            }
+            _ => {}
+        }
+        if k.kind != TypeKind::Named {
+            return ty;
+        }
+        let name = self.str_name(k.a);
+        // Active generic substitution (a `Self`/`T` Named inside an instantiated
+        // method body/signature) -> the concrete instance/type arg. No-op when no
+        // frame is active (the common case).
+        if self.has_active_subst() {
+            let sub = self.lookup_current_subst(&name);
+            if !sub.is_none() {
+                return sub;
+            }
+        }
+        if name.contains('.') {
+            return ty;
+        }
+        // A module's OWN type wins over a same-named global alias (two modules
+        // may each define `Pair`): try the body-module requalify map first.
+        if !ctx_module.is_empty()
+            && let Some(&q) = self
+                .requalify_map
+                .borrow()
+                .get(&(ctx_module.to_string(), name.clone()))
+        {
+            return q;
+        }
+        // Then a destructuring-import alias (`Token` -> `m.Token`), which is a
+        // qualified `Named`: resolve the SPELLING. A type-alias-const whose
+        // target is a GenericCall (`CounterI32` -> `Counter(i32)`) keeps its own
+        // spelling here (the oracle dumps `*CounterI32`); name_for_kinds chases
+        // it only at lookup time.
+        if let Some(&aliased) = self.type_aliases.borrow().get(&name)
+            && self.type_pool.get(aliased).kind == TypeKind::Named
+        {
+            return aliased;
+        }
+        ty
+    }
+
+    /// Requalify a GenericCall's *argument* the way the C++ `requalifyType`
+    /// does when called from `requalifyTypeUncached`'s GenericCall arm: an
+    /// active-subst `Named` (the generic param `T`/`Self`) stays LITERAL rather
+    /// than being substituted. `requalify_type` substitutes such a Named (it is
+    /// the only requalify caller that does so); for args we must keep `T`
+    /// un-substituted so a literal `Vec(T)` / `Option(T)` GenericCall interns
+    /// during an instantiated body — matching the oracle's TypePool order.
+    /// Recurses wrapper kinds (`*Vec(T)`) and nested GenericCalls.
+    fn requalify_generic_arg(&self, ty: TypeIdx, ctx_module: &str) -> TypeIdx {
+        let k = self.type_pool.get(ty);
+        match k.kind {
+            TypeKind::Named => {
+                let name = self.str_name(k.a);
+                // Active-subst param stays literal (the C++ rule); fall through
+                // to the ordinary requalify otherwise.
+                if self.has_active_subst() && !self.lookup_current_subst(&name).is_none() {
+                    return ty;
+                }
+                self.requalify_type(ty, ctx_module)
+            }
+            TypeKind::PtrSingle | TypeKind::PtrMany | TypeKind::Slice | TypeKind::Array => {
+                let elem = self.requalify_generic_arg(TypeIdx::new(k.a), ctx_module);
+                if elem == TypeIdx::new(k.a) {
+                    return ty;
+                }
+                let mut nk = k;
+                nk.a = elem.raw();
+                self.type_pool.intern(nk)
+            }
+            TypeKind::GenericCall => {
+                let callee = self.str_name(k.a);
+                let args = self.type_pool.generic_args_at(k.b).to_vec();
+                let new_callee = if callee.contains('.') {
+                    callee.clone()
+                } else if !ctx_module.is_empty()
+                    && let Some(f) = self.get_function_ast(&format!("{ctx_module}.{callee}"))
+                {
+                    format!("{}.{}", f.module_path, f.name)
+                } else if let Some(f) = self.get_function_ast(&callee) {
+                    if f.module_path.is_empty() {
+                        callee.clone()
+                    } else {
+                        format!("{}.{}", f.module_path, f.name)
+                    }
+                } else {
+                    callee.clone()
+                };
+                let new_args: Vec<TypeIdx> = args
+                    .iter()
+                    .map(|&a| self.requalify_generic_arg(a, ctx_module))
+                    .collect();
+                if new_callee == callee && new_args == args {
+                    return ty;
+                }
+                let sid = self.string_pool.intern(new_callee.as_bytes());
+                self.type_pool.intern_generic_call(sid, new_args)
+            }
+            _ => ty,
+        }
+    }
+
+    // ---- accessors ----
+    pub fn context(&self) -> &'ctx Context {
+        self.ctx
+    }
+    pub fn module(&self) -> &Module<'ctx> {
+        &self.module
+    }
+    pub fn builder(&self) -> &jam_llvm::Builder<'ctx> {
+        &self.builder
+    }
+
+    /// If `ty` is a `Struct`/`Named` (or the given kinds), its registry name.
+    fn name_for_kinds(&self, ty: TypeIdx, kinds: &[TypeKind]) -> Option<String> {
+        // Requalify a bare imported-module type to its qualified registry name
+        // (no-op for the entry module / already-qualified). This is the single
+        // chokepoint every struct/union/enum registry lookup flows through, so a
+        // module body's bare reference to its own type resolves correctly.
+        let mut ty = self.requalify_type(ty, &self.current_body_module());
+        // Chase, bounded: a GenericCall (`Pair(u64)`) resolves to its
+        // instantiated `Named` struct; a type-alias Named (`CounterI32` ->
+        // `Counter(i32)`) resolves to its target (which may itself be a
+        // GenericCall, hence the loop) so struct/enum field lookups land on the
+        // monomorphized type. Mirrors the C++ lookupStruct recursive chaser.
+        for _ in 0..8 {
+            let k = self.type_pool.get(ty);
+            if k.kind == TypeKind::GenericCall {
+                // On-demand: instantiate the GenericCall if not cached, so a
+                // qualified callee (`std/option.Option(i32)`) resolves to its
+                // monomorph even when only the bare form was cached earlier.
+                let r = self.resolve_generic_call(ty);
+                if r.is_none() || r == ty {
+                    break;
+                }
+                ty = r;
+                continue;
+            }
+            if k.kind == TypeKind::Named {
+                let name = self.str_name(k.a);
+                // Multi-dot chained type (`w.leaf.Point`): resolve through the
+                // module-namespace re-export chain to the leaf's canonical Named.
+                if name.matches('.').count() >= 2 {
+                    let chained = self.resolve_chained_type(&name);
+                    if !chained.is_none() && chained != ty {
+                        ty = chained;
+                        continue;
+                    }
+                }
+                let aliased = self.lookup_type_alias(&name);
+                if !aliased.is_none() && aliased != ty {
+                    ty = self.requalify_type(aliased, &self.current_body_module());
+                    continue;
+                }
+            }
+            break;
+        }
+        let k = self.type_pool.get(ty);
+        if kinds.contains(&k.kind) {
+            Some(self.str_name(k.a))
+        } else {
+            None
+        }
+    }
+
