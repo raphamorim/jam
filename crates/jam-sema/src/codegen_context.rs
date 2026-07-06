@@ -1058,3 +1058,105 @@ impl<'ctx> CodegenContext<'ctx> {
         }
     }
 
+    // ---- function registry ----
+    /// Register a function/method signature under `name` (the call-site lookup
+    /// key). Last registration wins, matching the C++ `registerFunctionAST`.
+    pub fn register_function_ast(&self, name: impl Into<String>, f: FunctionAST) {
+        self.function_asts.borrow_mut().insert(name.into(), f);
+    }
+    /// Withdraw a conditionally-instantiated method whose body failed to compile
+    /// for these type args (the C++ `withdraw`).
+    pub fn unregister_function_ast(&self, name: &str) {
+        self.function_asts.borrow_mut().remove(name);
+    }
+    /// Record why a conditionally-instantiated method was withdrawn (the C++
+    /// `recordWithdrawnMethod`): a call to a withdrawn method reports "not
+    /// available for this instantiation — <reason>" instead of a bare
+    /// "unknown method".
+    pub fn record_withdrawn_method(&self, name: impl Into<String>, reason: impl Into<String>) {
+        self.withdrawn_methods
+            .borrow_mut()
+            .insert(name.into(), reason.into());
+    }
+    /// The recorded withdrawal reason for `name`, if it was withdrawn (the C++
+    /// `getWithdrawnMethod`).
+    pub fn get_withdrawn_method(&self, name: &str) -> Option<String> {
+        self.withdrawn_methods.borrow().get(name).cloned()
+    }
+    /// Install the astgen hook that lowers instantiated generic method bodies.
+    pub fn set_method_instantiator(&self, f: MethodInstantiator) {
+        self.method_instantiator.set(Some(f));
+    }
+    fn method_instantiator(&self) -> Option<MethodInstantiator> {
+        self.method_instantiator.get()
+    }
+    /// While set, `instantiate_struct_expr` instantiates a generic's TYPE only and
+    /// stashes its method-body lowering (the C++ Phase-1b `bindDeclTypes`).
+    pub fn set_defer_method_lowering(&self, on: bool) {
+        self.defer_method_lowering.set(on);
+    }
+    /// Lower every method body stashed by the deferred (type-only) instantiation,
+    /// in stash order (the method pre-pass, the C++ Phase-1k). Drains the queue
+    /// with deferral OFF so nested generics encountered in a body instantiate
+    /// immediately (the C++ resolveGenericCall during method codegen).
+    pub fn drain_pending_method_lowering(&self) -> Result<(), String> {
+        let Some(lower) = self.method_instantiator() else {
+            return Ok(());
+        };
+        let was = self.defer_method_lowering.replace(false);
+        let pending = std::mem::take(&mut *self.pending_method_lowering.borrow_mut());
+        let mut result = Ok(());
+        for (clones, body_subst, bm) in pending {
+            self.push_body_module(bm);
+            let r = lower(self, &clones, &body_subst);
+            self.pop_body_module();
+            if let Err(e) = r {
+                result = Err(e);
+                break;
+            }
+        }
+        self.defer_method_lowering.set(was);
+        result
+    }
+    /// Look up a registered function by call-site name, returning a clone (the
+    /// body is `NodeIdx` indices, so this stays cheap).
+    pub fn get_function_ast(&self, name: &str) -> Option<FunctionAST> {
+        self.function_asts.borrow().get(name).cloned()
+    }
+
+    // ---- drop registry ----
+    /// Register the (already-mangled) LLVM symbol of `T`'s `cfn drop`, keyed by
+    /// the type name the drop site resolves through. The C++ stores a
+    /// `FunctionAST*` and mangles on lookup; we pre-mangle so the registry holds
+    /// owned `String`s (no module-AST borrow entangling the context lifetime).
+    pub fn register_drop_fn(
+        &self,
+        type_name: impl Into<String>,
+        mangled_symbol: impl Into<String>,
+    ) {
+        self.drop_fns
+            .borrow_mut()
+            .insert(type_name.into(), mangled_symbol.into());
+    }
+
+    /// The mangled drop-fn symbol for the type `ty` names (Struct/Named/Enum),
+    /// or `None` when it has no registered drop. Resolves through `name_for_kinds`
+    /// so an instantiated generic / type-alias (`CounterI32` -> `Counter__i32`)
+    /// finds its drop — the C++ `lookupDropFnLLVMName` chase.
+    pub fn lookup_drop_fn_name(&self, ty: TypeIdx) -> Option<String> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Struct, TypeKind::Named, TypeKind::Enum])?;
+        self.drop_fns.borrow().get(&name).cloned()
+    }
+
+    /// Register a top-level `cfn clone(self: T) T` under its receiver struct name.
+    pub fn register_clone_fn(&self, type_name: impl Into<String>, clone_fn: FunctionAST) {
+        self.clone_fns
+            .borrow_mut()
+            .insert(type_name.into(), clone_fn);
+    }
+
+    /// The top-level `cfn clone` for the struct named `name`, if registered.
+    pub fn lookup_clone_fn(&self, name: &str) -> Option<FunctionAST> {
+        self.clone_fns.borrow().get(name).cloned()
+    }
+
