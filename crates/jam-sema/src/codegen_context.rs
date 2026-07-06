@@ -1160,3 +1160,130 @@ impl<'ctx> CodegenContext<'ctx> {
         self.clone_fns.borrow().get(name).cloned()
     }
 
+    /// Whether `ty` owns heap that must be released at scope exit: it has a
+    /// registered `cfn drop`, OR it is an array/struct whose element/fields
+    /// recursively need drop. (Payloaded-enum and generic resolution deferred;
+    /// no memoization yet — correctness first.)
+    pub fn type_needs_drop(&self, ty: TypeIdx) -> bool {
+        if self.lookup_drop_fn_name(ty).is_some() {
+            return true;
+        }
+        let k = self.type_pool.get(ty);
+        match k.kind {
+            TypeKind::Array => self.type_needs_drop(TypeIdx::new(k.a)),
+            TypeKind::Struct | TypeKind::Named => {
+                if let Some(fields) = self.struct_fields(ty) {
+                    return fields.iter().any(|(_, fty)| self.type_needs_drop(*fty));
+                }
+                // An enum carries drop if any variant payload does (e.g.
+                // `Item.Many(Vec(u64))` — the Vec owns its buffer).
+                if let Some(name) = self.enum_name_of(ty)
+                    && let Some(vs) = self.enum_variants_by_name(&name)
+                {
+                    return vs
+                        .iter()
+                        .any(|v| v.payload_types.iter().any(|pt| self.type_needs_drop(*pt)));
+                }
+                false
+            }
+            // A `Vec(u64)` payload/field resolves to its `Vec__u64` monomorph,
+            // which carries the `cfn drop`.
+            TypeKind::GenericCall => {
+                let r = self.resolve_generic_call(ty);
+                !r.is_none() && r != ty && self.type_needs_drop(r)
+            }
+            _ => false,
+        }
+    }
+
+    // ---- diagnostics ----
+    /// Push an error diagnostic (the analyzer reports through `&self`).
+    pub fn push_error(&self, loc: SrcLoc, message: impl Into<String>) {
+        self.diagnostics.borrow_mut().error(loc, message);
+    }
+    pub fn push_error_with_trace(
+        &self,
+        loc: SrcLoc,
+        message: impl Into<String>,
+        trace: Vec<Trace>,
+    ) {
+        self.diagnostics
+            .borrow_mut()
+            .error_with_trace(loc, message, trace);
+    }
+    pub fn has_errors(&self) -> bool {
+        self.diagnostics.borrow().has_errors()
+    }
+    pub fn error_count(&self) -> usize {
+        self.diagnostics.borrow().error_count()
+    }
+    /// Borrow the accumulated diagnostics (e.g. to render at the end of a run).
+    pub fn diagnostics(&self) -> Ref<'_, Diagnostics> {
+        self.diagnostics.borrow()
+    }
+
+    // ---- current display file (for astgen diagnostics) ----
+    /// Set the display filename stamped onto astgen diagnostics (the C++
+    /// `setCurrentFile`). Entry-global; swapped for imported-body lowering.
+    pub fn set_current_file(&self, file: impl Into<String>) {
+        *self.current_file.borrow_mut() = file.into();
+    }
+    /// The display filename for the body currently lowering (the C++
+    /// `currentFile`). Empty until the driver sets it.
+    pub fn current_file(&self) -> String {
+        self.current_file.borrow().clone()
+    }
+
+    // ---- body-module stack ----
+    /// Enter a type body's owning module (the C++ `BodyModuleGuard` ctor).
+    pub fn push_body_module(&self, module_path: impl Into<String>) {
+        self.body_module_stack.borrow_mut().push(module_path.into());
+    }
+    /// Leave the current body module (the guard's dtor).
+    pub fn pop_body_module(&self) {
+        self.body_module_stack.borrow_mut().pop();
+    }
+    /// The module whose body is currently being resolved (empty = entry module).
+    pub fn current_body_module(&self) -> String {
+        self.body_module_stack
+            .borrow()
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    // ---- type-owner registry + requalify ----
+    /// Record that within `ctx_module` the bare type `type_name` is owned by
+    /// `owner_module` (declared there or imported). Built once up front.
+    pub fn register_type_owner(&self, ctx_module: &str, type_name: &str, owner_module: &str) {
+        self.type_module_of
+            .borrow_mut()
+            .entry(ctx_module.to_string())
+            .or_default()
+            .insert(type_name.to_string(), owner_module.to_string());
+        // Ownership feeds the resolution memos; clear them (registration is an
+        // up-front pass, so this is effectively free).
+        self.size_memo.borrow_mut().clear();
+        self.align_memo.borrow_mut().clear();
+    }
+
+    /// The owner module recorded for `(ctx_module, type_name)`, if any.
+    pub fn type_owner(&self, ctx_module: &str, type_name: &str) -> Option<String> {
+        self.type_module_of
+            .borrow()
+            .get(ctx_module)
+            .and_then(|m| m.get(type_name))
+            .cloned()
+    }
+
+    /// Record that within `ctx_module` the bare user type `bare_name` resolves
+    /// to the (already-interned) qualified `qualified_ty`. Populated by the
+    /// driver's register pass — interning happens there (with `&mut` pool
+    /// access), so [`requalify_type`] stays a pure `&self` lookup.
+    pub fn register_requalify(&self, ctx_module: &str, bare_name: &str, qualified_ty: TypeIdx) {
+        self.requalify_map.borrow_mut().insert(
+            (ctx_module.to_string(), bare_name.to_string()),
+            qualified_ty,
+        );
+    }
+
