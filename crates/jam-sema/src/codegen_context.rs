@@ -1797,3 +1797,403 @@ impl<'ctx> CodegenContext<'ctx> {
 
     // ---- type lowering ----
 
+    /// Resolve a `TypeIdx` to its LLVM type, memoized per TypeIdx.
+    ///
+    /// `requalify_type` (which keys each module's same-named type separately) is
+    /// deferred to the decl/analyzer increment; until then the caller is
+    /// responsible for passing already-qualified TypeIdxs.
+    pub fn get_llvm_type(&self, ty: TypeIdx) -> Result<Type<'ctx>, String> {
+        // Requalify a bare imported-module type to its qualified registry name
+        // against the module whose body is being lowered (no-op for the entry
+        // module / already-qualified types); memoize by the resolved TypeIdx.
+        let ty = self.requalify_type(ty, &self.current_body_module());
+        let idx = ty.index();
+        {
+            let cache = self.llvm_type_cache.borrow();
+            if let Some(Some(t)) = cache.get(idx) {
+                return Ok(*t);
+            }
+        }
+        // Compute without holding the cache borrow (the recursion re-enters).
+        let result = self.compute_llvm_type(ty)?;
+        {
+            let mut cache = self.llvm_type_cache.borrow_mut();
+            if cache.len() <= idx {
+                cache.resize(idx + 1, None);
+            }
+            cache[idx] = Some(result);
+        }
+        Ok(result)
+    }
+
+    fn compute_llvm_type(&self, ty: TypeIdx) -> Result<Type<'ctx>, String> {
+        let k = self.type_pool.get(ty);
+        match k.kind {
+            TypeKind::Invalid | TypeKind::Void | TypeKind::NoReturn => Ok(self.ctx.void_type()),
+            TypeKind::Bool => Ok(self.ctx.i1_type()),
+            TypeKind::Int => match k.a {
+                8 => Ok(self.ctx.i8_type()),
+                16 => Ok(self.ctx.i16_type()),
+                32 => Ok(self.ctx.i32_type()),
+                64 => Ok(self.ctx.i64_type()),
+                w => Err(format!("Unsupported int width: {w}")),
+            },
+            TypeKind::Float => {
+                if k.a == 32 {
+                    Ok(self.ctx.f32_type())
+                } else {
+                    Ok(self.ctx.f64_type())
+                }
+            }
+            TypeKind::PtrSingle | TypeKind::PtrMany => {
+                // Pointee lowered for cache priming / validation; LLVM pointers
+                // are opaque so the address space is what matters.
+                let _elem = self.get_llvm_type(TypeIdx::new(k.a))?;
+                Ok(self.ctx.pointer_type(0))
+            }
+            TypeKind::Slice => {
+                let elem = self.get_llvm_type(TypeIdx::new(k.a))?;
+                let _ = elem;
+                let elem_ptr = self.ctx.pointer_type(0);
+                let usize_ty = self.ctx.i64_type();
+                Ok(self.ctx.struct_type(&[elem_ptr, usize_ty], false))
+            }
+            TypeKind::Array => {
+                let elem = self.get_llvm_type(TypeIdx::new(k.a))?;
+                Ok(elem.array_type(k.b as u64))
+            }
+            // Direct enum kind always lowers to the i8 tag.
+            TypeKind::Enum => Ok(self.ctx.i8_type()),
+            TypeKind::Struct => self
+                .struct_llvm_type(ty)
+                .ok_or_else(|| format!("Unknown struct type: {}", self.str_name(k.a))),
+            TypeKind::Union => self
+                .union_llvm_type(ty)
+                .ok_or_else(|| format!("Unknown union type: {}", self.str_name(k.a))),
+            TypeKind::Named => {
+                // Registry-backed resolution. The substitution / alias /
+                // chained-reexport / privacy resolution order lands with the
+                // analyzer + substitution engine.
+                if let Some(t) = self.struct_llvm_type(ty) {
+                    Ok(t)
+                } else if let Some(t) = self.union_llvm_type(ty) {
+                    Ok(t)
+                } else if let Some(has_payload) = self.enum_has_payload(ty) {
+                    if has_payload {
+                        self.enum_llvm_type(ty).ok_or_else(|| {
+                            format!("enum `{}` has no lowered LLVM type yet", self.str_name(k.a))
+                        })
+                    } else {
+                        Ok(self.ctx.i8_type())
+                    }
+                } else {
+                    Err(format!(
+                        "unresolved Named type `{}` (subst/alias/chained resolution \
+                         not yet ported)",
+                        self.str_name(k.a)
+                    ))
+                }
+            }
+            TypeKind::ArrayExpr => {
+                let resolved = self.resolve_array_expr(ty);
+                if !resolved.is_none() && resolved != ty {
+                    self.get_llvm_type(resolved)
+                } else {
+                    Err("ArrayExpr lowering needs array-expr resolution (deferred)".into())
+                }
+            }
+            TypeKind::GenericCall => {
+                let resolved = self.resolve_generic_call(ty);
+                if !resolved.is_none() && resolved != ty {
+                    self.get_llvm_type(resolved)
+                } else {
+                    Err("GenericCall lowering needs the substitution engine (deferred)".into())
+                }
+            }
+            TypeKind::Type => Err(
+                "internal: cannot lower `type` to LLVM (generic was not instantiated before codegen)"
+                    .into(),
+            ),
+            TypeKind::Module => Err("Module type has no LLVM representation".into()),
+            // An opaque pointer — the per-call-site signature is rebuilt by the
+            // CallIndirect path from the Fn TypeKey (the C++ codegen.cpp:244).
+            TypeKind::Fn => Ok(self.ctx.pointer_type(0)),
+        }
+    }
+
+    // ---- size / alignment ----
+
+    /// Size of a type in bytes (memoized). Mirrors LLVM's aggregate layout so
+    /// `{i64, i8}` reports 16, not 9.
+    pub fn type_size(&self, ty: TypeIdx) -> Result<u64, String> {
+        let ty = self.requalify_type(ty, &self.current_body_module());
+        if let Some(&v) = self.size_memo.borrow().get(&ty) {
+            return Ok(v);
+        }
+        let r = self.type_size_impl(ty)?;
+        self.size_memo.borrow_mut().insert(ty, r);
+        Ok(r)
+    }
+
+    fn type_size_impl(&self, ty: TypeIdx) -> Result<u64, String> {
+        let k = self.type_pool.get(ty);
+        match k.kind {
+            TypeKind::Invalid
+            | TypeKind::Void
+            | TypeKind::NoReturn
+            | TypeKind::Type
+            | TypeKind::Module => Ok(0),
+            TypeKind::Bool => Ok(1),
+            TypeKind::Int | TypeKind::Float => Ok((k.a / 8) as u64),
+            TypeKind::PtrSingle | TypeKind::PtrMany | TypeKind::Fn => Ok(8),
+            TypeKind::Slice => Ok(16), // { ptr, len }
+            TypeKind::Array => Ok(k.b as u64 * self.type_size(TypeIdx::new(k.a))?),
+            TypeKind::Enum => Ok(1), // unit-only enums lower to u8
+            TypeKind::Struct | TypeKind::Named => {
+                // Deferred: substitution + alias resolution.
+                if let Some(fields) = self.struct_fields(ty) {
+                    let mut off = 0u64;
+                    let mut max_align = 1u64;
+                    for (_, fty) in &fields {
+                        let a = self.type_align(*fty)?;
+                        off = align_up(off, a);
+                        off += self.type_size(*fty)?;
+                        if a > max_align {
+                            max_align = a;
+                        }
+                    }
+                    return Ok(align_up(off, max_align));
+                }
+                if let Some(fields) = self.union_fields(ty) {
+                    return self.union_size(fields);
+                }
+                if let Some(has_payload) = self.enum_has_payload(ty) {
+                    if !has_payload {
+                        return Ok(1);
+                    }
+                    let (mps, mpa) = self.enum_payload_layout(ty).unwrap();
+                    let padded = align_up(mps, mpa);
+                    return Ok(if padded == 0 { 2 * mpa } else { mpa + padded });
+                }
+                Err("type_size: unresolved user type (subst/alias resolution deferred)".into())
+            }
+            TypeKind::Union => match self.union_fields(ty) {
+                Some(fields) => self.union_size(fields),
+                None => Err("type_size: unknown union".into()),
+            },
+            TypeKind::ArrayExpr => {
+                let resolved = self.resolve_array_expr(ty);
+                if !resolved.is_none() && resolved != ty {
+                    self.type_size(resolved)
+                } else {
+                    Err("type_size: ArrayExpr resolution deferred".into())
+                }
+            }
+            TypeKind::GenericCall => {
+                let resolved = self.resolve_generic_call(ty);
+                if !resolved.is_none() && resolved != ty {
+                    self.type_size(resolved)
+                } else {
+                    Err("type_size: GenericCall resolution deferred".into())
+                }
+            }
+        }
+    }
+
+    fn union_size(&self, fields: Vec<(String, TypeIdx)>) -> Result<u64, String> {
+        let mut max_size = 0u64;
+        let mut max_align = 1u64;
+        for (_, fty) in &fields {
+            let s = self.type_size(*fty)?;
+            let a = self.type_align(*fty)?;
+            if s > max_size {
+                max_size = s;
+            }
+            if a > max_align {
+                max_align = a;
+            }
+        }
+        Ok(align_up(max_size, max_align))
+    }
+
+    /// Alignment of a type in bytes (memoized). Equal to size for scalars; the
+    /// max of constituents for aggregates.
+    pub fn type_align(&self, ty: TypeIdx) -> Result<u64, String> {
+        let ty = self.requalify_type(ty, &self.current_body_module());
+        if let Some(&v) = self.align_memo.borrow().get(&ty) {
+            return Ok(v);
+        }
+        let r = self.type_align_impl(ty)?;
+        self.align_memo.borrow_mut().insert(ty, r);
+        Ok(r)
+    }
+
+    /// Alignment for a *standalone storage slot* (alloca / byref-aggregate
+    /// memcpy). Matches the C++ oracle's quirk: a payloaded, NON-generic enum
+    /// referenced by a *module-qualified* (imported) name reports slot
+    /// alignment 1, because the imported enum's `max_payload_align` is never
+    /// lifted past its initial 1 even though its LLVM body is laid out fully.
+    /// The entry module's own (bare-named) enums, every generic monomorph
+    /// (`Enum__arg`, which `set_enum_llvm_type`s the real align at
+    /// instantiation), and all structs/unions keep their real alignment.
+    /// Use this ONLY at the standalone-storage sites, never for field layout.
+    pub fn alloca_align(&self, ty: TypeIdx) -> Result<u64, String> {
+        if self.enum_has_payload(ty) == Some(true)
+            && let Some(name) = self.enum_name_of(ty)
+        {
+            let qualified = name.contains('.') || name.contains('/');
+            let is_monomorph = name.contains("__");
+            if qualified && !is_monomorph {
+                return Ok(1);
+            }
+        }
+        self.type_align(ty)
+    }
+
+    fn type_align_impl(&self, ty: TypeIdx) -> Result<u64, String> {
+        let k = self.type_pool.get(ty);
+        match k.kind {
+            TypeKind::Invalid
+            | TypeKind::Void
+            | TypeKind::NoReturn
+            | TypeKind::Bool
+            | TypeKind::Type
+            | TypeKind::Module
+            | TypeKind::Enum => Ok(1),
+            TypeKind::Int | TypeKind::Float => Ok((k.a / 8) as u64),
+            TypeKind::PtrSingle | TypeKind::PtrMany | TypeKind::Slice | TypeKind::Fn => Ok(8),
+            TypeKind::Array => self.type_align(TypeIdx::new(k.a)),
+            TypeKind::Struct | TypeKind::Named => {
+                if let Some(fields) = self.struct_fields(ty) {
+                    return self.max_field_align(fields);
+                }
+                if let Some(fields) = self.union_fields(ty) {
+                    return self.max_field_align(fields);
+                }
+                if let Some(has_payload) = self.enum_has_payload(ty) {
+                    let (_mps, mpa) = self.enum_payload_layout(ty).unwrap();
+                    return Ok(if has_payload { mpa } else { 1 });
+                }
+                Err("type_align: unresolved user type (subst/alias resolution deferred)".into())
+            }
+            TypeKind::Union => match self.union_fields(ty) {
+                Some(fields) => self.max_field_align(fields),
+                None => Err("type_align: unknown union".into()),
+            },
+            TypeKind::ArrayExpr => {
+                let resolved = self.resolve_array_expr(ty);
+                if !resolved.is_none() && resolved != ty {
+                    self.type_align(resolved)
+                } else {
+                    Err("type_align: ArrayExpr resolution deferred".into())
+                }
+            }
+            TypeKind::GenericCall => {
+                let resolved = self.resolve_generic_call(ty);
+                if !resolved.is_none() && resolved != ty {
+                    self.type_align(resolved)
+                } else {
+                    Err("type_align: GenericCall resolution deferred".into())
+                }
+            }
+        }
+    }
+
+    fn max_field_align(&self, fields: Vec<(String, TypeIdx)>) -> Result<u64, String> {
+        let mut max_align = 1u64;
+        for (_, fty) in &fields {
+            let a = self.type_align(*fty)?;
+            if a > max_align {
+                max_align = a;
+            }
+        }
+        Ok(max_align)
+    }
+}
+
+/// Folds a `cfn` call encountered in a comptime position (`[bufLen(8)]u8`, a
+/// `cfn` calling another `cfn`) by running the callee's body in the evaluator.
+/// Mirrors the C++ `CompCallResolverImpl`. The depth / total-call budgets are
+/// shared `Cell`s so the whole instantiation chain is bounded.
+struct CfnResolver<'a, 'ctx> {
+    ctx: &'a CodegenContext<'ctx>,
+    depth: &'a Cell<u32>,
+    total: &'a Cell<u32>,
+}
+
+/// Recursion cap (C++ `kMaxDepth`).
+const CFN_MAX_DEPTH: u32 = 256;
+/// Total-call cap across one fold (C++ `kMaxTotalCalls`).
+const CFN_MAX_TOTAL_CALLS: u32 = 1_000_000;
+
+impl CompCallResolver for CfnResolver<'_, '_> {
+    fn resolve_call(
+        &mut self,
+        name: &str,
+        args: &[ComptimeValue],
+        diags: &mut Diagnostics,
+        loc: &SrcLoc,
+    ) -> ComptimeValue {
+        // Resolve against the body module first (the C++ namespace walk), then
+        // the bare name — two modules may each define a same-named cfn.
+        let cur = self.ctx.current_body_module();
+        let f = if !cur.is_empty() && !name.contains('.') {
+            self.ctx
+                .get_function_ast(&format!("{cur}.{name}"))
+                .or_else(|| self.ctx.get_function_ast(name))
+        } else {
+            self.ctx.get_function_ast(name)
+        };
+        let f = match f {
+            Some(f) if f.is_comp_time_fn => f,
+            _ => return ComptimeValue::None,
+        };
+        if f.args.len() != args.len() {
+            return ComptimeValue::None;
+        }
+        if self.total.get() >= CFN_MAX_TOTAL_CALLS || self.depth.get() >= CFN_MAX_DEPTH {
+            return ComptimeValue::None;
+        }
+        self.total.set(self.total.get() + 1);
+        self.depth.set(self.depth.get() + 1);
+
+        // A fresh lexical scope: the callee sees only its bound params.
+        let mut scope = ComptimeScope::new();
+        for (p, v) in f.args.iter().zip(args.iter()) {
+            scope.bind(p.name.clone(), v.clone());
+        }
+        let mut ret = ComptimeValue::None;
+        let mut iter = 0u32;
+        // Build a local evaluator from the context pools (the resolver no longer
+        // borrows one), and a fresh resolver sharing the SAME budget Cells for
+        // cfn->cfn calls.
+        let ev = ComptimeEvaluator::new(
+            &self.ctx.node_store,
+            &self.ctx.string_pool,
+            &self.ctx.type_pool,
+        );
+        let mut nested = CfnResolver {
+            ctx: self.ctx,
+            depth: self.depth,
+            total: self.total,
+        };
+        let mut nctx = CompCtx {
+            resolver: Some(&mut nested),
+            emitter: None,
+            diags: Some(diags),
+            loc: loc.clone(),
+            host_os: Os::MacOs,
+        };
+        ev.exec_block(
+            &f.body,
+            &mut scope,
+            &mut iter,
+            DEFAULT_ITER_CAP,
+            &mut ret,
+            &mut nctx,
+        );
+        self.depth.set(self.depth.get() - 1);
+        ret
+    }
+}
+
