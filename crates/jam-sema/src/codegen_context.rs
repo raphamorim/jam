@@ -909,3 +909,152 @@ impl<'ctx> CodegenContext<'ctx> {
             .and_then(|v| v.get(idx as usize).cloned())
     }
 
+    /// Qualify a `GenericCall` signature type to its defining/owning modules:
+    /// the callee to its generic's module (`Holder`->`mod_x.Holder`) and each
+    /// arg requalified against `ctx_module` (`Inner`->`mod_x.Inner`). Used for
+    /// SIGNATURE types (the oracle qualifies return/param generic types; local-
+    /// slot ones stay bare). No-op for non-`GenericCall` / already-qualified.
+    pub fn qualify_generic_callee(&self, ty: TypeIdx, ctx_module: &str) -> TypeIdx {
+        let k = self.type_pool.get(ty);
+        if k.kind != TypeKind::GenericCall {
+            return ty;
+        }
+        let callee = self.str_name(k.a);
+        let args = self.type_pool.generic_args_at(k.b).to_vec();
+        let new_callee = if let Some((prefix, rest)) = callee.split_once('.') {
+            // A handle-qualified generic callee (`c.Vec`): resolve the import handle
+            // to its canonical module path so `c.Vec(i32)` interns the SAME
+            // GenericCall as bare `Vec(i32)` and dedups to one monomorph (the C++
+            // resolves these through its scoped handle-fn table, main.cpp:1609-1660).
+            // An already-canonical dotted callee (`std/collections.Vec`) — whose
+            // prefix is a module path, not a handle — passes through unchanged.
+            match self.import_handle_module(prefix) {
+                Some(module) => format!("{module}.{rest}"),
+                None => callee.clone(),
+            }
+        } else if !ctx_module.is_empty()
+            && let Some(f) = self.get_function_ast(&format!("{ctx_module}.{callee}"))
+        {
+            // A module's OWN generic wins over a same-named one elsewhere (two
+            // modules may each define `Pair`); resolve against ctx_module first.
+            format!("{}.{}", f.module_path, f.name)
+        } else if let Some(f) = self.get_function_ast(&callee) {
+            if f.module_path.is_empty() {
+                callee.clone()
+            } else {
+                format!("{}.{}", f.module_path, f.name)
+            }
+        } else {
+            callee.clone()
+        };
+        // Requalify args with the active-subst-keeps-literal rule (matches the
+        // C++ requalifyTypeUncached GenericCall arm): a generic param `T` arg
+        // stays literal so an instantiated body interns the literal
+        // `Vec(T)`/`Option(T)` GenericCalls in the oracle's order.
+        let new_args: Vec<TypeIdx> = args
+            .iter()
+            .map(|&a| self.requalify_generic_arg(a, ctx_module))
+            .collect();
+        if new_callee == callee && new_args == args {
+            return ty;
+        }
+        let sid = self.string_pool.intern(new_callee.as_bytes());
+        self.type_pool.intern_generic_call(sid, new_args)
+    }
+
+    /// A clone of `module_path`'s anonymous struct at `idx`, if registered.
+    fn anon_struct(&self, module_path: &str, idx: u32) -> Option<StructDeclAST> {
+        self.anon_structs
+            .borrow()
+            .get(module_path)
+            .and_then(|v| v.get(idx as usize).cloned())
+    }
+
+    /// The instantiated `Named` for a `GenericCall` TypeIdx, or `NONE`.
+    pub fn lookup_generic_resolution(&self, ty: TypeIdx) -> TypeIdx {
+        let key = (self.current_body_module(), ty);
+        self.generic_resolutions
+            .borrow()
+            .get(&key)
+            .copied()
+            .unwrap_or(TypeIdx::NONE)
+    }
+
+    // ---- generic substitution stack ----
+    /// Enter a generic instantiation: bind parameter names to concrete args
+    /// while its body is lowered.
+    pub fn push_subst(&self, frame: HashMap<String, TypeIdx>) {
+        self.current_subst.borrow_mut().push(frame);
+    }
+    /// Leave the current generic instantiation.
+    pub fn pop_subst(&self) {
+        self.current_subst.borrow_mut().pop();
+    }
+    /// Apply the active generic substitution to `ty` (recursing compounds /
+    /// GenericCall args): `Vec(T)` -> `Vec(u8)`, `*mut[] T` -> `*mut[] u8`,
+    /// `Self`/`T` -> the instance/arg. No-op when no frame is active.
+    pub fn apply_current_subst(&self, ty: TypeIdx) -> TypeIdx {
+        if !self.has_active_subst() {
+            return ty;
+        }
+        let frame = self
+            .current_subst
+            .borrow()
+            .last()
+            .cloned()
+            .unwrap_or_default();
+        substitute_type(ty, &frame, &self.type_pool, &self.string_pool)
+    }
+
+    /// Rewrite a `Self.method` / `T.method` callee inside an instantiated body to
+    /// the concrete `Inst.method` (the C++ `resolvePrefix` reads currentSubst).
+    /// No-op outside an instantiation or for a non-subst prefix.
+    pub fn resolve_subst_prefix(&self, callee: &str) -> String {
+        if !self.has_active_subst() {
+            return callee.to_string();
+        }
+        if let Some((prefix, rest)) = callee.split_once('.') {
+            let sub = self.lookup_current_subst(prefix);
+            if !sub.is_none() {
+                let k = self.type_pool.get(sub);
+                if k.kind == TypeKind::Named {
+                    return format!("{}.{rest}", self.str_name(k.a));
+                }
+            }
+        }
+        callee.to_string()
+    }
+
+    /// The concrete TypeIdx bound to generic parameter `name` in the innermost
+    /// frame, or `NONE`.
+    pub fn lookup_current_subst(&self, name: &str) -> TypeIdx {
+        self.current_subst
+            .borrow()
+            .last()
+            .and_then(|f| f.get(name).copied())
+            .unwrap_or(TypeIdx::NONE)
+    }
+    /// Whether any substitution frame is active (memoization in the type-layout
+    /// methods is bypassed while a substitution is in flight).
+    pub fn has_active_subst(&self) -> bool {
+        !self.current_subst.borrow().is_empty()
+    }
+
+    /// Install the comp-value substitution map active while a comp-instantiated
+    /// fn clone's body is lowered (the C++ `setCurrentCompSubst`).
+    pub fn set_current_comp_subst(&self, s: HashMap<String, ComptimeValue>) {
+        *self.current_comp_subst.borrow_mut() = s;
+    }
+    /// Clear the comp-value substitution map (the C++ `clearCurrentCompSubst`).
+    pub fn clear_current_comp_subst(&self) {
+        self.current_comp_subst.borrow_mut().clear();
+    }
+    /// Bind the active comp-value substitutions into `scope`, so a body
+    /// reference to a comp param folds to its call-site constant (the C++
+    /// `seedComptimeScope` tail loop). Bound last to shadow same-named consts.
+    pub fn seed_comp_subst_into(&self, scope: &mut ComptimeScope) {
+        for (name, value) in self.current_comp_subst.borrow().iter() {
+            scope.bind(name.clone(), value.clone());
+        }
+    }
+
