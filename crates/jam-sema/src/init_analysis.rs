@@ -964,3 +964,189 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         }
     }
 
+    fn analyze_struct_lit(
+        &mut self,
+        _idx: NodeIdx,
+        n: &jam_syntax::ast_flat::AstNode,
+        state: NameMap,
+    ) -> StmtResult {
+        let extra = n.rhs;
+        let field_count = self.extra(extra);
+        let mut r = StmtResult {
+            state,
+            terminated: false,
+        };
+        for i in 0..field_count {
+            if r.terminated {
+                return r;
+            }
+            let expr_idx = NodeIdx::new(self.extra(extra + 1 + 2 * i + 1));
+            r = self.analyze_node(expr_idx, r.state);
+
+            // A bare drop-bearing binding used as a field initializer is a MOVE.
+            if self.node_tag(expr_idx) == AstTag::Variable {
+                let fname = self.str_name(self.ctx.node_store.get(expr_idx).lhs);
+                if self.binding_is_drop_bearing(&fname) {
+                    self.apply_move_to_binding(&fname, expr_idx, &mut r.state);
+                }
+            }
+        }
+        r
+    }
+
+    /// Apply the caller-side effect of moving `name`. The binding becomes
+    /// Uninit; for drop-bearing types the move is validated against the rules
+    /// that keep codegen's lexical drop suppression sound.
+    fn apply_move_to_binding(&mut self, name: &str, anchor: NodeIdx, state: &mut NameMap) {
+        if self.binding_is_drop_bearing(name) {
+            match self.decl_depth.get(name).copied() {
+                None => {
+                    // Not an owned binding (a `let`/`mut` param, or a global).
+                    // Moving a drop-bearing value out of a borrowed parameter is
+                    // rejected — it is borrowed, not owned. This is the
+                    // `Vec(T).filled` trigger (`value: T` is a `let` param). The
+                    // diagnostic spells the param mode (the C++ message, ll.
+                    // 1024-1029).
+                    if let Some(&mode) = self.param_modes.get(name)
+                        && mode != ParamMode::Move
+                    {
+                        let mode_word = if mode == ParamMode::Mut { "mut" } else { "let" };
+                        self.emit_error(
+                            format!(
+                                "cannot move drop-bearing `{name}` out of a `{mode_word}` \
+                                 parameter — it is borrowed, not owned; declare the parameter \
+                                 `move` to take ownership"
+                            ),
+                            anchor,
+                            name.to_string(),
+                        );
+                    }
+                    // Unknown/global name: just record the state.
+                }
+                Some(dd) if dd != self.cond_depth => {
+                    self.emit_error(
+                        format!(
+                            "cannot move `{name}` here: the move is conditional relative to its \
+                             declaration, so its drop cannot run unconditionally — move it on all \
+                             control-flow paths or none"
+                        ),
+                        anchor,
+                        name.to_string(),
+                    );
+                }
+                Some(_) => {
+                    self.moved_drop_bearing.insert(name.to_string());
+                }
+            }
+        }
+        self.moved_bindings.insert(name.to_string());
+        state.insert(name.to_string(), InitState::Uninit);
+    }
+
+    /// Extract a borrow path from a call-arg expression: a chain of `&`,
+    /// `.field`, `[idx]`, `.*` rooted at a Variable. Any other shape leaves
+    /// `base == None` so the exclusivity check skips that arg. `&` is transparent
+    /// — it does not contribute a step. Mirrors the C++ `Analyzer::extractPath`,
+    /// init_analysis.cpp:1078-1140.
+    fn extract_path(&self, arg_idx: NodeIdx) -> BorrowPath {
+        let mut path = BorrowPath {
+            base: None,
+            steps: Vec::new(),
+        };
+        let mut cur = arg_idx;
+        while !cur.is_none() {
+            let n = *self.ctx.node_store.get(cur);
+            match n.tag {
+                AstTag::Variable => {
+                    path.base = Some(n.lhs);
+                    path.steps.reverse();
+                    return path;
+                }
+                // Pass through; `&` is not a path step.
+                AstTag::AddressOf => cur = NodeIdx::new(n.lhs),
+                AstTag::MemberAccess => {
+                    path.steps.push(PathStep::Field(n.rhs));
+                    cur = NodeIdx::new(n.lhs);
+                }
+                AstTag::Index => {
+                    let idx_node = *self.ctx.node_store.get(NodeIdx::new(n.rhs));
+                    let step = if idx_node.tag == AstTag::NumberLit {
+                        // lhs = lo32, rhs = hi32, flags bit 0 = isNeg.
+                        let mag = (idx_node.lhs as u64) | ((idx_node.rhs as u64) << 32);
+                        if idx_node.flags & 1 == 0 {
+                            PathStep::Index(Some(mag))
+                        } else {
+                            PathStep::Index(None)
+                        }
+                    } else {
+                        PathStep::Index(None)
+                    };
+                    path.steps.push(step);
+                    cur = NodeIdx::new(n.lhs);
+                }
+                AstTag::Deref => {
+                    path.steps.push(PathStep::Deref);
+                    cur = NodeIdx::new(n.lhs);
+                }
+                _ => {
+                    // Computed expression — not a tracked path.
+                    path.steps.clear();
+                    return path;
+                }
+            }
+        }
+        path
+    }
+
+    /// Two paths overlap when one is a prefix of the other (or they are equal).
+    /// Per MVS §4.1; mirrors the C++ `Analyzer::pathsOverlap`,
+    /// init_analysis.cpp:1152-1177.
+    fn paths_overlap(a: &BorrowPath, b: &BorrowPath) -> bool {
+        let (Some(ab), Some(bb)) = (a.base, b.base) else {
+            return false;
+        };
+        if ab != bb {
+            return false;
+        }
+        let common = a.steps.len().min(b.steps.len());
+        for i in 0..common {
+            match (a.steps[i], b.steps[i]) {
+                (PathStep::Field(fa), PathStep::Field(fb)) => {
+                    if fa != fb {
+                        return false;
+                    }
+                }
+                (PathStep::Index(ia), PathStep::Index(ib)) => match (ia, ib) {
+                    (Some(ca), Some(cb)) => {
+                        if ca != cb {
+                            return false;
+                        }
+                    }
+                    // At least one dynamic index — conservatively overlap.
+                    _ => return true,
+                },
+                (PathStep::Deref, PathStep::Deref) => {}
+                // Different kinds: disjoint.
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Walk an lvalue/arg chain (`x`, `p.x`, `arr[i]`, `p.*`) down to the
+    /// leftmost Variable; return its name. `None` if not a trackable base.
+    fn find_base_binding(&self, arg_idx: NodeIdx) -> Option<String> {
+        let mut cur = arg_idx;
+        while !cur.is_none() {
+            let n = *self.ctx.node_store.get(cur);
+            match n.tag {
+                AstTag::Variable => return Some(self.str_name(n.lhs)),
+                AstTag::AddressOf | AstTag::MemberAccess | AstTag::Index | AstTag::Deref => {
+                    cur = NodeIdx::new(n.lhs)
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
