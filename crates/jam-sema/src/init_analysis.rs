@@ -1150,3 +1150,217 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         None
     }
 
+    fn check_variable_read(&mut self, idx: NodeIdx, state: &NameMap) {
+        let n = *self.ctx.node_store.get(idx);
+        let name = self.str_name(n.lhs);
+        match state.get(&name) {
+            None => {} // unseen (global/import/for-var) — assume Init
+            Some(InitState::Init) | Some(InitState::Unknown) => {}
+            Some(InitState::Uninit) => {
+                if self.moved_bindings.contains(&name) {
+                    self.emit_error(
+                        format!(
+                            "use of moved binding `{name}` — its value was moved out here or \
+                             earlier; if both values are needed, clone before moving \
+                             (`{name}.clone()`)"
+                        ),
+                        idx,
+                        name.clone(),
+                    );
+                } else {
+                    self.emit_error(
+                        format!("use of uninitialized binding `{name}`"),
+                        idx,
+                        name.clone(),
+                    );
+                }
+            }
+            Some(InitState::MaybeInit) => {
+                if self.moved_bindings.contains(&name) {
+                    self.emit_error(
+                        format!("binding `{name}` may have been moved on a path that reaches here"),
+                        idx,
+                        name.clone(),
+                    );
+                } else {
+                    self.emit_error(
+                        format!(
+                            "binding `{name}` may not be initialized on every path that reaches here"
+                        ),
+                        idx,
+                        name.clone(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// `comp if` verdict: fold the condition. Returns `Some(true/false)` for a
+    /// foldable comptime bool, `None` to fall back to conservative both-arm
+    /// analysis. Generic method bodies under analysis carry no comp scope of
+    /// their own, so this folds only against module/comp-subst consts.
+    ///
+    /// Divergence note vs the C++ (which replays astgen's RECORDED verdict via
+    /// `AnalysisHooks::compIfVerdict`): both fold module/comp-subst consts
+    /// identically, so a foldable condition always agrees with astgen. A
+    /// condition astgen folded through a FUNCTION-LOCAL comp binding is
+    /// unfoldable here (`None`) and analyzes BOTH arms — strictly conservative:
+    /// it can surface an extra diagnostic from the arm astgen elided, but can
+    /// never pick the opposite arm or miss an error in live code.
+    fn comp_if_verdict(&self, cond: NodeIdx) -> Option<bool> {
+        match self.ctx.fold_comptime_expr(cond) {
+            crate::comptime::ComptimeValue::Bool(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// At every `return` and at fall-off-end, a drop-bearing local that is not
+    /// definitely-initialized must be rejected — codegen synthesizes a drop on
+    /// it at this exit and dropping uninit memory is UB. Ported 1:1 from the C++
+    /// `Analyzer::checkDropBearingLocalsInit`, init_analysis.cpp:1256-1325.
+    fn check_drop_bearing_locals_init(&mut self, state: &NameMap, anchor: NodeIdx) {
+        // Walk only the bindings CURRENTLY IN SCOPE (present in the merged state
+        // map). Inner-block bindings have been dropped at their own scope end and
+        // the merge removed them; var_types retains every name we ever saw, so
+        // checking those would false-positive.
+        for (name, &s) in state.iter() {
+            // `let`/`mut` params are borrowed — the caller owns the value and its
+            // drop. `move` params are callee-owned and DO drop at exit, so they
+            // go through the same classification as locals.
+            if let Some(&mode) = self.param_modes.get(name)
+                && mode != ParamMode::Move
+            {
+                continue;
+            }
+
+            if !self.binding_is_drop_bearing(name) {
+                continue;
+            }
+
+            if s == InitState::Init {
+                continue;
+            }
+
+            // Uninit + definitely-moved-on-every-path == rustc's Dead: codegen
+            // suppressed the drop, nothing runs. OK.
+            if s == InitState::Uninit && self.moved_drop_bearing.contains(name) {
+                continue;
+            }
+
+            // Recover the source-spelled type name for the diagnostic.
+            let mut type_name = String::from("?");
+            if let Some(&ty) = self.var_types.get(name) {
+                let k = self.ctx.type_pool.get(ty);
+                if matches!(
+                    k.kind,
+                    TypeKind::Struct
+                        | TypeKind::Named
+                        | TypeKind::Enum
+                        | TypeKind::Union
+                        | TypeKind::GenericCall
+                ) && k.a != 0
+                {
+                    type_name = self.str_name(k.a);
+                }
+            }
+
+            let mut msg = format!("drop-bearing binding `{name}` of type `{type_name}` ");
+            if s == InitState::Uninit {
+                msg.push_str(
+                    "must be initialized before this exit; drop runs on it and would otherwise \
+                     read uninit memory",
+                );
+            } else if self.moved_bindings.contains(name) {
+                // rustc's Conditional (maybe-init AND maybe-uninit): rustc inserts
+                // a runtime drop flag; jam rejects (Swift SE-0390 style).
+                msg.push_str(
+                    "is moved on some control-flow paths but not others; its drop cannot run \
+                     conditionally — move it on all paths or none",
+                );
+            } else {
+                msg.push_str(
+                    "may not be initialized on every path that reaches this exit; drop runs on it \
+                     on every path",
+                );
+            }
+            self.emit_error(msg, anchor, name.clone());
+        }
+    }
+
+    /// Returning the address of a `mut`-mode parameter must be rejected — borrows
+    /// are second-class and cannot escape the function (dangling pointer). Ported
+    /// 1:1 from the C++ `Analyzer::checkScopeEscape`, init_analysis.cpp:1327-1368.
+    fn check_scope_escape(&mut self, expr_idx: NodeIdx) {
+        if expr_idx.is_none() {
+            return;
+        }
+        let top = *self.ctx.node_store.get(expr_idx);
+        // Only `&`-rooted expressions can carry a borrow out of the function.
+        // Returning a parameter by value (`return p;`, `return p.x;`) is a copy.
+        if top.tag != AstTag::AddressOf {
+            return;
+        }
+        // Walk the path under the `&` to the base Variable, descending through
+        // MemberAccess / Index (so `&p.field`, `&arr[i]` are covered) but stopping
+        // at Deref (the dereferenced pointee is data, not the borrow path).
+        let mut cur = NodeIdx::new(top.lhs);
+        while !cur.is_none() {
+            let m = *self.ctx.node_store.get(cur);
+            match m.tag {
+                AstTag::Variable => {
+                    let name = self.str_name(m.lhs);
+                    // Find this name in the parameter list.
+                    if let Some(&(_, mode)) = self.params.iter().find(|(pn, _)| pn == &name) {
+                        if mode != ParamMode::Mut {
+                            return;
+                        }
+                        self.emit_error(
+                            format!(
+                                "cannot return `&` of `mut`-mode parameter `{name}` — borrows are \
+                                 second-class and cannot escape the function"
+                            ),
+                            expr_idx,
+                            name,
+                        );
+                    }
+                    return; // not a parameter at all
+                }
+                AstTag::MemberAccess | AstTag::Index => cur = NodeIdx::new(m.lhs),
+                // Deref or anything else: not a borrow path on the parameter.
+                _ => return,
+            }
+        }
+    }
+
+    /// 1-based source line of `idx`, or `0` for `kNoNode`. NodeStore's parallel
+    /// line table is parse-time stamped, so it is correct for imported modules
+    /// too (the C++ `Analyzer::lineOf`).
+    fn line_of(&self, idx: NodeIdx) -> u32 {
+        if idx.is_none() {
+            return 0;
+        }
+        self.ctx.node_store.get_line(idx)
+    }
+
+    fn emit_error(&mut self, message: String, anchor: NodeIdx, var_name: String) {
+        let line = self.line_of(anchor);
+        self.diagnostics.push(Diagnostic {
+            message,
+            var_name,
+            line,
+        });
+    }
+}
+
+/// Lattice merge: union of keys, bitwise-OR of overlapping states.
+fn merge_maps(a: &NameMap, b: &NameMap) -> NameMap {
+    let mut result = a.clone();
+    for (k, &v) in b {
+        result
+            .entry(k.clone())
+            .and_modify(|s| *s = merge_state(*s, v))
+            .or_insert(v);
+    }
+    result
+}
+
