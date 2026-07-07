@@ -254,3 +254,245 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
     // ---- tag dispatch ----
 
+    fn analyze_node(&mut self, idx: NodeIdx, state: NameMap) -> StmtResult {
+        if idx.is_none() {
+            return StmtResult {
+                state,
+                terminated: false,
+            };
+        }
+        let n = *self.ctx.node_store.get(idx);
+        match n.tag {
+            AstTag::VarDecl => self.analyze_var_decl(idx, state),
+            AstTag::Assign => self.analyze_assign(idx, state),
+            AstTag::IfNode => self.analyze_if(idx, state),
+            AstTag::WhileNode => self.analyze_while(idx, state),
+            AstTag::ForNode => self.analyze_for(idx, state),
+            AstTag::MatchNode => self.analyze_match(idx, state),
+            AstTag::Return => self.analyze_return(idx, state),
+            AstTag::Break | AstTag::Continue => StmtResult {
+                state,
+                terminated: true,
+            },
+
+            AstTag::Variable => {
+                self.check_variable_read(idx, &state);
+                StmtResult {
+                    state,
+                    terminated: false,
+                }
+            }
+            AstTag::Call => self.analyze_call(idx, state),
+            AstTag::TypeMethodCall => self.analyze_type_method_call(idx, &n, state),
+            AstTag::BinaryOp => {
+                let r = self.analyze_node(NodeIdx::new(n.lhs), state);
+                if r.terminated {
+                    return r;
+                }
+                self.analyze_node(NodeIdx::new(n.rhs), r.state)
+            }
+            AstTag::UnaryOp => self.analyze_node(NodeIdx::new(n.lhs), state),
+            AstTag::MemberAccess => self.analyze_node(NodeIdx::new(n.lhs), state),
+            AstTag::Index => {
+                let r = self.analyze_node(NodeIdx::new(n.lhs), state);
+                if r.terminated {
+                    return r;
+                }
+                self.analyze_node(NodeIdx::new(n.rhs), r.state)
+            }
+            AstTag::Slice => {
+                let r = self.analyze_node(NodeIdx::new(n.lhs), state);
+                if r.terminated {
+                    return r;
+                }
+                let start = NodeIdx::new(self.extra(n.rhs));
+                let end = NodeIdx::new(self.extra(n.rhs + 1));
+                let r = self.analyze_node(start, r.state);
+                if r.terminated {
+                    return r;
+                }
+                self.analyze_node(end, r.state)
+            }
+            AstTag::Deref => self.analyze_node(NodeIdx::new(n.lhs), state),
+            // `&x` — taking an address is not a read.
+            AstTag::AddressOf => StmtResult {
+                state,
+                terminated: false,
+            },
+            AstTag::AsCast => self.analyze_node(NodeIdx::new(n.lhs), state),
+            AstTag::StructLit => self.analyze_struct_lit(idx, &n, state),
+            AstTag::ArrayLit => {
+                let count = self.extra(n.rhs);
+                let mut r = StmtResult {
+                    state,
+                    terminated: false,
+                };
+                for i in 0..count {
+                    let elem = NodeIdx::new(self.extra(n.rhs + 1 + i));
+                    r = self.analyze_node(elem, r.state);
+                    if r.terminated {
+                        return r;
+                    }
+                    if self.node_tag(elem) == AstTag::Variable {
+                        let src = self.str_name(self.ctx.node_store.get(elem).lhs);
+                        if self.binding_is_drop_bearing(&src) {
+                            self.apply_move_to_binding(&src, elem, &mut r.state);
+                        }
+                    }
+                }
+                r
+            }
+            AstTag::ArrayRepeat => {
+                let value = NodeIdx::new(self.extra(n.rhs));
+                let count = NodeIdx::new(self.extra(n.rhs + 1));
+                let r = self.analyze_node(value, state);
+                if r.terminated {
+                    return r;
+                }
+                self.analyze_node(count, r.state)
+            }
+
+            // Literals + comptime intrinsics + type expressions — no effect.
+            AstTag::NumberLit
+            | AstTag::BoolLit
+            | AstTag::StringLit
+            | AstTag::ImportLit
+            | AstTag::AtCall
+            | AstTag::StructExpr
+            | AstTag::EnumExpr
+            | AstTag::PatLit
+            | AstTag::PatRange
+            | AstTag::PatWildcard
+            | AstTag::PatOr
+            | AstTag::PatEnumVariant
+            | AstTag::Invalid
+            | AstTag::Count => StmtResult {
+                state,
+                terminated: false,
+            },
+        }
+    }
+
+    fn analyze_var_decl(&mut self, idx: NodeIdx, mut state: NameMap) -> StmtResult {
+        let n = *self.ctx.node_store.get(idx);
+        let extra = n.lhs;
+        let name_idx = self.extra(extra);
+        let type_idx = TypeIdx::new(self.extra(extra + 1));
+        let init_idx = NodeIdx::new(self.extra(extra + 2));
+        let name = self.str_name(name_idx);
+
+        // `comp const` / `comp var` (rhs bit 1): no runtime slot, nothing to walk.
+        if n.rhs & 2 != 0 {
+            self.comp_names.insert(name);
+            return StmtResult {
+                state,
+                terminated: false,
+            };
+        }
+        self.comp_names.remove(&name);
+
+        self.var_types.insert(name.clone(), type_idx);
+        self.decl_depth.insert(name.clone(), self.cond_depth);
+        // Re-declaration (inner-block shadow) starts a fresh binding.
+        self.moved_bindings.remove(&name);
+        self.moved_drop_bearing.remove(&name);
+
+        if init_idx.is_none() {
+            state.insert(name, InitState::Init);
+            return StmtResult {
+                state,
+                terminated: false,
+            };
+        }
+
+        let mut r = self.analyze_node(init_idx, state);
+        if r.terminated {
+            return r;
+        }
+
+        // `var owned = c;` with a bare drop-bearing `c` MOVES it.
+        if self.node_tag(init_idx) == AstTag::Variable {
+            let src = self.str_name(self.ctx.node_store.get(init_idx).lhs);
+            if self.binding_is_drop_bearing(&src) {
+                self.apply_move_to_binding(&src, init_idx, &mut r.state);
+            }
+        }
+
+        r.state.insert(name, InitState::Init);
+        r
+    }
+
+    fn analyze_assign(&mut self, idx: NodeIdx, state: NameMap) -> StmtResult {
+        let n = *self.ctx.node_store.get(idx);
+        // Assignment to a comp binding mutates astgen's comp scope — skip.
+        {
+            let target = *self.ctx.node_store.get(NodeIdx::new(n.lhs));
+            if target.tag == AstTag::Variable {
+                let tname = self.str_name(target.lhs);
+                if self.comp_names.contains(&tname) && !self.var_types.contains_key(&tname) {
+                    return StmtResult {
+                        state,
+                        terminated: false,
+                    };
+                }
+            }
+        }
+        // RHS evaluated first (drop old, then store new).
+        let mut r = self.analyze_node(NodeIdx::new(n.rhs), state);
+        if r.terminated {
+            return r;
+        }
+
+        // A bare drop-bearing RHS is MOVED into the store destination
+        // (`self.ptr[i] = value`, `s.field = c`).
+        if self.node_tag(NodeIdx::new(n.rhs)) == AstTag::Variable {
+            let src = self.str_name(self.ctx.node_store.get(NodeIdx::new(n.rhs)).lhs);
+            if self.binding_is_drop_bearing(&src) {
+                self.apply_move_to_binding(&src, NodeIdx::new(n.rhs), &mut r.state);
+            }
+        }
+
+        self.analyze_assign_target(NodeIdx::new(n.lhs), r.state)
+    }
+
+    fn analyze_assign_target(&mut self, idx: NodeIdx, mut state: NameMap) -> StmtResult {
+        if idx.is_none() {
+            return StmtResult {
+                state,
+                terminated: false,
+            };
+        }
+        let n = *self.ctx.node_store.get(idx);
+        match n.tag {
+            AstTag::Variable => {
+                let name = self.str_name(n.lhs);
+                // A moved-out drop-bearing binding cannot be re-initialized.
+                if self.moved_drop_bearing.contains(&name) {
+                    self.emit_error(
+                        format!(
+                            "cannot assign to `{name}` after it was moved — its scope-exit drop \
+                             was suppressed by the move; bind a new name instead"
+                        ),
+                        idx,
+                        name.clone(),
+                    );
+                }
+                state.insert(name, InitState::Init);
+                StmtResult {
+                    state,
+                    terminated: false,
+                }
+            }
+            AstTag::MemberAccess => self.analyze_assign_target(NodeIdx::new(n.lhs), state),
+            AstTag::Index => {
+                let r = self.analyze_node(NodeIdx::new(n.rhs), state);
+                if r.terminated {
+                    return r;
+                }
+                self.analyze_assign_target(NodeIdx::new(n.lhs), r.state)
+            }
+            AstTag::Deref => self.analyze_node(NodeIdx::new(n.lhs), state),
+            _ => self.analyze_node(idx, state),
+        }
+    }
+
