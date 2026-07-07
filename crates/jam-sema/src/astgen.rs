@@ -307,3 +307,82 @@ fn fail_node(gctx: &AstGenCtx, node: NodeIdx, message: &str) -> String {
     }
 }
 
+/// Ownership is tracked per WHOLE binding. Extracting a drop-bearing value out
+/// of a pure field path (`h.c`, `o.inner.c`) duplicates ownership: the extracted
+/// value and the aggregate's drop glue would both drop the same payload. True
+/// when `expr_idx` is a `MemberAccess` chain rooted at a LOCAL binding whose
+/// `result_ty` needs drop. Paths that index through raw pointers (`self.ptr[i]`)
+/// are the pointer world and stay unchecked. Ported from the C++
+/// `isDropBearingFieldExtract`, astgen.cpp:5874-5898.
+fn is_drop_bearing_field_extract(gctx: &AstGenCtx, expr_idx: NodeIdx, result_ty: TypeIdx) -> bool {
+    if result_ty.is_none() {
+        return false;
+    }
+    let top = *gctx.ctx.node_store.get(expr_idx);
+    if top.tag != AstTag::MemberAccess {
+        return false;
+    }
+    let mut cur = expr_idx;
+    while !cur.is_none() {
+        let n = *gctx.ctx.node_store.get(cur);
+        if n.tag == AstTag::MemberAccess {
+            cur = NodeIdx::new(n.lhs);
+            continue;
+        }
+        if n.tag == AstTag::Variable {
+            let root = str_at(gctx, n.lhs);
+            // Only locals/params — `Color.Red` and module paths also parse as
+            // MemberAccess on a Variable root.
+            if !gctx.locals.contains_key(&root) {
+                return false;
+            }
+            return gctx.ctx.type_needs_drop(result_ty);
+        }
+        // Index / Deref / call in the path: pointer world.
+        return false;
+    }
+    false
+}
+
+/// Reject moving/extracting a drop-bearing field out of its owned aggregate (else
+/// double-free). The C++ `rejectDropBearingFieldExtract`, astgen.cpp:5900-5909.
+fn reject_drop_bearing_field_extract(
+    gctx: &AstGenCtx,
+    expr_idx: NodeIdx,
+    result_ty: TypeIdx,
+    verb: &str,
+) -> Result<(), String> {
+    if !is_drop_bearing_field_extract(gctx, expr_idx, result_ty) {
+        return Ok(());
+    }
+    Err(fail_node(
+        gctx,
+        expr_idx,
+        &format!(
+            "cannot {verb} a drop-bearing field out of its aggregate — ownership is tracked per \
+             whole binding, so the field and the aggregate's drop would both run; clone the field \
+             out (`.clone()`) or move the whole value"
+        ),
+    ))
+}
+
+/// If the return expr is a bare `Variable` naming a tracked drop local, return
+/// its name — its scope-exit drop is suppressed in this return path (the value
+/// is moved to the caller).
+fn detect_return_move(gctx: &AstGenCtx, val_idx: NodeIdx) -> Option<String> {
+    let n = *gctx.ctx.node_store.get(val_idx);
+    if n.tag != AstTag::Variable {
+        return None;
+    }
+    let name = str_at(gctx, n.lhs);
+    if gctx
+        .drop_scopes
+        .iter()
+        .any(|s| s.iter().any(|d| d.var_name == name))
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
