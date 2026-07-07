@@ -1074,3 +1074,208 @@ pub fn jir_define_body<'ctx>(jfn: &JirFunction, ctx: &CodegenContext<'ctx>) -> R
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jir::{JirFunction, JirInst};
+    use jam_core::index::TypeIdx;
+    use jam_llvm::Context;
+
+    #[test]
+    fn declare_simple_function_prototype() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let mut jfn = JirFunction::new();
+        jfn.name = "add".into();
+        jfn.param_types = vec![builtin::I32, builtin::I32];
+        jfn.param_modes = vec![ParamMode::Let, ParamMode::Let];
+        jfn.return_type = builtin::I32;
+        let f = jir_declare_prototype(&jfn, &cg).unwrap();
+        assert_eq!(f.count_params(), 2);
+        assert!(f.return_type().is_integer());
+        // NB: a bodyless *internal*-linkage function does NOT verify yet — LLVM
+        // requires internal functions to have a definition; the body is added
+        // by jir_define_body. (An `extern` decl with external linkage would.)
+    }
+
+    #[test]
+    fn mut_param_lowers_to_pointer() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let mut jfn = JirFunction::new();
+        jfn.name = "bump".into();
+        jfn.param_types = vec![builtin::I32];
+        jfn.param_modes = vec![ParamMode::Mut];
+        jfn.return_type = TypeIdx::NONE; // void
+        let f = jir_declare_prototype(&jfn, &cg).unwrap();
+        assert_eq!(f.count_params(), 1);
+        assert!(f.param(0).type_of().is_pointer()); // mut -> ByPointer
+        assert!(f.return_type().is_void());
+    }
+
+    #[test]
+    fn extern_declaration_verifies() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let mut jfn = JirFunction::new();
+        jfn.name = "putchar".into();
+        jfn.param_types = vec![builtin::I32];
+        jfn.return_type = builtin::I32;
+        jfn.is_extern = true;
+        let f = jir_declare_prototype(&jfn, &cg).unwrap();
+        // extern -> external linkage; a bodyless external declaration verifies.
+        assert!(f.verify());
+        assert_eq!(f.count_params(), 1);
+    }
+
+    #[test]
+    fn lower_arithmetic_body_emits_real_ir() {
+        // fn five() i32 { return 2 + 3 }
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let mut jfn = JirFunction::new();
+        jfn.name = "five".into();
+        jfn.return_type = builtin::I32;
+        let entry = jfn.push_block("entry");
+        let i2 = jfn.push_inst(JirInst {
+            tag: JirTag::Int,
+            a: 2,
+            ty: builtin::I32,
+            ..Default::default()
+        });
+        let i3 = jfn.push_inst(JirInst {
+            tag: JirTag::Int,
+            a: 3,
+            ty: builtin::I32,
+            ..Default::default()
+        });
+        let add = jfn.push_inst(JirInst {
+            tag: JirTag::Add,
+            a: i2,
+            b: i3,
+            ty: builtin::I32,
+            ..Default::default()
+        });
+        let ret = jfn.push_inst(JirInst {
+            tag: JirTag::Ret,
+            a: add,
+            ..Default::default()
+        });
+        jfn.get_block_mut(entry).insts.extend([i2, i3, add, ret]);
+
+        jir_declare_prototype(&jfn, &cg).unwrap();
+        jir_define_body(&jfn, &cg).unwrap();
+        let f = cg.module().get_function("five").unwrap();
+        // An internal-linkage function WITH a body now verifies.
+        assert!(f.verify());
+    }
+
+    #[test]
+    fn lower_local_variable_body() {
+        // fn f() i32 { var x: i32; x = 7; return x }  (Alloca, Store, Load, Ret)
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let mut jfn = JirFunction::new();
+        jfn.name = "f".into();
+        jfn.return_type = builtin::I32;
+        let entry = jfn.push_block("entry");
+        let slot = jfn.push_inst(JirInst {
+            tag: JirTag::Alloca,
+            ty: builtin::I32,
+            ..Default::default()
+        });
+        let seven = jfn.push_inst(JirInst {
+            tag: JirTag::Int,
+            a: 7,
+            ty: builtin::I32,
+            ..Default::default()
+        });
+        let store = jfn.push_inst(JirInst {
+            tag: JirTag::Store,
+            a: slot,
+            b: seven,
+            ..Default::default()
+        });
+        let load = jfn.push_inst(JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: builtin::I32,
+            ..Default::default()
+        });
+        let ret = jfn.push_inst(JirInst {
+            tag: JirTag::Ret,
+            a: load,
+            ..Default::default()
+        });
+        jfn.get_block_mut(entry)
+            .insts
+            .extend([slot, seven, store, load, ret]);
+
+        jir_declare_prototype(&jfn, &cg).unwrap();
+        jir_define_body(&jfn, &cg).unwrap();
+        assert!(cg.module().get_function("f").unwrap().verify());
+    }
+
+    #[test]
+    fn lower_comparison_body() {
+        // fn lt() bool { return 2 < 3 }
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let mut jfn = JirFunction::new();
+        jfn.name = "lt".into();
+        jfn.return_type = builtin::BOOL;
+        let entry = jfn.push_block("entry");
+        let i2 = jfn.push_inst(JirInst {
+            tag: JirTag::Int,
+            a: 2,
+            ty: builtin::I32,
+            ..Default::default()
+        });
+        let i3 = jfn.push_inst(JirInst {
+            tag: JirTag::Int,
+            a: 3,
+            ty: builtin::I32,
+            ..Default::default()
+        });
+        let lt = jfn.push_inst(JirInst {
+            tag: JirTag::ICmpSlt,
+            a: i2,
+            b: i3,
+            ty: builtin::BOOL,
+            ..Default::default()
+        });
+        let ret = jfn.push_inst(JirInst {
+            tag: JirTag::Ret,
+            a: lt,
+            ..Default::default()
+        });
+        jfn.get_block_mut(entry).insts.extend([i2, i3, lt, ret]);
+
+        jir_declare_prototype(&jfn, &cg).unwrap();
+        jir_define_body(&jfn, &cg).unwrap();
+        let f = cg.module().get_function("lt").unwrap();
+        assert!(f.verify());
+    }
+
+    #[test]
+    fn struct_return_uses_sret() {
+        let ctx = Context::new();
+        let cg = CodegenContext::new(&ctx, "m");
+        let nid = cg.string_pool.intern(b"Pair");
+        let pair = cg.type_pool.intern_struct(nid);
+        let named = ctx.named_struct("Pair");
+        cg.register_struct(
+            "Pair",
+            named,
+            vec![("a".into(), builtin::I64), ("b".into(), builtin::I64)],
+        );
+        let mut jfn = JirFunction::new();
+        jfn.name = "makePair".into();
+        jfn.return_type = pair;
+        let f = jir_declare_prototype(&jfn, &cg).unwrap();
+        // sret: a leading ptr param + a void return.
+        assert_eq!(f.count_params(), 1);
+        assert!(f.param(0).type_of().is_pointer());
+        assert!(f.return_type().is_void());
+    }
+}
