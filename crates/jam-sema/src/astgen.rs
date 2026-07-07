@@ -194,3 +194,116 @@ fn str_at(gctx: &AstGenCtx, id: u32) -> String {
 
 // ---- drop / move tracking ----
 
+/// Enter a structured body's lexical scope (new drop frame).
+fn push_drop_scope(gctx: &mut AstGenCtx) {
+    gctx.drop_scopes.push(Vec::new());
+    gctx.local_scopes.push(std::collections::HashSet::new());
+    // Comp bindings are lexically scoped too: an inner block's `comp const x`
+    // shadows an outer one, and the outer value is restored at block exit.
+    gctx.comp_scope.push();
+    gctx.comp_bind_info.push(HashMap::new());
+}
+
+/// Drop a scope's bindings in reverse declaration order.
+fn emit_drops(gctx: &mut AstGenCtx, bindings: &[DropTrack]) {
+    for d in bindings.iter().rev() {
+        emit_drop_in_place(gctx, d.slot, d.ty);
+    }
+}
+
+/// Emit drops for every scope from the top down to (and including) `target_idx`,
+/// WITHOUT popping — the AST walker still owns the scope stack (break / continue
+/// / return; the structured bodies pop on their own).
+fn emit_drops_through_scope(gctx: &mut AstGenCtx, target_idx: usize) {
+    let mut i = gctx.drop_scopes.len();
+    while i > target_idx {
+        let scope = gctx.drop_scopes[i - 1].clone();
+        emit_drops(gctx, &scope);
+        i -= 1;
+    }
+}
+
+/// Like [`emit_drops_through_scope`] but skips the first binding named
+/// `moved_var` (return-as-move: ownership transferred to the caller). Rebuilds
+/// filtered copies; does not mutate the scope stack, so other return paths still
+/// drop the local.
+fn emit_drops_through_scope_moved_out(gctx: &mut AstGenCtx, target_idx: usize, moved_var: &str) {
+    let mut i = gctx.drop_scopes.len();
+    while i > target_idx {
+        let orig = gctx.drop_scopes[i - 1].clone();
+        let mut filtered = Vec::with_capacity(orig.len());
+        let mut removed = false;
+        for d in orig {
+            if !removed && d.var_name == moved_var {
+                removed = true;
+                continue;
+            }
+            filtered.push(d);
+        }
+        emit_drops(gctx, &filtered);
+        i -= 1;
+    }
+}
+
+/// Pop the top drop scope, emitting its drops first unless the current block
+/// already terminated (a divergent return/break/continue dropped them).
+fn pop_drop_scope_emitting(gctx: &mut AstGenCtx) {
+    if gctx.drop_scopes.is_empty() {
+        return;
+    }
+    if !block_has_terminator(gctx) {
+        let scope = gctx.drop_scopes.last().unwrap().clone();
+        emit_drops(gctx, &scope);
+    }
+    gctx.drop_scopes.pop();
+    gctx.local_scopes.pop();
+    gctx.comp_scope.pop();
+    gctx.comp_bind_info.pop();
+}
+
+/// Find the binding-info record for an explicit comp binding, innermost frame
+/// first (the C++ `lookupCompBindingInfo`). `None` when `name` is not an
+/// explicit comp binding — seeded module consts / comp params don't match.
+fn lookup_comp_binding_info(gctx: &AstGenCtx, name: &str) -> Option<CompBindingInfo> {
+    gctx.comp_bind_info
+        .iter()
+        .rev()
+        .find_map(|frame| frame.get(name).copied())
+}
+
+/// If `expr_idx` is a bare `Variable` naming a tracked drop local, remove it
+/// from its drop scope — ownership has moved to the surrounding owner (a struct
+/// field, an array element, a `move` arg), which now runs the drop.
+fn consume_moved_variable(gctx: &mut AstGenCtx, expr_idx: NodeIdx) {
+    let n = *gctx.ctx.node_store.get(expr_idx);
+    if n.tag != AstTag::Variable {
+        return;
+    }
+    let name = str_at(gctx, n.lhs);
+    for scope in gctx.drop_scopes.iter_mut() {
+        if let Some(pos) = scope.iter().position(|d| d.var_name == name) {
+            scope.remove(pos);
+            return;
+        }
+    }
+}
+
+/// Format an astgen failure anchored at `node` as `file:line: error: message`,
+/// matching the C++ `failNode` -> `Diagnostics::emit` byte output. The file is
+/// the context's current display file; the line is `node`'s parse-time line.
+fn fail_node(gctx: &AstGenCtx, node: NodeIdx, message: &str) -> String {
+    let file = gctx.ctx.current_file();
+    let line = gctx.ctx.node_store.get_line(node);
+    if file.is_empty() {
+        if line > 0 {
+            format!("{line}: error: {message}")
+        } else {
+            format!("error: {message}")
+        }
+    } else if line > 0 {
+        format!("{file}:{line}: error: {message}")
+    } else {
+        format!("{file}: error: {message}")
+    }
+}
+
