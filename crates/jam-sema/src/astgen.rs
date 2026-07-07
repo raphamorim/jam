@@ -862,3 +862,354 @@ fn emit_container_element_drops(gctx: &mut AstGenCtx, ptr: JirRef, container_ty:
     true
 }
 
+/// Deep-clone `*src` of type `ty` into `*dest` (the C++ `emitCloneInto`): plain
+/// data bitwise-copies; arrays / enum payloads / struct fields recurse; a type
+/// with its own `cfn clone` calls it; a drop-bearing struct with NO clone recipe
+/// is an error (it owns resources). Returns Err on the error tier (the caller
+/// withdraws the conditional method).
+fn emit_clone_into(
+    gctx: &mut AstGenCtx,
+    src: JirRef,
+    dest: JirRef,
+    ty: TypeIdx,
+) -> Result<(), String> {
+    let mut ty = gctx.ctx.apply_current_subst(ty);
+    if gctx.ctx.type_pool.get(ty).kind == TypeKind::GenericCall {
+        ty = gctx.ctx.resolve_generic_call_instantiate(ty)?;
+    }
+    if gctx.ctx.type_pool.get(ty).kind == TypeKind::ArrayExpr {
+        ty = gctx.ctx.resolve_array_expr_instantiate(ty)?;
+    }
+    // Tier 1: plain data — a bitwise Load+Store is a true value copy.
+    if !gctx.ctx.type_needs_drop(ty) {
+        let v = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: src,
+                ty,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: dest,
+                b: v,
+                ..Default::default()
+            },
+        );
+        return Ok(());
+    }
+    let k = gctx.ctx.type_pool.get(ty);
+    // Fixed-size array: clone element-wise.
+    if k.kind == TypeKind::Array {
+        let (elem, n) = (TypeIdx::new(k.a), k.b);
+        let elem_ptr = gctx.ctx.type_pool.intern_ptr_single(elem);
+        for i in 0..n {
+            let idx = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Int,
+                    a: i,
+                    ty: builtin::U64,
+                    ..Default::default()
+                },
+            );
+            let se = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::IndexAddr,
+                    a: src,
+                    b: idx,
+                    ty: elem_ptr,
+                    ..Default::default()
+                },
+            );
+            let de = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::IndexAddr,
+                    a: dest,
+                    b: idx,
+                    ty: elem_ptr,
+                    ..Default::default()
+                },
+            );
+            emit_clone_into(gctx, se, de, elem)?;
+        }
+        return Ok(());
+    }
+    // Enum: bitwise-copy the whole value, then re-clone each live variant's
+    // droppable payload over the raw copy (tag-dispatched at byte offsets).
+    if let Some(en) = gctx.ctx.enum_name_of(ty) {
+        let whole = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: src,
+                ty,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: dest,
+                b: whole,
+                ..Default::default()
+            },
+        );
+        if gctx.ctx.enum_has_payload(ty) != Some(true) {
+            return Ok(());
+        }
+        let u8_ptr = gctx.ctx.type_pool.intern_ptr_single(builtin::U8);
+        let tag_ptr = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::FieldAddr,
+                a: src,
+                b: 0,
+                ty: u8_ptr,
+                ..Default::default()
+            },
+        );
+        let tag_val = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: tag_ptr,
+                ty: builtin::U8,
+                ..Default::default()
+            },
+        );
+        let variants = gctx.ctx.enum_variants_by_name(&en).unwrap_or_default();
+        for v in &variants {
+            if !v
+                .payload_types
+                .iter()
+                .any(|&pt| gctx.ctx.type_needs_drop(pt))
+            {
+                continue;
+            }
+            let clone_b = gctx.jfn.push_block("eclone");
+            let cont_b = gctx.jfn.push_block("eclonecont");
+            let disc = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Int,
+                    a: v.discriminant,
+                    ty: builtin::U8,
+                    ..Default::default()
+                },
+            );
+            let cmp = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::ICmpEq,
+                    a: tag_val,
+                    b: disc,
+                    ty: builtin::BOOL,
+                    ..Default::default()
+                },
+            );
+            emit_cond_br(gctx, cmp, clone_b, cont_b);
+            gctx.current_block = clone_b;
+            let s_pay = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::FieldAddr,
+                    a: src,
+                    b: 1,
+                    ty: u8_ptr,
+                    ..Default::default()
+                },
+            );
+            let d_pay = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::FieldAddr,
+                    a: dest,
+                    b: 1,
+                    ty: u8_ptr,
+                    ..Default::default()
+                },
+            );
+            let mut off: u64 = 0;
+            for &pt in &v.payload_types {
+                let sz = gctx.ctx.type_size(pt)?;
+                let al = gctx.ctx.type_align(pt)?;
+                off = off.div_ceil(al) * al;
+                if gctx.ctx.type_needs_drop(pt) {
+                    let offr = emit(
+                        gctx,
+                        JirInst {
+                            tag: JirTag::Int,
+                            a: off as u32,
+                            ty: builtin::U64,
+                            ..Default::default()
+                        },
+                    );
+                    let sf = emit(
+                        gctx,
+                        JirInst {
+                            tag: JirTag::IndexAddr,
+                            a: s_pay,
+                            b: offr,
+                            ty: u8_ptr,
+                            ..Default::default()
+                        },
+                    );
+                    let df = emit(
+                        gctx,
+                        JirInst {
+                            tag: JirTag::IndexAddr,
+                            a: d_pay,
+                            b: offr,
+                            ty: u8_ptr,
+                            ..Default::default()
+                        },
+                    );
+                    emit_clone_into(gctx, sf, df, pt)?;
+                }
+                off += sz;
+            }
+            emit_br(gctx, cont_b);
+            gctx.current_block = cont_b;
+        }
+        return Ok(());
+    }
+    // Struct.
+    let Some(sname) = gctx.ctx.struct_name_of(ty) else {
+        return Err("astgen: cannot clone this type — no structural clone is available".into());
+    };
+    // Tier 3: the type's own `cfn clone` — an in-struct `Name.clone` method, or the
+    // top-level `cfn clone(self: T) T` from the clone registry.
+    if let Some(clone_fn) = gctx
+        .ctx
+        .get_function_ast(&format!("{sname}.clone"))
+        .or_else(|| gctx.ctx.lookup_clone_fn(&sname))
+    {
+        let result = emit_call(gctx, &clone_fn, &[src], NO_JIR_REF)?;
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: dest,
+                b: result,
+                ..Default::default()
+            },
+        );
+        return Ok(());
+    }
+    // Error tier: owns a resource (its own drop), no clone recipe.
+    if gctx.ctx.lookup_drop_fn_name(ty).is_some() {
+        return Err(format!(
+            "`{sname}` owns resources (it has `cfn drop`); define `cfn clone(self: Self) Self` to make it cloneable"
+        ));
+    }
+    // Tier 2: field-wise structural clone.
+    let fields = gctx.ctx.struct_fields(ty).unwrap_or_default();
+    for (i, (_, fty)) in fields.iter().enumerate() {
+        let fty = *fty;
+        let fptr = gctx.ctx.type_pool.intern_ptr_single(fty);
+        let sf = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::FieldAddr,
+                a: src,
+                b: i as u32,
+                ty: fptr,
+                ..Default::default()
+            },
+        );
+        let df = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::FieldAddr,
+                a: dest,
+                b: i as u32,
+                ty: fptr,
+                ..Default::default()
+            },
+        );
+        emit_clone_into(gctx, sf, df, fty)?;
+    }
+    Ok(())
+}
+
+/// Built-in `recv.clone()` for receivers WITHOUT a user `cfn clone` (the C++
+/// `tryLowerBuiltinClone`). Returns `Some(NO_JIR_REF-or-value)`; `Ok(None)` when
+/// a user clone exists (caller does ordinary dispatch). Tier 1 returns the value
+/// directly; tier 2 glues into a fresh slot and returns the dest pointer.
+fn try_lower_builtin_clone(
+    gctx: &mut AstGenCtx,
+    recv_ptr: JirRef,
+    recv_val: JirRef,
+    recv_ty: TypeIdx,
+) -> Result<Option<JirRef>, String> {
+    let mut ty = gctx.ctx.apply_current_subst(recv_ty);
+    if gctx.ctx.type_pool.get(ty).kind == TypeKind::GenericCall {
+        ty = gctx.ctx.resolve_generic_call_instantiate(ty)?;
+    }
+    // A user in-struct `cfn clone` wins — let ordinary dispatch handle it.
+    if let Some(sname) = gctx.ctx.struct_name_of(ty)
+        && gctx
+            .ctx
+            .get_function_ast(&format!("{sname}.clone"))
+            .is_some()
+    {
+        return Ok(None);
+    }
+    // Tier 1: plain data — the clone IS the value.
+    if !gctx.ctx.type_needs_drop(ty) {
+        if recv_val != NO_JIR_REF {
+            return Ok(Some(recv_val));
+        }
+        return Ok(Some(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: recv_ptr,
+                ty,
+                ..Default::default()
+            },
+        )));
+    }
+    // Tier 2: glue into a fresh slot (spill a value-form receiver first).
+    let src = if recv_ptr != NO_JIR_REF {
+        recv_ptr
+    } else {
+        let s = emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: s,
+                b: recv_val,
+                ..Default::default()
+            },
+        );
+        s
+    };
+    let dest = emit_alloca_hoisted(
+        gctx,
+        JirInst {
+            tag: JirTag::Alloca,
+            ty,
+            ..Default::default()
+        },
+    );
+    emit_clone_into(gctx, src, dest, ty)?;
+    Ok(Some(dest))
+}
+
