@@ -496,3 +496,238 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         }
     }
 
+    fn analyze_if(&mut self, idx: NodeIdx, state: NameMap) -> StmtResult {
+        let n = *self.ctx.node_store.get(idx);
+
+        // `comp if` (flags bit 0): astgen folds the condition and lowers ONLY
+        // the taken arm, inline at the surrounding depth. Mirror that — walk
+        // just the taken arm, no depth bump, no merge. If the condition can't be
+        // folded (no comp scope here), fall through to the conservative
+        // both-arm analysis below, which never under-reports a move.
+        if n.flags & 1 != 0
+            && let Some(verdict) = self.comp_if_verdict(NodeIdx::new(n.lhs))
+        {
+            let c_extra = n.rhs;
+            let c_then = self.extra(c_extra);
+            let c_else = self.extra(c_extra + 1);
+            let (base, count) = if verdict {
+                (2, c_then)
+            } else {
+                (2 + c_then, c_else)
+            };
+            let mut arm = StmtResult {
+                state,
+                terminated: false,
+            };
+            for i in 0..count {
+                if arm.terminated {
+                    break;
+                }
+                let s = NodeIdx::new(self.extra(c_extra + base + i));
+                arm = self.analyze_node(s, arm.state);
+            }
+            return arm;
+        }
+
+        let r = self.analyze_node(NodeIdx::new(n.lhs), state);
+        if r.terminated {
+            return r;
+        }
+
+        let extra = n.rhs;
+        let then_count = self.extra(extra);
+        let else_count = self.extra(extra + 1);
+
+        let state_before_branch = r.state.clone();
+
+        self.cond_depth += 1;
+        let mut then_r = StmtResult {
+            state: r.state,
+            terminated: false,
+        };
+        for i in 0..then_count {
+            if then_r.terminated {
+                break;
+            }
+            let s = NodeIdx::new(self.extra(extra + 2 + i));
+            then_r = self.analyze_node(s, then_r.state);
+        }
+
+        let mut else_r = StmtResult {
+            state: state_before_branch,
+            terminated: false,
+        };
+        for i in 0..else_count {
+            if else_r.terminated {
+                break;
+            }
+            let s = NodeIdx::new(self.extra(extra + 2 + then_count + i));
+            else_r = self.analyze_node(s, else_r.state);
+        }
+        self.cond_depth -= 1;
+
+        if then_r.terminated && else_r.terminated {
+            return StmtResult {
+                state: HashMap::new(),
+                terminated: true,
+            };
+        }
+        if then_r.terminated {
+            return else_r;
+        }
+        if else_r.terminated {
+            return then_r;
+        }
+        StmtResult {
+            state: merge_maps(&then_r.state, &else_r.state),
+            terminated: false,
+        }
+    }
+
+    fn analyze_while(&mut self, idx: NodeIdx, state: NameMap) -> StmtResult {
+        let n = *self.ctx.node_store.get(idx);
+        let r = self.analyze_node(NodeIdx::new(n.lhs), state);
+        if r.terminated {
+            return r;
+        }
+
+        let state_before = r.state.clone();
+        let extra = n.rhs;
+        let body_count = self.extra(extra);
+
+        self.cond_depth += 1;
+        let mut body_r = StmtResult {
+            state: r.state,
+            terminated: false,
+        };
+        for i in 0..body_count {
+            if body_r.terminated {
+                break;
+            }
+            let s = NodeIdx::new(self.extra(extra + 1 + i));
+            body_r = self.analyze_node(s, body_r.state);
+        }
+        self.cond_depth -= 1;
+
+        if body_r.terminated {
+            return StmtResult {
+                state: state_before,
+                terminated: false,
+            };
+        }
+        StmtResult {
+            state: merge_maps(&state_before, &body_r.state),
+            terminated: false,
+        }
+    }
+
+    fn analyze_for(&mut self, idx: NodeIdx, state: NameMap) -> StmtResult {
+        let n = *self.ctx.node_store.get(idx);
+        let extra = n.lhs;
+        let var_idx = self.extra(extra);
+        let start_idx = NodeIdx::new(self.extra(extra + 1));
+        let end_idx = NodeIdx::new(self.extra(extra + 2));
+        let body_count = self.extra(extra + 3);
+
+        let r = self.analyze_node(start_idx, state);
+        if r.terminated {
+            return r;
+        }
+        let mut r = self.analyze_node(end_idx, r.state);
+        if r.terminated {
+            return r;
+        }
+
+        let state_before = r.state.clone();
+        let var_name = self.str_name(var_idx);
+        r.state.insert(var_name, InitState::Init);
+
+        self.cond_depth += 1;
+        let mut body_r = StmtResult {
+            state: r.state,
+            terminated: false,
+        };
+        for i in 0..body_count {
+            if body_r.terminated {
+                break;
+            }
+            let s = NodeIdx::new(self.extra(extra + 4 + i));
+            body_r = self.analyze_node(s, body_r.state);
+        }
+        self.cond_depth -= 1;
+
+        // For-over-range assumes the body runs at least once (matches existing
+        // Jam idioms). On `break`, fall back to the pre-loop state.
+        if body_r.terminated {
+            return StmtResult {
+                state: state_before,
+                terminated: false,
+            };
+        }
+        body_r
+    }
+
+    fn analyze_match(&mut self, idx: NodeIdx, state: NameMap) -> StmtResult {
+        let n = *self.ctx.node_store.get(idx);
+        let mut r = self.analyze_node(NodeIdx::new(n.lhs), state);
+        if r.terminated {
+            return r;
+        }
+
+        // MATCH-MOVE: matching a drop-bearing enum by value CONSUMES the
+        // scrutinee, before the arms fork (so it is unconditional).
+        {
+            let scrut = *self.ctx.node_store.get(NodeIdx::new(n.lhs));
+            if scrut.tag == AstTag::Variable {
+                let sname = self.str_name(scrut.lhs);
+                if let Some(&ty) = self.var_types.get(&sname)
+                    && self.type_owns_drops(ty)
+                {
+                    self.apply_move_to_binding(&sname, NodeIdx::new(n.lhs), &mut r.state);
+                }
+            }
+        }
+
+        let extra = n.rhs;
+        let arm_count = self.extra(extra);
+        let state_before = r.state.clone();
+
+        let mut merged = StmtResult {
+            state: HashMap::new(),
+            terminated: true,
+        };
+        let mut cursor = 1u32;
+        for _ in 0..arm_count {
+            cursor += 1; // patIdx
+            let arm_body_count = self.extra(extra + cursor);
+            cursor += 1;
+
+            self.cond_depth += 1;
+            let mut arm = StmtResult {
+                state: state_before.clone(),
+                terminated: false,
+            };
+            for i in 0..arm_body_count {
+                if arm.terminated {
+                    break;
+                }
+                let s = NodeIdx::new(self.extra(extra + cursor + i));
+                arm = self.analyze_node(s, arm.state);
+            }
+            self.cond_depth -= 1;
+            cursor += arm_body_count;
+
+            if merged.terminated && arm.terminated {
+                // both terminated; stay terminated
+            } else if merged.terminated {
+                merged = arm;
+            } else if arm.terminated {
+                // keep merged
+            } else {
+                merged.state = merge_maps(&merged.state, &arm.state);
+            }
+        }
+
+        merged
+    }
+
