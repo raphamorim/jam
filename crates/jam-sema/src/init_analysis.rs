@@ -1364,3 +1364,112 @@ fn merge_maps(a: &NameMap, b: &NameMap) -> NameMap {
     result
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen_context::CodegenContext;
+    use jam_llvm::Context;
+    use jam_syntax::lexer::Lexer;
+    use jam_syntax::parser::Parser;
+
+    /// Parse `src` into a fresh context, register `Counter` as a drop-bearing
+    /// struct (so `type_needs_drop(Counter)` is true), then run the analyzer on
+    /// the function named `fn_name`. Returns the diagnostics.
+    fn analyze_named(src: &str, fn_name: &str) -> Vec<Diagnostic> {
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        // Register `Counter` with a drop fn so it is drop-bearing.
+        let named = cg.context().named_struct("Counter");
+        named.set_body(&[cg.context().i32_type()], false);
+        cg.register_struct(
+            "Counter",
+            named,
+            vec![("value".to_string(), jam_syntax::ast_flat::builtin::I32)],
+        );
+        cg.register_drop_fn("Counter", "Counter.drop");
+
+        let func = module
+            .functions
+            .iter()
+            .find(|f| f.name == fn_name)
+            .unwrap_or_else(|| panic!("fn `{fn_name}` not parsed"));
+        analyze(func, &cg)
+    }
+
+    #[test]
+    fn plain_function_no_diagnostic() {
+        let d = analyze_named("fn add(a: i32, b: i32) i32 { return a + b; }", "add");
+        assert!(d.is_empty(), "plain function flagged: {d:?}");
+    }
+
+    #[test]
+    fn move_param_into_slot_ok() {
+        // A `move`-mode drop-bearing param consumed once is fine (owned).
+        let src = "fn take(p: *mut[] Counter, v: move Counter) { p[0] = v; }";
+        let d = analyze_named(src, "take");
+        assert!(d.is_empty(), "move-param consume flagged: {d:?}");
+    }
+
+    #[test]
+    fn let_param_moved_in_loop_flags() {
+        // The `Vec(T).filled` shape: a by-value (`let`) drop-bearing param moved
+        // into a slot inside a loop is a borrowed-param move + use-after-move.
+        let src = "\
+            fn fill(p: *mut[] Counter, value: Counter, n: u32) {\n\
+                var i: u32 = 0;\n\
+                while (i < n) {\n\
+                    p[i] = value;\n\
+                    i = i + 1;\n\
+                }\n\
+            }";
+        let d = analyze_named(src, "fill");
+        assert!(!d.is_empty(), "let-param loop-move NOT flagged");
+        assert!(
+            d.iter().any(|x| x.var_name == "value"),
+            "expected `value` diagnostic: {d:?}"
+        );
+    }
+
+    #[test]
+    fn let_param_non_drop_no_diagnostic() {
+        // The same shape with a non-drop element type (u64) is a copy, not a
+        // move — no diagnostic. (Guards against false positives on Vec(u64).)
+        let src = "\
+            fn fill(p: *mut[] u64, value: u64, n: u32) {\n\
+                var i: u32 = 0;\n\
+                while (i < n) {\n\
+                    p[i] = value;\n\
+                    i = i + 1;\n\
+                }\n\
+            }";
+        let d = analyze_named(src, "fill");
+        assert!(d.is_empty(), "non-drop copy flagged: {d:?}");
+    }
+
+    #[test]
+    fn move_param_local_owned_loop_ok() {
+        // A local owned drop-bearing binding moved at its own depth is OK even in
+        // a loop body when re-initialized each iteration (depth-matched move).
+        let src = "fn one(p: *mut[] Counter, v: move Counter) { p[0] = v; }";
+        let d = analyze_named(src, "one");
+        assert!(d.is_empty(), "depth-matched move flagged: {d:?}");
+    }
+}
