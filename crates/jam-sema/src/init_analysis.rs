@@ -731,3 +731,236 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         merged
     }
 
+    fn analyze_return(&mut self, idx: NodeIdx, state: NameMap) -> StmtResult {
+        let n = *self.ctx.node_store.get(idx);
+        // Scope-escape check BEFORE any reads of the operand (the C++
+        // analyzeReturn, init_analysis.cpp:841): returning `&` of a `mut`-mode
+        // parameter would extend a second-class borrow past the call frame.
+        if !NodeIdx::new(n.lhs).is_none() {
+            self.check_scope_escape(NodeIdx::new(n.lhs));
+        }
+        let mut r = StmtResult {
+            state,
+            terminated: false,
+        };
+        if !NodeIdx::new(n.lhs).is_none() {
+            r = self.analyze_node(NodeIdx::new(n.lhs), r.state);
+        }
+        // Every in-scope drop-bearing local must be Init at this return: codegen
+        // emits a drop on it here, and dropping uninit memory is UB.
+        self.check_drop_bearing_locals_init(&r.state, idx);
+        r.terminated = true;
+        r
+    }
+
+    fn analyze_call(&mut self, idx: NodeIdx, state: NameMap) -> StmtResult {
+        let n = *self.ctx.node_store.get(idx);
+        // Resolve the callee so its parameter MODES are visible (so `move`-mode
+        // args move the caller's binding). We look up by call-site name + by
+        // `recv.method` through the receiver's static type.
+        let mut callee: Option<FunctionAST> = None;
+        let mut arg_mode_offset = 0usize;
+        let mut is_variant_ctor = false;
+
+        if n.flags & 1 == 0 {
+            let callee_name = self.str_name(n.lhs);
+            callee = self.ctx.get_function_ast(&callee_name);
+            if let Some(dot) = callee_name.find('.')
+                && callee.is_none()
+                && callee_name.rfind('.') == Some(dot)
+            {
+                let recv = &callee_name[..dot];
+                let method = &callee_name[dot + 1..];
+                if self.is_enum_variant_ctor(recv, method) {
+                    is_variant_ctor = true;
+                }
+                if let Some(&recv_ty) = self.var_types.get(recv) {
+                    let recv_ty = self
+                        .ctx
+                        .requalify_type(recv_ty, &self.ctx.current_body_module());
+                    let k = self.ctx.type_pool.get(recv_ty);
+                    if matches!(
+                        k.kind,
+                        TypeKind::Struct | TypeKind::Named | TypeKind::GenericCall
+                    ) {
+                        let type_name = self.str_name(k.a);
+                        if let Some(f) = self.ctx.get_function_ast(&format!("{type_name}.{method}"))
+                        {
+                            callee = Some(f);
+                            arg_mode_offset = 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let extra = n.rhs;
+        let arg_count = self.extra(extra);
+
+        // Pre-pass: collect (argIdx, mode, path) for every arg so the exclusivity
+        // check runs BEFORE any state transition (a flagged conflict surfaces even
+        // if a later arg would terminate the analysis). Mirrors the C++ ArgInfo
+        // pre-pass, init_analysis.cpp:914-932.
+        struct ArgInfo {
+            arg_idx: NodeIdx,
+            mode: ParamMode,
+            path: BorrowPath,
+        }
+        let mut arg_infos: Vec<ArgInfo> = Vec::with_capacity(arg_count as usize);
+        for i in 0..arg_count {
+            let arg_idx = NodeIdx::new(self.extra(extra + 1 + i));
+            let mode = match &callee {
+                Some(c) if i as usize + arg_mode_offset < c.args.len() => {
+                    c.args[i as usize + arg_mode_offset].mode
+                }
+                _ => ParamMode::Let,
+            };
+            let path = self.extract_path(arg_idx);
+            arg_infos.push(ArgInfo {
+                arg_idx,
+                mode,
+                path,
+            });
+        }
+
+        // MVS P5 exclusivity: for each pair of args with overlapping paths, the
+        // borrow set is OK only if BOTH modes are Let (multiple readers). Any
+        // other combination on overlapping paths is rejected. The C++
+        // exclusivity loop, init_analysis.cpp:937-950.
+        for i in 0..arg_infos.len() {
+            for j in (i + 1)..arg_infos.len() {
+                let a = &arg_infos[i];
+                let b = &arg_infos[j];
+                if a.mode == ParamMode::Let && b.mode == ParamMode::Let {
+                    continue;
+                }
+                if !Self::paths_overlap(&a.path, &b.path) {
+                    continue;
+                }
+                let Some(base) = a.path.base else { continue }; // un-tracked, skip
+                let name = self.str_name(base);
+                let anchor = a.arg_idx;
+                self.emit_error(
+                    format!(
+                        "conflicting borrows of `{name}` in the same call: at least one access is \
+                         exclusive (mut/move/undefined)"
+                    ),
+                    anchor,
+                    name,
+                );
+            }
+        }
+
+        let mut r = StmtResult {
+            state,
+            terminated: false,
+        };
+
+        // Walk the indirect callee subtree (`expr.method(args)`).
+        if n.flags & 1 != 0 {
+            r = self.analyze_node(NodeIdx::new(n.lhs), r.state);
+            if r.terminated {
+                return r;
+            }
+        }
+
+        for info in &arg_infos {
+            if r.terminated {
+                return r;
+            }
+            r = self.analyze_node(info.arg_idx, r.state);
+            if r.terminated {
+                return r;
+            }
+
+            // `&`-rooted args skip the read-check (taking an address is not a
+            // read), but borrowing a MOVED binding must still be rejected: a
+            // callee could write through the pointer and "re-initialize" storage
+            // whose scope-exit drop was already suppressed, leaking the new value.
+            // The C++ borrow-of-moved check, init_analysis.cpp:976-988.
+            if self.node_tag(info.arg_idx) == AstTag::AddressOf
+                && let Some(base) = info.path.base
+            {
+                let bname = self.str_name(base);
+                if self.moved_bindings.contains(&bname)
+                    && r.state.get(&bname).copied() != Some(InitState::Init)
+                    && r.state.contains_key(&bname)
+                {
+                    self.emit_error(
+                        format!(
+                            "cannot borrow `{bname}` after it was moved — a write through the \
+                             borrow would re-initialize storage whose drop was suppressed; bind a \
+                             new name instead"
+                        ),
+                        info.arg_idx,
+                        bname,
+                    );
+                }
+            }
+
+            // `move`-mode arg moves the caller's base binding.
+            if info.mode == ParamMode::Move
+                && let Some(base) = self.find_base_binding(info.arg_idx)
+            {
+                self.apply_move_to_binding(&base, info.arg_idx, &mut r.state);
+            }
+        }
+
+        // Enum-variant construction: bare drop-bearing payload args MOVE.
+        if is_variant_ctor {
+            self.apply_payload_moves(extra + 1, arg_count, &mut r.state);
+        }
+        r
+    }
+
+    fn analyze_type_method_call(
+        &mut self,
+        _idx: NodeIdx,
+        n: &jam_syntax::ast_flat::AstNode,
+        state: NameMap,
+    ) -> StmtResult {
+        // Receiver is a TypeIdx; walk the value-arg list. When the receiver is an
+        // ENUM and the "method" is a variant, bare drop-bearing args MOVE.
+        let extra = n.rhs;
+        let _method_id = self.extra(extra);
+        let arg_count = self.extra(extra + 1);
+        let mut r = StmtResult {
+            state,
+            terminated: false,
+        };
+        for i in 0..arg_count {
+            let arg_idx = NodeIdx::new(self.extra(extra + 2 + i));
+            r = self.analyze_node(arg_idx, r.state);
+            if r.terminated {
+                return r;
+            }
+        }
+        let recv_ty = TypeIdx::new(n.lhs);
+        let k = self.ctx.type_pool.get(recv_ty);
+        if matches!(
+            k.kind,
+            TypeKind::Named | TypeKind::Enum | TypeKind::GenericCall
+        ) {
+            let recv_name = self.str_name(k.a);
+            let method = self.str_name(self.extra(extra));
+            if !recv_name.is_empty() && self.is_enum_variant_ctor(&recv_name, &method) {
+                self.apply_payload_moves(extra + 2, arg_count, &mut r.state);
+            }
+        }
+        r
+    }
+
+    /// Apply the enum-payload capture rule: a bare drop-bearing payload arg
+    /// MOVES into the enum.
+    fn apply_payload_moves(&mut self, args_base: u32, arg_count: u32, state: &mut NameMap) {
+        for i in 0..arg_count {
+            let arg_idx = NodeIdx::new(self.extra(args_base + i));
+            if self.node_tag(arg_idx) == AstTag::Variable {
+                let src = self.str_name(self.ctx.node_store.get(arg_idx).lhs);
+                if self.binding_is_drop_bearing(&src) {
+                    self.apply_move_to_binding(&src, arg_idx, state);
+                }
+            }
+        }
+    }
+
