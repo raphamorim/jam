@@ -386,3 +386,281 @@ fn detect_return_move(gctx: &AstGenCtx, val_idx: NodeIdx) -> Option<String> {
     }
 }
 
+/// Drop every element of a fixed-size array `*ptr` via a runtime `0..count`
+/// loop (IndexAddr + recursive drop). Mirrors the C++ `emitArrayElementDrops`.
+fn emit_array_element_drops(gctx: &mut AstGenCtx, ptr: JirRef, arr_ty: TypeIdx) {
+    let (elem_ty, count) = {
+        let ak = gctx.ctx.type_pool.get(arr_ty);
+        (TypeIdx::new(ak.a), ak.b)
+    };
+    if count == 0 {
+        return;
+    }
+    let count_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: count,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let slot = emit_alloca_hoisted(
+        gctx,
+        JirInst {
+            tag: JirTag::Alloca,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let zero_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: 0,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: slot,
+            b: zero_ref,
+            ..Default::default()
+        },
+    );
+
+    let cond_b = gctx.jfn.push_block("adropcond");
+    let body_b = gctx.jfn.push_block("adropbody");
+    let exit_b = gctx.jfn.push_block("adropexit");
+    emit_br(gctx, cond_b);
+
+    gctx.current_block = cond_b;
+    let i_val = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let cmp_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ICmpUlt,
+            a: i_val,
+            b: count_ref,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    );
+    emit_cond_br(gctx, cmp_ref, body_b, exit_b);
+
+    gctx.current_block = body_b;
+    let i_body = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let elem_ptr_ty = gctx.ctx.type_pool.intern_ptr_single(elem_ty);
+    let elem_ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::IndexAddr,
+            a: ptr,
+            b: i_body,
+            ty: elem_ptr_ty,
+            ..Default::default()
+        },
+    );
+    emit_drop_in_place(gctx, elem_ptr, elem_ty);
+    let cur = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let one_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: 1,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let next = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Add,
+            a: cur,
+            b: one_ref,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: slot,
+            b: next,
+            ..Default::default()
+        },
+    );
+    emit_br(gctx, cond_b);
+
+    gctx.current_block = exit_b;
+}
+
+/// Recursively destroy `*ptr` of type `ty`: a fixed array drops its elements; a
+/// struct/named type emits its `cfn drop` call (if any) then drops droppable
+/// fields. Container (Vec etc.) and payloaded-enum element drops are deferred.
+fn emit_drop_in_place(gctx: &mut AstGenCtx, ptr: JirRef, ty: TypeIdx) {
+    // Fixed-size array: own its elements (no cfn drop / fields of its own).
+    if gctx.ctx.type_pool.get(ty).kind == TypeKind::Array {
+        let elem = TypeIdx::new(gctx.ctx.type_pool.get(ty).a);
+        if gctx.ctx.type_needs_drop(elem) {
+            emit_array_element_drops(gctx, ptr, ty);
+        }
+        return;
+    }
+    // Contiguous owning container (a `cfn len` + one `*mut[] Elem` data field):
+    // synthesize the element-destructor loop BEFORE the container's own drop
+    // frees the backing — elements must die while their storage lives.
+    emit_container_element_drops(gctx, ptr, ty);
+    if let Some(name) = gctx.ctx.lookup_drop_fn_name(ty) {
+        let sym = gctx.ctx.string_pool.intern_str(&name).raw();
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::DropBinding,
+                a: ptr,
+                b: sym,
+                ..Default::default()
+            },
+        );
+    }
+    emit_field_drops(gctx, ptr, ty);
+    // Payloaded enums own the live variant's payload: tag-dispatched payload drops
+    // run after any user drop (the C++ emitEnumPayloadDrops, astgen.cpp:5476).
+    emit_enum_payload_drops(gctx, ptr, ty);
+}
+
+/// Tag-dispatched payload drops for a payloaded enum at `ptr`: load the
+/// discriminant (field 0) and, for each variant whose payload needs dropping,
+/// branch to an `edrop` block that drops each payload field at its byte offset
+/// within the payload area (field 1) — the same offset math the constructors use.
+/// A no-op for non-enums / enums with no drop-bearing payload.
+fn emit_enum_payload_drops(gctx: &mut AstGenCtx, ptr: JirRef, ty: TypeIdx) {
+    let Some(name) = gctx.ctx.enum_name_of(ty) else {
+        return;
+    };
+    let Some(variants) = gctx.ctx.enum_variants_by_name(&name) else {
+        return;
+    };
+    let u8_ptr = gctx.ctx.type_pool.intern_ptr_single(builtin::U8);
+    let tag_ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::FieldAddr,
+            a: ptr,
+            b: 0,
+            ty: u8_ptr,
+            ..Default::default()
+        },
+    );
+    let tag_val = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: tag_ptr,
+            ty: builtin::U8,
+            ..Default::default()
+        },
+    );
+    for v in &variants {
+        if !v
+            .payload_types
+            .iter()
+            .any(|pt| gctx.ctx.type_needs_drop(*pt))
+        {
+            continue;
+        }
+        let drop_b = gctx.jfn.push_block("edrop");
+        let cont_b = gctx.jfn.push_block("edropcont");
+        let disc = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Int,
+                a: v.discriminant,
+                ty: builtin::U8,
+                ..Default::default()
+            },
+        );
+        let cmp = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::ICmpEq,
+                a: tag_val,
+                b: disc,
+                ty: builtin::BOOL,
+                ..Default::default()
+            },
+        );
+        emit_cond_br(gctx, cmp, drop_b, cont_b);
+        gctx.current_block = drop_b;
+        let pay_area = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::FieldAddr,
+                a: ptr,
+                b: 1,
+                ty: u8_ptr,
+                ..Default::default()
+            },
+        );
+        let mut off: u64 = 0;
+        for pt in &v.payload_types {
+            let s = gctx.ctx.type_size(*pt).unwrap_or(0);
+            let a = gctx.ctx.type_align(*pt).unwrap_or(1).max(1);
+            off = off.div_ceil(a) * a;
+            if gctx.ctx.type_needs_drop(*pt) {
+                let off_ref = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Int,
+                        a: off as u32,
+                        ty: builtin::U64,
+                        ..Default::default()
+                    },
+                );
+                let field_ptr = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::IndexAddr,
+                        a: pay_area,
+                        b: off_ref,
+                        ty: u8_ptr,
+                        ..Default::default()
+                    },
+                );
+                emit_drop_in_place(gctx, field_ptr, *pt);
+            }
+            off += s;
+        }
+        emit_br(gctx, cont_b);
+        gctx.current_block = cont_b;
+    }
+}
+
