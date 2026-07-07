@@ -1213,3 +1213,27 @@ fn try_lower_builtin_clone(
     Ok(Some(dest))
 }
 
+/// Drop each droppable field of struct `*ptr` (FieldAddr + recursion).
+fn emit_field_drops(gctx: &mut AstGenCtx, ptr: JirRef, ty: TypeIdx) {
+    let Some(fields) = gctx.ctx.struct_fields(ty) else {
+        return;
+    };
+    for (i, (_, fty)) in fields.iter().enumerate() {
+        if !gctx.ctx.type_needs_drop(*fty) {
+            continue;
+        }
+        let ptr_ty = gctx.ctx.type_pool.intern_ptr_single(*fty);
+        let field_ptr = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::FieldAddr,
+                a: ptr,
+                b: i as u32,
+                ty: ptr_ty,
+                ..Default::default()
+            },
+        );
+        emit_drop_in_place(gctx, field_ptr, *fty);
+    }
+}
+
