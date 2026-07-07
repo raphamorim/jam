@@ -664,3 +664,201 @@ fn emit_enum_payload_drops(gctx: &mut AstGenCtx, ptr: JirRef, ty: TypeIdx) {
     }
 }
 
+/// If `container_ty` is a contiguous owning container — a struct with a `cfn len`
+/// and exactly one `*mut[] Elem` data field whose `Elem` needs drop — emit the
+/// `0..self.len()` loop that drops each live element (the C++
+/// `emitContainerElementDrops`). Returns whether it applied.
+fn emit_container_element_drops(gctx: &mut AstGenCtx, ptr: JirRef, container_ty: TypeIdx) -> bool {
+    let Some(sname) = gctx.ctx.struct_name_of(container_ty) else {
+        return false;
+    };
+    // Opt-in marker: a `cfn len` (a plain `fn len` is a borrowing view, not an
+    // owning container).
+    let Some(len_fn) = gctx.ctx.get_function_ast(&format!("{sname}.len")) else {
+        return false;
+    };
+    if !len_fn.is_cfn || len_fn.args.is_empty() {
+        return false;
+    }
+    let Some(fields) = gctx.ctx.struct_fields(container_ty) else {
+        return false;
+    };
+    let mut data_idx: Option<usize> = None;
+    let mut elem_ty = TypeIdx::NONE;
+    for (i, (_, fty)) in fields.iter().enumerate() {
+        let k = gctx.ctx.type_pool.get(*fty);
+        if k.kind == TypeKind::PtrMany {
+            if data_idx.is_some() {
+                return false; // ambiguous
+            }
+            data_idx = Some(i);
+            elem_ty = TypeIdx::new(k.a);
+        }
+    }
+    let Some(data_idx) = data_idx else {
+        return false;
+    };
+    if !gctx.ctx.type_needs_drop(elem_ty) {
+        return false;
+    }
+    // count = self.len()  (receiver is the pointer-to-self we hold).
+    let Ok(recv_abi) = classify_param(len_fn.args[0].mode, container_ty, gctx.ctx) else {
+        return false;
+    };
+    let recv = if recv_abi.kind == ParamAbiKind::ByPointer {
+        ptr
+    } else {
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: ptr,
+                ty: container_ty,
+                ..Default::default()
+            },
+        )
+    };
+    let Ok(count) = emit_call(gctx, &len_fn, &[recv], NO_JIR_REF) else {
+        return false;
+    };
+    let count_ty = gctx.jfn.get_inst(count).ty;
+    // base = load self.<data> -> a `*mut[] Elem` value.
+    let data_field_ty = fields[data_idx].1;
+    let data_addr_ty = gctx.ctx.type_pool.intern_ptr_single(data_field_ty);
+    let data_addr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::FieldAddr,
+            a: ptr,
+            b: data_idx as u32,
+            ty: data_addr_ty,
+            ..Default::default()
+        },
+    );
+    let base = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: data_addr,
+            ty: data_field_ty,
+            ..Default::default()
+        },
+    );
+    // i = 0
+    let slot = emit_alloca_hoisted(
+        gctx,
+        JirInst {
+            tag: JirTag::Alloca,
+            ty: count_ty,
+            ..Default::default()
+        },
+    );
+    let zero = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: 0,
+            ty: count_ty,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: slot,
+            b: zero,
+            ..Default::default()
+        },
+    );
+    let cond_b = gctx.jfn.push_block("dropcond");
+    let body_b = gctx.jfn.push_block("dropbody");
+    let exit_b = gctx.jfn.push_block("dropexit");
+    emit_br(gctx, cond_b);
+    // cond: i < count
+    gctx.current_block = cond_b;
+    let i_val = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: count_ty,
+            ..Default::default()
+        },
+    );
+    let cmp = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ICmpUlt,
+            a: i_val,
+            b: count,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    );
+    emit_cond_br(gctx, cmp, body_b, exit_b);
+    // body: drop element i; i += 1
+    gctx.current_block = body_b;
+    let i_body = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: count_ty,
+            ..Default::default()
+        },
+    );
+    let elem_ptr_ty = gctx.ctx.type_pool.intern_ptr_many(elem_ty);
+    let elem_ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::IndexAddr,
+            a: base,
+            b: i_body,
+            ty: elem_ptr_ty,
+            ..Default::default()
+        },
+    );
+    emit_drop_in_place(gctx, elem_ptr, elem_ty);
+    let cur = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: count_ty,
+            ..Default::default()
+        },
+    );
+    let one = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: 1,
+            ty: count_ty,
+            ..Default::default()
+        },
+    );
+    let next = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Add,
+            a: cur,
+            b: one,
+            ty: count_ty,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: slot,
+            b: next,
+            ..Default::default()
+        },
+    );
+    emit_br(gctx, cond_b);
+    gctx.current_block = exit_b;
+    true
+}
+
