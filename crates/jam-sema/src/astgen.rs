@@ -1449,3 +1449,147 @@ fn astgen_string_lit(
     ))
 }
 
+fn astgen_variable(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Result<JirRef, String> {
+    let name = str_at(gctx, n.lhs);
+    if let Some(&slot) = gctx.locals.get(&name) {
+        let ty = gctx.local_types[&name];
+        let inst = JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty,
+            ..Default::default()
+        };
+        return Ok(emit(gctx, inst));
+    }
+    // Function-local comp binding (shadows module consts): materialize the value.
+    if let Some(cv) = gctx.comp_scope.lookup(&name).cloned() {
+        return materialize_comptime_value(gctx, &cv, expected, &format!("comp binding `{name}`"));
+    }
+    // Module-scope const: inline it. Resolve the CURRENT module's const first
+    // (two modules may define the same name). A `comp` const folds to a single
+    // value and materializes (narrowed to its declared type); a plain const
+    // re-lowers its initializer (recursively, for sibling references).
+    let bm = gctx.ctx.current_body_module();
+    let mc = (!bm.is_empty())
+        .then(|| gctx.ctx.get_module_const(&format!("{bm}.{name}")))
+        .flatten()
+        .or_else(|| gctx.ctx.get_module_const(&name));
+    if let Some(mc) = mc {
+        if mc.is_comp {
+            let v = gctx.ctx.fold_comptime_expr(mc.init_expr);
+            if !v.is_none() {
+                // A `comp const` (width u64 for an untyped int literal)
+                // materializes narrowed to the USE SITE's expected type first,
+                // falling back to the const's own declared type — the C++
+                // `want = (expected != kNoType) ? expected : declaredType`
+                // (astgen.cpp:1424). Without this, `var n: u32 = N` stores an
+                // i64 into the i32 slot.
+                let want = if expected.is_none() {
+                    mc.declared_type
+                } else {
+                    expected
+                };
+                return materialize_comptime_value(gctx, &v, want, &format!("comp const `{name}`"));
+            }
+        }
+        return astgen_expr(gctx, mc.init_expr, mc.declared_type);
+    }
+    // Fn-name as a value: a typed function pointer when the use site expects a
+    // `Fn`, else the legacy raw u64 address. (Generic fns have no body to point
+    // at here.)
+    if let Some(f) = gctx.ctx.get_function_ast(&name) {
+        if f.is_generic() {
+            return Err(format!(
+                "astgen: cannot take address of generic fn `{name}`"
+            ));
+        }
+        let sid = gctx.ctx.string_pool.intern(name.as_bytes());
+        let expect_fn =
+            !expected.is_none() && gctx.ctx.type_pool.get(expected).kind == TypeKind::Fn;
+        let ty = if expect_fn { expected } else { builtin::U64 };
+        return Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::FnRef,
+                a: sid.raw(),
+                ty,
+                ..Default::default()
+            },
+        ));
+    }
+    Err(format!("unknown variable `{name}`"))
+}
+
+/// Emit a JIR constant for a folded compile-time value, narrowed to `expected`
+/// when it is a matching scalar (the C++ `materializeComptimeValue`).
+/// Does comp int `bits` (interpreted per `is_signed`) fit a `width`-bit integer
+/// of signedness `target_signed`? Mirrors the C++ `compIntFits` (astgen.cpp).
+fn comp_int_fits(bits: u64, is_signed: bool, width: u16, target_signed: bool) -> bool {
+    if width >= 64 {
+        if target_signed {
+            return is_signed || bits <= i64::MAX as u64;
+        }
+        return !is_signed || (bits as i64) >= 0;
+    }
+    if is_signed {
+        let x = bits as i64;
+        if target_signed {
+            let min = -(1i64 << (width - 1));
+            let max = (1i64 << (width - 1)) - 1;
+            return x >= min && x <= max;
+        }
+        if x < 0 {
+            return false;
+        }
+        return (x as u64) <= ((1u64 << width) - 1);
+    }
+    if target_signed {
+        return bits <= ((1u64 << (width - 1)) - 1);
+    }
+    bits <= ((1u64 << width) - 1)
+}
+
+/// Decimal spelling of a comp int for diagnostics (C++ `compIntToString`).
+fn comp_int_to_string(bits: u64, is_signed: bool) -> String {
+    if is_signed {
+        (bits as i64).to_string()
+    } else {
+        bits.to_string()
+    }
+}
+
+/// Chase a declared annotation through generic-call / substitution / type-alias
+/// links to its underlying scalar (the C++ `resolveScalarExpected`).
+fn resolve_scalar_expected(ctx: &CodegenContext, mut t: TypeIdx) -> TypeIdx {
+    let mut guard = 0;
+    while guard < 8 && !t.is_none() {
+        guard += 1;
+        let k = ctx.type_pool.get(t);
+        if k.kind == TypeKind::GenericCall {
+            let r = ctx.resolve_generic_call(t);
+            if r.is_none() || r == t {
+                return t;
+            }
+            t = r;
+            continue;
+        }
+        if k.kind == TypeKind::Named {
+            let nm =
+                String::from_utf8_lossy(&ctx.string_pool.get(StringIdx::new(k.a))).into_owned();
+            let sub = ctx.lookup_current_subst(&nm);
+            if !sub.is_none() && sub != t {
+                t = sub;
+                continue;
+            }
+            let alias = ctx.lookup_type_alias(&nm);
+            if !alias.is_none() && alias != t {
+                t = alias;
+                continue;
+            }
+            return t;
+        }
+        return t;
+    }
+    t
+}
+
