@@ -2219,3 +2219,340 @@ fn astgen_var_decl(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve an assignable expression to its (pointer JirRef, leaf type) — the
+/// `ResultLoc::Pointer` lowering of an lvalue:
+///   * `Variable` — the local's alloca slot (no Load).
+///   * `Deref` — the operand pointer value itself.
+///   * `MemberAccess` — `FieldAddr` into a struct base, or a `BitCast` of a
+///     union base (every union field shares the union's address).
+///
+/// `Index` lvalues (array/slice element addresses) land with array support.
+fn astgen_lvalue(gctx: &mut AstGenCtx, node: NodeIdx) -> Result<(JirRef, TypeIdx), String> {
+    let n = *gctx.ctx.node_store.get(node);
+    match n.tag {
+        AstTag::Variable => {
+            let name = str_at(gctx, n.lhs);
+            match gctx.locals.get(&name) {
+                Some(&slot) => Ok((slot, gctx.local_types[&name])),
+                None => Err(format!("astgen: unknown lvalue variable `{name}`")),
+            }
+        }
+        AstTag::Deref => {
+            let inner = astgen_expr(gctx, NodeIdx::new(n.lhs), TypeIdx::NONE)?;
+            let pk = gctx.ctx.type_pool.get(gctx.jfn.get_inst(inner).ty);
+            if pk.kind != TypeKind::PtrSingle && pk.kind != TypeKind::PtrMany {
+                return Err("astgen: cannot deref non-pointer".into());
+            }
+            Ok((inner, TypeIdx::new(pk.a)))
+        }
+        AstTag::MemberAccess => {
+            let (base_ptr, base_ty) = astgen_lvalue(gctx, NodeIdx::new(n.lhs))?;
+            let member = str_at(gctx, n.rhs);
+            // Union field lvalue: every field shares the union's address — the
+            // field pointer IS the union pointer, just retyped.
+            if gctx.ctx.is_union_registered(base_ty) {
+                let field_ty = gctx
+                    .ctx
+                    .union_fields(base_ty)
+                    .and_then(|fs| fs.into_iter().find(|(nm, _)| *nm == member).map(|(_, t)| t))
+                    .ok_or_else(|| format!("astgen: union has no field `{member}`"))?;
+                let ptr_ty = gctx.ctx.type_pool.intern_ptr_single(field_ty);
+                let p = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::BitCast,
+                        a: base_ptr,
+                        ty: ptr_ty,
+                        ..Default::default()
+                    },
+                );
+                return Ok((p, field_ty));
+            }
+            let fields = gctx
+                .ctx
+                .struct_fields(base_ty)
+                .ok_or_else(|| "astgen: lvalue field access on non-struct".to_string())?;
+            let idx = fields
+                .iter()
+                .position(|(nm, _)| *nm == member)
+                .ok_or_else(|| format!("astgen: unknown field `{member}`"))?;
+            let mut field_ty = fields[idx].1;
+            if gctx.ctx.type_pool.get(field_ty).kind == TypeKind::ArrayExpr {
+                let r = gctx.ctx.resolve_array_expr(field_ty);
+                if !r.is_none() {
+                    field_ty = r;
+                }
+            }
+            let ptr_ty = gctx.ctx.type_pool.intern_ptr_single(field_ty);
+            let fa = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::FieldAddr,
+                    a: base_ptr,
+                    b: idx as u32,
+                    ty: ptr_ty,
+                    ..Default::default()
+                },
+            );
+            Ok((fa, field_ty))
+        }
+        AstTag::Index => {
+            let (mut base_ptr, base_ty) = astgen_lvalue(gctx, NodeIdx::new(n.lhs))?;
+            let idx_ref = astgen_expr(gctx, NodeIdx::new(n.rhs), builtin::U64)?;
+            let (kind, a) = {
+                let k = gctx.ctx.type_pool.get(base_ty);
+                (k.kind, k.a)
+            };
+            let elem_ty = match kind {
+                TypeKind::Array | TypeKind::Slice | TypeKind::PtrMany => TypeIdx::new(a),
+                _ => {
+                    // A struct base usually means the `v[i]` sugar's `at` was
+                    // withdrawn for this instantiation — replay why (the C++
+                    // astgen.cpp:7473).
+                    if let Some(sb) = gctx.ctx.struct_name_of(base_ty) {
+                        let qualified = format!("{sb}.at");
+                        if gctx.ctx.get_withdrawn_method(&qualified).is_some() {
+                            report_method_miss(gctx, &qualified)?;
+                        }
+                    }
+                    return Err("astgen: lvalue index on non-array/slice/ptr-many".into());
+                }
+            };
+            // PtrMany base: the slot holds the pointer value — Load to follow it.
+            // Slice base: Load the {ptr,len}, ExtractValue the data pointer.
+            // Array base: the slot IS the inline storage — GEP it directly.
+            if kind == TypeKind::PtrMany {
+                base_ptr = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Load,
+                        a: base_ptr,
+                        ty: base_ty,
+                        ..Default::default()
+                    },
+                );
+            } else if kind == TypeKind::Slice {
+                let slice_val = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Load,
+                        a: base_ptr,
+                        ty: base_ty,
+                        ..Default::default()
+                    },
+                );
+                let ptr_many_ty = gctx.ctx.type_pool.intern_ptr_many(elem_ty);
+                base_ptr = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::ExtractValue,
+                        a: slice_val,
+                        b: 0,
+                        ty: ptr_many_ty,
+                        ..Default::default()
+                    },
+                );
+            }
+            let ptr_ty = gctx.ctx.type_pool.intern_ptr_single(elem_ty);
+            let ia = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::IndexAddr,
+                    a: base_ptr,
+                    b: idx_ref,
+                    ty: ptr_ty,
+                    ..Default::default()
+                },
+            );
+            Ok((ia, elem_ty))
+        }
+        other => Err(format!("astgen: lvalue {other:?} not yet ported")),
+    }
+}
+
+/// Is the assignment target a *value-world* destination (a whole local, a
+/// struct field, or a fixed-array element) rather than pointer-world (through a
+/// `Deref` / slice / many-pointer)? Only value-world destinations get the
+/// overwrite-drop of their old value. Walks the projection root→leaf, requiring
+/// every `Index` step to land on a fixed `Array`.
+fn assign_target_is_value_world(gctx: &AstGenCtx, target_idx: NodeIdx) -> bool {
+    let mut steps: Vec<AstNode> = Vec::new();
+    let mut cur = target_idx;
+    let mut root: Option<AstNode> = None;
+    while !cur.is_none() {
+        let nd = *gctx.ctx.node_store.get(cur);
+        if nd.tag == AstTag::Variable {
+            root = Some(nd);
+            break;
+        }
+        if nd.tag == AstTag::MemberAccess || nd.tag == AstTag::Index {
+            steps.push(nd);
+            cur = NodeIdx::new(nd.lhs);
+            continue;
+        }
+        return false; // Deref or any other shape: pointer world
+    }
+    let Some(root) = root else { return false };
+    let root_name = str_at(gctx, root.lhs);
+    let mut cur_ty = match gctx.local_types.get(&root_name) {
+        Some(&t) => t,
+        None => return false,
+    };
+    for step in steps.iter().rev() {
+        let k = gctx.ctx.type_pool.get(cur_ty);
+        if step.tag == AstTag::Index {
+            if k.kind != TypeKind::Array {
+                return false;
+            }
+            cur_ty = TypeIdx::new(k.a);
+            continue;
+        }
+        // MemberAccess: advance to the field's type.
+        if k.kind != TypeKind::Struct && k.kind != TypeKind::Named {
+            return false;
+        }
+        let member = str_at(gctx, step.rhs);
+        match gctx
+            .ctx
+            .struct_fields(cur_ty)
+            .and_then(|fs| fs.into_iter().find(|(nm, _)| *nm == member).map(|(_, t)| t))
+        {
+            Some(t) => cur_ty = t,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Lower an assignment `target = value`: resolve the target to a pointer, lower
+/// the value at the slot's leaf type, drop the old value first (overwrite-drop
+/// of a live drop-bearing value-world destination — RHS evaluates first, old
+/// drops, new stores), then Store. A bare drop-bearing RHS local is MOVED.
+fn astgen_assign(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
+    let target_idx = NodeIdx::new(n.lhs);
+    let value_idx = NodeIdx::new(n.rhs);
+    // Assignment to a `comp var` (an explicit comp binding, not a runtime
+    // local) mutates the comp scope — no JIR. Runtime locals shadow comp
+    // bindings; seeded names (module consts, comp params) don't match and fall
+    // through to the runtime lvalue path. Ports the C++ astgenAssign comp path
+    // (astgen.cpp:1510-1565) rule-for-rule.
+    let tnode = *gctx.ctx.node_store.get(target_idx);
+    if tnode.tag == AstTag::Variable {
+        let tname = str_at(gctx, tnode.lhs);
+        if !gctx.locals.contains_key(&tname)
+            && let Some(info) = lookup_comp_binding_info(gctx, &tname)
+        {
+            if info.is_const {
+                return Err(fail_node(
+                    gctx,
+                    target_idx,
+                    &format!("cannot assign to comp const `{tname}`"),
+                ));
+            }
+            if gctx.runtime_cond_depth != info.decl_depth {
+                return Err(fail_node(
+                    gctx,
+                    target_idx,
+                    &format!(
+                        "cannot assign to comp binding `{tname}` from inside runtime \
+                         conditional control flow — a comp value cannot depend on a \
+                         runtime branch"
+                    ),
+                ));
+            }
+            let mut v = gctx.ctx.fold_comptime_expr_in(value_idx, &gctx.comp_scope);
+            if v.is_none() {
+                return Err(fail_node(
+                    gctx,
+                    value_idx,
+                    &format!("comp assignment to `{tname}` must be a compile-time-known value"),
+                ));
+            }
+            // Keep the binding's shape stable: same kind, and for ints the
+            // established width/signedness (with a fit check) so reads keep
+            // lowering consistently.
+            if let Some(prev) = gctx.comp_scope.lookup(&tname).cloned() {
+                if std::mem::discriminant(&prev) != std::mem::discriminant(&v) {
+                    return Err(fail_node(
+                        gctx,
+                        value_idx,
+                        &format!("comp assignment changes the kind of `{tname}` (e.g. int -> str)"),
+                    ));
+                }
+                if let ComptimeValue::Int {
+                    width: prev_width,
+                    is_signed: prev_signed,
+                    ..
+                } = prev
+                    && let ComptimeValue::Int {
+                        bits,
+                        width,
+                        is_signed,
+                    } = &mut v
+                {
+                    if !comp_int_fits(*bits, *is_signed, prev_width, prev_signed) {
+                        return Err(fail_node(
+                            gctx,
+                            value_idx,
+                            &format!(
+                                "comp assignment value {} does not fit `{tname}` ({}{})",
+                                comp_int_to_string(*bits, *is_signed),
+                                if prev_signed { "i" } else { "u" },
+                                prev_width
+                            ),
+                        ));
+                    }
+                    *width = prev_width;
+                    *is_signed = prev_signed;
+                }
+            }
+            gctx.comp_scope.set(&tname, v);
+            return Ok(());
+        }
+    }
+    // `v[i] = x` on a container -> `v.setAt(i, x)` cfn dispatch (the cfn frees the
+    // overwritten element + takes ownership of the moved value).
+    if tnode.tag == AstTag::Index {
+        let base_idx = NodeIdx::new(tnode.lhs);
+        let idx_idx = NodeIdx::new(tnode.rhs);
+        if let Some((recv, method)) = container_index_recv(gctx, base_idx, "setAt")? {
+            // The oracle's emitStructCfnDispatch order: index at u64, THEN the value
+            // by value (astgen_expr, not lower_arg — a by-value StructLit arg, no
+            // spill), THEN narrow the index, then the call.
+            // A bare drop-bearing local stored into a container element MOVES;
+            // field extraction on the RHS has no per-field suppression — reject
+            // (the C++ rejectDropBearingFieldExtract, astgen.cpp:1624).
+            let val_param_ty = method.args[2].ty;
+            reject_drop_bearing_field_extract(gctx, value_idx, val_param_ty, "copy")?;
+            let idx_u64 = astgen_expr(gctx, idx_idx, builtin::U64)?;
+            let val_ref = astgen_expr(gctx, value_idx, val_param_ty)?;
+            let idx_ref = narrow_index(gctx, idx_u64, method.args[1].ty);
+            emit_call(gctx, &method, &[recv, idx_ref, val_ref], NO_JIR_REF)?;
+            consume_moved_variable(gctx, value_idx);
+            return Ok(());
+        }
+    }
+    let (ptr_ref, leaf_ty) = astgen_lvalue(gctx, target_idx)?;
+    // Field extraction on the RHS (`x = h.c`) has no per-field suppression —
+    // reject (the C++ rejectDropBearingFieldExtract, astgen.cpp:1660).
+    reject_drop_bearing_field_extract(gctx, value_idx, leaf_ty, "copy")?;
+    let val_ref = astgen_expr(gctx, value_idx, leaf_ty)?;
+    if !leaf_ty.is_none()
+        && gctx.ctx.type_needs_drop(leaf_ty)
+        && assign_target_is_value_world(gctx, target_idx)
+    {
+        emit_drop_in_place(gctx, ptr_ref, leaf_ty);
+    }
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: ptr_ref,
+            b: val_ref,
+            ..Default::default()
+        },
+    );
+    consume_moved_variable(gctx, value_idx);
+    Ok(())
+}
+
