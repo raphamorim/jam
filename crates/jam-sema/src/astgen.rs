@@ -1773,3 +1773,254 @@ fn materialize_comptime_value(
     }
 }
 
+fn astgen_binary_op(
+    gctx: &mut AstGenCtx,
+    n: &AstNode,
+    expected: TypeIdx,
+) -> Result<JirRef, String> {
+    let mut lhs_ref = astgen_expr(gctx, NodeIdx::new(n.lhs), expected)?;
+    // Peer-type hint: lower the RHS at the LHS's resolved width.
+    let mut lhs_type = gctx.jfn.get_inst(lhs_ref).ty;
+    let mut rhs_ref = astgen_expr(gctx, NodeIdx::new(n.rhs), lhs_type)?;
+
+    // Width reconciliation: floats must match exactly; integers widen the
+    // narrower side (sext if signed, else zext).
+    let rhs_type = gctx.jfn.get_inst(rhs_ref).ty;
+    let lk = gctx.ctx.type_pool.get(lhs_type);
+    let rk = gctx.ctx.type_pool.get(rhs_type);
+    if lk.kind == TypeKind::Float && rk.kind == TypeKind::Float && lk.a != rk.a {
+        return Err("astgen: mismatched float widths; use an explicit `as` cast".into());
+    }
+    if lk.kind == TypeKind::Int && rk.kind == TypeKind::Int && lk.a != rk.a {
+        if lk.a < rk.a {
+            let tag = if lk.b != 0 {
+                JirTag::SExt
+            } else {
+                JirTag::ZExt
+            };
+            lhs_ref = emit(
+                gctx,
+                JirInst {
+                    tag,
+                    a: lhs_ref,
+                    ty: rhs_type,
+                    ..Default::default()
+                },
+            );
+            lhs_type = rhs_type;
+        } else {
+            let tag = if rk.b != 0 {
+                JirTag::SExt
+            } else {
+                JirTag::ZExt
+            };
+            rhs_ref = emit(
+                gctx,
+                JirInst {
+                    tag,
+                    a: rhs_ref,
+                    ty: lhs_type,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    // Short-circuit LogAnd (11) / LogOr (12) lower as an if-expression over a
+    // bool result slot. Both operands were eagerly emitted above (and are i1,
+    // so the reconciliation was a no-op); the RHS value is *stored* only on the
+    // branch that needs it — `LogAnd: lhs ? rhs : false`, `LogOr: lhs ? true :
+    // rhs`. (jir_codegen folds the slot to a phi at -O2.)
+    if n.op == 11 || n.op == 12 {
+        let is_and = n.op == 11;
+        let res_slot = emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty: builtin::BOOL,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: res_slot,
+                b: lhs_ref,
+                ..Default::default()
+            },
+        );
+        let rhs_b = gctx
+            .jfn
+            .push_block(if is_and { "and.rhs" } else { "or.rhs" });
+        let end_b = gctx
+            .jfn
+            .push_block(if is_and { "and.end" } else { "or.end" });
+        if is_and {
+            emit_cond_br(gctx, lhs_ref, rhs_b, end_b);
+        } else {
+            emit_cond_br(gctx, lhs_ref, end_b, rhs_b);
+        }
+        gctx.current_block = rhs_b;
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: res_slot,
+                b: rhs_ref,
+                ..Default::default()
+            },
+        );
+        emit_br(gctx, end_b);
+        gctx.current_block = end_b;
+        return Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: res_slot,
+                ty: builtin::BOOL,
+                ..Default::default()
+            },
+        ));
+    }
+
+    let k = gctx.ctx.type_pool.get(lhs_type);
+    let is_float = k.kind == TypeKind::Float;
+    let is_signed = k.kind == TypeKind::Int && k.b != 0;
+
+    // `n.op` is the BinOp discriminant (1=Add..18=Ge; see ast_flat BinOp).
+    use JirTag::*;
+    let (tag, is_cmp): (JirTag, bool) = match n.op {
+        1 => (if is_float { FAdd } else { Add }, false),
+        2 => (if is_float { FSub } else { Sub }, false),
+        3 => (if is_float { FMul } else { Mul }, false),
+        4 => (
+            if is_float {
+                FDiv
+            } else if is_signed {
+                SDiv
+            } else {
+                UDiv
+            },
+            false,
+        ),
+        5 => (
+            if is_float {
+                FRem
+            } else if is_signed {
+                SRem
+            } else {
+                URem
+            },
+            false,
+        ),
+        6 => (BitAnd, false),
+        7 => (BitOr, false),
+        8 => (BitXor, false),
+        9 => (Shl, false),
+        10 => (if is_signed { AShr } else { LShr }, false),
+        13 => (if is_float { FCmpOeq } else { ICmpEq }, true),
+        14 => (if is_float { FCmpOne } else { ICmpNe }, true),
+        15 => (
+            if is_float {
+                FCmpOlt
+            } else if is_signed {
+                ICmpSlt
+            } else {
+                ICmpUlt
+            },
+            true,
+        ),
+        16 => (
+            if is_float {
+                FCmpOle
+            } else if is_signed {
+                ICmpSle
+            } else {
+                ICmpUle
+            },
+            true,
+        ),
+        17 => (
+            if is_float {
+                FCmpOgt
+            } else if is_signed {
+                ICmpSgt
+            } else {
+                ICmpUgt
+            },
+            true,
+        ),
+        18 => (
+            if is_float {
+                FCmpOge
+            } else if is_signed {
+                ICmpSge
+            } else {
+                ICmpUge
+            },
+            true,
+        ),
+        11 | 12 => unreachable!("LogAnd/LogOr handled before the operator table"),
+        other => return Err(format!("astgen: unsupported binary operator {other}")),
+    };
+    let result_ty = if is_cmp { builtin::BOOL } else { lhs_type };
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag,
+            a: lhs_ref,
+            b: rhs_ref,
+            ty: result_ty,
+            ..Default::default()
+        },
+    ))
+}
+
+/// Resolve a declared/initializer type through generic-call, type-alias,
+/// generic-substitution, and module re-export chains for the var-decl
+/// declared-vs-initializer comparison (the C++ `resolveForCmp` lambda,
+/// astgen.cpp:1252-1289). Both sides are run through this so `var a:
+/// Identity(i32) = 42;` compares `i32 == i32` rather than `GenericCall != Int`.
+fn resolve_for_cmp(ctx: &CodegenContext, t: TypeIdx) -> TypeIdx {
+    if t.is_none() {
+        return t;
+    }
+    // Qualify bare user-type references first so a declared bare `Color` and an
+    // initializer typed with the qualified `mod.Color` compare equal. No-op for
+    // already-qualified, substitution, and primitive types.
+    let t = ctx.requalify_type(t, &ctx.current_body_module());
+    let k = ctx.type_pool.get(t);
+    if k.kind == TypeKind::Named {
+        let name = String::from_utf8_lossy(&ctx.string_pool.get(StringIdx::new(k.a))).into_owned();
+        // Generic substitution wins (inside an instantiated method body, `T`
+        // resolves to whatever the instantiation supplied).
+        let sub = ctx.lookup_current_subst(&name);
+        if !sub.is_none() {
+            return resolve_for_cmp(ctx, sub);
+        }
+    }
+    if k.kind == TypeKind::GenericCall {
+        let r = ctx.resolve_generic_call(t);
+        if !r.is_none() {
+            return resolve_for_cmp(ctx, r);
+        }
+    }
+    if k.kind == TypeKind::Named {
+        let name = String::from_utf8_lossy(&ctx.string_pool.get(StringIdx::new(k.a))).into_owned();
+        let a = ctx.lookup_type_alias(&name);
+        if !a.is_none() {
+            return resolve_for_cmp(ctx, a);
+        }
+        // 3+ segment chain through module re-exports — collapse `w.leaf.Point`
+        // to the canonical `Point`.
+        if name.contains('.') {
+            let c = ctx.resolve_chained_type(&name);
+            if !c.is_none() {
+                return resolve_for_cmp(ctx, c);
+            }
+        }
+    }
+    t
+}
+
