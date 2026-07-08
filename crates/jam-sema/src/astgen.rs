@@ -1313,3 +1313,139 @@ fn astgen_expr(gctx: &mut AstGenCtx, node: NodeIdx, expected: TypeIdx) -> Result
     }
 }
 
+fn astgen_number_lit(
+    gctx: &mut AstGenCtx,
+    n: &AstNode,
+    expected: TypeIdx,
+) -> Result<JirRef, String> {
+    let val = (n.lhs as u64) | ((n.rhs as u64) << 32);
+    let is_neg = n.flags & 1 != 0;
+    let is_float = n.flags & 2 != 0;
+
+    if is_float {
+        // Coercion point: round once to the target f32/f64 (no double-round).
+        let to_f32 = expected == builtin::F32;
+        let d = if n.flags & 4 != 0 {
+            let ei = n.lhs;
+            let quad = [
+                gctx.ctx.node_store.get_extra(ExtraIdx::new(ei)),
+                gctx.ctx.node_store.get_extra(ExtraIdx::new(ei + 1)),
+                gctx.ctx.node_store.get_extra(ExtraIdx::new(ei + 2)),
+                gctx.ctx.node_store.get_extra(ExtraIdx::new(ei + 3)),
+            ];
+            quad_to_target_as_double(&quad, to_f32)
+        } else {
+            f64::from_bits(val)
+        };
+        let bits = d.to_bits();
+        let inst = JirInst {
+            tag: JirTag::Float,
+            a: (bits & 0xFFFF_FFFF) as u32,
+            b: (bits >> 32) as u32,
+            flags: if is_neg { 1 } else { 0 },
+            ty: if to_f32 { builtin::F32 } else { builtin::F64 },
+            ..Default::default()
+        };
+        return Ok(emit(gctx, inst));
+    }
+
+    let mut inst = JirInst {
+        tag: JirTag::Int,
+        a: (val & 0xFFFF_FFFF) as u32,
+        b: (val >> 32) as u32,
+        flags: if is_neg { 1 } else { 0 },
+        ..Default::default()
+    };
+    // With an integer `expected` we honour it directly (peer-type propagation).
+    // GenericCall destinations and type-alias chains resolve first so the
+    // contract holds transitively; these route through context stubs that are
+    // no-ops today, so a builtin int resolves immediately.
+    if !expected.is_none() {
+        let mut resolved = expected;
+        if gctx.ctx.type_pool.get(resolved).kind == TypeKind::GenericCall {
+            let r = gctx.ctx.resolve_generic_call(resolved);
+            if !r.is_none() {
+                resolved = r;
+            }
+        }
+        // A Named expected may be a type-alias chain ending at an integer
+        // (`const Flag = u64; var f: Flag = 100000;`). Chase it, requalifying
+        // per hop so the alias resolves in the right module.
+        for _ in 0..8 {
+            let module = gctx.ctx.current_body_module();
+            let rq = gctx.ctx.requalify_type(resolved, &module);
+            let (kn_kind, kn_a) = {
+                let kn = gctx.ctx.type_pool.get(rq);
+                (kn.kind, kn.a)
+            };
+            if kn_kind != TypeKind::Named {
+                resolved = rq;
+                break;
+            }
+            let name = str_at(gctx, kn_a);
+            let target = gctx.ctx.lookup_type_alias(&name);
+            if target.is_none() || target == rq {
+                resolved = rq;
+                break;
+            }
+            resolved = target;
+        }
+        if gctx.ctx.type_pool.get(resolved).kind == TypeKind::Int {
+            inst.ty = resolved;
+            return Ok(emit(gctx, inst));
+        }
+        // Int literal into a float destination stays permissive — falls through
+        // to smallest-fit, and the consumer emits the SIToFP / UIToFP.
+    }
+    // Smallest-fit width: the narrowest builtin that holds the magnitude.
+    inst.ty = if is_neg {
+        if val <= 128 {
+            builtin::I8
+        } else if val <= 32768 {
+            builtin::I16
+        } else if val <= 2_147_483_648 {
+            builtin::I32
+        } else {
+            builtin::I64
+        }
+    } else if val <= 255 {
+        builtin::U8
+    } else if val <= 65535 {
+        builtin::U16
+    } else if val <= 4_294_967_295 {
+        builtin::U32
+    } else {
+        builtin::U64
+    };
+    Ok(emit(gctx, inst))
+}
+
+/// Lower a `StringLit` to a `Str` inst typed as `[]u8` (a `{ptr,len}` slice).
+/// Pointer decay: when the use site expects a `*const[] u8` / `*mut[] u8` /
+/// `*const u8`, the literal lowers to the bare global pointer instead of a fat
+/// slice (the C FFI hand-off), keyed on the expected type.
+fn astgen_string_lit(
+    gctx: &mut AstGenCtx,
+    n: &AstNode,
+    expected: TypeIdx,
+) -> Result<JirRef, String> {
+    let mut result_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
+    if !expected.is_none() {
+        let ek = gctx.ctx.type_pool.get(expected);
+        if (ek.kind == TypeKind::PtrMany || ek.kind == TypeKind::PtrSingle)
+            && TypeIdx::new(ek.a) == builtin::U8
+        {
+            result_ty = expected;
+        }
+    }
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Str,
+            a: n.lhs,
+            ty: result_ty,
+            ..Default::default()
+        },
+    ))
+}
+
