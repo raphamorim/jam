@@ -1593,3 +1593,183 @@ fn resolve_scalar_expected(ctx: &CodegenContext, mut t: TypeIdx) -> TypeIdx {
     t
 }
 
+/// Coerce a freshly evaluated comp value to a declared annotation
+/// (`comp const N: u8 = 200;`) — scalar kinds only, with hard-error misfits.
+/// Ports the C++ `coerceCompToDeclared` (astgen.cpp:909-963). The returned value
+/// carries the declared width/signedness for ints; the error strings match the
+/// oracle byte-for-byte.
+fn coerce_comp_to_declared(
+    gctx: &mut AstGenCtx,
+    v: ComptimeValue,
+    declared: TypeIdx,
+    name: &str,
+) -> Result<ComptimeValue, String> {
+    let resolved = resolve_scalar_expected(gctx.ctx, declared);
+    let k = gctx.ctx.type_pool.get(resolved);
+    match k.kind {
+        TypeKind::Int => {
+            let ComptimeValue::Int {
+                bits, is_signed, ..
+            } = v
+            else {
+                return Err(format!(
+                    "comp binding `{name}` declared as an integer type but its initializer is not an integer"
+                ));
+            };
+            let ew = k.a as u16;
+            let es = k.b != 0;
+            if !comp_int_fits(bits, is_signed, ew, es) {
+                return Err(format!(
+                    "comp binding `{name}` value {} does not fit {}{}",
+                    comp_int_to_string(bits, is_signed),
+                    if es { "i" } else { "u" },
+                    ew
+                ));
+            }
+            Ok(ComptimeValue::Int {
+                bits,
+                width: ew,
+                is_signed: es,
+            })
+        }
+        TypeKind::Float => {
+            let ComptimeValue::Float { value, .. } = v else {
+                return Err(format!(
+                    "comp binding `{name}` declared as a float type; use a float literal (e.g. `3.0`)"
+                ));
+            };
+            Ok(ComptimeValue::Float {
+                value,
+                width: k.a as u16,
+            })
+        }
+        TypeKind::Bool => {
+            if !matches!(v, ComptimeValue::Bool(_)) {
+                return Err(format!(
+                    "comp binding `{name}` declared as bool but its initializer is not a bool"
+                ));
+            }
+            Ok(v)
+        }
+        TypeKind::Slice => {
+            if k.a == builtin::U8.index() as u32 && matches!(v, ComptimeValue::Str(_)) {
+                return Ok(v);
+            }
+            Err(format!(
+                "comp binding `{name}` declared as a slice type; only `[]u8` (str) comp values are supported"
+            ))
+        }
+        _ => Err(format!(
+            "comp binding `{name}` has an unsupported declared type — comp bindings hold int / float / bool / str values"
+        )),
+    }
+}
+
+fn materialize_comptime_value(
+    gctx: &mut AstGenCtx,
+    cv: &ComptimeValue,
+    expected: TypeIdx,
+    what: &str,
+) -> Result<JirRef, String> {
+    match cv {
+        ComptimeValue::Int {
+            bits,
+            width,
+            is_signed,
+        } => {
+            let (mut w, mut s) = (*width, *is_signed);
+            if !expected.is_none() {
+                let resolved = resolve_scalar_expected(gctx.ctx, expected);
+                let ek = gctx.ctx.type_pool.get(resolved);
+                if ek.kind == TypeKind::Int {
+                    let ew = ek.a as u16;
+                    let es = ek.b != 0;
+                    // A comp value that can't represent the expected width is a
+                    // hard error, not a silent truncation (the C++
+                    // materializeComptimeValue fit-check, astgen.cpp:785+).
+                    if !comp_int_fits(*bits, *is_signed, ew, es) {
+                        return Err(format!(
+                            "{what} has value {}, which does not fit the expected {}{}",
+                            comp_int_to_string(*bits, *is_signed),
+                            if es { "i" } else { "u" },
+                            ew
+                        ));
+                    }
+                    w = ew;
+                    s = es;
+                }
+            }
+            let ty = gctx.ctx.type_pool.intern_int(w, s);
+            Ok(emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Int,
+                    a: (*bits & 0xFFFF_FFFF) as u32,
+                    b: (*bits >> 32) as u32,
+                    ty,
+                    ..Default::default()
+                },
+            ))
+        }
+        ComptimeValue::Bool(v) => Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Bool,
+                a: u32::from(*v),
+                ty: builtin::BOOL,
+                ..Default::default()
+            },
+        )),
+        ComptimeValue::Float { value, width } => {
+            let mut w = *width;
+            if !expected.is_none() {
+                let resolved = resolve_scalar_expected(gctx.ctx, expected);
+                let ek = gctx.ctx.type_pool.get(resolved);
+                if ek.kind == TypeKind::Float {
+                    w = ek.a as u16;
+                }
+            }
+            // f32 narrowing rounds once through the target precision.
+            let d = if w == 32 {
+                *value as f32 as f64
+            } else {
+                *value
+            };
+            let bits = d.to_bits();
+            let ty = if w == 32 { builtin::F32 } else { builtin::F64 };
+            Ok(emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Float,
+                    a: (bits & 0xFFFF_FFFF) as u32,
+                    b: (bits >> 32) as u32,
+                    ty,
+                    ..Default::default()
+                },
+            ))
+        }
+        ComptimeValue::Str(sid) => {
+            // Slice-of-u8 by default; decay to a bare u8 pointer when expected.
+            let mut result_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
+            if !expected.is_none() {
+                let ek = gctx.ctx.type_pool.get(expected);
+                if (ek.kind == TypeKind::PtrMany || ek.kind == TypeKind::PtrSingle)
+                    && TypeIdx::new(ek.a) == builtin::U8
+                {
+                    result_ty = expected;
+                }
+            }
+            Ok(emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Str,
+                    a: sid.raw(),
+                    ty: result_ty,
+                    ..Default::default()
+                },
+            ))
+        }
+        _ => Err("astgen: comptime value kind not yet materializable".into()),
+    }
+}
+
