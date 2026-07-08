@@ -2556,3 +2556,340 @@ fn astgen_assign(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     Ok(())
 }
 
+/// Lower a `UnaryOp` (`n.op`: 1=Neg, 2=LogNot, 3=BitNot).
+///   `-x` — `FNeg` for floats, `0 - x` for ints (reuses Sub's signedness).
+///   `!x` — `LogNot` (i1).
+///   `~x` — `BitNot`.
+fn astgen_unary_op(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Result<JirRef, String> {
+    let operand = astgen_expr(gctx, NodeIdx::new(n.lhs), expected)?;
+    let ty = gctx.jfn.get_inst(operand).ty;
+    match n.op {
+        1 => {
+            if gctx.ctx.type_pool.get(ty).kind == TypeKind::Float {
+                return Ok(emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::FNeg,
+                        a: operand,
+                        ty,
+                        ..Default::default()
+                    },
+                ));
+            }
+            // Integer negate as `0 - operand` so Sub's signed/unsigned
+            // semantics fall out for free.
+            let zero = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Int,
+                    a: 0,
+                    b: 0,
+                    ty,
+                    ..Default::default()
+                },
+            );
+            Ok(emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Sub,
+                    a: zero,
+                    b: operand,
+                    ty,
+                    ..Default::default()
+                },
+            ))
+        }
+        2 => Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::LogNot,
+                a: operand,
+                ty: builtin::BOOL,
+                ..Default::default()
+            },
+        )),
+        3 => Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::BitNot,
+                a: operand,
+                ty,
+                ..Default::default()
+            },
+        )),
+        other => Err(format!("astgen: unknown UnaryOp {other}")),
+    }
+}
+
+/// Lower an `as` cast (`expr as T`, `lhs`=operand, `rhs`=target type). The
+/// destination is passed as the operand's expected hint for numeric targets so
+/// a literal settles at the target width in one step (essential for floats — a
+/// double-then-FPTrunc would double-round). Scalar conversions are covered:
+/// bool→int, ptr↔ptr, ptr↔int, int↔int, int↔float, float↔float. The
+/// enum↔int conversions are deferred with enum codegen; GenericCall
+/// destinations resolve through the (currently no-op) context stub.
+fn astgen_as_cast(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
+    let operand_idx = NodeIdx::new(n.lhs);
+    let mut dst_ty = TypeIdx::new(n.rhs);
+    if gctx.ctx.type_pool.get(dst_ty).kind == TypeKind::GenericCall {
+        let r = gctx.ctx.resolve_generic_call(dst_ty);
+        if !r.is_none() {
+            dst_ty = r;
+        }
+    }
+    let (dst_kind, dst_width, dst_signed) = {
+        let d = gctx.ctx.type_pool.get(dst_ty);
+        (d.kind, d.a, d.b != 0)
+    };
+    let hint = if dst_kind == TypeKind::Int || dst_kind == TypeKind::Float {
+        dst_ty
+    } else {
+        TypeIdx::NONE
+    };
+    let val = astgen_expr(gctx, operand_idx, hint)?;
+    let mut src_ty = gctx.jfn.get_inst(val).ty;
+    if src_ty == dst_ty {
+        return Ok(val);
+    }
+    if gctx.ctx.type_pool.get(src_ty).kind == TypeKind::GenericCall {
+        let r = gctx.ctx.resolve_generic_call(src_ty);
+        if !r.is_none() {
+            src_ty = r;
+        }
+    }
+    if src_ty == dst_ty {
+        return Ok(val);
+    }
+    let (src_kind, src_width, src_signed) = {
+        let s = gctx.ctx.type_pool.get(src_ty);
+        (s.kind, s.a, s.b != 0)
+    };
+
+    let is_ptr = |k: TypeKind| k == TypeKind::PtrSingle || k == TypeKind::PtrMany;
+    let cast = |gctx: &mut AstGenCtx, tag: JirTag| {
+        emit(
+            gctx,
+            JirInst {
+                tag,
+                a: val,
+                ty: dst_ty,
+                ..Default::default()
+            },
+        )
+    };
+
+    // Bool → integer.
+    if src_kind == TypeKind::Bool && dst_kind == TypeKind::Int {
+        return Ok(cast(gctx, JirTag::ZExt));
+    }
+    // Pointer ↔ pointer: identical runtime representation under opaque
+    // pointers, so a zero-cost retag.
+    if is_ptr(src_kind) && is_ptr(dst_kind) {
+        return Ok(cast(gctx, JirTag::BitCast));
+    }
+    // Pointer → integer: only u64 is wide enough to round-trip on every target.
+    if is_ptr(src_kind) && dst_kind == TypeKind::Int && dst_width == 64 {
+        return Ok(cast(gctx, JirTag::PtrToInt));
+    }
+    // Integer → thin pointer: widen/truncate to pointer width first.
+    if src_kind == TypeKind::Int && is_ptr(dst_kind) {
+        let widened = if src_width < 64 {
+            let tag = if src_signed {
+                JirTag::SExt
+            } else {
+                JirTag::ZExt
+            };
+            emit(
+                gctx,
+                JirInst {
+                    tag,
+                    a: val,
+                    ty: builtin::U64,
+                    ..Default::default()
+                },
+            )
+        } else if src_width > 64 {
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Trunc,
+                    a: val,
+                    ty: builtin::U64,
+                    ..Default::default()
+                },
+            )
+        } else {
+            val
+        };
+        return Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::IntToPtr,
+                a: widened,
+                ty: dst_ty,
+                ..Default::default()
+            },
+        ));
+    }
+    if src_kind == TypeKind::Int && dst_kind == TypeKind::Int {
+        if src_width < dst_width {
+            return Ok(cast(
+                gctx,
+                if src_signed {
+                    JirTag::SExt
+                } else {
+                    JirTag::ZExt
+                },
+            ));
+        }
+        if src_width > dst_width {
+            return Ok(cast(gctx, JirTag::Trunc));
+        }
+        // Same width, different signedness — retag only.
+        return Ok(cast(gctx, JirTag::BitCast));
+    }
+    if src_kind == TypeKind::Int && dst_kind == TypeKind::Float {
+        return Ok(cast(
+            gctx,
+            if src_signed {
+                JirTag::SIToFP
+            } else {
+                JirTag::UIToFP
+            },
+        ));
+    }
+    if src_kind == TypeKind::Float && dst_kind == TypeKind::Int {
+        return Ok(cast(
+            gctx,
+            if dst_signed {
+                JirTag::FPToSI
+            } else {
+                JirTag::FPToUI
+            },
+        ));
+    }
+    if src_kind == TypeKind::Float && dst_kind == TypeKind::Float {
+        if src_width < dst_width {
+            return Ok(cast(gctx, JirTag::FPExt));
+        }
+        if src_width > dst_width {
+            return Ok(cast(gctx, JirTag::FPTrunc));
+        }
+        return Ok(val);
+    }
+    // Integer → enum: narrow the source to the u8 tag. A unit-only enum IS that
+    // tag; a payloaded enum becomes a `{tag, undef-payload}` aggregate.
+    if src_kind == TypeKind::Int
+        && (dst_kind == TypeKind::Named || dst_kind == TypeKind::Enum)
+        && gctx.ctx.enum_name_of(dst_ty).is_some()
+    {
+        let tag_ref = if src_width != 8 {
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Trunc,
+                    a: val,
+                    ty: builtin::U8,
+                    ..Default::default()
+                },
+            )
+        } else if src_signed {
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::BitCast,
+                    a: val,
+                    ty: builtin::U8,
+                    ..Default::default()
+                },
+            )
+        } else {
+            val
+        };
+        if !gctx.ctx.enum_has_payload(dst_ty).unwrap_or(false) {
+            return Ok(tag_ref);
+        }
+        let slot = emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty: dst_ty,
+                ..Default::default()
+            },
+        );
+        let u8_ptr = gctx.ctx.type_pool.intern_ptr_single(builtin::U8);
+        let tag_ptr = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::FieldAddr,
+                a: slot,
+                b: 0,
+                ty: u8_ptr,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: tag_ptr,
+                b: tag_ref,
+                ..Default::default()
+            },
+        );
+        return Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: slot,
+                ty: dst_ty,
+                ..Default::default()
+            },
+        ));
+    }
+    // Enum → integer: extract the discriminant byte (payloaded enums are a
+    // `{tag, payload}` aggregate; unit-only enums are already an i8 tag), then
+    // width-adjust the u8 tag to the destination integer width.
+    if (src_kind == TypeKind::Named || src_kind == TypeKind::Enum)
+        && dst_kind == TypeKind::Int
+        && gctx.ctx.enum_name_of(src_ty).is_some()
+    {
+        let tag_ref = if gctx.ctx.enum_has_payload(src_ty).unwrap_or(false) {
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::ExtractValue,
+                    a: val,
+                    b: 0,
+                    ty: builtin::U8,
+                    ..Default::default()
+                },
+            )
+        } else {
+            val
+        };
+        if dst_ty == builtin::U8 {
+            return Ok(tag_ref);
+        }
+        let tag_inst = |gctx: &mut AstGenCtx, tag: JirTag| {
+            emit(
+                gctx,
+                JirInst {
+                    tag,
+                    a: tag_ref,
+                    ty: dst_ty,
+                    ..Default::default()
+                },
+            )
+        };
+        return Ok(if dst_width > 8 {
+            tag_inst(gctx, JirTag::ZExt)
+        } else if dst_width < 8 {
+            tag_inst(gctx, JirTag::Trunc)
+        } else {
+            tag_inst(gctx, JirTag::BitCast)
+        });
+    }
+    Err("astgen: unsupported `as` cast between these types".into())
+}
+
