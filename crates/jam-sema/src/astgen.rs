@@ -3324,3 +3324,84 @@ fn astgen_enum_variant_ctor(
     )))
 }
 
+fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<JirRef, String> {
+    if n.flags & 1 != 0 {
+        return astgen_indirect_call(gctx, n, dest_ptr);
+    }
+    let callee = str_at(gctx, n.lhs);
+    // Inside an instantiated body, rewrite `Self.method`/`T.method` to the
+    // concrete `Inst.method` (the C++ resolvePrefix). No-op otherwise.
+    let callee = gctx.ctx.resolve_subst_prefix(&callee);
+    let args_extra = n.rhs;
+    let arg_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra));
+
+    // `assert(actual, expected)` is a compiler builtin (from `import("test")`),
+    // not a real function — lower it directly.
+    if callee == "assert" {
+        return astgen_assert_call(gctx, n);
+    }
+
+    // Resolve a bare callee against the BODY module first (the C++ namespace
+    // lookup): two modules may each define `scale`, and a body must reach its
+    // own, not whichever registered last under the bare key.
+    let body_qualified = {
+        let bm = gctx.ctx.current_body_module();
+        if !bm.is_empty() && !callee.contains('.') {
+            gctx.ctx.get_function_ast(&format!("{bm}.{callee}"))
+        } else {
+            None
+        }
+    };
+    let fn_ast = match body_qualified.or_else(|| gctx.ctx.get_function_ast(&callee)) {
+        Some(f) => f,
+        None => {
+            // A dotted callee `prefix.suffix`: an enum-variant constructor, a
+            // `Type.method` static call, or a method on a local instance.
+            if let Some(r) = astgen_dotted_call(gctx, &callee, args_extra, arg_count, dest_ptr)? {
+                return Ok(r);
+            }
+            // A Fn-typed local (`f(args)`) or Fn-typed struct field
+            // (`recv.field(args)`) — call indirect through the pointer.
+            if let Some(r) = astgen_indirect_fn_call(gctx, &callee, args_extra, arg_count)? {
+                return Ok(r);
+            }
+            // Qualified callees (`std.fmt.println`, `lib.priv`) get the precise
+            // namespace diagnostic — "symbol `X` does not exist in module `M`"
+            // — anchored at the import handle; bare callees get "unknown
+            // function" (the C++ astgen.cpp:7336-7341). The C++ `recoverHere`s
+            // here (not `failHere`): each independent call site reports its own
+            // miss, so a body with several bad calls emits one error per call.
+            let msg = if callee.contains('.') {
+                gctx.ctx.format_namespace_lookup_error("function", &callee)
+            } else {
+                format!("unknown function `{callee}`")
+            };
+            return Ok(recover_here(gctx, msg, TypeIdx::NONE));
+        }
+    };
+    if fn_ast.is_comp_time_fn {
+        return astgen_comptime_fn_call(gctx, &fn_ast, args_extra, arg_count);
+    }
+    if fn_ast.args.iter().any(|p| p.is_comp) {
+        return astgen_comp_instantiated_call(gctx, n, &fn_ast, dest_ptr);
+    }
+
+    let mut arg_refs: Vec<JirRef> = Vec::with_capacity(arg_count as usize);
+    for i in 0..arg_count {
+        let arg_idx = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(args_extra + 1 + i)),
+        );
+        if (i as usize) < fn_ast.args.len() {
+            arg_refs.push(lower_arg(gctx, arg_idx, &fn_ast.args[i as usize])?);
+        } else {
+            // varargs tail — pass by value.
+            arg_refs.push(astgen_expr(gctx, arg_idx, TypeIdx::NONE)?);
+        }
+    }
+    emit_call(gctx, &fn_ast, &arg_refs, dest_ptr)
+}
+
+// ---- cfn-call expansion (the C++ astgenCompTimeFnCall + CfnEmitter) ----
+
