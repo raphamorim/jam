@@ -2024,3 +2024,198 @@ fn resolve_for_cmp(ctx: &CodegenContext, t: TypeIdx) -> TypeIdx {
     t
 }
 
+/// Lower a local `var`/`const` declaration (extra layout `[nameId, declared,
+/// initIdx]`). For a declared type the slot is registered *before* the
+/// initializer is lowered (so a self-referential init can find it); inferred
+/// types register after, once the init's result type is known. An alloca plus
+/// a value Store is emitted — `jir_codegen` lowers it correctly for both
+/// scalars and (via memcpy) aggregates.
+fn astgen_var_decl(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
+    let extra = n.lhs;
+    let name_id = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra));
+    // The declared type stays LITERAL inside an instantiated body (the C++
+    // astgenVarDecl never substitutes it): `var out: Vec(T)` keeps `Vec(T)`,
+    // so the slot's AddrOf receiver interns the literal `*Vec(T)` GenericCall in
+    // the oracle's TypePool order. Downstream registry lookups requalify/resolve
+    // at use, so the bare literal slot type is still correct.
+    let declared = TypeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 1)));
+    let init_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 2)));
+    let name = str_at(gctx, name_id);
+
+    // Reject re-declaration within the same lexical scope only. We inspect the
+    // innermost `local_scopes` frame, so `const a = X; var a = Y;` at the same
+    // level errors, but
+    //     fn f() { var x = 1; if (c) { var x = 2; } }
+    // still compiles — intentional inner-block shadowing is allowed (the C++
+    // astgen.cpp:1149).
+    if let Some(frame) = gctx.local_scopes.last()
+        && frame.contains(&name)
+    {
+        return Err(fail_node(
+            gctx,
+            gctx.current_node,
+            &format!("redeclaration of `{name}` in the same scope"),
+        ));
+    }
+
+    // `comp const X = E;` / `comp var X = E;` (rhs bit 1) — fold the initializer
+    // and bind it in the comp scope (no runtime slot); uses inline the value.
+    // Mirrors the C++ astgen.cpp:1157-1172: non-foldable inits are rejected
+    // (anchored at the initializer), and a declared annotation coerces +
+    // range-checks the value.
+    if n.rhs & 2 != 0 {
+        let is_const_binding = n.rhs & 1 != 0;
+        let mut v = gctx.ctx.fold_comptime_expr_in(init_idx, &gctx.comp_scope);
+        if v.is_none() {
+            return Err(fail_node(
+                gctx,
+                init_idx,
+                &format!("comp initializer of `{name}` must be a compile-time-known value"),
+            ));
+        }
+        if !declared.is_none() {
+            v = coerce_comp_to_declared(gctx, v, declared, &name)?;
+        }
+        gctx.comp_scope.bind(name.clone(), v);
+        gctx.comp_bind_info.last_mut().unwrap().insert(
+            name.clone(),
+            CompBindingInfo {
+                decl_depth: gctx.runtime_cond_depth,
+                is_const: is_const_binding,
+            },
+        );
+        if let Some(frame) = gctx.local_scopes.last_mut() {
+            frame.insert(name);
+        }
+        return Ok(());
+    }
+
+    let (alloca_ref, ty) = if declared.is_none() {
+        // Inferred: lower the init first so we have a concrete type to allocate,
+        // then store the value (the place path needs a pre-existing slot).
+        let init_ref = astgen_expr(gctx, init_idx, TypeIdx::NONE)?;
+        let ty = gctx.jfn.get_inst(init_ref).ty;
+        if ty.is_none() {
+            return Err(format!(
+                "could not infer type of `{name}`; add an explicit `: T` annotation"
+            ));
+        }
+        let alloca_ref = emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty,
+                ..Default::default()
+            },
+        );
+        gctx.locals.insert(name.clone(), alloca_ref);
+        gctx.local_types.insert(name.clone(), ty);
+        if let Some(frame) = gctx.local_scopes.last_mut() {
+            frame.insert(name.clone());
+        }
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: alloca_ref,
+                b: init_ref,
+                ..Default::default()
+            },
+        );
+        (alloca_ref, ty)
+    } else {
+        // Declared: register the slot before lowering the init (self-ref). Try
+        // the place-into-destination path first (StructLit / sret Call write
+        // directly into the slot); fall back to value-compile + Store. The
+        // declared type stays bare (the oracle keeps local-slot types bare;
+        // registry lookups requalify at use). An `[expr]T` array type resolves
+        // its comptime length so the slot is a concrete `[n]T`.
+        let ty = if gctx.ctx.type_pool.get(declared).kind == TypeKind::ArrayExpr {
+            gctx.ctx.resolve_array_expr_instantiate(declared)?
+        } else {
+            declared
+        };
+        let alloca_ref = emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty,
+                ..Default::default()
+            },
+        );
+        gctx.locals.insert(name.clone(), alloca_ref);
+        gctx.local_types.insert(name.clone(), ty);
+        if let Some(frame) = gctx.local_scopes.last_mut() {
+            frame.insert(name.clone());
+        }
+        if !astgen_expr_into_ptr(gctx, init_idx, ty, alloca_ref)? {
+            let init_ref = astgen_expr(gctx, init_idx, ty)?;
+            // Type-check the init against the declared type (the C++
+            // astgen.cpp:1290-1327). The astgen_number_lit path already narrows
+            // integer literals to the declared int width when `expected` is an
+            // Int, so `var x: i32 = 5;` lands as I32. Anything else that doesn't
+            // match is a real mismatch — `var x: f32 = 3;` (int into float),
+            // `var x: i32 = 3.5;` (float into int), `const y: u32 = x`(i8), etc.
+            // Both sides are resolved through generic-call / type-alias chains
+            // first; PtrSingle(T)/PtrMany(T) share a representation so they're
+            // leniently compatible (a zero-cost retag).
+            let init_ty = gctx.jfn.get_inst(init_ref).ty;
+            let decl_res = resolve_for_cmp(gctx.ctx, ty);
+            let init_res = resolve_for_cmp(gctx.ctx, init_ty);
+            let pointer_compatible = |a: TypeIdx, b: TypeIdx| -> bool {
+                if a.is_none() || b.is_none() {
+                    return false;
+                }
+                let ka = gctx.ctx.type_pool.get(a);
+                let kb = gctx.ctx.type_pool.get(b);
+                let a_ptr = ka.kind == TypeKind::PtrSingle || ka.kind == TypeKind::PtrMany;
+                let b_ptr = kb.kind == TypeKind::PtrSingle || kb.kind == TypeKind::PtrMany;
+                a_ptr && b_ptr && ka.a == kb.a
+            };
+            let types_match = decl_res == init_res || pointer_compatible(decl_res, init_res);
+            if !init_ty.is_none() && !types_match {
+                let dk = gctx.ctx.type_pool.get(decl_res);
+                let ik = gctx.ctx.type_pool.get(init_res);
+                if dk.kind == TypeKind::Float && ik.kind == TypeKind::Int {
+                    return Err(format!(
+                        "cannot assign integer to float-typed `{name}`; use a float literal (e.g. `3.0`) or an explicit `as` cast"
+                    ));
+                }
+                return Err(format!(
+                    "type mismatch in `{name}`: declared and initialised values disagree"
+                ));
+            }
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Store,
+                    a: alloca_ref,
+                    b: init_ref,
+                    ..Default::default()
+                },
+            );
+        }
+        (alloca_ref, ty)
+    };
+
+    // `var owned = c;` with a bare drop-bearing `c` MOVES it: the new binding
+    // owns the value, so the source's scope-exit drop is suppressed. `var x = h.c`
+    // (field extraction) has no per-field suppression — reject it instead (the C++
+    // rejectDropBearingFieldExtract, astgen.cpp:1344).
+    reject_drop_bearing_field_extract(gctx, init_idx, ty, "copy")?;
+    consume_moved_variable(gctx, init_idx);
+    // If this binding's type owns heap, track it for scope-exit cleanup (a
+    // registered `cfn drop`, or field-recursive when the name is empty).
+    if gctx.ctx.type_needs_drop(ty) {
+        gctx.drop_scopes
+            .last_mut()
+            .expect("a drop scope is always active during a body")
+            .push(DropTrack {
+                var_name: name,
+                slot: alloca_ref,
+                ty,
+            });
+    }
+    Ok(())
+}
+
