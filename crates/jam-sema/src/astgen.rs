@@ -2893,3 +2893,126 @@ fn astgen_as_cast(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     Err("astgen: unsupported `as` cast between these types".into())
 }
 
+/// Lower a single call argument against parameter `p` (the C++ `lowerArgInner`).
+/// ByValue params take the value (with the slice→pointer rejection); ByPointer
+/// params (`mut`, or any aggregate) take an address — the caller's storage for
+/// an lvalue arg, or a fresh spill slot for an rvalue.
+///
+/// A `move`-mode arg transfers ownership to the callee — the source's drop is
+/// consumed. Deferred: the `AddressOf`-on-mode validation and the
+/// place-into-destination spill optimization (`astgenExprIntoPtr`).
+/// True when `n` is a `MemberAccess` whose base is a non-local Variable — i.e. a
+/// `Type.Variant` / `handle.X` constructor expression rather than an addressable
+/// lvalue (a local's `s.field` has its base in `locals`). lower_arg spills these.
+fn member_access_is_ctor(gctx: &AstGenCtx, n: &AstNode) -> bool {
+    if n.tag != AstTag::MemberAccess {
+        return false;
+    }
+    let base = *gctx.ctx.node_store.get(NodeIdx::new(n.lhs));
+    base.tag == AstTag::Variable && !gctx.locals.contains_key(&str_at(gctx, base.lhs))
+}
+
+fn lower_arg(gctx: &mut AstGenCtx, arg_idx: NodeIdx, p: &Param) -> Result<JirRef, String> {
+    // A `move`-mode arg that extracts a drop-bearing field out of an owned
+    // aggregate is rejected — the callee and the parent's glue would both drop it
+    // (the C++ lowerArg's rejectDropBearingFieldExtract, astgen.cpp:5933).
+    if p.mode == jam_core::param_mode::ParamMode::Move {
+        reject_drop_bearing_field_extract(gctx, arg_idx, p.ty, "move")?;
+    }
+    let pabi = classify_param(p.mode, p.ty, gctx.ctx)?;
+    let r = if pabi.kind != ParamAbiKind::ByPointer {
+        let v = astgen_expr(gctx, arg_idx, p.ty)?;
+        // A runtime slice does not implicitly decay to a pointer parameter;
+        // passing a {ptr,len} aggregate where a bare pointer is expected
+        // silently corrupts the ABI — require an explicit `.ptr`.
+        let vk = gctx.ctx.type_pool.get(gctx.jfn.get_inst(v).ty).kind;
+        let pk = gctx.ctx.type_pool.get(p.ty).kind;
+        if vk == TypeKind::Slice && (pk == TypeKind::PtrMany || pk == TypeKind::PtrSingle) {
+            return Err(format!(
+                "cannot pass a slice to pointer parameter `{}`; use `.ptr` to pass \
+                 the slice's data pointer",
+                p.name
+            ));
+        }
+        v
+    } else {
+        // ByPointer: feed an address.
+        let arg_node = *gctx.ctx.node_store.get(arg_idx);
+        match arg_node.tag {
+            // Lvalueable args hand over their existing storage pointer. (Index is
+            // accepted by astgen_lvalue only once array support lands.)
+            AstTag::Variable | AstTag::Index | AstTag::Deref => astgen_lvalue(gctx, arg_idx)?.0,
+            // A `Type.Variant` / `handle.X` member access whose base is a non-local
+            // Variable is a CONSTRUCTOR (e.g. a payloaded enum's unit variant
+            // `Msg.Quit`), not an lvalue — astgen_lvalue can't resolve the base. Spill
+            // it like any rvalue (the `_` arm) — the C++ `memberAccessOnNonLvalue`
+            // guard, astgen.cpp:5808. A member access on a LOCAL (`s.field`) stays an
+            // lvalue.
+            AstTag::MemberAccess if !member_access_is_ctor(gctx, &arg_node) => {
+                astgen_lvalue(gctx, arg_idx)?.0
+            }
+            AstTag::AddressOf => astgen_expr(gctx, arg_idx, TypeIdx::NONE)?,
+            // Spill an rvalue into a fresh slot so the callee gets a pointer. The
+            // place-into-destination fast path is deferred — value-compile + Store.
+            _ => {
+                let ptr = emit_alloca_hoisted(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Alloca,
+                        ty: p.ty,
+                        ..Default::default()
+                    },
+                );
+                let val = astgen_expr(gctx, arg_idx, p.ty)?;
+                emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Store,
+                        a: ptr,
+                        b: val,
+                        ..Default::default()
+                    },
+                );
+                ptr
+            }
+        }
+    };
+    if p.mode == jam_core::param_mode::ParamMode::Move {
+        consume_moved_variable(gctx, arg_idx);
+    }
+    Ok(r)
+}
+
+/// Emit a `Call` to `fn_ast` with already-lowered `arg_refs`. sret-returning
+/// callees get their result slot as a leading arg (the caller's `dest_ptr` when
+/// supplied, else a fresh alloca that becomes the Call's result). The arg list
+/// The per-value mangle token for a `comp` argument (`scale__u2`), mirroring the
+/// C++ switch (astgen.cpp:6539-6566): an int folds to `i`/`u` + its u64 value, a
+/// bool to `true`/`false`, a string to `s` + its libc++ `std::hash` (stable +
+/// printable over arbitrary contents), a type to its width spelling / `bool` /
+/// `t` + TypeIdx. A bare `_ => "x"` previously collapsed DISTINCT string and type
+/// instantiations onto one cache key + LLVM symbol (the linker then merged them).
+fn comp_value_spelling(v: &ComptimeValue, gctx: &AstGenCtx) -> String {
+    match v {
+        ComptimeValue::Int { is_signed, .. } => {
+            format!("{}{}", if *is_signed { "i" } else { "u" }, v.as_u64())
+        }
+        ComptimeValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        ComptimeValue::Str(sid) => {
+            format!(
+                "s{}",
+                crate::libcxx_order::libcxx_string_hash(&gctx.ctx.string_pool.get(*sid))
+            )
+        }
+        ComptimeValue::Type(tid) => {
+            let tk = gctx.ctx.type_pool.get(*tid);
+            match tk.kind {
+                TypeKind::Int => format!("{}{}", if tk.b != 0 { "i" } else { "u" }, tk.a),
+                TypeKind::Bool => "bool".to_string(),
+                _ => format!("t{}", tid.raw()),
+            }
+        }
+        _ => "x".to_string(),
+    }
+}
+
