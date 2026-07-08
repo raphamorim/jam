@@ -3016,3 +3016,311 @@ fn comp_value_spelling(v: &ComptimeValue, gctx: &AstGenCtx) -> String {
     }
 }
 
+/// A call to a fn with `comp` value params (`fn scale(comp k: u32, x: u32)`):
+/// fold each comp arg to a value, bake it into a per-instantiation symbol
+/// (`scale__u2`), and dispatch to that monomorphization passing only the
+/// runtime args. The instantiated body is emitted lazily by the backend and is
+/// not part of the JIR dump, so only the call site is lowered here.
+fn astgen_comp_instantiated_call(
+    gctx: &mut AstGenCtx,
+    n: &AstNode,
+    fn_ast: &FunctionAST,
+    dest_ptr: JirRef,
+) -> Result<JirRef, String> {
+    let args_extra = n.rhs;
+    let arg_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra));
+    let mut suffix = String::new();
+    let mut runtime_idx: Vec<NodeIdx> = Vec::new();
+    let mut runtime_params: Vec<jam_syntax::ast::Param> = Vec::new();
+    // The comp-param substitution baked into the clone's body (the C++
+    // `compSubst`): a body reference to `k` folds to this call-site value.
+    let mut comp_subst: HashMap<String, ComptimeValue> = HashMap::new();
+    for i in 0..arg_count {
+        let arg_idx = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(args_extra + 1 + i)),
+        );
+        match fn_ast.args.get(i as usize) {
+            Some(p) if p.is_comp => {
+                let v = gctx.ctx.fold_comptime_expr_in(arg_idx, &gctx.comp_scope);
+                if matches!(v, ComptimeValue::None) {
+                    return Err(format!(
+                        "astgen: argument for comp param `{}` must be a compile-time constant",
+                        p.name
+                    ));
+                }
+                suffix.push_str("__");
+                suffix.push_str(&comp_value_spelling(&v, gctx));
+                comp_subst.insert(p.name.clone(), v);
+            }
+            Some(p) => {
+                runtime_idx.push(arg_idx);
+                runtime_params.push(p.clone());
+            }
+            None => runtime_idx.push(arg_idx),
+        }
+    }
+    let base = if fn_ast.module_path.is_empty() {
+        fn_ast.name.clone()
+    } else {
+        format!("{}.{}", fn_ast.module_path, fn_ast.name)
+    };
+    // A clone whose signature drops the comp params; module_path empty so the
+    // mangler passes the instantiation name through unchanged.
+    let mut clone = fn_ast.clone();
+    clone.name = format!("{base}{suffix}");
+    clone.module_path = String::new();
+    clone.parent_struct = String::new();
+    clone.args = runtime_params;
+
+    // EAGERLY declare + define the clone the first time this instantiation is
+    // seen (the C++ `astgenCompInstantiatedCall`): the clone body is never
+    // emitted by the regular pipeline, so without this the call dangles
+    // ("unknown callee"). The clone's name doubles as the cache key AND its
+    // LLVM symbol. Cache on `get_function_ast` so a repeat call reuses it.
+    if gctx.ctx.get_function_ast(&clone.name).is_none() {
+        gctx.ctx
+            .register_function_ast(clone.name.clone(), clone.clone());
+        // Metadata + LLVM prototype, then the body — with the comp subst
+        // active so body refs to comp params fold to the baked constants, and
+        // the defining module pushed so bare type/name refs resolve there.
+        let mut jfn = astgen_metadata(&clone, gctx.ctx);
+        jfn.name = clone.name.clone();
+        let _ = jir_declare_prototype(&jfn, gctx.ctx);
+        gctx.ctx.push_body_module(fn_ast.module_path.clone());
+        gctx.ctx.set_current_comp_subst(comp_subst);
+        let body_res = astgen_body_into(&mut jfn, &clone, gctx.ctx);
+        gctx.ctx.clear_current_comp_subst();
+        gctx.ctx.pop_body_module();
+        body_res?;
+        jir_define_body(&jfn, gctx.ctx)?;
+    }
+
+    let mut arg_refs: Vec<JirRef> = Vec::with_capacity(runtime_idx.len());
+    for (j, arg_idx) in runtime_idx.iter().enumerate() {
+        arg_refs.push(lower_arg(gctx, *arg_idx, &clone.args[j])?);
+    }
+    emit_call(gctx, &clone, &arg_refs, dest_ptr)
+}
+
+/// is packed `[count, args..]` into the function's extra array. A `noreturn`
+/// callee terminates the current block with `Unreachable`.
+fn emit_call(
+    gctx: &mut AstGenCtx,
+    fn_ast: &FunctionAST,
+    arg_refs: &[JirRef],
+    dest_ptr: JirRef,
+) -> Result<JirRef, String> {
+    let mangled = mangled_function_name(fn_ast, &gctx.ctx.type_pool, &gctx.ctx.string_pool);
+    let callee_id = gctx.ctx.string_pool.intern_str(&mangled).raw();
+
+    // The callee's return type spelled in ITS module (a callee returning its own
+    // module's `Token` shows `mod.Token` at the call site, like the oracle).
+    let rq = gctx
+        .ctx
+        .requalify_type(fn_ast.return_type, &fn_ast.module_path);
+    let ret_ty = gctx.ctx.qualify_generic_callee(rq, &fn_ast.module_path);
+
+    let sret_callee =
+        !ret_ty.is_none() && classify_return(ret_ty, gctx.ctx)?.kind == ReturnAbiKind::Indirect;
+
+    let mut all_args: Vec<u32> = Vec::with_capacity(arg_refs.len() + usize::from(sret_callee));
+    if sret_callee {
+        // The caller's destination when supplied, else a fresh slot that
+        // becomes the Call's result (a pointer to the freshly-written value).
+        let slot = if dest_ptr != NO_JIR_REF {
+            dest_ptr
+        } else {
+            emit_alloca_hoisted(
+                gctx,
+                JirInst {
+                    tag: JirTag::Alloca,
+                    ty: ret_ty,
+                    ..Default::default()
+                },
+            )
+        };
+        all_args.push(slot);
+    }
+    all_args.extend_from_slice(arg_refs);
+
+    let mut packed: Vec<u32> = Vec::with_capacity(1 + all_args.len());
+    packed.push(all_args.len() as u32);
+    packed.extend_from_slice(&all_args);
+    let extra = gctx.jfn.push_extra(&packed);
+
+    let call_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Call,
+            a: callee_id,
+            b: extra,
+            ty: ret_ty,
+            ..Default::default()
+        },
+    );
+    if fn_ast.return_type == builtin::NORETURN {
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Unreachable,
+                ..Default::default()
+            },
+        );
+    }
+    // Place-call: the value was written through `dest_ptr`, so bind no JirRef.
+    if sret_callee && dest_ptr != NO_JIR_REF {
+        return Ok(NO_JIR_REF);
+    }
+    Ok(call_ref)
+}
+
+/// Lower a direct free-function `Call` (`lhs`=callee StringIdx, `rhs`=ExtraIdx
+/// → `[argCount, args..]`). The indirect/method form (flags bit 0), comptime-fn
+/// and comp-instantiated calls, and the fn-pointer-in-local fallback are
+/// deferred — they error cleanly until ported.
+/// Construct an enum variant value `Enum.Variant(args)`: the discriminant byte
+/// (unit-only enums return it directly), else a `{tag, payload}` aggregate built
+/// via an alloca — `FieldAddr(0)` = tag, `FieldAddr(1)` = payload area, each
+/// payload field stored at its computed byte offset through an i8-stride GEP.
+/// Returns `None` when the variant name is unknown (caller falls through).
+fn astgen_enum_variant_ctor(
+    gctx: &mut AstGenCtx,
+    canonical_type: &str,
+    variant_name: &str,
+    args_extra: u32,
+    arg_count: u32,
+) -> Result<Option<JirRef>, String> {
+    let vidx = gctx.ctx.enum_variant_index(canonical_type, variant_name);
+    if vidx < 0 {
+        return Ok(None);
+    }
+    let variants = gctx
+        .ctx
+        .enum_variants_by_name(canonical_type)
+        .unwrap_or_default();
+    let disc = variants[vidx as usize].discriminant;
+    let payload_types = variants[vidx as usize].payload_types.clone();
+    let has_payload = gctx
+        .ctx
+        .enum_has_payload_by_name(canonical_type)
+        .unwrap_or(false);
+    let esid = gctx.ctx.string_pool.intern(canonical_type.as_bytes());
+    let enum_ty = gctx.ctx.type_pool.intern_named(esid);
+
+    let tag_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: disc,
+            ty: builtin::U8,
+            ..Default::default()
+        },
+    );
+    if !has_payload {
+        return Ok(Some(tag_ref));
+    }
+    let slot = emit_alloca_hoisted(
+        gctx,
+        JirInst {
+            tag: JirTag::Alloca,
+            ty: enum_ty,
+            ..Default::default()
+        },
+    );
+    let u8_ptr = gctx.ctx.type_pool.intern_ptr_single(builtin::U8);
+    let tag_ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::FieldAddr,
+            a: slot,
+            b: 0,
+            ty: u8_ptr,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: tag_ptr,
+            b: tag_ref,
+            ..Default::default()
+        },
+    );
+
+    if arg_count as usize > payload_types.len() {
+        return Err(format!(
+            "astgen: too many args for variant `{canonical_type}.{variant_name}`"
+        ));
+    }
+    if !payload_types.is_empty() && arg_count >= 1 {
+        let pay_area = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::FieldAddr,
+                a: slot,
+                b: 1,
+                ty: u8_ptr,
+                ..Default::default()
+            },
+        );
+        let mut off: u64 = 0;
+        for (i, &field_ty) in payload_types.iter().take(arg_count as usize).enumerate() {
+            let s = gctx.ctx.type_size(field_ty)?;
+            let a = gctx.ctx.type_align(field_ty)?;
+            off = off.div_ceil(a) * a;
+            let arg_idx = NodeIdx::new(
+                gctx.ctx
+                    .node_store
+                    .get_extra(ExtraIdx::new(args_extra + 1 + i as u32)),
+            );
+            // Enum payload capture is a MOVE — extracting a drop-bearing field out
+            // of an aggregate to capture it is rejected (the C++
+            // rejectDropBearingFieldExtract, astgen.cpp:4561).
+            reject_drop_bearing_field_extract(gctx, arg_idx, field_ty, "capture")?;
+            let pay_val = astgen_expr(gctx, arg_idx, field_ty)?;
+            consume_moved_variable(gctx, arg_idx);
+            let off_ref = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Int,
+                    a: off as u32,
+                    ty: builtin::U64,
+                    ..Default::default()
+                },
+            );
+            let field_ptr = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::IndexAddr,
+                    a: pay_area,
+                    b: off_ref,
+                    ty: u8_ptr,
+                    ..Default::default()
+                },
+            );
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Store,
+                    a: field_ptr,
+                    b: pay_val,
+                    ..Default::default()
+                },
+            );
+            off += s;
+        }
+    }
+    Ok(Some(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: enum_ty,
+            ..Default::default()
+        },
+    )))
+}
+
