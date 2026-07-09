@@ -6506,3 +6506,289 @@ fn astgen_address_of(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String
     ))
 }
 
+fn astgen_member_access(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
+    let base_idx = NodeIdx::new(n.lhs);
+    let member = str_at(gctx, n.rhs);
+    let base_node = *gctx.ctx.node_store.get(base_idx);
+    let base_tag = base_node.tag;
+
+    // Enum-variant constructor reference (`Color.Red`): a `Variable` base whose
+    // name is a registered enum (and isn't a runtime local). Unit-only enums
+    // lower to the tag i8 retagged to the enum type; a payloaded enum's unit
+    // variant builds a `{tag, undef}` StructLit. (Handle-qualified chains —
+    // `a.Status.Ok` — land with module resolution.)
+    if base_tag == AstTag::Variable {
+        let base_name = str_at(gctx, base_node.lhs);
+        // Mirror the C++ `astgenMemberAccess` (codegen.cpp:2053-2055, 2094): a
+        // pure-Variable base ALWAYS interns its name as a `Named` enum probe,
+        // even when the name is a runtime local — `self.field` interns
+        // `Named("self")` before the field projection. The earlier `!locals`
+        // guard skipped this, leaving the type pool one `Named` short and
+        // shifting every later GenericCall's TypeIdx (the `Vec__T<idx>`
+        // monomorph spelling read 4 too low).
+        {
+            let sid = gctx.ctx.string_pool.intern(base_name.as_bytes());
+            let named = gctx.ctx.type_pool.intern_named(sid);
+            let bm = gctx.ctx.current_body_module();
+            let named = gctx.ctx.requalify_type(named, &bm);
+            if !gctx.locals.contains_key(&base_name)
+                && let Some(en) = gctx.ctx.enum_name_of(named)
+            {
+                let vidx = gctx.ctx.enum_variant_index(&en, &member);
+                if vidx < 0 {
+                    return Err(format!("astgen: enum `{en}` has no variant `{member}`"));
+                }
+                let disc = gctx.ctx.enum_variants_by_name(&en).unwrap()[vidx as usize].discriminant;
+                let has_payload = gctx.ctx.enum_has_payload_by_name(&en).unwrap_or(false);
+                let esid = gctx.ctx.string_pool.intern(en.as_bytes());
+                let enum_ty = gctx.ctx.type_pool.intern_named(esid);
+                let tag = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Int,
+                        a: disc,
+                        ty: builtin::U8,
+                        ..Default::default()
+                    },
+                );
+                if !has_payload {
+                    return Ok(emit(
+                        gctx,
+                        JirInst {
+                            tag: JirTag::BitCast,
+                            a: tag,
+                            ty: enum_ty,
+                            ..Default::default()
+                        },
+                    ));
+                }
+                let extra = gctx.jfn.push_extra(&[1, tag]);
+                return Ok(emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::StructLit,
+                        b: extra,
+                        ty: enum_ty,
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+    }
+
+    // Handle-qualified enum-variant reference (`a.Status.Ok`): the base is itself
+    // a `MemberAccess` whose own base is a non-local `Variable` (an import handle).
+    // Build the dotted `handle.Type` spelling, intern it as a `Named`, and if it
+    // resolves to a registered enum (via the A2 `handle.Type` alias), emit the
+    // unit-variant reference — exactly like the single-dot `Color.Red` path above.
+    // The multi-dot CALL form (`a.Status.Bad(5)`) is handled in astgen_dotted_call.
+    if base_tag == AstTag::MemberAccess {
+        let inner_base = *gctx.ctx.node_store.get(NodeIdx::new(base_node.lhs));
+        if inner_base.tag == AstTag::Variable {
+            let handle = str_at(gctx, inner_base.lhs);
+            let type_name = str_at(gctx, base_node.rhs);
+            if !gctx.locals.contains_key(&handle) {
+                let dotted = format!("{handle}.{type_name}");
+                let sid = gctx.ctx.string_pool.intern(dotted.as_bytes());
+                let named = gctx.ctx.type_pool.intern_named(sid);
+                if let Some(en) = gctx.ctx.enum_name_of(named) {
+                    let vidx = gctx.ctx.enum_variant_index(&en, &member);
+                    if vidx < 0 {
+                        return Err(format!("astgen: enum `{en}` has no variant `{member}`"));
+                    }
+                    let disc =
+                        gctx.ctx.enum_variants_by_name(&en).unwrap()[vidx as usize].discriminant;
+                    let has_payload = gctx.ctx.enum_has_payload_by_name(&en).unwrap_or(false);
+                    let esid = gctx.ctx.string_pool.intern(en.as_bytes());
+                    let enum_ty = gctx.ctx.type_pool.intern_named(esid);
+                    let tag = emit(
+                        gctx,
+                        JirInst {
+                            tag: JirTag::Int,
+                            a: disc,
+                            ty: builtin::U8,
+                            ..Default::default()
+                        },
+                    );
+                    if !has_payload {
+                        return Ok(emit(
+                            gctx,
+                            JirInst {
+                                tag: JirTag::BitCast,
+                                a: tag,
+                                ty: enum_ty,
+                                ..Default::default()
+                            },
+                        ));
+                    }
+                    let extra = gctx.jfn.push_extra(&[1, tag]);
+                    return Ok(emit(
+                        gctx,
+                        JirInst {
+                            tag: JirTag::StructLit,
+                            b: extra,
+                            ty: enum_ty,
+                            ..Default::default()
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
+    // Addressable base → field pointer + Load.
+    if matches!(
+        base_tag,
+        AstTag::Variable | AstTag::MemberAccess | AstTag::Index | AstTag::Deref
+    ) {
+        let (base_ptr, base_leaf) = astgen_lvalue(gctx, base_idx)?;
+        if gctx.ctx.is_union_registered(base_leaf) {
+            let field_ty = gctx
+                .ctx
+                .union_fields(base_leaf)
+                .and_then(|fs| fs.into_iter().find(|(nm, _)| *nm == member).map(|(_, t)| t))
+                .ok_or_else(|| format!("astgen: union has no field `{member}`"))?;
+            let ptr_ty = gctx.ctx.type_pool.intern_ptr_single(field_ty);
+            let fp = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::BitCast,
+                    a: base_ptr,
+                    ty: ptr_ty,
+                    ..Default::default()
+                },
+            );
+            return Ok(emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Load,
+                    a: fp,
+                    ty: field_ty,
+                    ..Default::default()
+                },
+            ));
+        }
+        if let Some(fields) = gctx.ctx.struct_fields(base_leaf) {
+            let sname = gctx.ctx.struct_name_of(base_leaf).unwrap_or_default();
+            let idx = fields
+                .iter()
+                .position(|(nm, _)| *nm == member)
+                .ok_or_else(|| format!("unknown field `{member}` on `{sname}`"))?;
+            let mut field_ty = fields[idx].1;
+            // An `[expr]T` field resolves to its concrete `[n]T` (cached at
+            // registration) for the FieldAddr/Load types.
+            if gctx.ctx.type_pool.get(field_ty).kind == TypeKind::ArrayExpr {
+                let r = gctx.ctx.resolve_array_expr(field_ty);
+                if !r.is_none() {
+                    field_ty = r;
+                }
+            }
+            let ptr_ty = gctx.ctx.type_pool.intern_ptr_single(field_ty);
+            let fp = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::FieldAddr,
+                    a: base_ptr,
+                    b: idx as u32,
+                    ty: ptr_ty,
+                    ..Default::default()
+                },
+            );
+            return Ok(emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Load,
+                    a: fp,
+                    ty: field_ty,
+                    ..Default::default()
+                },
+            ));
+        }
+        // Slice / other base: fall through to the value path.
+    }
+
+    let base_ref = astgen_expr(gctx, base_idx, TypeIdx::NONE)?;
+    let base_ty = gctx.jfn.get_inst(base_ref).ty;
+    let (bk_kind, bk_a) = {
+        let bk = gctx.ctx.type_pool.get(base_ty);
+        (bk.kind, bk.a)
+    };
+
+    // Slice `.ptr` (field 0, `[*]elem`) / `.len` (field 1, u64).
+    if bk_kind == TypeKind::Slice {
+        let (field_idx, field_ty) = match member.as_str() {
+            "ptr" => (0u32, gctx.ctx.type_pool.intern_ptr_many(TypeIdx::new(bk_a))),
+            "len" => (1u32, builtin::U64),
+            _ => return Err(format!("astgen: slice has no field `{member}`")),
+        };
+        return Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::ExtractValue,
+                a: base_ref,
+                b: field_idx,
+                ty: field_ty,
+                ..Default::default()
+            },
+        ));
+    }
+
+    // Union value: spill to a slot, reload at the field's type (opaque pointers
+    // let any field-typed value come back from the same storage).
+    if gctx.ctx.is_union_registered(base_ty) {
+        let field_ty = gctx
+            .ctx
+            .union_fields(base_ty)
+            .and_then(|fs| fs.into_iter().find(|(nm, _)| *nm == member).map(|(_, t)| t))
+            .ok_or_else(|| format!("astgen: union has no field `{member}`"))?;
+        let slot = emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty: base_ty,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: slot,
+                b: base_ref,
+                ..Default::default()
+            },
+        );
+        return Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: slot,
+                ty: field_ty,
+                ..Default::default()
+            },
+        ));
+    }
+
+    // Struct value: ExtractValue at the field's positional index.
+    let fields = gctx
+        .ctx
+        .struct_fields(base_ty)
+        .ok_or_else(|| "astgen: cannot access field of non-struct type".to_string())?;
+    let sname = gctx.ctx.struct_name_of(base_ty).unwrap_or_default();
+    let idx = fields
+        .iter()
+        .position(|(nm, _)| *nm == member)
+        .ok_or_else(|| format!("unknown field `{member}` on `{sname}`"))?;
+    let field_ty = fields[idx].1;
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::FieldAccess,
+            a: base_ref,
+            b: idx as u32,
+            ty: field_ty,
+            ..Default::default()
+        },
+    ))
+}
+
