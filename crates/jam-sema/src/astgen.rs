@@ -5314,3 +5314,341 @@ fn collect_switch_cases(
     }
 }
 
+/// Compare `scrut` against one pattern, branching to `arm_block` on match and
+/// `next_block` otherwise (the C++ `astgenPatternCompare`). Handles PatLit,
+/// PatRange, PatOr, PatEnumVariant (with payload-binding extraction into
+/// `out_bindings`), and PatWildcard. Module-const patterns are deferred.
+fn astgen_pattern_compare(
+    gctx: &mut AstGenCtx,
+    pat_idx: NodeIdx,
+    scrut: JirRef,
+    scrut_ty: TypeIdx,
+    arm_block: JirBlockRef,
+    next_block: JirBlockRef,
+    out_bindings: &mut Vec<ArmBinding>,
+) -> Result<(), String> {
+    let p = *gctx.ctx.node_store.get(pat_idx);
+    let signed_cmp = {
+        let sk = gctx.ctx.type_pool.get(scrut_ty);
+        sk.kind == TypeKind::Int && sk.b != 0
+    };
+    match p.tag {
+        AstTag::PatLit => {
+            let val = (p.lhs as u64) | ((p.rhs as u64) << 32);
+            let k = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Int,
+                    a: (val & 0xFFFF_FFFF) as u32,
+                    b: (val >> 32) as u32,
+                    flags: if p.flags & 1 != 0 { 1 } else { 0 },
+                    ty: scrut_ty,
+                    ..Default::default()
+                },
+            );
+            let cmp = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::ICmpEq,
+                    a: scrut,
+                    b: k,
+                    ty: builtin::BOOL,
+                    ..Default::default()
+                },
+            );
+            emit_cond_br(gctx, cmp, arm_block, next_block);
+            Ok(())
+        }
+        AstTag::PatRange => {
+            let lo_k = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Int,
+                    a: p.lhs,
+                    ty: scrut_ty,
+                    ..Default::default()
+                },
+            );
+            let hi_k = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Int,
+                    a: p.rhs,
+                    ty: scrut_ty,
+                    ..Default::default()
+                },
+            );
+            let ge = emit(
+                gctx,
+                JirInst {
+                    tag: if signed_cmp {
+                        JirTag::ICmpSge
+                    } else {
+                        JirTag::ICmpUge
+                    },
+                    a: scrut,
+                    b: lo_k,
+                    ty: builtin::BOOL,
+                    ..Default::default()
+                },
+            );
+            let check_hi = gctx.jfn.push_block("range.hi");
+            emit_cond_br(gctx, ge, check_hi, next_block);
+            gctx.current_block = check_hi;
+            let le = emit(
+                gctx,
+                JirInst {
+                    tag: if signed_cmp {
+                        JirTag::ICmpSle
+                    } else {
+                        JirTag::ICmpUle
+                    },
+                    a: scrut,
+                    b: hi_k,
+                    ty: builtin::BOOL,
+                    ..Default::default()
+                },
+            );
+            emit_cond_br(gctx, le, arm_block, next_block);
+            Ok(())
+        }
+        AstTag::PatOr => {
+            let ex = p.lhs;
+            let cnt = gctx.ctx.node_store.get_extra(ExtraIdx::new(ex));
+            for i in 0..cnt {
+                let sub = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(ex + 1 + i)));
+                let try_next = if i + 1 == cnt {
+                    next_block
+                } else {
+                    gctx.jfn.push_block("or.next")
+                };
+                astgen_pattern_compare(
+                    gctx,
+                    sub,
+                    scrut,
+                    scrut_ty,
+                    arm_block,
+                    try_next,
+                    out_bindings,
+                )?;
+                if i + 1 != cnt {
+                    gctx.current_block = try_next;
+                }
+            }
+            Ok(())
+        }
+        AstTag::PatEnumVariant => astgen_pattern_compare_enum(
+            gctx,
+            &p,
+            scrut,
+            scrut_ty,
+            arm_block,
+            next_block,
+            out_bindings,
+        ),
+        AstTag::PatWildcard => {
+            emit_br(gctx, arm_block);
+            Ok(())
+        }
+        other => Err(format!("astgen: unsupported pattern form {other:?}")),
+    }
+}
+
+/// The `PatEnumVariant` arm of [`astgen_pattern_compare`] (tag check + optional
+/// payload-binding extraction). Split out to keep the dispatch readable.
+fn astgen_pattern_compare_enum(
+    gctx: &mut AstGenCtx,
+    p: &AstNode,
+    scrut: JirRef,
+    scrut_ty: TypeIdx,
+    arm_block: JirBlockRef,
+    next_block: JirBlockRef,
+    out_bindings: &mut Vec<ArmBinding>,
+) -> Result<(), String> {
+    let has_bindings = p.flags & 1 != 0;
+    let type_idx_receiver = p.flags & 2 != 0;
+    let infer_receiver = p.flags & 4 != 0;
+    let (recv_slot, variant_name_id, binding_count, bindings_start) = if has_bindings {
+        let ex = p.lhs;
+        (
+            gctx.ctx.node_store.get_extra(ExtraIdx::new(ex)),
+            gctx.ctx.node_store.get_extra(ExtraIdx::new(ex + 1)),
+            gctx.ctx.node_store.get_extra(ExtraIdx::new(ex + 2)),
+            ex + 3,
+        )
+    } else {
+        (p.lhs, p.rhs, 0, 0)
+    };
+
+    let enum_name: Option<String> = if infer_receiver {
+        gctx.ctx.enum_name_of(scrut_ty)
+    } else if type_idx_receiver {
+        gctx.ctx.enum_name_of(TypeIdx::new(recv_slot))
+    } else {
+        let recv_name = str_at(gctx, recv_slot);
+        let sid = gctx.ctx.string_pool.intern(recv_name.as_bytes());
+        let recv_ty = gctx.ctx.type_pool.intern_named(sid);
+        let bm = gctx.ctx.current_body_module();
+        let recv_ty = gctx.ctx.requalify_type(recv_ty, &bm);
+        gctx.ctx.enum_name_of(recv_ty).or(Some(recv_name))
+    };
+    let en = match enum_name {
+        Some(ref n) if gctx.ctx.is_enum_name_registered(n) => n.clone(),
+        _ => {
+            // Const pattern (bare ident naming a module const): compare the
+            // scrutinee against the const's value (the C++ astgenPatternCompare).
+            if infer_receiver && !has_bindings {
+                let cname = str_at(gctx, variant_name_id);
+                let bm = gctx.ctx.current_body_module();
+                let mc = (!bm.is_empty())
+                    .then(|| gctx.ctx.get_module_const(&format!("{bm}.{cname}")))
+                    .flatten()
+                    .or_else(|| gctx.ctx.get_module_const(&cname));
+                if let Some(mc) = mc {
+                    let k = astgen_expr(gctx, mc.init_expr, scrut_ty)?;
+                    let cmp = emit(
+                        gctx,
+                        JirInst {
+                            tag: JirTag::ICmpEq,
+                            a: scrut,
+                            b: k,
+                            ty: builtin::BOOL,
+                            ..Default::default()
+                        },
+                    );
+                    emit_cond_br(gctx, cmp, arm_block, next_block);
+                    return Ok(());
+                }
+            }
+            return Err(
+                "astgen: pattern receiver doesn't resolve to an enum (const pattern deferred)"
+                    .into(),
+            );
+        }
+    };
+
+    let variant = str_at(gctx, variant_name_id);
+    let vidx = gctx.ctx.enum_variant_index(&en, &variant);
+    if vidx < 0 {
+        return Err(format!("astgen: unknown variant `{en}.{variant}`"));
+    }
+    let variants = gctx.ctx.enum_variants_by_name(&en).unwrap_or_default();
+    let disc = variants[vidx as usize].discriminant;
+    let has_payload = gctx.ctx.enum_has_payload_by_name(&en).unwrap_or(false);
+
+    // Tag = ExtractValue(0) for payloaded enums, BitCast for unit-only.
+    let tag_ref = emit(
+        gctx,
+        JirInst {
+            tag: if has_payload {
+                JirTag::ExtractValue
+            } else {
+                JirTag::BitCast
+            },
+            a: scrut,
+            b: 0,
+            ty: builtin::U8,
+            ..Default::default()
+        },
+    );
+    let k_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: disc,
+            ty: builtin::U8,
+            ..Default::default()
+        },
+    );
+    let cmp = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ICmpEq,
+            a: tag_ref,
+            b: k_ref,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    );
+
+    if has_bindings && binding_count > 0 {
+        let bind_b = gctx.jfn.push_block("matchbind");
+        emit_cond_br(gctx, cmp, bind_b, next_block);
+        gctx.current_block = bind_b;
+        let payload_types = variants[vidx as usize].payload_types.clone();
+        if binding_count as usize != payload_types.len() {
+            return Err(format!(
+                "astgen: pattern binds {binding_count} field(s), variant has {}",
+                payload_types.len()
+            ));
+        }
+        // Spill scrut so EnumPayload can take its address.
+        let scrut_slot = emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty: scrut_ty,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: scrut_slot,
+                b: scrut,
+                ..Default::default()
+            },
+        );
+        let mut off: u64 = 0;
+        for b in 0..binding_count {
+            let bind_name_id = gctx
+                .ctx
+                .node_store
+                .get_extra(ExtraIdx::new(bindings_start + b));
+            let bind_name = str_at(gctx, bind_name_id);
+            let field_ty = payload_types[b as usize];
+            let s = gctx.ctx.type_size(field_ty)?;
+            let a = gctx.ctx.type_align(field_ty)?;
+            off = off.div_ceil(a) * a;
+            let payload_ref = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::EnumPayload,
+                    a: scrut_slot,
+                    b: off as u32,
+                    ty: field_ty,
+                    ..Default::default()
+                },
+            );
+            let bind_slot = emit_alloca_hoisted(
+                gctx,
+                JirInst {
+                    tag: JirTag::Alloca,
+                    ty: field_ty,
+                    ..Default::default()
+                },
+            );
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Store,
+                    a: bind_slot,
+                    b: payload_ref,
+                    ..Default::default()
+                },
+            );
+            out_bindings.push(ArmBinding {
+                name: bind_name,
+                slot: bind_slot,
+                ty: field_ty,
+            });
+            off += s;
+        }
+        emit_br(gctx, arm_block);
+        return Ok(());
+    }
+    emit_cond_br(gctx, cmp, arm_block, next_block);
+    Ok(())
+}
+
