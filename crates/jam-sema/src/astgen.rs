@@ -3535,3 +3535,137 @@ fn ensure_exit(gctx: &mut AstGenCtx) {
     let _ = jir_declare_prototype(&jfn, gctx.ctx);
 }
 
+/// Lower `assert(actual, expected)`: ICmpEq (or FCmpOeq for floats) + CondBr to
+/// an `assert.fail` block (printf "Assertion failed\n" + exit(1) + Unreachable)
+/// and an `assert.pass` continuation (the C++ astgenAssertCall).
+fn astgen_assert_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
+    let args_extra = n.rhs;
+    let arg_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra));
+    if arg_count != 2 {
+        return Err("astgen: assert expects exactly 2 arguments".into());
+    }
+    let actual_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra + 1)));
+    let expected_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra + 2)));
+    let mut actual_ref = astgen_expr(gctx, actual_idx, TypeIdx::NONE)?;
+    let mut actual_ty = gctx.jfn.get_inst(actual_ref).ty;
+    let mut expected_ref = astgen_expr(gctx, expected_idx, actual_ty)?;
+    let expected_ty = gctx.jfn.get_inst(expected_ref).ty;
+    if actual_ty != expected_ty {
+        let ak = gctx.ctx.type_pool.get(actual_ty);
+        let ek = gctx.ctx.type_pool.get(expected_ty);
+        if ak.kind == TypeKind::Int && ek.kind == TypeKind::Int {
+            if ak.a > ek.a {
+                expected_ref = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::ZExt,
+                        a: expected_ref,
+                        ty: actual_ty,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                actual_ref = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::ZExt,
+                        a: actual_ref,
+                        ty: expected_ty,
+                        ..Default::default()
+                    },
+                );
+                actual_ty = expected_ty;
+            }
+        }
+    }
+    let cmp_tag = if gctx.ctx.type_pool.get(actual_ty).kind == TypeKind::Float {
+        JirTag::FCmpOeq
+    } else {
+        JirTag::ICmpEq
+    };
+    let cmp_ref = emit(
+        gctx,
+        JirInst {
+            tag: cmp_tag,
+            a: actual_ref,
+            b: expected_ref,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    );
+    let fail_b = gctx.jfn.push_block("assert.fail");
+    let pass_b = gctx.jfn.push_block("assert.pass");
+    emit_cond_br(gctx, cmp_ref, pass_b, fail_b);
+
+    gctx.current_block = fail_b;
+    // Intern "printf" FIRST (the C++ printfNameId at astgen.cpp:5646, before the
+    // message string) to keep the string-pool order byte-exact.
+    let pid = gctx.ctx.string_pool.intern(b"printf");
+    ensure_printf(gctx);
+    let slice_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
+    let u8ptr = gctx.ctx.type_pool.intern_ptr_many(builtin::U8);
+    let msg = gctx.ctx.string_pool.intern(b"Assertion failed\n");
+    let str_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Str,
+            a: msg.raw(),
+            ty: slice_ty,
+            ..Default::default()
+        },
+    );
+    let str_ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ExtractValue,
+            a: str_ref,
+            b: 0,
+            ty: u8ptr,
+            ..Default::default()
+        },
+    );
+    let pe = gctx.jfn.push_extra(&[1, str_ptr]);
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Call,
+            a: pid.raw(),
+            b: pe,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+    ensure_exit(gctx);
+    let code = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: 1,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+    let eid = gctx.ctx.string_pool.intern(b"exit");
+    let ee = gctx.jfn.push_extra(&[1, code]);
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Call,
+            a: eid.raw(),
+            b: ee,
+            ty: TypeIdx::NONE,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Unreachable,
+            ..Default::default()
+        },
+    );
+
+    gctx.current_block = pass_b;
+    Ok(NO_JIR_REF)
+}
+
