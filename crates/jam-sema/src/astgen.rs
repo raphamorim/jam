@@ -6792,3 +6792,164 @@ fn astgen_member_access(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Str
     ))
 }
 
+/// Lower a `StructLit` (`lhs`=type TypeIdx or 0, `rhs`=ExtraIdx →
+/// `[fieldCount, (nameId, exprIdx)..]`). Struct literals build an SSA aggregate
+/// by permuting the named field values into positional order (jir_codegen emits
+/// the InsertValue chain). A union literal lists exactly one field: alloca the
+/// union, store the field value into the slot, load the whole union back.
+///
+/// Deferred: the place-into-destination form (`astgenStructLitInto`) and
+/// drop/move tracking of captured fields.
+fn astgen_struct_lit(
+    gctx: &mut AstGenCtx,
+    n: &AstNode,
+    expected: TypeIdx,
+) -> Result<JirRef, String> {
+    let mut ty = TypeIdx::new(n.lhs);
+    if ty.is_none() {
+        ty = expected;
+    }
+    if ty.is_none() {
+        return Err("astgen: struct literal without target type".into());
+    }
+    // A generic instance (`Pair(u64)`) must be instantiated so its fields
+    // resolve; the inst type keeps its `GenericCall` spelling in the JIR.
+    gctx.ctx.resolve_alias_generic_instantiate(ty)?;
+    let fields_extra = n.rhs;
+    let field_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(fields_extra));
+
+    // Union literal: exactly one field, stored into a union-sized slot.
+    if gctx.ctx.is_union_registered(ty) {
+        if field_count != 1 {
+            return Err("astgen: union literal must list exactly one field".into());
+        }
+        let name_id = gctx
+            .ctx
+            .node_store
+            .get_extra(ExtraIdx::new(fields_extra + 1));
+        let expr_idx = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(fields_extra + 2)),
+        );
+        let field_name = str_at(gctx, name_id);
+        let field_ty = gctx
+            .ctx
+            .union_fields(ty)
+            .and_then(|fs| {
+                fs.into_iter()
+                    .find(|(nm, _)| *nm == field_name)
+                    .map(|(_, t)| t)
+            })
+            .ok_or_else(|| format!("astgen: union has no field `{field_name}`"))?;
+        let field_val = astgen_expr(gctx, expr_idx, field_ty)?;
+        let slot = emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: slot,
+                b: field_val,
+                ..Default::default()
+            },
+        );
+        return Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: slot,
+                ty,
+                ..Default::default()
+            },
+        ));
+    }
+
+    let fields = gctx
+        .ctx
+        .struct_fields(ty)
+        .ok_or_else(|| "astgen: struct literal type is not a known struct".to_string())?;
+    let mut ordered = vec![NO_JIR_REF; fields.len()];
+    for i in 0..field_count {
+        let name_id = gctx
+            .ctx
+            .node_store
+            .get_extra(ExtraIdx::new(fields_extra + 1 + i * 2));
+        let expr_idx = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(fields_extra + 2 + i * 2)),
+        );
+        let field_name = str_at(gctx, name_id);
+        let idx = match fields.iter().position(|(nm, _)| *nm == field_name) {
+            Some(p) => p,
+            None => return Err(format!("unknown struct field `{field_name}`")),
+        };
+        let expected_field = fields[idx].1;
+        // Capturing a drop-bearing field extracted out of an aggregate would leave
+        // the aggregate's glue to re-drop it — reject (the C++
+        // rejectDropBearingFieldExtract, astgen.cpp:1754).
+        reject_drop_bearing_field_extract(gctx, expr_idx, expected_field, "capture")?;
+        let mut field_val = astgen_expr(gctx, expr_idx, expected_field)?;
+        // Struct-literal field capture MOVES a bare drop-bearing local: the
+        // field now owns it, so its scope-exit drop is suppressed.
+        consume_moved_variable(gctx, expr_idx);
+        // Silent int→float widening (matches the legacy struct codegen): an
+        // integer literal in a float field settles via SIToFP / UIToFP rather
+        // than feeding an int into the float slot of the InsertValue chain.
+        let vt = gctx.jfn.get_inst(field_val).ty;
+        if vt != expected_field && !vt.is_none() {
+            let fk_kind = gctx.ctx.type_pool.get(expected_field).kind;
+            let (vk_kind, vk_signed) = {
+                let vk = gctx.ctx.type_pool.get(vt);
+                (vk.kind, vk.b != 0)
+            };
+            if fk_kind == TypeKind::Float && vk_kind == TypeKind::Int {
+                let tag = if vk_signed {
+                    JirTag::SIToFP
+                } else {
+                    JirTag::UIToFP
+                };
+                field_val = emit(
+                    gctx,
+                    JirInst {
+                        tag,
+                        a: field_val,
+                        ty: expected_field,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        ordered[idx] = field_val;
+    }
+    for (i, &r) in ordered.iter().enumerate() {
+        if r == NO_JIR_REF {
+            return Err(format!(
+                "astgen: struct literal missing field `{}`",
+                fields[i].0
+            ));
+        }
+    }
+
+    let mut packed: Vec<u32> = Vec::with_capacity(1 + ordered.len());
+    packed.push(ordered.len() as u32);
+    packed.extend_from_slice(&ordered);
+    let extra = gctx.jfn.push_extra(&packed);
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::StructLit,
+            b: extra,
+            ty,
+            ..Default::default()
+        },
+    ))
+}
+
