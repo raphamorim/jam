@@ -7211,3 +7211,125 @@ fn astgen_struct_lit_into(
     Ok(())
 }
 
+fn astgen_return(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
+    let mut val_ref = NO_JIR_REF;
+    // A bare `return localOwned;` MOVES the value to the caller — its drop must
+    // be suppressed on THIS return path (computed before lowering, which only
+    // reads it). Detected up front so both the sret and value paths skip it.
+    let moved_var = if n.lhs != 0 {
+        detect_return_move(gctx, NodeIdx::new(n.lhs))
+    } else {
+        None
+    };
+    if n.lhs != 0 {
+        let val_idx = NodeIdx::new(n.lhs);
+        let ret_ty = gctx.jfn.return_type;
+        // `return h.c` extracting a drop-bearing field out of an owned aggregate
+        // is rejected — the caller's copy and the aggregate's glue would both drop
+        // the payload (the C++ rejectDropBearingFieldExtract, astgen.cpp:1030).
+        reject_drop_bearing_field_extract(gctx, val_idx, ret_ty, "return")?;
+        // sret (indirect) returns place the value directly into the return slot:
+        // byref producers (StructLit / sret Call) write through `SretArg`, and
+        // the function returns void. The `SretArg` is emitted eagerly (matching
+        // the C++ argument evaluation) even when the place path declines.
+        let sret_fn =
+            !ret_ty.is_none() && classify_return(ret_ty, gctx.ctx)?.kind == ReturnAbiKind::Indirect;
+        if sret_fn {
+            let sret = emit_sret_arg(gctx, ret_ty);
+            if astgen_expr_into_ptr(gctx, val_idx, ret_ty, sret)? {
+                emit_return_drops(gctx, moved_var.as_deref());
+                emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Ret,
+                        ..Default::default()
+                    },
+                );
+                return Ok(());
+            }
+        }
+        val_ref = astgen_expr(gctx, val_idx, ret_ty)?;
+        // Reconcile the returned value's type with the declared return type
+        // (resolve-then-compare, like the var-decl declared-vs-init check).
+        // The C++ oracle has NO check here and ships LLVM-invalid IR for
+        // `fn f() i32 { var x = 1; return x; }` (the literal infers at
+        // smallest fit, the load returns at the slot's width, and codegen
+        // emits `ret i8` from an i32 function). We deliberately diverge:
+        // a LOSSLESS narrower int widens (ZExt/SExt by the value's own
+        // signedness — the semantics the invalid narrow `ret` accidentally
+        // approximated), and anything lossy (narrowing, signed→unsigned) is
+        // a hard error.
+        let val_ty = gctx.jfn.get_inst(val_ref).ty;
+        if !ret_ty.is_none() && !val_ty.is_none() {
+            let want = resolve_for_cmp(gctx.ctx, ret_ty);
+            let got = resolve_for_cmp(gctx.ctx, val_ty);
+            let pointer_compatible = {
+                let ka = gctx.ctx.type_pool.get(want);
+                let kb = gctx.ctx.type_pool.get(got);
+                let a_ptr = ka.kind == TypeKind::PtrSingle || ka.kind == TypeKind::PtrMany;
+                let b_ptr = kb.kind == TypeKind::PtrSingle || kb.kind == TypeKind::PtrMany;
+                a_ptr && b_ptr && ka.a == kb.a
+            };
+            // A unit-only enum lowers to its bare u8 tag, and the enum→int
+            // cast returns that tag WITHOUT retagging (both here and in the
+            // C++), so `return p as u8;` carries the enum TypeIdx at u8's
+            // representation. Treat the pair as identical.
+            let unit_enum_as_u8 = |t: TypeIdx, other: TypeIdx| -> bool {
+                other == builtin::U8
+                    && gctx.ctx.enum_name_of(t).is_some()
+                    && !gctx.ctx.enum_has_payload(t).unwrap_or(true)
+            };
+            if want != got
+                && !pointer_compatible
+                && !unit_enum_as_u8(got, want)
+                && !unit_enum_as_u8(want, got)
+            {
+                let wk = gctx.ctx.type_pool.get(want);
+                let gk = gctx.ctx.type_pool.get(got);
+                let lossless_widen = wk.kind == TypeKind::Int
+                    && gk.kind == TypeKind::Int
+                    && gk.a < wk.a
+                    // Unsigned zero-extends into any wider int; signed
+                    // sign-extends only into a wider SIGNED int.
+                    && (gk.b == 0 || wk.b != 0);
+                if lossless_widen {
+                    val_ref = emit(
+                        gctx,
+                        JirInst {
+                            tag: if gk.b != 0 { JirTag::SExt } else { JirTag::ZExt },
+                            a: val_ref,
+                            ty: want,
+                            ..Default::default()
+                        },
+                    );
+                } else {
+                    return Err(format!(
+                        "return value type does not match the declared return type of `{}`; \
+                         add an explicit `as` cast or adjust the declaration",
+                        gctx.jfn.name
+                    ));
+                }
+            }
+        }
+    }
+    emit_return_drops(gctx, moved_var.as_deref());
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Ret,
+            a: val_ref,
+            ..Default::default()
+        },
+    );
+    Ok(())
+}
+
+/// Drop every active scope (down to the function root) before returning,
+/// suppressing the drop of a moved-out return value when present.
+fn emit_return_drops(gctx: &mut AstGenCtx, moved_var: Option<&str>) {
+    match moved_var {
+        Some(v) => emit_drops_through_scope_moved_out(gctx, 0, v),
+        None => emit_drops_through_scope(gctx, 0),
+    }
+}
+
