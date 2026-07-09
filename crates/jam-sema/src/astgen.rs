@@ -6194,3 +6194,315 @@ fn astgen_array_repeat(
     ))
 }
 
+/// The receiver `JirRef` for a `cfn` index method on a `Variable` container base
+/// (`v[i]` / `v[i] = x`): `AddrOf`/`Load` of the local slot per the `self` ABI,
+/// plus the resolved method AST + its instance type. `None` when the base isn't a
+/// local struct with the named `cfn` method (caller falls through / errors).
+fn container_index_recv(
+    gctx: &mut AstGenCtx,
+    base_idx: NodeIdx,
+    method_suffix: &str,
+) -> Result<Option<(JirRef, FunctionAST)>, String> {
+    let bnode = *gctx.ctx.node_store.get(base_idx);
+    if bnode.tag != AstTag::Variable {
+        return Ok(None);
+    }
+    let name = str_at(gctx, bnode.lhs);
+    if !gctx.locals.contains_key(&name) {
+        return Ok(None);
+    }
+    let inst_ty = gctx
+        .local_types
+        .get(&name)
+        .copied()
+        .unwrap_or(TypeIdx::NONE);
+    let Some(recv_name) = gctx.ctx.struct_name_of(inst_ty) else {
+        return Ok(None);
+    };
+    let qualified = format!("{recv_name}.{method_suffix}");
+    let Some(method) = gctx.ctx.get_function_ast(&qualified) else {
+        // `at`/`setAt` may be a WITHDRAWN conditional method for this
+        // instantiation (e.g. Vec(T) where T isn't cloneable): replay the
+        // reason instead of the generic index error (the C++ astgen.cpp:1598,
+        // 2699).
+        if gctx.ctx.get_withdrawn_method(&qualified).is_some() {
+            report_method_miss(gctx, &qualified)?;
+        }
+        return Ok(None);
+    };
+    if !method.is_cfn {
+        return Ok(None);
+    }
+    let self_mode = method
+        .args
+        .first()
+        .map(|p| p.mode)
+        .unwrap_or(jam_core::param_mode::ParamMode::Let);
+    // The receiver via the lvalue path (the C++ `astgenLvalue`): a Variable base's
+    // storage pointer is just its alloca ref — no extra `AddrOf`. ByPointer self
+    // takes that pointer; ByValue self loads through it.
+    let (slot_ptr, _) = astgen_lvalue(gctx, base_idx)?;
+    let recv = if classify_param(self_mode, inst_ty, gctx.ctx)?.kind == ParamAbiKind::ByPointer {
+        slot_ptr
+    } else {
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: slot_ptr,
+                ty: inst_ty,
+                ..Default::default()
+            },
+        )
+    };
+    Ok(Some((recv, method)))
+}
+
+/// Lower a container index expression the way the oracle's index-method dispatch
+/// does: at its natural `u64` width, then `Trunc` to the method's index-param type
+/// (typically `u32`). Matches the `Int(u64)`+`Trunc` the oracle emits.
+fn lower_index_arg(
+    gctx: &mut AstGenCtx,
+    idx_idx: NodeIdx,
+    param_ty: TypeIdx,
+) -> Result<JirRef, String> {
+    let idx_u64 = astgen_expr(gctx, idx_idx, builtin::U64)?;
+    Ok(narrow_index(gctx, idx_u64, param_ty))
+}
+
+/// Narrow an already-lowered `u64` index to the index-method's param type (a
+/// `Trunc` to the typical `u32`; a no-op at `u64`). Kept separate from
+/// `lower_index_arg` so the `setAt` dispatch can lower the value BETWEEN the index
+/// and this narrowing, matching the oracle's emitStructCfnDispatch order.
+fn narrow_index(gctx: &mut AstGenCtx, idx_u64: JirRef, param_ty: TypeIdx) -> JirRef {
+    if param_ty == builtin::U64 {
+        return idx_u64;
+    }
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Trunc,
+            a: idx_u64,
+            ty: param_ty,
+            ..Default::default()
+        },
+    )
+}
+
+/// Lower an `Index` (`base[idx]`) in value position. An addressable `Array` base
+/// reads through `IndexAddr` + `Load` (avoids loading the whole backing
+/// storage); a value base (slice / many-pointer / array SSA) lowers to `Index`.
+/// A struct container `v[i]` dispatches its `cfn at(self, i)`.
+fn astgen_index(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
+    let base_idx = NodeIdx::new(n.lhs);
+    let idx_idx = NodeIdx::new(n.rhs);
+
+    // Container `v[i]` -> `v.at(i)` cfn dispatch (Variable base).
+    if let Some((recv, method)) = container_index_recv(gctx, base_idx, "at")? {
+        let idx_ref = lower_index_arg(gctx, idx_idx, method.args[1].ty)?;
+        return emit_call(gctx, &method, &[recv, idx_ref], NO_JIR_REF);
+    }
+
+    if peek_addressable_array_leaf_type(gctx, base_idx).is_some() {
+        let (base_ptr, leaf_ty) = astgen_lvalue(gctx, base_idx)?;
+        let (kind, a) = {
+            let k = gctx.ctx.type_pool.get(leaf_ty);
+            (k.kind, k.a)
+        };
+        if kind == TypeKind::Array {
+            let elem_ty = TypeIdx::new(a);
+            let idx_ref = astgen_expr(gctx, idx_idx, builtin::U64)?;
+            let elem_ptr_ty = gctx.ctx.type_pool.intern_ptr_single(elem_ty);
+            let elem_ptr = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::IndexAddr,
+                    a: base_ptr,
+                    b: idx_ref,
+                    ty: elem_ptr_ty,
+                    ..Default::default()
+                },
+            );
+            return Ok(emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Load,
+                    a: elem_ptr,
+                    ty: elem_ty,
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+
+    let base_ref = astgen_expr(gctx, base_idx, TypeIdx::NONE)?;
+    let idx_ref = astgen_expr(gctx, idx_idx, builtin::U64)?;
+    let (kind, a) = {
+        let k = gctx.ctx.type_pool.get(gctx.jfn.get_inst(base_ref).ty);
+        (k.kind, k.a)
+    };
+    let elem_ty = match kind {
+        TypeKind::Array | TypeKind::Slice | TypeKind::PtrMany => TypeIdx::new(a),
+        _ => return Err("astgen: cannot index value of this type".into()),
+    };
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Index,
+            a: base_ref,
+            b: idx_ref,
+            ty: elem_ty,
+            ..Default::default()
+        },
+    ))
+}
+
+/// Lower a `MemberAccess` (`lhs`=base, `rhs`=member StringIdx) in value
+/// position. An addressable base reads through a `FieldAddr`/`BitCast` + `Load`
+/// (no whole-aggregate value load); a value base uses `ExtractValue` (slice
+/// `.ptr`/`.len`), a spill+`Load` (union), or `FieldAccess` (struct).
+///
+/// Deferred: enum-variant constructor references (`Color.Red`) — they fall
+/// through to the lvalue/value path and surface as an unknown-variable error.
+/// Lower a slice expression `base[a..b]` (the C++ `astgenSlice`): the base is a
+/// many-item pointer; emit `IndexAddr(base, a)` for the data pointer and `b - a`
+/// (u64) for the length, then a `MakeSlice` `{ptr, len}` aggregate. Implemented
+/// wired into astgen_expr dispatch.
+fn astgen_slice(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
+    let base_idx = NodeIdx::new(n.lhs);
+    let ex = n.rhs;
+    let start_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(ex)));
+    let end_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(ex + 1)));
+
+    let base = astgen_expr(gctx, base_idx, TypeIdx::NONE)?;
+    let bk = gctx.ctx.type_pool.get(gctx.jfn.get_inst(base).ty);
+    if bk.kind != TypeKind::PtrMany && bk.kind != TypeKind::PtrSingle {
+        return Err("astgen: slice expression `base[a..b]` needs a many-item pointer base".into());
+    }
+    let elem = TypeIdx::new(bk.a);
+
+    let mut start = astgen_expr(gctx, start_idx, builtin::U64)?;
+    let mut end = astgen_expr(gctx, end_idx, builtin::U64)?;
+    if gctx.jfn.get_inst(start).ty != builtin::U64 {
+        start = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::ZExt,
+                a: start,
+                ty: builtin::U64,
+                ..Default::default()
+            },
+        );
+    }
+    if gctx.jfn.get_inst(end).ty != builtin::U64 {
+        end = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::ZExt,
+                a: end,
+                ty: builtin::U64,
+                ..Default::default()
+            },
+        );
+    }
+
+    let ptr_ty = gctx.ctx.type_pool.intern_ptr_many(elem);
+    let ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::IndexAddr,
+            a: base,
+            b: start,
+            ty: ptr_ty,
+            ..Default::default()
+        },
+    );
+    let len = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Sub,
+            a: end,
+            b: start,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let slice_ty = gctx.ctx.type_pool.intern_slice(elem);
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::MakeSlice,
+            a: ptr,
+            b: len,
+            ty: slice_ty,
+            ..Default::default()
+        },
+    ))
+}
+
+/// Lower `Deref` (`p.*`): the operand evaluates to a pointer; emit a `Deref`
+/// (a Load through it) typed at the pointee.
+fn astgen_deref(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
+    let ptr_ref = astgen_expr(gctx, NodeIdx::new(n.lhs), TypeIdx::NONE)?;
+    let (kind, pointee) = {
+        let k = gctx.ctx.type_pool.get(gctx.jfn.get_inst(ptr_ref).ty);
+        (k.kind, k.a)
+    };
+    if kind != TypeKind::PtrSingle && kind != TypeKind::PtrMany {
+        return Err("astgen: cannot dereference non-pointer".into());
+    }
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Deref,
+            a: ptr_ref,
+            ty: TypeIdx::new(pointee),
+            ..Default::default()
+        },
+    ))
+}
+
+/// Lower `&op` (`AddressOf`): an lvalueable operand hands over its storage
+/// pointer; an rvalue is spilled to a fresh slot. Result is `*const leafTy`.
+fn astgen_address_of(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
+    let op_idx = NodeIdx::new(n.lhs);
+    let op_tag = gctx.ctx.node_store.get(op_idx).tag;
+    let (ptr_ref, leaf_ty) = match op_tag {
+        AstTag::Variable | AstTag::MemberAccess | AstTag::Index | AstTag::Deref => {
+            astgen_lvalue(gctx, op_idx)?
+        }
+        _ => {
+            let val = astgen_expr(gctx, op_idx, TypeIdx::NONE)?;
+            let leaf = gctx.jfn.get_inst(val).ty;
+            let slot = emit_alloca_hoisted(
+                gctx,
+                JirInst {
+                    tag: JirTag::Alloca,
+                    ty: leaf,
+                    ..Default::default()
+                },
+            );
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Store,
+                    a: slot,
+                    b: val,
+                    ..Default::default()
+                },
+            );
+            (slot, leaf)
+        }
+    };
+    let ptr_ty = gctx.ctx.type_pool.intern_ptr_single(leaf_ty);
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::AddrOf,
+            a: ptr_ref,
+            ty: ptr_ty,
+            ..Default::default()
+        },
+    ))
+}
+
