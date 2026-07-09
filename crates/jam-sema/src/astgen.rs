@@ -5002,3 +5002,106 @@ fn astgen_indirect_fn_call(
     )?))
 }
 
+/// `@`-intrinsics. `@sizeOf(T)` / `@alignOf(T)` fold the type's layout to an
+/// integer constant (an `[expr]T` argument resolves its comptime length first).
+fn astgen_at_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
+    let name = str_at(gctx, n.lhs);
+    // `@dropInPlace(ptr)` (flags&1: n.rhs is an args ExtraIdx, not a type arg):
+    // synthesize T's drop sequence at the pointee. Rust's `drop_in_place::<T>`.
+    if n.flags & 1 != 0 && name == "dropInPlace" {
+        let args_extra = n.rhs;
+        let arg_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra));
+        if arg_count != 1 {
+            return Err("astgen: @dropInPlace takes exactly one pointer argument".into());
+        }
+        let ptr_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra + 1)));
+        let ptr_ref = astgen_expr(gctx, ptr_idx, TypeIdx::NONE)?;
+        let pk = gctx.ctx.type_pool.get(gctx.jfn.get_inst(ptr_ref).ty);
+        if pk.kind != TypeKind::PtrSingle && pk.kind != TypeKind::PtrMany {
+            return Err("astgen: @dropInPlace argument must be a pointer".into());
+        }
+        let pointee = gctx.ctx.apply_current_subst(TypeIdx::new(pk.a));
+        let _ = gctx.ctx.resolve_generic_call_instantiate(pointee)?;
+        emit_drop_in_place(gctx, ptr_ref, pointee);
+        return Ok(NO_JIR_REF);
+    }
+    match name.as_str() {
+        "sizeOf" | "alignOf" => {
+            let mut ty_arg = TypeIdx::new(n.rhs);
+            if gctx.ctx.type_pool.get(ty_arg).kind == TypeKind::ArrayExpr {
+                ty_arg = gctx.ctx.resolve_array_expr_instantiate(ty_arg)?;
+            }
+            if name == "sizeOf" {
+                let bytes = gctx.ctx.type_size(ty_arg)?;
+                Ok(emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Int,
+                        a: (bytes & 0xFFFF_FFFF) as u32,
+                        b: (bytes >> 32) as u32,
+                        ty: builtin::U64,
+                        ..Default::default()
+                    },
+                ))
+            } else {
+                let align = gctx.ctx.type_align(ty_arg)?;
+                Ok(emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Int,
+                        a: align as u32,
+                        ty: builtin::U8,
+                        ..Default::default()
+                    },
+                ))
+            }
+        }
+        "isDarwin" | "isLinux" | "isWindows" | "isUnix" => {
+            // Target-OS predicates fold to a `Bool` literal from the host OS;
+            // emit_cond_br then drops the dead arm. Host = the default triple.
+            use crate::target::{Os, Target};
+            let os = Target::from_triple_str(&jam_llvm::default_target_triple()).os;
+            let v = match name.as_str() {
+                "isDarwin" => os == Os::MacOs,
+                "isLinux" => os == Os::Linux,
+                "isWindows" => os == Os::Windows,
+                _ => matches!(os, Os::MacOs | Os::Linux | Os::FreeBsd), // isUnix
+            };
+            Ok(emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Bool,
+                    a: u32::from(v),
+                    ty: builtin::BOOL,
+                    ..Default::default()
+                },
+            ))
+        }
+        "os" => {
+            // `@os()` -> the host OS tag name as a `[]u8`, the same JIR a string
+            // literal would emit (an interned StringIdx in a Str inst).
+            use crate::target::{Os, Target};
+            let os = Target::from_triple_str(&jam_llvm::default_target_triple()).os;
+            let os_name = match os {
+                Os::MacOs => "macos",
+                Os::Linux => "linux",
+                Os::Windows => "windows",
+                Os::FreeBsd => "freebsd",
+                Os::Unknown => "unknown",
+            };
+            let sid = gctx.ctx.string_pool.intern_str(os_name).raw();
+            let result_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
+            Ok(emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Str,
+                    a: sid,
+                    ty: result_ty,
+                    ..Default::default()
+                },
+            ))
+        }
+        other => Err(format!("astgen: @{other} intrinsic not yet ported")),
+    }
+}
+
