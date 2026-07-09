@@ -3669,3 +3669,456 @@ fn astgen_assert_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Strin
     Ok(NO_JIR_REF)
 }
 
+/// Register + declare the libc `dprintf` extern prototype, once. cfn output
+/// (print/eprint) lowers to `dprintf(fd, "%.*s", len, ptr)` calls — the C++
+/// `ensureDprintfForCfn`. The LLVM proto is `(i32, i8*, ...)` varargs; the
+/// `fmt` param is typed `*const u8` so jir_declare_prototype lowers it to `i8*`.
+fn ensure_dprintf(gctx: &mut AstGenCtx) {
+    if gctx.ctx.get_function_ast("dprintf").is_some() {
+        return;
+    }
+    let u8ptr = gctx.ctx.type_pool.intern_ptr_single(builtin::U8);
+    let mut f = FunctionAST::new(
+        "dprintf",
+        vec![Param::new("fd", builtin::I32), Param::new("fmt", u8ptr)],
+        builtin::I32,
+        vec![],
+    );
+    f.is_extern = true;
+    f.is_var_args = true;
+    let jfn = astgen_metadata(&f, gctx.ctx);
+    gctx.ctx.register_function_ast("dprintf", f);
+    let _ = jir_declare_prototype(&jfn, gctx.ctx);
+}
+
+/// Replay `@emitWriteBytes(fd, fmt, start, end)` — emit `dprintf(fd, "%.*s",
+/// len, ptr)` for the literal byte span `fmt[start..end]` (the C++ handleWrite
+/// Bytes). The substring is interned to `.rodata`; runtime hands its ptr+len to
+/// dprintf.
+fn replay_write_bytes(
+    gctx: &mut AstGenCtx,
+    fd: u32,
+    fmt: jam_core::index::StringIdx,
+    start: u32,
+    end: u32,
+) -> Result<(), String> {
+    if start == end {
+        return Ok(());
+    }
+    let fmt_bytes = gctx.ctx.string_pool.get(fmt).to_vec();
+    if start > end || end as usize > fmt_bytes.len() {
+        return Err("astgen: cfn @emitWriteBytes range out of bounds".to_string());
+    }
+    ensure_dprintf(gctx);
+    let lit = gctx
+        .ctx
+        .string_pool
+        .intern(&fmt_bytes[start as usize..end as usize]);
+    let slice_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
+    let u8ptr = gctx.ctx.type_pool.intern_ptr_many(builtin::U8);
+    let lit_slice = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Str,
+            a: lit.raw(),
+            ty: slice_ty,
+            ..Default::default()
+        },
+    );
+    let ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ExtractValue,
+            a: lit_slice,
+            b: 0,
+            ty: u8ptr,
+            ..Default::default()
+        },
+    );
+    let ln = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ExtractValue,
+            a: lit_slice,
+            b: 1,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let ln_i32 = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Trunc,
+            a: ln,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+    let fmt_id = gctx.ctx.string_pool.intern(b"%.*s");
+    let fmt_slice = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Str,
+            a: fmt_id.raw(),
+            ty: slice_ty,
+            ..Default::default()
+        },
+    );
+    let fmt_ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ExtractValue,
+            a: fmt_slice,
+            b: 0,
+            ty: u8ptr,
+            ..Default::default()
+        },
+    );
+    let fd_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: fd,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+    let dp = gctx.ctx.string_pool.intern(b"dprintf");
+    let pe = gctx.jfn.push_extra(&[4, fd_ref, fmt_ptr, ln_i32, ptr]);
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Call,
+            a: dp.raw(),
+            b: pe,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+    Ok(())
+}
+
+/// Emit `dprintf(fd, "%.*s", len, ptr)` for a compile-time literal byte string
+/// in the current block (the C++ Bool-case `emitStrLit`). `fd_ref` is reused, not
+/// re-emitted.
+fn emit_write_literal(gctx: &mut AstGenCtx, fd_ref: JirRef, literal: &[u8]) {
+    let slice_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
+    let u8ptr = gctx.ctx.type_pool.intern_ptr_many(builtin::U8);
+    let lit = gctx.ctx.string_pool.intern(literal);
+    let lit_slice = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Str,
+            a: lit.raw(),
+            ty: slice_ty,
+            ..Default::default()
+        },
+    );
+    let ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ExtractValue,
+            a: lit_slice,
+            b: 0,
+            ty: u8ptr,
+            ..Default::default()
+        },
+    );
+    let ln = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ExtractValue,
+            a: lit_slice,
+            b: 1,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let ln_i32 = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Trunc,
+            a: ln,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+    let fmt_id = gctx.ctx.string_pool.intern(b"%.*s");
+    let fmt_slice = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Str,
+            a: fmt_id.raw(),
+            ty: slice_ty,
+            ..Default::default()
+        },
+    );
+    let fmt_ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ExtractValue,
+            a: fmt_slice,
+            b: 0,
+            ty: u8ptr,
+            ..Default::default()
+        },
+    );
+    let dp = gctx.ctx.string_pool.intern(b"dprintf");
+    let pe = gctx.jfn.push_extra(&[4, fd_ref, fmt_ptr, ln_i32, ptr]);
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Call,
+            a: dp.raw(),
+            b: pe,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+}
+
+/// Replay `@emitPutByte(fd, byte)` — emit `dprintf(fd, "%c", byte)` with the
+/// byte widened to i32 (`%c` expects an int) — the C++ handlePutByte
+/// (astgen.cpp:6276).
+fn replay_put_byte(gctx: &mut AstGenCtx, fd: u32, byte: u8) {
+    ensure_dprintf(gctx);
+    let fd_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: fd,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+    let byte_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: byte as u32,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+    emit_dprintf_single_arg(gctx, fd_ref, b"%c", byte_ref);
+}
+
+/// Emit `dprintf(fd, fmtSpec, arg)` — one extra runtime arg after the spec (the
+/// C++ emitDprintfSingleArg).
+fn emit_dprintf_single_arg(gctx: &mut AstGenCtx, fd_ref: JirRef, spec: &[u8], arg: JirRef) {
+    let slice_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
+    let u8ptr = gctx.ctx.type_pool.intern_ptr_many(builtin::U8);
+    let fmt_id = gctx.ctx.string_pool.intern(spec);
+    let fmt_slice = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Str,
+            a: fmt_id.raw(),
+            ty: slice_ty,
+            ..Default::default()
+        },
+    );
+    let fmt_ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ExtractValue,
+            a: fmt_slice,
+            b: 0,
+            ty: u8ptr,
+            ..Default::default()
+        },
+    );
+    let dp = gctx.ctx.string_pool.intern(b"dprintf");
+    let pe = gctx.jfn.push_extra(&[3, fd_ref, fmt_ptr, arg]);
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Call,
+            a: dp.raw(),
+            b: pe,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+}
+
+/// Per-type runtime print dispatch for `@emitPrintLocalByRange` (the C++
+/// emitDprintfForValue): widen ints to i64 (`%lld`/`%llu`), floats to f64
+/// (`%g`), and write `str` slices as `%.*s`. Bool stays a follow-up.
+fn emit_dprintf_for_value(
+    gctx: &mut AstGenCtx,
+    fd_ref: JirRef,
+    val: JirRef,
+    ty: TypeIdx,
+) -> Result<(), String> {
+    let k = gctx.ctx.type_pool.get(ty);
+    match k.kind {
+        TypeKind::Int => {
+            let signed = k.b != 0;
+            let wide = if k.a < 64 {
+                let tag = if signed { JirTag::SExt } else { JirTag::ZExt };
+                emit(
+                    gctx,
+                    JirInst {
+                        tag,
+                        a: val,
+                        ty: builtin::I64,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                val
+            };
+            let spec: &[u8] = if signed { b"%lld" } else { b"%llu" };
+            emit_dprintf_single_arg(gctx, fd_ref, spec, wide);
+            Ok(())
+        }
+        TypeKind::Float => {
+            let wide = if k.a < 64 {
+                emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::FPExt,
+                        a: val,
+                        ty: builtin::F64,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                val
+            };
+            emit_dprintf_single_arg(gctx, fd_ref, b"%g", wide);
+            Ok(())
+        }
+        TypeKind::Slice if k.a == builtin::U8.raw() => {
+            let slice_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
+            let u8ptr = gctx.ctx.type_pool.intern_ptr_many(builtin::U8);
+            let ptr = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::ExtractValue,
+                    a: val,
+                    b: 0,
+                    ty: u8ptr,
+                    ..Default::default()
+                },
+            );
+            let ln = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::ExtractValue,
+                    a: val,
+                    b: 1,
+                    ty: builtin::U64,
+                    ..Default::default()
+                },
+            );
+            let ln_i32 = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Trunc,
+                    a: ln,
+                    ty: builtin::I32,
+                    ..Default::default()
+                },
+            );
+            let fmt_id = gctx.ctx.string_pool.intern(b"%.*s");
+            let fmt_slice = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Str,
+                    a: fmt_id.raw(),
+                    ty: slice_ty,
+                    ..Default::default()
+                },
+            );
+            let fmt_ptr = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::ExtractValue,
+                    a: fmt_slice,
+                    b: 0,
+                    ty: u8ptr,
+                    ..Default::default()
+                },
+            );
+            let dp = gctx.ctx.string_pool.intern(b"dprintf");
+            let pe = gctx.jfn.push_extra(&[4, fd_ref, fmt_ptr, ln_i32, ptr]);
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Call,
+                    a: dp.raw(),
+                    b: pe,
+                    ty: builtin::I32,
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        }
+        TypeKind::Bool => {
+            // Branch on the value, writing the "true"/"false" literal in each arm
+            // (the C++ Bool case). Block labels match the oracle for byte-exact IR.
+            let true_b = gctx.jfn.push_block("emit.true");
+            let false_b = gctx.jfn.push_block("emit.false");
+            let join_b = gctx.jfn.push_block("emit.bool.end");
+            emit_cond_br(gctx, val, true_b, false_b);
+            gctx.current_block = true_b;
+            emit_write_literal(gctx, fd_ref, b"true");
+            emit_br(gctx, join_b);
+            gctx.current_block = false_b;
+            emit_write_literal(gctx, fd_ref, b"false");
+            emit_br(gctx, join_b);
+            gctx.current_block = join_b;
+            Ok(())
+        }
+        _ => Err("astgen: cfn format placeholder has an unsupported value type".to_string()),
+    }
+}
+
+/// Replay `@emitPrintLocalByRange(fd, fmt, start, end)` — look up the caller
+/// local named `fmt[start..end]`, load it, and emit the type-dispatched write.
+fn replay_print_local(
+    gctx: &mut AstGenCtx,
+    fd: u32,
+    fmt: jam_core::index::StringIdx,
+    start: u32,
+    end: u32,
+) -> Result<(), String> {
+    let fmt_bytes = gctx.ctx.string_pool.get(fmt).to_vec();
+    if start > end || end as usize > fmt_bytes.len() {
+        return Err("astgen: cfn @emitPrintLocalByRange range out of bounds".to_string());
+    }
+    let name = String::from_utf8_lossy(&fmt_bytes[start as usize..end as usize]).into_owned();
+    let Some(&slot) = gctx.locals.get(&name) else {
+        return Err(format!(
+            "unknown variable `{name}` referenced from cfn format string"
+        ));
+    };
+    let local_ty = gctx
+        .local_types
+        .get(&name)
+        .copied()
+        .unwrap_or(TypeIdx::NONE);
+    ensure_dprintf(gctx);
+    let val = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: local_ty,
+            ..Default::default()
+        },
+    );
+    let fd_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: fd,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+    emit_dprintf_for_value(gctx, fd_ref, val, local_ty)
+}
+
