@@ -4122,3 +4122,152 @@ fn replay_print_local(
     emit_dprintf_for_value(gctx, fd_ref, val, local_ty)
 }
 
+/// Run a `cfn` body at the call site, replaying its `@emit*` output into the
+/// caller's JIR (the C++ astgenCompTimeFnCall). The args fold in the caller's
+/// comp scope; the body then runs in a fresh scope holding only the params.
+fn astgen_comptime_fn_call(
+    gctx: &mut AstGenCtx,
+    fn_ast: &FunctionAST,
+    args_extra: u32,
+    arg_count: u32,
+) -> Result<JirRef, String> {
+    if arg_count as usize != fn_ast.args.len() {
+        return Err(format!(
+            "cfn `{}` expects {} arg(s), got {}",
+            fn_ast.name,
+            fn_ast.args.len(),
+            arg_count
+        ));
+    }
+    let line = gctx.ctx.node_store.get_line(gctx.current_node);
+
+    // A VALUE-returning cfn (declared return type) folds its body at compile time
+    // — with a CfnResolver active so cfn->cfn calls and recursion resolve — and
+    // materializes the `return` value as a JIR constant, narrowed to the declared
+    // return type (the C++ astgen.cpp:6499-6509). Value cfns carry no @-emit
+    // output, so the recording path below is only for VOID @-emit cfns.
+    if !fn_ast.return_type.is_none() && fn_ast.return_type != builtin::VOID {
+        let arg_exprs: Vec<NodeIdx> = (0..arg_count)
+            .map(|i| {
+                NodeIdx::new(
+                    gctx.ctx
+                        .node_store
+                        .get_extra(ExtraIdx::new(args_extra + 1 + i)),
+                )
+            })
+            .collect();
+        let returned = gctx
+            .ctx
+            .eval_cfn_call(fn_ast, &arg_exprs, &gctx.comp_scope, line)?;
+        if returned.is_none() {
+            return Err(format!(
+                "cfn `{}` declares a return type but its body did not `return` a \
+                 compile-time value on every path",
+                fn_ast.name
+            ));
+        }
+        return materialize_comptime_value(
+            gctx,
+            &returned,
+            fn_ast.return_type,
+            &format!("cfn `{}` result", fn_ast.name),
+        );
+    }
+
+    // A VOID cfn (no declared return type) produces no value — its effect is the
+    // @-emit JIR it drops into the caller. Run the body RECORDING @-emit
+    // intrinsics (no JIR mutation while the evaluator holds its pool borrows),
+    // folding args in the caller's comp scope.
+    use crate::comptime::{
+        CompCtx, ComptimeEvaluator, ComptimeScope, DEFAULT_ITER_CAP, ExecResult,
+    };
+    let host_os = crate::target::Target::from_triple_str(&jam_llvm::default_target_triple()).os;
+    let mut outer = ComptimeScope::new();
+    {
+        let ev = ComptimeEvaluator::new(
+            &gctx.ctx.node_store,
+            &gctx.ctx.string_pool,
+            &gctx.ctx.type_pool,
+        );
+        let mut diags = jam_core::diag::Diagnostics::new();
+        let mut ctx = CompCtx {
+            resolver: None,
+            emitter: None,
+            diags: Some(&mut diags),
+            loc: jam_core::diag::SrcLoc::new("", line),
+            host_os,
+        };
+        for i in 0..arg_count {
+            let arg_idx = NodeIdx::new(
+                gctx.ctx
+                    .node_store
+                    .get_extra(ExtraIdx::new(args_extra + 1 + i)),
+            );
+            let v = ev.eval(arg_idx, &gctx.comp_scope, &mut ctx);
+            if v.is_none() {
+                return Err(format!(
+                    "argument to cfn `{}` (param `{}`) must be a compile-time constant",
+                    fn_ast.name, fn_ast.args[i as usize].name
+                ));
+            }
+            outer.bind(fn_ast.args[i as usize].name.clone(), v);
+        }
+    }
+    let mut emitter = RecordingCfnEmitter::default();
+    {
+        let ev = ComptimeEvaluator::new(
+            &gctx.ctx.node_store,
+            &gctx.ctx.string_pool,
+            &gctx.ctx.type_pool,
+        );
+        let mut diags = jam_core::diag::Diagnostics::new();
+        let mut ctx = CompCtx {
+            resolver: None,
+            emitter: Some(&mut emitter),
+            diags: Some(&mut diags),
+            loc: jam_core::diag::SrcLoc::new("", line),
+            host_os,
+        };
+        let mut iter = 0u32;
+        let mut ret = ComptimeValue::None;
+        let r = ev.exec_block(
+            &fn_ast.body,
+            &mut outer,
+            &mut iter,
+            DEFAULT_ITER_CAP,
+            &mut ret,
+            &mut ctx,
+        );
+        if matches!(r, ExecResult::Error | ExecResult::IterationCap) {
+            return Err(format!(
+                "cfn `{}` failed to evaluate at compile time",
+                fn_ast.name
+            ));
+        }
+    }
+    replay_cfn_emits(gctx, &emitter)?;
+    Ok(NO_JIR_REF)
+}
+
+/// Replay a cfn body's recorded `@emit*` commands into the caller's JIR.
+fn replay_cfn_emits(gctx: &mut AstGenCtx, emitter: &RecordingCfnEmitter) -> Result<(), String> {
+    for cmd in &emitter.cmds {
+        match *cmd {
+            CfnEmitCmd::WriteBytes {
+                fd,
+                fmt,
+                start,
+                end,
+            } => replay_write_bytes(gctx, fd, fmt, start, end)?,
+            CfnEmitCmd::PrintLocal {
+                fd,
+                fmt,
+                start,
+                end,
+            } => replay_print_local(gctx, fd, fmt, start, end)?,
+            CfnEmitCmd::PutByte { fd, byte } => replay_put_byte(gctx, fd, byte),
+        }
+    }
+    Ok(())
+}
+
