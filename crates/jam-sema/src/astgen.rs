@@ -5105,3 +5105,212 @@ fn astgen_at_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     }
 }
 
+/// One payload binding introduced by an enum pattern: the source name, the
+/// alloca holding the extracted field, and the field's type.
+struct ArmBinding {
+    name: String,
+    slot: JirRef,
+    ty: TypeIdx,
+}
+
+/// A Switch case row: the discriminant value (zero-extended to 64 bits; sign
+/// recorded separately so codegen picks the right const helper) and its target.
+struct SwitchCase {
+    value: u64,
+    is_signed: bool,
+    target: JirBlockRef,
+}
+
+/// Peer-resolve two arm-tail types: widen the narrower int / float, or `NONE`
+/// when they can't unify (the C++ `peerResolveType`).
+fn peer_resolve_type(a: TypeIdx, b: TypeIdx, tp: &TypePool) -> TypeIdx {
+    if a.is_none() {
+        return b;
+    }
+    if b.is_none() {
+        return a;
+    }
+    if a == b {
+        return a;
+    }
+    let (ka_kind, ka_w, ka_s) = {
+        let k = tp.get(a);
+        (k.kind, k.a, k.b != 0)
+    };
+    let (kb_kind, kb_w, kb_s) = {
+        let k = tp.get(b);
+        (k.kind, k.a, k.b != 0)
+    };
+    if ka_kind == TypeKind::Int && kb_kind == TypeKind::Int {
+        return tp.intern_int(ka_w.max(kb_w) as u16, ka_s || kb_s);
+    }
+    if ka_kind == TypeKind::Float && kb_kind == TypeKind::Float {
+        return tp.intern_float(ka_w.max(kb_w) as u16);
+    }
+    TypeIdx::NONE
+}
+
+/// Lightweight source-level type inference for an arm tail (only NumberLit /
+/// BoolLit / Variable are precise; else `NONE` and the caller falls back).
+fn infer_tail_type(gctx: &AstGenCtx, idx: NodeIdx) -> TypeIdx {
+    let n = *gctx.ctx.node_store.get(idx);
+    match n.tag {
+        AstTag::NumberLit => {
+            let val = (n.lhs as u64) | ((n.rhs as u64) << 32);
+            if n.flags & 2 != 0 {
+                return builtin::F64;
+            }
+            if n.flags & 1 != 0 {
+                if val <= 128 {
+                    builtin::I8
+                } else if val <= 32768 {
+                    builtin::I16
+                } else if val <= 2_147_483_648 {
+                    builtin::I32
+                } else {
+                    builtin::I64
+                }
+            } else if val <= 255 {
+                builtin::U8
+            } else if val <= 65535 {
+                builtin::U16
+            } else if val <= 4_294_967_295 {
+                builtin::U32
+            } else {
+                builtin::U64
+            }
+        }
+        AstTag::BoolLit => builtin::BOOL,
+        AstTag::Variable => gctx
+            .local_types
+            .get(&str_at(gctx, n.lhs))
+            .copied()
+            .unwrap_or(TypeIdx::NONE),
+        _ => TypeIdx::NONE,
+    }
+}
+
+/// Whether `node` is a divergent statement (return / break / continue, or a
+/// call to a `noreturn` fn), so the arm contributes no tail value.
+fn stmt_diverges(gctx: &AstGenCtx, node: NodeIdx) -> bool {
+    let n = *gctx.ctx.node_store.get(node);
+    if matches!(n.tag, AstTag::Return | AstTag::Break | AstTag::Continue) {
+        return true;
+    }
+    if n.tag == AstTag::Call && n.flags & 1 == 0 {
+        let callee = str_at(gctx, n.lhs);
+        if let Some(f) = gctx.ctx.get_function_ast(&callee) {
+            return f.return_type == builtin::NORETURN;
+        }
+    }
+    false
+}
+
+/// Try to express a pattern as Switch case(s) targeting `arm_block`. Returns
+/// `false` for any shape that needs a binding/compare block (ranges, payload
+/// bindings, module-const patterns) — the caller then falls to the CondBr chain.
+fn collect_switch_cases(
+    gctx: &mut AstGenCtx,
+    pat_idx: NodeIdx,
+    arm_block: JirBlockRef,
+    scrut_ty: TypeIdx,
+    scrut_is_enum: bool,
+    enum_name: Option<&str>,
+    out: &mut Vec<SwitchCase>,
+) -> bool {
+    let p = *gctx.ctx.node_store.get(pat_idx);
+    match p.tag {
+        AstTag::PatLit => {
+            if scrut_is_enum {
+                return false;
+            }
+            let mut val = (p.lhs as u64) | ((p.rhs as u64) << 32);
+            if p.flags & 1 != 0 {
+                val = (val as i64).wrapping_neg() as u64;
+            }
+            let signed = {
+                let sk = gctx.ctx.type_pool.get(scrut_ty);
+                sk.kind == TypeKind::Int && sk.b != 0
+            };
+            out.push(SwitchCase {
+                value: val,
+                is_signed: signed,
+                target: arm_block,
+            });
+            true
+        }
+        AstTag::PatEnumVariant => {
+            let has_bindings = p.flags & 1 != 0;
+            let infer_receiver = p.flags & 4 != 0;
+            // A bare-identifier const pattern (`A` naming `const A = 10`) folds
+            // the const to a Switch case value (the C++ collectSwitchCases).
+            if !scrut_is_enum && infer_receiver && !has_bindings {
+                let cname = str_at(gctx, p.rhs);
+                let bm = gctx.ctx.current_body_module();
+                let mc = (!bm.is_empty())
+                    .then(|| gctx.ctx.get_module_const(&format!("{bm}.{cname}")))
+                    .flatten()
+                    .or_else(|| gctx.ctx.get_module_const(&cname));
+                if let Some(mc) = mc {
+                    let v = gctx.ctx.fold_comptime_expr(mc.init_expr);
+                    if v.is_int() {
+                        let sk = gctx.ctx.type_pool.get(scrut_ty);
+                        let signed = sk.kind == TypeKind::Int && sk.b != 0;
+                        out.push(SwitchCase {
+                            value: v.as_u64(),
+                            is_signed: signed,
+                            target: arm_block,
+                        });
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if !scrut_is_enum || enum_name.is_none() || has_bindings {
+                return false;
+            }
+            let en = enum_name.unwrap();
+            let variant = str_at(gctx, p.rhs);
+            let vidx = gctx.ctx.enum_variant_index(en, &variant);
+            if vidx < 0 {
+                return false;
+            }
+            match gctx
+                .ctx
+                .enum_variants_by_name(en)
+                .and_then(|vs| vs.get(vidx as usize).map(|v| v.discriminant))
+            {
+                Some(disc) => {
+                    out.push(SwitchCase {
+                        value: disc as u64,
+                        is_signed: false,
+                        target: arm_block,
+                    });
+                    true
+                }
+                None => false,
+            }
+        }
+        AstTag::PatOr => {
+            let ex = p.lhs;
+            let cnt = gctx.ctx.node_store.get_extra(ExtraIdx::new(ex));
+            for i in 0..cnt {
+                let sub = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(ex + 1 + i)));
+                if !collect_switch_cases(
+                    gctx,
+                    sub,
+                    arm_block,
+                    scrut_ty,
+                    scrut_is_enum,
+                    enum_name,
+                    out,
+                ) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
