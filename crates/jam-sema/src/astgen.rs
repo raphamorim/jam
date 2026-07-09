@@ -4713,3 +4713,292 @@ fn astgen_dotted_call(
     Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?))
 }
 
+/// The `Type.method()` enum-variant constructor (`Option(i32).Some(42)`): the
+/// SINGLE-payload form the oracle's `astgenTypeMethodCall` uses — `FieldAddr(1)`
+/// typed `*PayloadType` + a direct store (distinct from the shared byte-stride
+/// `astgen_enum_variant_ctor` the dotted-Call path uses). `None` when the suffix
+/// isn't a variant. `extra` is the TypeMethodCall extra (`[methodId, argc, args]`).
+fn astgen_type_method_enum_ctor(
+    gctx: &mut AstGenCtx,
+    enum_name: &str,
+    variant_name: &str,
+    extra: u32,
+    arg_count: u32,
+) -> Result<Option<JirRef>, String> {
+    let vidx = gctx.ctx.enum_variant_index(enum_name, variant_name);
+    if vidx < 0 {
+        return Ok(None);
+    }
+    let variants = gctx
+        .ctx
+        .enum_variants_by_name(enum_name)
+        .unwrap_or_default();
+    let disc = variants[vidx as usize].discriminant;
+    let payload_types = variants[vidx as usize].payload_types.clone();
+    let has_payload = gctx
+        .ctx
+        .enum_has_payload_by_name(enum_name)
+        .unwrap_or(false);
+    let esid = gctx.ctx.string_pool.intern(enum_name.as_bytes());
+    let enum_ty = gctx.ctx.type_pool.intern_named(esid);
+
+    let tag_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: disc,
+            ty: builtin::U8,
+            ..Default::default()
+        },
+    );
+    if !has_payload {
+        return Ok(Some(tag_ref));
+    }
+    let slot = emit_alloca_hoisted(
+        gctx,
+        JirInst {
+            tag: JirTag::Alloca,
+            ty: enum_ty,
+            ..Default::default()
+        },
+    );
+    let u8_ptr = gctx.ctx.type_pool.intern_ptr_single(builtin::U8);
+    let tag_ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::FieldAddr,
+            a: slot,
+            b: 0,
+            ty: u8_ptr,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: tag_ptr,
+            b: tag_ref,
+            ..Default::default()
+        },
+    );
+    if !payload_types.is_empty() && arg_count >= 1 {
+        let field_ty = payload_types[0];
+        let arg_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 2)));
+        // Enum payload capture is a MOVE — a drop-bearing field extracted out of an
+        // aggregate is rejected (the C++ rejectDropBearingFieldExtract, the
+        // TypeMethodCall enum-construct path).
+        reject_drop_bearing_field_extract(gctx, arg_idx, field_ty, "capture")?;
+        let payload_val = astgen_expr(gctx, arg_idx, field_ty)?;
+        let pf_ptr = gctx.ctx.type_pool.intern_ptr_single(field_ty);
+        let pay_ptr = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::FieldAddr,
+                a: slot,
+                b: 1,
+                ty: pf_ptr,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: pay_ptr,
+                b: payload_val,
+                ..Default::default()
+            },
+        );
+        consume_moved_variable(gctx, arg_idx);
+    }
+    Ok(Some(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: enum_ty,
+            ..Default::default()
+        },
+    )))
+}
+
+/// The `Type.method(args)` static-call node (`Counter.init()`, `Vec(i32).empty()`,
+/// `Option(i32).Some(x)`). `n.lhs` is the receiver TYPE (instantiated on use for
+/// a generic), `n.rhs` an extra `[methodNameId, argCount, args...]`. Resolves to
+/// an enum-variant constructor or a `RecvType.method` static call (no receiver).
+fn astgen_type_method_call(
+    gctx: &mut AstGenCtx,
+    n: &AstNode,
+    dest_ptr: JirRef,
+) -> Result<JirRef, String> {
+    // The receiver type stays LITERAL (the C++ astgenTypeMethodCall reads
+    // `n.lhs` directly and never substitutes it): a generic receiver inside an
+    // instantiated body (`Vec(T).empty()`) keeps `Vec(T)`, so the AddrOf
+    // receiver interns the literal `*Vec(T)` GenericCall in the oracle's
+    // TypePool order. Resolution applies the active subst internally
+    // (resolve_generic_call reads current_subst), so `Vec(T)` still resolves to
+    // the right monomorph.
+    let recv_ty = TypeIdx::new(n.lhs);
+    let extra = n.rhs;
+    let method_name_id = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra));
+    let arg_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 1));
+    let method_name = str_at(gctx, method_name_id);
+    // TypeMethodCall args live at extra+2+i; the Call-shaped helpers read
+    // args_extra+1+i, so offset the base by one.
+    let args_extra = extra + 1;
+
+    // Instantiate a generic receiver (`Vec(i32)`) so its name + methods resolve.
+    let _ = gctx.ctx.resolve_generic_call_instantiate(recv_ty)?;
+
+    if let Some(en) = gctx.ctx.enum_name_of(recv_ty) {
+        if let Some(r) = astgen_type_method_enum_ctor(gctx, &en, &method_name, extra, arg_count)? {
+            return Ok(r);
+        }
+        let qualified = format!("{en}.{method_name}");
+        if let Some(method) = gctx.ctx.get_function_ast(&qualified) {
+            let arg_refs = lower_type_method_args(gctx, &method, args_extra, arg_count)?;
+            return emit_call(gctx, &method, &arg_refs, dest_ptr);
+        }
+    }
+    let recv_name = gctx
+        .ctx
+        .struct_name_of(recv_ty)
+        .ok_or_else(|| format!("astgen: `{method_name}` receiver is not a struct/enum"))?;
+    let qualified = format!("{recv_name}.{method_name}");
+    // Intern the qualified callee name BEFORE lowering args (the C++
+    // astgenTypeMethodCall interns it at the head, ahead of the arg loop). When
+    // an arg fails to lower — e.g. `Box(Counter).init(self.ptr[0].clone())` in
+    // Box(T).clone, where `Counter` has no `clone` — the callee name has already
+    // landed in the string pool, matching the oracle's eager nested-arg order.
+    gctx.ctx.string_pool.intern_str(&qualified);
+    let Some(method) = gctx.ctx.get_function_ast(&qualified) else {
+        return report_method_miss(gctx, &qualified);
+    };
+    let arg_refs = lower_type_method_args(gctx, &method, args_extra, arg_count)?;
+    emit_call(gctx, &method, &arg_refs, dest_ptr)
+}
+
+/// Emit a `CallIndirect` through an already-lowered Fn-typed value: lower the
+/// args against the Fn type's parameter types, pack `[count, args..]`, return
+/// the call (typed by the Fn's return type).
+fn build_indirect_call(
+    gctx: &mut AstGenCtx,
+    callee_val: JirRef,
+    args_extra: u32,
+    arg_count: u32,
+) -> Result<JirRef, String> {
+    let (ret_ty, param_tys) = {
+        let k = gctx.ctx.type_pool.get(gctx.jfn.get_inst(callee_val).ty);
+        (
+            TypeIdx::new(k.a),
+            gctx.ctx.type_pool.fn_params_at(k.b).to_vec(),
+        )
+    };
+    let mut arg_refs: Vec<u32> = Vec::with_capacity(arg_count as usize);
+    for i in 0..arg_count {
+        let arg_idx = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(args_extra + 1 + i)),
+        );
+        let expect = param_tys.get(i as usize).copied().unwrap_or(TypeIdx::NONE);
+        arg_refs.push(astgen_expr(gctx, arg_idx, expect)?);
+    }
+    let mut packed: Vec<u32> = Vec::with_capacity(1 + arg_refs.len());
+    packed.push(arg_refs.len() as u32);
+    packed.extend_from_slice(&arg_refs);
+    let extra = gctx.jfn.push_extra(&packed);
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::CallIndirect,
+            a: callee_val,
+            b: extra,
+            ty: ret_ty,
+            ..Default::default()
+        },
+    ))
+}
+
+/// Call through a Fn-typed local (`f(args)`) or a Fn-typed struct field
+/// (`recv.field(args)`). Returns `None` when the callee isn't one of those.
+fn astgen_indirect_fn_call(
+    gctx: &mut AstGenCtx,
+    callee: &str,
+    args_extra: u32,
+    arg_count: u32,
+) -> Result<Option<JirRef>, String> {
+    let fn_val = match callee.split_once('.') {
+        None => {
+            // Zero-dot bare name — a Fn-typed local?
+            let Some(&slot) = gctx.locals.get(callee) else {
+                return Ok(None);
+            };
+            let local_ty = gctx
+                .local_types
+                .get(callee)
+                .copied()
+                .unwrap_or(TypeIdx::NONE);
+            if gctx.ctx.type_pool.get(local_ty).kind != TypeKind::Fn {
+                return Ok(None);
+            }
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Load,
+                    a: slot,
+                    ty: local_ty,
+                    ..Default::default()
+                },
+            )
+        }
+        Some((recv_name, field_name)) => {
+            // Single-dot `recv.field` where `field` is a Fn-typed field.
+            if field_name.contains('.') {
+                return Ok(None);
+            }
+            let Some(&slot) = gctx.locals.get(recv_name) else {
+                return Ok(None);
+            };
+            let recv_ty = gctx
+                .local_types
+                .get(recv_name)
+                .copied()
+                .unwrap_or(TypeIdx::NONE);
+            let Some(fields) = gctx.ctx.struct_fields(recv_ty) else {
+                return Ok(None);
+            };
+            let Some(idx) = fields.iter().position(|(n, _)| n == field_name) else {
+                return Ok(None);
+            };
+            let field_ty = fields[idx].1;
+            if gctx.ctx.type_pool.get(field_ty).kind != TypeKind::Fn {
+                return Ok(None);
+            }
+            let recv_val = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Load,
+                    a: slot,
+                    ty: recv_ty,
+                    ..Default::default()
+                },
+            );
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::ExtractValue,
+                    a: recv_val,
+                    b: idx as u32,
+                    ty: field_ty,
+                    ..Default::default()
+                },
+            )
+        }
+    };
+    Ok(Some(build_indirect_call(
+        gctx, fn_val, args_extra, arg_count,
+    )?))
+}
+
