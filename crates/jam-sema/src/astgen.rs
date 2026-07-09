@@ -5652,3 +5652,347 @@ fn astgen_pattern_compare_enum(
     Ok(())
 }
 
+/// Lower a `match` (`lhs`=scrutinee, `rhs`=ExtraIdx → `[armCount, (pat,
+/// bodyCount, body..)..]`). Peer-types the arm tails into a result slot for
+/// expression position; lowers via a `Switch` when every non-wildcard arm is a
+/// single integer/variant equality, else a `CondBr` chain (ranges, payload
+/// bindings). A drop-bearing enum scrutinee is consumed and its residual
+/// payload dropped on non-binding arms (match-move).
+fn astgen_match(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Result<JirRef, String> {
+    let scrut_idx = NodeIdx::new(n.lhs);
+    let arms_extra = n.rhs;
+    let arm_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(arms_extra));
+
+    // Decode arms (pattern + body statements); note the wildcard arm.
+    let mut arms: Vec<(NodeIdx, Vec<NodeIdx>)> = Vec::with_capacity(arm_count as usize);
+    let mut wildcard_arm_idx: i64 = -1;
+    let mut pos = 1u32;
+    for _ in 0..arm_count {
+        let pat_idx = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(arms_extra + pos)),
+        );
+        let bc = gctx
+            .ctx
+            .node_store
+            .get_extra(ExtraIdx::new(arms_extra + pos + 1));
+        let mut body = Vec::with_capacity(bc as usize);
+        for j in 0..bc {
+            body.push(NodeIdx::new(
+                gctx.ctx
+                    .node_store
+                    .get_extra(ExtraIdx::new(arms_extra + pos + 2 + j)),
+            ));
+        }
+        pos += 2 + bc;
+        if gctx.ctx.node_store.get(pat_idx).tag == AstTag::PatWildcard {
+            wildcard_arm_idx = arms.len() as i64;
+        }
+        arms.push((pat_idx, body));
+    }
+
+    // Peer-type pre-pass (statement-form matches with non-value arms stay None).
+    let mut peer = expected;
+    if peer.is_none() {
+        let mut all_inferred = true;
+        for (_, body) in &arms {
+            if body.is_empty() {
+                continue;
+            }
+            let tail = *body.last().unwrap();
+            if stmt_diverges(gctx, tail) {
+                continue;
+            }
+            let t = infer_tail_type(gctx, tail);
+            if t.is_none() {
+                all_inferred = false;
+                break;
+            }
+            peer = peer_resolve_type(peer, t, &gctx.ctx.type_pool);
+        }
+        if !all_inferred {
+            peer = TypeIdx::NONE;
+        }
+    }
+
+    let scrut = astgen_expr(gctx, scrut_idx, TypeIdx::NONE)?;
+    let scrut_ty = gctx.jfn.get_inst(scrut).ty;
+
+    // Match-move: a drop-bearing enum scrutinee is owned by the match.
+    let match_owns =
+        gctx.ctx.enum_name_of(scrut_ty).is_some() && gctx.ctx.type_needs_drop(scrut_ty);
+    let mut scrut_owned = NO_JIR_REF;
+    if match_owns {
+        // Matching a drop-bearing field extracted out of an aggregate would leave
+        // the aggregate's glue to re-drop it — reject (the C++
+        // rejectDropBearingFieldExtract, astgen.cpp:4175).
+        reject_drop_bearing_field_extract(gctx, scrut_idx, scrut_ty, "consume")?;
+        consume_moved_variable(gctx, scrut_idx);
+        scrut_owned = emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty: scrut_ty,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: scrut_owned,
+                b: scrut,
+                ..Default::default()
+            },
+        );
+    }
+
+    let merge_b = gctx.jfn.push_block("matchend");
+    let mut arm_blocks: Vec<JirBlockRef> = Vec::with_capacity(arm_count as usize);
+    for _ in 0..arm_count {
+        arm_blocks.push(gctx.jfn.push_block("matcharm"));
+    }
+    let result_slot = if peer.is_none() {
+        NO_JIR_REF
+    } else {
+        emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty: peer,
+                ..Default::default()
+            },
+        )
+    };
+    let mut arm_bindings: Vec<Vec<ArmBinding>> = (0..arm_count).map(|_| Vec::new()).collect();
+    let default_b = if wildcard_arm_idx >= 0 {
+        arm_blocks[wildcard_arm_idx as usize]
+    } else {
+        gctx.jfn.push_block("nomatch")
+    };
+
+    let scrut_is_int = gctx.ctx.type_pool.get(scrut_ty).kind == TypeKind::Int;
+    let enum_name = gctx.ctx.enum_name_of(scrut_ty);
+    let scrut_is_enum = enum_name.is_some();
+    let mut trying_switch = scrut_is_int || scrut_is_enum;
+    let mut switch_cases: Vec<SwitchCase> = Vec::new();
+    if trying_switch {
+        for i in 0..arm_count as usize {
+            if i as i64 == wildcard_arm_idx {
+                continue;
+            }
+            if !collect_switch_cases(
+                gctx,
+                arms[i].0,
+                arm_blocks[i],
+                scrut_ty,
+                scrut_is_enum,
+                enum_name.as_deref(),
+                &mut switch_cases,
+            ) {
+                trying_switch = false;
+                break;
+            }
+        }
+        // LLVM SwitchInst needs unique case values; keep the earliest
+        // (first-match-wins).
+        let mut seen = std::collections::HashSet::new();
+        switch_cases.retain(|c| seen.insert(c.value));
+    }
+
+    if trying_switch {
+        // Integer scrutinee for the Switch — an enum yields its discriminant byte.
+        let case_scrut = if scrut_is_enum {
+            let has_payload = gctx
+                .ctx
+                .enum_has_payload_by_name(enum_name.as_deref().unwrap())
+                .unwrap_or(false);
+            emit(
+                gctx,
+                JirInst {
+                    tag: if has_payload {
+                        JirTag::ExtractValue
+                    } else {
+                        JirTag::BitCast
+                    },
+                    a: scrut,
+                    b: 0,
+                    ty: builtin::U8,
+                    ..Default::default()
+                },
+            )
+        } else {
+            scrut
+        };
+        let mut packed: Vec<u32> = Vec::with_capacity(2 + switch_cases.len() * 4);
+        packed.push(default_b);
+        packed.push(switch_cases.len() as u32);
+        for sc in &switch_cases {
+            packed.push((sc.value & 0xFFFF_FFFF) as u32);
+            packed.push((sc.value >> 32) as u32);
+            packed.push(if sc.is_signed { 1 } else { 0 });
+            packed.push(sc.target);
+        }
+        let extra = gctx.jfn.push_extra(&packed);
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Switch,
+                a: case_scrut,
+                b: extra,
+                ..Default::default()
+            },
+        );
+        if wildcard_arm_idx < 0 {
+            gctx.current_block = default_b;
+            if match_owns {
+                emit_drop_in_place(gctx, scrut_owned, scrut_ty);
+            }
+            emit_br(gctx, merge_b);
+        }
+    } else {
+        let mut emitted_any = false;
+        for i in 0..arm_count as usize {
+            if i as i64 == wildcard_arm_idx {
+                continue;
+            }
+            let next = if i + 1 < arm_count as usize && (i + 1) as i64 != wildcard_arm_idx {
+                gctx.jfn.push_block("matchnext")
+            } else {
+                default_b
+            };
+            astgen_pattern_compare(
+                gctx,
+                arms[i].0,
+                scrut,
+                scrut_ty,
+                arm_blocks[i],
+                next,
+                &mut arm_bindings[i],
+            )?;
+            if next != default_b {
+                gctx.current_block = next;
+            }
+            emitted_any = true;
+        }
+        if !emitted_any {
+            emit_br(gctx, default_b);
+        }
+        if wildcard_arm_idx < 0 {
+            gctx.current_block = default_b;
+            if match_owns {
+                emit_drop_in_place(gctx, scrut_owned, scrut_ty);
+            }
+            emit_br(gctx, merge_b);
+        }
+    }
+
+    // Arm bodies — install bindings, run statements (tail stores to the result
+    // slot in expression form), restore the prior locals. Arm bodies run at +1
+    // runtime-conditional depth (comp bindings declared outside may not be
+    // mutated inside an arm).
+    gctx.runtime_cond_depth += 1;
+    for i in 0..arm_count as usize {
+        gctx.current_block = arm_blocks[i];
+        let bindings = std::mem::take(&mut arm_bindings[i]);
+        let mut saved: Vec<(String, Option<(JirRef, TypeIdx)>)> = Vec::new();
+        for bind in &bindings {
+            let prior = gctx
+                .locals
+                .get(&bind.name)
+                .map(|&s| (s, gctx.local_types[&bind.name]));
+            saved.push((bind.name.clone(), prior));
+            gctx.locals.insert(bind.name.clone(), bind.slot);
+            gctx.local_types.insert(bind.name.clone(), bind.ty);
+        }
+        push_drop_scope(gctx);
+
+        if match_owns {
+            if bindings.is_empty() {
+                emit_drop_in_place(gctx, scrut_owned, scrut_ty);
+            } else if gctx.ctx.lookup_drop_fn_name(scrut_ty).is_some() {
+                return Err(
+                    "astgen: cannot bind the payload out of an enum that has its own `cfn drop`"
+                        .into(),
+                );
+            } else {
+                for bind in &bindings {
+                    if gctx.ctx.type_needs_drop(bind.ty) {
+                        gctx.drop_scopes.last_mut().unwrap().push(DropTrack {
+                            var_name: bind.name.clone(),
+                            slot: bind.slot,
+                            ty: bind.ty,
+                        });
+                    }
+                }
+            }
+        }
+
+        let body = arms[i].1.clone();
+        let mut arm_diverged = false;
+        for (s, &stmt) in body.iter().enumerate() {
+            let is_tail = s + 1 == body.len();
+            let divergent = stmt_diverges(gctx, stmt);
+            if is_tail && !peer.is_none() && !divergent {
+                let val = astgen_expr(gctx, stmt, peer)?;
+                emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Store,
+                        a: result_slot,
+                        b: val,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                astgen_expr(gctx, stmt, TypeIdx::NONE)?;
+            }
+            if is_tail && divergent {
+                arm_diverged = true;
+            }
+        }
+        if arm_diverged && !block_has_terminator(gctx) {
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Unreachable,
+                    ..Default::default()
+                },
+            );
+        }
+        pop_drop_scope_emitting(gctx);
+        if !block_has_terminator(gctx) {
+            emit_br(gctx, merge_b);
+        }
+        for (name, prior) in saved {
+            match prior {
+                Some((slot, ty)) => {
+                    gctx.locals.insert(name.clone(), slot);
+                    gctx.local_types.insert(name, ty);
+                }
+                None => {
+                    gctx.locals.remove(&name);
+                    gctx.local_types.remove(&name);
+                }
+            }
+        }
+    }
+    gctx.runtime_cond_depth -= 1;
+
+    gctx.current_block = merge_b;
+    if result_slot == NO_JIR_REF {
+        Ok(NO_JIR_REF)
+    } else {
+        Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: result_slot,
+                ty: peer,
+                ..Default::default()
+            },
+        ))
+    }
+}
+
