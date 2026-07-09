@@ -5996,3 +5996,201 @@ fn astgen_match(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Result<
     }
 }
 
+/// Peek (no JIR emitted) whether `node` resolves to a fixed `Array` through an
+/// addressable chain — a local `Variable`, or a `MemberAccess` on a local
+/// struct. Returns the array type for the index fast path, else `None`.
+fn peek_addressable_array_leaf_type(gctx: &AstGenCtx, node: NodeIdx) -> Option<TypeIdx> {
+    let n = *gctx.ctx.node_store.get(node);
+    let ty = match n.tag {
+        AstTag::Variable => *gctx.local_types.get(&str_at(gctx, n.lhs))?,
+        AstTag::MemberAccess => {
+            let parent = *gctx.ctx.node_store.get(NodeIdx::new(n.lhs));
+            if parent.tag != AstTag::Variable {
+                return None;
+            }
+            let parent_ty = *gctx.local_types.get(&str_at(gctx, parent.lhs))?;
+            let field = str_at(gctx, n.rhs);
+            gctx.ctx
+                .struct_fields(parent_ty)?
+                .into_iter()
+                .find(|(nm, _)| *nm == field)
+                .map(|(_, t)| t)?
+        }
+        _ => return None,
+    };
+    if gctx.ctx.type_pool.get(ty).kind == TypeKind::Array {
+        Some(ty)
+    } else {
+        None
+    }
+}
+
+/// Lower an `ArrayLit` (`lhs`=elem TypeIdx or 0, `rhs`=ExtraIdx → `[count,
+/// elems..]`) to a `[N]elem` SSA aggregate (jir_codegen emits the InsertValue
+/// chain). Each bare drop-bearing local element is MOVED into the array.
+fn astgen_array_lit(
+    gctx: &mut AstGenCtx,
+    n: &AstNode,
+    expected: TypeIdx,
+) -> Result<JirRef, String> {
+    let mut elem_ty = TypeIdx::new(n.lhs);
+    if elem_ty.is_none() && !expected.is_none() {
+        let ek = gctx.ctx.type_pool.get(expected);
+        if ek.kind == TypeKind::Array {
+            elem_ty = TypeIdx::new(ek.a);
+        }
+    }
+    let elems_extra = n.rhs;
+    let count = gctx.ctx.node_store.get_extra(ExtraIdx::new(elems_extra));
+    if !expected.is_none() {
+        let ek = gctx.ctx.type_pool.get(expected);
+        if ek.kind == TypeKind::Array && ek.b != count {
+            return Err(format!(
+                "array literal has {count} element(s) but the array type expects {}",
+                ek.b
+            ));
+        }
+    }
+    let mut elems: Vec<JirRef> = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let e = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(elems_extra + 1 + i)),
+        );
+        // Capturing a drop-bearing field extracted out of an aggregate into an
+        // array element is rejected (the C++ rejectDropBearingFieldExtract,
+        // astgen.cpp:1989).
+        reject_drop_bearing_field_extract(gctx, e, elem_ty, "capture")?;
+        let r = astgen_expr(gctx, e, elem_ty)?;
+        consume_moved_variable(gctx, e);
+        elems.push(r);
+    }
+    if elem_ty.is_none() && !elems.is_empty() {
+        elem_ty = gctx.jfn.get_inst(elems[0]).ty;
+    }
+    if elem_ty.is_none() {
+        return Err("astgen: array literal element type could not be inferred".into());
+    }
+    let arr_ty = gctx.ctx.type_pool.intern_array(elem_ty, count);
+    let mut packed: Vec<u32> = Vec::with_capacity(1 + elems.len());
+    packed.push(count);
+    packed.extend_from_slice(&elems);
+    let extra = gctx.jfn.push_extra(&packed);
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ArrayLit,
+            b: extra,
+            ty: arr_ty,
+            ..Default::default()
+        },
+    ))
+}
+
+/// Lower an `ArrayRepeat` (`[expr; N]`). A constant zero / byte fill lowers to a
+/// single `MemSet`; everything else expands to an N-copy `ArrayLit`. Drop-
+/// bearing element types are rejected (N owners of one value). Non-literal
+/// counts (which need the comptime folder) are deferred.
+fn astgen_array_repeat(
+    gctx: &mut AstGenCtx,
+    n: &AstNode,
+    expected: TypeIdx,
+) -> Result<JirRef, String> {
+    let mut arr_ty = TypeIdx::new(n.lhs);
+    if arr_ty.is_none() {
+        arr_ty = expected;
+    }
+    if !arr_ty.is_none() && gctx.ctx.type_pool.get(arr_ty).kind == TypeKind::ArrayExpr {
+        arr_ty = gctx.ctx.resolve_array_expr_instantiate(arr_ty)?;
+    }
+    let extra = n.rhs;
+    let value_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra)));
+    let count_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 1)));
+    let cn = *gctx.ctx.node_store.get(count_idx);
+    let count: u64 = if cn.tag == AstTag::NumberLit {
+        (cn.lhs as u64) | ((cn.rhs as u64) << 32)
+    } else {
+        // Comptime-fold a non-literal count (a `comp const` / const expr).
+        let v = gctx.ctx.fold_comptime_expr(count_idx);
+        if !v.is_int() {
+            return Err("astgen: array-repeat count is not comptime-foldable".into());
+        }
+        v.as_u64()
+    };
+    if count > u32::MAX as u64 {
+        return Err(format!("array repeat count {count} exceeds u32 range"));
+    }
+
+    let mut elem_ty = TypeIdx::NONE;
+    if !arr_ty.is_none() {
+        let k = gctx.ctx.type_pool.get(arr_ty);
+        if k.kind == TypeKind::Array {
+            elem_ty = TypeIdx::new(k.a);
+            if k.b as u64 != count {
+                return Err(format!(
+                    "array repeat count {count} does not match array type length {}",
+                    k.b
+                ));
+            }
+        }
+    }
+    let val = astgen_expr(gctx, value_idx, elem_ty)?;
+    if elem_ty.is_none() {
+        elem_ty = gctx.jfn.get_inst(val).ty;
+    }
+    if arr_ty.is_none() {
+        arr_ty = gctx.ctx.type_pool.intern_array(elem_ty, count as u32);
+    }
+    if gctx.ctx.type_needs_drop(elem_ty) {
+        return Err(format!(
+            "repeat literal would create {count} owners of one drop-bearing value; \
+             initialize each element explicitly"
+        ));
+    }
+
+    // Constant zero / byte fill → one MemSet.
+    let vinst = *gctx.jfn.get_inst(val);
+    if vinst.tag == JirTag::Int {
+        let fv = (vinst.a as u64) | ((vinst.b as u64) << 32);
+        let elem_sz = gctx.ctx.type_size(elem_ty)?;
+        if fv == 0 || (elem_sz == 1 && fv <= 255) {
+            let slot = emit_alloca_hoisted(
+                gctx,
+                JirInst {
+                    tag: JirTag::Alloca,
+                    ty: arr_ty,
+                    ..Default::default()
+                },
+            );
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::MemSet,
+                    a: slot,
+                    b: (count * elem_sz) as u32,
+                    flags: (fv & 0xFF) as u16,
+                    ..Default::default()
+                },
+            );
+            return Ok(slot);
+        }
+    }
+
+    let mut packed: Vec<u32> = Vec::with_capacity(1 + count as usize);
+    packed.push(count as u32);
+    for _ in 0..count {
+        packed.push(val);
+    }
+    let extra2 = gctx.jfn.push_extra(&packed);
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ArrayLit,
+            b: extra2,
+            ty: arr_ty,
+            ..Default::default()
+        },
+    ))
+}
+
