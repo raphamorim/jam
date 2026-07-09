@@ -6953,3 +6953,261 @@ fn astgen_struct_lit(
     ))
 }
 
+/// Emit a `SretArg` — a pointer (`*const retTy`) to the caller-provided return
+/// slot for an indirect (sret) return.
+fn emit_sret_arg(gctx: &mut AstGenCtx, ret_ty: TypeIdx) -> JirRef {
+    let ptr_ty = gctx.ctx.type_pool.intern_ptr_single(ret_ty);
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::SretArg,
+            ty: ptr_ty,
+            ..Default::default()
+        },
+    )
+}
+
+/// Try to lower `expr_idx` directly into `dest_ptr`, returning `true` when the
+/// destination was written (no SSA value remains for the caller to bind).
+/// Byref producers — `StructLit` (per-field stores) and sret `Call` (forwarded
+/// sret slot) — place in-line; everything else returns `false` so the caller
+/// takes the value-compile + Store path. (ArrayLit/TypeMethodCall place paths
+/// land with those handlers.)
+fn astgen_expr_into_ptr(
+    gctx: &mut AstGenCtx,
+    expr_idx: NodeIdx,
+    expected_ty: TypeIdx,
+    dest_ptr: JirRef,
+) -> Result<bool, String> {
+    let n = *gctx.ctx.node_store.get(expr_idx);
+    match n.tag {
+        AstTag::StructLit => {
+            astgen_struct_lit_into(gctx, &n, expected_ty, dest_ptr)?;
+            Ok(true)
+        }
+        AstTag::Call => {
+            let r = astgen_call(gctx, &n, dest_ptr)?;
+            // A real ref means a Direct (ByValue) return — finish by storing it.
+            // `NO_JIR_REF` means the call used `dest_ptr` as its sret slot.
+            if r != NO_JIR_REF {
+                emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Store,
+                        a: dest_ptr,
+                        b: r,
+                        ..Default::default()
+                    },
+                );
+            }
+            Ok(true)
+        }
+        AstTag::TypeMethodCall => {
+            let r = astgen_type_method_call(gctx, &n, dest_ptr)?;
+            if r != NO_JIR_REF {
+                emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Store,
+                        a: dest_ptr,
+                        b: r,
+                        ..Default::default()
+                    },
+                );
+            }
+            Ok(true)
+        }
+        AstTag::ArrayLit => {
+            // Per-element write into dest_ptr (no SSA array). ArrayRepeat
+            // deliberately falls through to the value+Store path (keeps JIR
+            // compact; jir_codegen's byref ArrayLit emits the per-element stores).
+            let mut e_ty = TypeIdx::new(n.lhs);
+            if e_ty.is_none() && !expected_ty.is_none() {
+                let ek = gctx.ctx.type_pool.get(expected_ty);
+                if ek.kind == TypeKind::Array {
+                    e_ty = TypeIdx::new(ek.a);
+                }
+            }
+            if e_ty.is_none() {
+                return Ok(false);
+            }
+            let elems_extra = n.rhs;
+            let count = gctx.ctx.node_store.get_extra(ExtraIdx::new(elems_extra));
+            if !expected_ty.is_none() {
+                let ek = gctx.ctx.type_pool.get(expected_ty);
+                if ek.kind == TypeKind::Array && ek.b != count {
+                    return Err(format!(
+                        "array literal has {count} element(s) but the array type expects {}",
+                        ek.b
+                    ));
+                }
+            }
+            let elem_ptr_ty = gctx.ctx.type_pool.intern_ptr_single(e_ty);
+            for i in 0..count {
+                let e_idx = NodeIdx::new(
+                    gctx.ctx
+                        .node_store
+                        .get_extra(ExtraIdx::new(elems_extra + 1 + i)),
+                );
+                let idx_ref = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::Int,
+                        a: i,
+                        ty: builtin::U64,
+                        ..Default::default()
+                    },
+                );
+                let ep = emit(
+                    gctx,
+                    JirInst {
+                        tag: JirTag::IndexAddr,
+                        a: dest_ptr,
+                        b: idx_ref,
+                        ty: elem_ptr_ty,
+                        ..Default::default()
+                    },
+                );
+                if !astgen_expr_into_ptr(gctx, e_idx, e_ty, ep)? {
+                    let ev = astgen_expr(gctx, e_idx, e_ty)?;
+                    emit(
+                        gctx,
+                        JirInst {
+                            tag: JirTag::Store,
+                            a: ep,
+                            b: ev,
+                            ..Default::default()
+                        },
+                    );
+                }
+                consume_moved_variable(gctx, e_idx);
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Write a `StructLit` directly into `dest_ptr` (per-field `FieldAddr` + place /
+/// store) instead of building an SSA aggregate. Unions / non-structs fall back
+/// to the value-form `StructLit` + `Store`.
+fn astgen_struct_lit_into(
+    gctx: &mut AstGenCtx,
+    n: &AstNode,
+    expected_ty: TypeIdx,
+    dest_ptr: JirRef,
+) -> Result<(), String> {
+    let mut ty = TypeIdx::new(n.lhs);
+    if ty.is_none() {
+        ty = expected_ty;
+    }
+    if ty.is_none() {
+        return Err("astgen: struct literal without target type".into());
+    }
+    gctx.ctx.resolve_alias_generic_instantiate(ty)?;
+    if !gctx.ctx.is_struct_registered(ty) || gctx.ctx.is_union_registered(ty) {
+        let val = astgen_struct_lit(gctx, n, expected_ty)?;
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: dest_ptr,
+                b: val,
+                ..Default::default()
+            },
+        );
+        return Ok(());
+    }
+
+    let fields = gctx.ctx.struct_fields(ty).unwrap();
+    let fields_extra = n.rhs;
+    let field_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(fields_extra));
+
+    // Map declared-field index -> initializer NodeIdx (0 = unset).
+    let mut expr_by_idx = vec![0u32; fields.len()];
+    let mut has_field = vec![false; fields.len()];
+    for i in 0..field_count {
+        let name_id = gctx
+            .ctx
+            .node_store
+            .get_extra(ExtraIdx::new(fields_extra + 1 + i * 2));
+        let expr_idx = gctx
+            .ctx
+            .node_store
+            .get_extra(ExtraIdx::new(fields_extra + 2 + i * 2));
+        let field_name = str_at(gctx, name_id);
+        match fields.iter().position(|(nm, _)| *nm == field_name) {
+            Some(p) => {
+                expr_by_idx[p] = expr_idx;
+                has_field[p] = true;
+            }
+            None => return Err(format!("unknown struct field `{field_name}`")),
+        }
+    }
+
+    for i in 0..fields.len() {
+        if !has_field[i] {
+            return Err(format!(
+                "astgen: struct literal missing field `{}`",
+                fields[i].0
+            ));
+        }
+        let expected_field = fields[i].1;
+        let expr_idx = NodeIdx::new(expr_by_idx[i]);
+        // Field capture (place path) extracting a drop-bearing field out of an
+        // aggregate is rejected (the C++ rejectDropBearingFieldExtract,
+        // astgen.cpp:1868).
+        reject_drop_bearing_field_extract(gctx, expr_idx, expected_field, "capture")?;
+        let ptr_ty = gctx.ctx.type_pool.intern_ptr_single(expected_field);
+        let field_ptr = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::FieldAddr,
+                a: dest_ptr,
+                b: i as u32,
+                ty: ptr_ty,
+                ..Default::default()
+            },
+        );
+        if !astgen_expr_into_ptr(gctx, expr_idx, expected_field, field_ptr)? {
+            let mut val = astgen_expr(gctx, expr_idx, expected_field)?;
+            let vt = gctx.jfn.get_inst(val).ty;
+            if vt != expected_field && !vt.is_none() {
+                let fk_kind = gctx.ctx.type_pool.get(expected_field).kind;
+                let (vk_kind, vk_signed) = {
+                    let vk = gctx.ctx.type_pool.get(vt);
+                    (vk.kind, vk.b != 0)
+                };
+                if fk_kind == TypeKind::Float && vk_kind == TypeKind::Int {
+                    let tag = if vk_signed {
+                        JirTag::SIToFP
+                    } else {
+                        JirTag::UIToFP
+                    };
+                    val = emit(
+                        gctx,
+                        JirInst {
+                            tag,
+                            a: val,
+                            ty: expected_field,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Store,
+                    a: field_ptr,
+                    b: val,
+                    ..Default::default()
+                },
+            );
+        }
+        // Field capture MOVES a bare drop-bearing local into the struct field.
+        consume_moved_variable(gctx, expr_idx);
+    }
+    Ok(())
+}
+
