@@ -3405,3 +3405,133 @@ fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<Ji
 
 // ---- cfn-call expansion (the C++ astgenCompTimeFnCall + CfnEmitter) ----
 
+/// A `@emit*` intrinsic recorded from a cfn body. The C++ aliases the AstGenCtx
+/// mutably during execBlock; Rust's borrow checker forbids that (the evaluator
+/// holds immutable pool borrows for all of exec_block), so we RECORD the
+/// intrinsics as pure data during execution and REPLAY them into the caller's
+/// JIR after the evaluator's borrows release.
+enum CfnEmitCmd {
+    WriteBytes {
+        fd: u32,
+        fmt: jam_core::index::StringIdx,
+        start: u32,
+        end: u32,
+    },
+    PrintLocal {
+        fd: u32,
+        fmt: jam_core::index::StringIdx,
+        start: u32,
+        end: u32,
+    },
+    PutByte { fd: u32, byte: u8 },
+}
+
+#[derive(Default)]
+struct RecordingCfnEmitter {
+    cmds: Vec<CfnEmitCmd>,
+}
+
+impl crate::comptime::CompEmitter for RecordingCfnEmitter {
+    fn handle_at_call(
+        &mut self,
+        name: &str,
+        args: &[ComptimeValue],
+        diags: &mut jam_core::diag::Diagnostics,
+        loc: &jam_core::diag::SrcLoc,
+    ) -> crate::comptime::ExecResult {
+        use crate::comptime::ExecResult;
+        match name {
+            "emitWriteBytes" | "emitPrintLocalByRange" => {
+                if args.len() != 4
+                    || !args[0].is_int()
+                    || !args[1].is_str()
+                    || !args[2].is_int()
+                    || !args[3].is_int()
+                {
+                    diags.error(
+                        loc.clone(),
+                        format!("@{name} expects (fd: i32, fmt: str, start: u32, end: u32)"),
+                    );
+                    return ExecResult::Error;
+                }
+                let ComptimeValue::Str(fmt) = args[1] else {
+                    unreachable!()
+                };
+                let fd = args[0].as_u64() as u32;
+                let start = args[2].as_u64() as u32;
+                let end = args[3].as_u64() as u32;
+                self.cmds.push(if name == "emitWriteBytes" {
+                    CfnEmitCmd::WriteBytes {
+                        fd,
+                        fmt,
+                        start,
+                        end,
+                    }
+                } else {
+                    CfnEmitCmd::PrintLocal {
+                        fd,
+                        fmt,
+                        start,
+                        end,
+                    }
+                });
+                ExecResult::Continue
+            }
+            "emitPutByte" => {
+                if args.len() != 2 || !args[0].is_int() || !args[1].is_int() {
+                    diags.error(
+                        loc.clone(),
+                        "@emitPutByte expects (fd: i32, byte: u8)".to_string(),
+                    );
+                    return ExecResult::Error;
+                }
+                self.cmds.push(CfnEmitCmd::PutByte {
+                    fd: args[0].as_u64() as u32,
+                    byte: (args[1].as_u64() & 0xff) as u8,
+                });
+                ExecResult::Continue
+            }
+            _ => {
+                diags.error(loc.clone(), format!("unknown @-emit intrinsic `@{name}`"));
+                ExecResult::Error
+            }
+        }
+    }
+}
+
+/// Register + declare a fake `printf` / `exit` extern prototype, once (the C++
+/// astgenAssertCall registers these lazily). Mirrors ensure_dprintf.
+fn ensure_printf(gctx: &mut AstGenCtx) {
+    if gctx.ctx.get_function_ast("printf").is_some() {
+        return;
+    }
+    let u8ptr = gctx.ctx.type_pool.intern_ptr_single(builtin::U8);
+    let mut f = FunctionAST::new(
+        "printf",
+        vec![Param::new("fmt", u8ptr)],
+        builtin::I32,
+        vec![],
+    );
+    f.is_extern = true;
+    f.is_var_args = true;
+    let jfn = astgen_metadata(&f, gctx.ctx);
+    gctx.ctx.register_function_ast("printf", f);
+    let _ = jir_declare_prototype(&jfn, gctx.ctx);
+}
+
+fn ensure_exit(gctx: &mut AstGenCtx) {
+    if gctx.ctx.get_function_ast("exit").is_some() {
+        return;
+    }
+    let mut f = FunctionAST::new(
+        "exit",
+        vec![Param::new("code", builtin::I32)],
+        TypeIdx::NONE,
+        vec![],
+    );
+    f.is_extern = true;
+    let jfn = astgen_metadata(&f, gctx.ctx);
+    gctx.ctx.register_function_ast("exit", f);
+    let _ = jir_declare_prototype(&jfn, gctx.ctx);
+}
+
