@@ -4516,3 +4516,200 @@ fn astgen_indirect_call(
     emit_call(gctx, &method, &arg_refs, dest_ptr)
 }
 
+/// A dotted direct-call callee `prefix.suffix`: enum-variant constructor, a
+/// `Type.method` static call (prefix is a type/alias), or a method on a local
+/// instance (prefix is a variable). Returns `None` when nothing matches (caller
+/// reports the unknown-function error).
+fn astgen_dotted_call(
+    gctx: &mut AstGenCtx,
+    callee: &str,
+    args_extra: u32,
+    arg_count: u32,
+    dest_ptr: JirRef,
+) -> Result<Option<JirRef>, String> {
+    let Some((prefix, suffix)) = callee.rsplit_once('.') else {
+        return Ok(None);
+    };
+    // Multi-dot handle chains (`w.leaf.makePoint`): resolve through the module
+    // namespace re-export chain to the leaf module's free function.
+    if prefix.contains('.') {
+        // The oracle's multi-dot pre-check probes the recv prefix as a Named
+        // (a handle-qualified enum-variant ctor); interning it here keeps the
+        // string pool byte-aligned even when the prefix isn't an enum.
+        let sid = gctx.ctx.string_pool.intern(prefix.as_bytes());
+        let _ = gctx.ctx.type_pool.intern_named(sid);
+        if let Some(method) = gctx.ctx.resolve_chained_function(callee) {
+            // A chained `cfn` (`std.fmt.print(...)`) expands at the call site.
+            if method.is_comp_time_fn {
+                return Ok(Some(astgen_comptime_fn_call(
+                    gctx, &method, args_extra, arg_count,
+                )?));
+            }
+            let arg_refs = lower_call_args(gctx, &method.args, args_extra, arg_count)?;
+            return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
+        }
+        // `a.Counter.init(args)` / `a.Status.Ok(args)`: a handle-qualified struct
+        // method/ctor or enum-variant ctor. Resolve the `handle.Type` prefix to its
+        // module, then dispatch (the C++ multi-dot branch, astgen.cpp:6981).
+        if let Some((handle, type_name)) = prefix.split_once('.')
+            && let Some(module) = gctx.ctx.import_handle_module(handle)
+        {
+            let qual = format!("{module}.{type_name}");
+            if let Some(method) = gctx.ctx.get_function_ast(&format!("{qual}.{suffix}")) {
+                let arg_refs = lower_call_args(gctx, &method.args, args_extra, arg_count)?;
+                return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
+            }
+            let esid = gctx.ctx.string_pool.intern(qual.as_bytes());
+            let enum_named = gctx.ctx.type_pool.intern_named(esid);
+            if let Some(en) = gctx.ctx.enum_name_of(enum_named)
+                && let Some(r) = astgen_enum_variant_ctor(gctx, &en, suffix, args_extra, arg_count)?
+            {
+                return Ok(Some(r));
+            }
+        }
+        return Ok(None);
+    }
+
+    // 1. Prefix as a TYPE: enum-variant ctor / enum static method / struct static.
+    let sid = gctx.ctx.string_pool.intern(prefix.as_bytes());
+    let named = gctx.ctx.type_pool.intern_named(sid);
+    let bm = gctx.ctx.current_body_module();
+    let named = gctx.ctx.requalify_type(named, &bm);
+    if let Some(en) = gctx.ctx.enum_name_of(named) {
+        if let Some(r) = astgen_enum_variant_ctor(gctx, &en, suffix, args_extra, arg_count)? {
+            return Ok(Some(r));
+        }
+        let qualified = format!("{en}.{suffix}");
+        if let Some(method) = gctx.ctx.get_function_ast(&qualified) {
+            let arg_refs = lower_call_args(gctx, &method.args, args_extra, arg_count)?;
+            return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
+        }
+    }
+    if let Some(sn) = gctx.ctx.struct_name_of(named) {
+        let qualified = format!("{sn}.{suffix}");
+        let method = gctx
+            .ctx
+            .get_function_ast(&qualified)
+            .ok_or_else(|| format!("astgen: type `{sn}` has no method `{suffix}`"))?;
+        let arg_refs = lower_call_args(gctx, &method.args, args_extra, arg_count)?;
+        return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
+    }
+
+    // 2. Prefix as an IMPORT HANDLE (`const lib = import("m"); lib.fn()`) -> the
+    // free function `m.fn`.
+    if let Some(module) = gctx.ctx.import_handle_module(prefix)
+        && let Some(method) = gctx.ctx.get_function_ast(&format!("{module}.{suffix}"))
+    {
+        // Privacy: a non-`pub` function reached through a module handle is not
+        // exported (the C++ `formatNamespaceLookupError` privateNames branch,
+        // codegen.cpp:831). `extern`/`export` libc bare names stay accessible.
+        if !method.is_pub && !method.is_extern && !method.is_export {
+            return Err(format!(
+                "symbol `{suffix}` is not exported from module `{module}`"
+            ));
+        }
+        // An import-handle `cfn` (`fmt.print(...)`) expands at the call site.
+        if method.is_comp_time_fn {
+            return Ok(Some(astgen_comptime_fn_call(
+                gctx, &method, args_extra, arg_count,
+            )?));
+        }
+        let arg_refs = lower_call_args(gctx, &method.args, args_extra, arg_count)?;
+        return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
+    }
+
+    // 3. Prefix as a LOCAL instance: dispatch `RecvType.method` with a receiver.
+    let Some(&slot) = gctx.locals.get(prefix) else {
+        return Ok(None);
+    };
+    let inst_ty = gctx
+        .local_types
+        .get(prefix)
+        .copied()
+        .unwrap_or(TypeIdx::NONE);
+    // Array builtin `arr.asPtr()` / `arr.asMutPtr()`: the array's base address,
+    // an i8-stride `IndexAddr` at constant 0 -> `PtrMany(elem)`.
+    if (suffix == "asPtr" || suffix == "asMutPtr")
+        && gctx.ctx.type_pool.get(inst_ty).kind == TypeKind::Array
+    {
+        let elem = TypeIdx::new(gctx.ctx.type_pool.get(inst_ty).a);
+        let zero = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Int,
+                a: 0,
+                ty: builtin::U64,
+                ..Default::default()
+            },
+        );
+        let pm = gctx.ctx.type_pool.intern_ptr_many(elem);
+        return Ok(Some(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::IndexAddr,
+                a: slot,
+                b: zero,
+                ty: pm,
+                ..Default::default()
+            },
+        )));
+    }
+    let _ = gctx.ctx.resolve_generic_call_instantiate(inst_ty)?;
+    // `t.clone()` on a local without a user `cfn clone` -> built-in clone
+    // synthesis (covers structs, arrays, and primitives, which aren't structs);
+    // a user clone returns None here and falls through to ordinary dispatch.
+    if suffix == "clone"
+        && let Some(r) = try_lower_builtin_clone(gctx, slot, NO_JIR_REF, inst_ty)?
+    {
+        return Ok(Some(r));
+    }
+    let Some(recv_name) = gctx.ctx.struct_name_of(inst_ty) else {
+        return Ok(None);
+    };
+    let qualified = format!("{recv_name}.{suffix}");
+    // Not a method — fall through (e.g. a Fn-typed field call via the
+    // fn-pointer fallback). A withdrawn conditional method replays its reason
+    // here rather than falling through to the module-handle fallback's
+    // confusing error (the C++ astgen.cpp:7152).
+    let Some(method) = gctx.ctx.get_function_ast(&qualified) else {
+        if gctx.ctx.get_withdrawn_method(&qualified).is_some() {
+            report_method_miss(gctx, &qualified)?;
+        }
+        return Ok(None);
+    };
+
+    // Receiver from the local slot: ByPointer wraps the slot in an explicit
+    // AddrOf (the oracle's `AddrOf ty=*Recv`); ByValue loads it.
+    let self_mode = method
+        .args
+        .first()
+        .map(|p| p.mode)
+        .unwrap_or(jam_core::param_mode::ParamMode::Let);
+    let recv_arg = if classify_param(self_mode, inst_ty, gctx.ctx)?.kind == ParamAbiKind::ByPointer
+    {
+        let pty = gctx.ctx.type_pool.intern_ptr_single(inst_ty);
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::AddrOf,
+                a: slot,
+                ty: pty,
+                ..Default::default()
+            },
+        )
+    } else {
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: slot,
+                ty: inst_ty,
+                ..Default::default()
+            },
+        )
+    };
+    let mut arg_refs = vec![recv_arg];
+    arg_refs.extend(lower_method_args(gctx, &method, args_extra, arg_count)?);
+    Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?))
+}
+
