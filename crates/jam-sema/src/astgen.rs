@@ -4271,3 +4271,248 @@ fn replay_cfn_emits(gctx: &mut AstGenCtx, emitter: &RecordingCfnEmitter) -> Resu
     Ok(())
 }
 
+/// Lower a call's positional args against `params` (param `i` is `params[i]`),
+/// passing a varargs tail by value. Used by static-method + free-fn-shaped emits.
+fn lower_call_args(
+    gctx: &mut AstGenCtx,
+    params: &[Param],
+    args_extra: u32,
+    arg_count: u32,
+) -> Result<Vec<JirRef>, String> {
+    let mut arg_refs: Vec<JirRef> = Vec::with_capacity(arg_count as usize);
+    for i in 0..arg_count {
+        let arg_idx = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(args_extra + 1 + i)),
+        );
+        if (i as usize) < params.len() {
+            arg_refs.push(lower_arg(gctx, arg_idx, &params[i as usize])?);
+        } else {
+            arg_refs.push(astgen_expr(gctx, arg_idx, TypeIdx::NONE)?);
+        }
+    }
+    Ok(arg_refs)
+}
+
+/// Lower a method call's non-receiver args. Method args are lowered by VALUE
+/// (`astgen_expr`, not `lower_arg`) — the oracle's method-dispatch loads a
+/// `move`/byref arg's value rather than passing its address — with the move's
+/// caller-side drop consumed. Param `1+i` skips the implicit `self`.
+fn lower_method_args(
+    gctx: &mut AstGenCtx,
+    method: &FunctionAST,
+    args_extra: u32,
+    arg_count: u32,
+) -> Result<Vec<JirRef>, String> {
+    let mut out: Vec<JirRef> = Vec::with_capacity(arg_count as usize);
+    for i in 0..arg_count {
+        let arg_idx = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(args_extra + 1 + i)),
+        );
+        let param = method.args.get(i as usize + 1);
+        let expect = param.map(|p| p.ty).unwrap_or(TypeIdx::NONE);
+        // A `move`-mode method arg extracting a drop-bearing field out of an
+        // aggregate is rejected (the C++ rejectDropBearingFieldExtract,
+        // astgen.cpp:6949).
+        if param.map(|p| p.mode) == Some(jam_core::param_mode::ParamMode::Move) {
+            reject_drop_bearing_field_extract(gctx, arg_idx, expect, "move")?;
+        }
+        out.push(astgen_expr(gctx, arg_idx, expect)?);
+        if param.map(|p| p.mode) == Some(jam_core::param_mode::ParamMode::Move) {
+            consume_moved_variable(gctx, arg_idx);
+        }
+    }
+    Ok(out)
+}
+
+/// Lower a `Type.method(args)` (TypeMethodCall) call's args BY VALUE — the oracle's
+/// `astgenTypeMethodCall` lowers each arg with `astgenExpr` regardless of the param
+/// ABI (no spill, no address-of even for a `move`/byref struct), consuming a move
+/// arg's caller-side drop. Like `lower_method_args` but params index from 0 (the
+/// `Type.method` form has no implicit `self`).
+fn lower_type_method_args(
+    gctx: &mut AstGenCtx,
+    method: &FunctionAST,
+    args_extra: u32,
+    arg_count: u32,
+) -> Result<Vec<JirRef>, String> {
+    let mut out: Vec<JirRef> = Vec::with_capacity(arg_count as usize);
+    for i in 0..arg_count {
+        let arg_idx = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(args_extra + 1 + i)),
+        );
+        let param = method.args.get(i as usize);
+        let expect = param.map(|p| p.ty).unwrap_or(TypeIdx::NONE);
+        // A `move`-mode arg extracting a drop-bearing field out of an aggregate is
+        // rejected (the C++ rejectDropBearingFieldExtract, astgen.cpp:7192).
+        if param.map(|p| p.mode) == Some(jam_core::param_mode::ParamMode::Move) {
+            reject_drop_bearing_field_extract(gctx, arg_idx, expect, "move")?;
+        }
+        out.push(astgen_expr(gctx, arg_idx, expect)?);
+        if param.map(|p| p.mode) == Some(jam_core::param_mode::ParamMode::Move) {
+            consume_moved_variable(gctx, arg_idx);
+        }
+    }
+    Ok(out)
+}
+
+/// Materialize a method receiver as call-arg 0. The pass-by-pointer-vs-value
+/// decision is the self param's full ABI (`classify_param`), NOT its bare mode:
+/// a `let self: Self` on a byref aggregate is still ByPointer. `recv_ptr` is a
+/// storage pointer (lvalue / local slot) when available, else `recv_val` holds
+/// the receiver value; exactly one is set.
+fn materialize_receiver(
+    gctx: &mut AstGenCtx,
+    method: &FunctionAST,
+    recv_ty: TypeIdx,
+    recv_ptr: JirRef,
+    recv_val: JirRef,
+) -> Result<JirRef, String> {
+    let self_mode = method
+        .args
+        .first()
+        .map(|p| p.mode)
+        .unwrap_or(jam_core::param_mode::ParamMode::Let);
+    let by_ptr = classify_param(self_mode, recv_ty, gctx.ctx)?.kind == ParamAbiKind::ByPointer;
+    if by_ptr {
+        if recv_ptr != NO_JIR_REF {
+            // The lvalue path already yields a pointer — pass it directly.
+            Ok(recv_ptr)
+        } else {
+            // Non-lvalue receiver: spill to a fresh slot so the callee has a
+            // stable address (byref values are pointers, so this is a memcpy).
+            let slot = emit_alloca_hoisted(
+                gctx,
+                JirInst {
+                    tag: JirTag::Alloca,
+                    ty: recv_ty,
+                    ..Default::default()
+                },
+            );
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Store,
+                    a: slot,
+                    b: recv_val,
+                    ..Default::default()
+                },
+            );
+            Ok(slot)
+        }
+    } else if recv_val != NO_JIR_REF {
+        Ok(recv_val)
+    } else {
+        Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: recv_ptr,
+                ty: recv_ty,
+                ..Default::default()
+            },
+        ))
+    }
+}
+
+/// The `n.flags & 1` indirect/method form `expr.method(args)`: the callee is a
+/// `MemberAccess` node (receiver subexpr + method name); the receiver is lowered
+/// as arg 0 and `RecvType.method` resolved in the function registry.
+fn astgen_indirect_call(
+    gctx: &mut AstGenCtx,
+    n: &AstNode,
+    dest_ptr: JirRef,
+) -> Result<JirRef, String> {
+    let cn = *gctx.ctx.node_store.get(NodeIdx::new(n.lhs));
+    if cn.tag != AstTag::MemberAccess {
+        return Err("astgen: indirect-call callee is not a member access".into());
+    }
+    let recv_expr_idx = NodeIdx::new(cn.lhs);
+    let method_name = str_at(gctx, cn.rhs);
+    let args_extra = n.rhs;
+    let arg_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra));
+
+    // Lvalueable receivers yield a pointer + leaf type without a value Load.
+    let recv_tag = gctx.ctx.node_store.get(recv_expr_idx).tag;
+    let lvalueable = matches!(
+        recv_tag,
+        AstTag::Variable | AstTag::MemberAccess | AstTag::Index | AstTag::Deref
+    );
+    let (recv_ptr, recv_val, recv_ty) = if lvalueable {
+        let (ptr, leaf) = astgen_lvalue(gctx, recv_expr_idx)?;
+        (ptr, NO_JIR_REF, leaf)
+    } else {
+        let v = astgen_expr(gctx, recv_expr_idx, TypeIdx::NONE)?;
+        let ty = gctx.jfn.get_inst(v).ty;
+        (NO_JIR_REF, v, ty)
+    };
+
+    // Instantiate a generic receiver, then resolve its struct/enum name.
+    let _ = gctx.ctx.resolve_generic_call_instantiate(recv_ty)?;
+    // Built-in `recv.clone()`: tier 1 (plain data -> the value), tier 2 (struct
+    // glue), or an error tier (owns-resources). A user `cfn clone` returns None
+    // here -> ordinary method dispatch below.
+    if method_name == "clone"
+        && let Some(r) = try_lower_builtin_clone(gctx, recv_ptr, recv_val, recv_ty)?
+    {
+        return Ok(r);
+    }
+    // Array builtin `recv.asPtr()` / `recv.asMutPtr()` on a field / index / deref
+    // array lvalue (`self.buf.asMutPtr()`): the array's base address — an
+    // `IndexAddr` at 0 -> `PtrMany(elem)`. Mirrors the C++ handling of any
+    // lvalueable receiver (astgen.cpp:6788-6827); the local-Variable form is
+    // handled in the prefix dispatch.
+    if (method_name == "asPtr" || method_name == "asMutPtr")
+        && recv_ptr != NO_JIR_REF
+        && gctx.ctx.type_pool.get(recv_ty).kind == TypeKind::Array
+    {
+        let elem = TypeIdx::new(gctx.ctx.type_pool.get(recv_ty).a);
+        let pm = gctx.ctx.type_pool.intern_ptr_many(elem);
+        let zero = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Int,
+                a: 0,
+                ty: builtin::U64,
+                ..Default::default()
+            },
+        );
+        return Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::IndexAddr,
+                a: recv_ptr,
+                b: zero,
+                ty: pm,
+                ..Default::default()
+            },
+        ));
+    }
+    let recv_name = match gctx
+        .ctx
+        .struct_name_of(recv_ty)
+        .or_else(|| gctx.ctx.enum_name_of(recv_ty))
+    {
+        Some(n) => n,
+        None => {
+            return Err(format!(
+                "astgen: receiver of `.{method_name}` is not a struct/enum"
+            ));
+        }
+    };
+    let qualified = format!("{recv_name}.{method_name}");
+    let Some(method) = gctx.ctx.get_function_ast(&qualified) else {
+        return report_method_miss(gctx, &qualified);
+    };
+
+    let recv_arg = materialize_receiver(gctx, &method, recv_ty, recv_ptr, recv_val)?;
+    let mut arg_refs = vec![recv_arg];
+    arg_refs.extend(lower_method_args(gctx, &method, args_extra, arg_count)?);
+    emit_call(gctx, &method, &arg_refs, dest_ptr)
+}
+
