@@ -7468,3 +7468,239 @@ fn astgen_if(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     Ok(())
 }
 
+/// Lower a `while (cond) { body }` loop: cond/body/exit blocks, branch into
+/// cond, conditional branch into body or exit, fall the body back to cond.
+fn astgen_while(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
+    let cond_idx = NodeIdx::new(n.lhs);
+    let extra = n.rhs;
+    let body_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra));
+
+    let cond_b = gctx.jfn.push_block("loopcond");
+    let body_b = gctx.jfn.push_block("loopbody");
+    let exit_b = gctx.jfn.push_block("loopexit");
+
+    emit_br(gctx, cond_b);
+    gctx.current_block = cond_b;
+    let cond_ref = astgen_expr(gctx, cond_idx, builtin::BOOL)?;
+    emit_cond_br(gctx, cond_ref, body_b, exit_b);
+
+    gctx.current_block = body_b;
+    push_drop_scope(gctx);
+    let body_scope_idx = gctx.drop_scopes.len() - 1;
+    gctx.loop_stack.push(LoopFrame {
+        continue_block: cond_b,
+        break_block: exit_b,
+        body_scope_idx,
+    });
+    gctx.runtime_cond_depth += 1;
+    for i in 0..body_count {
+        let s = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 1 + i)));
+        astgen_expr(gctx, s, TypeIdx::NONE)?;
+    }
+    gctx.runtime_cond_depth -= 1;
+    pop_drop_scope_emitting(gctx);
+    if !block_has_terminator(gctx) {
+        emit_br(gctx, cond_b);
+    }
+    gctx.loop_stack.pop();
+
+    gctx.current_block = exit_b;
+    Ok(())
+}
+
+/// Lower `for x in start..end { body }`. Desugars to an explicit induction
+/// variable looped while `x < end`, incremented in a dedicated step block (so
+/// `continue` re-runs the step before re-testing). Extra layout `[varName,
+/// start, end, bodyCount, body..]`. A bare-`Variable` end bound lends its
+/// declared type as the start's expected hint so the induction var adopts the
+/// bound's exact width and signedness; otherwise the narrower side of the
+/// comparison is widened (sext/zext).
+fn astgen_for(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
+    let extra = n.lhs;
+    let var_name_id = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra));
+    let start_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 1)));
+    let end_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 2)));
+    let body_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 3));
+    let var_name = str_at(gctx, var_name_id);
+
+    let mut start_hint = TypeIdx::NONE;
+    {
+        let en = *gctx.ctx.node_store.get(end_idx);
+        if en.tag == AstTag::Variable {
+            let end_name = str_at(gctx, en.lhs);
+            if let Some(&t) = gctx.local_types.get(&end_name) {
+                start_hint = t;
+            }
+        }
+    }
+    let start_ref = astgen_expr(gctx, start_idx, start_hint)?;
+    let idx_ty = gctx.jfn.get_inst(start_ref).ty;
+
+    let slot = emit_alloca_hoisted(
+        gctx,
+        JirInst {
+            tag: JirTag::Alloca,
+            ty: idx_ty,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: slot,
+            b: start_ref,
+            ..Default::default()
+        },
+    );
+    gctx.locals.insert(var_name.clone(), slot);
+    gctx.local_types.insert(var_name.clone(), idx_ty);
+
+    let cond_b = gctx.jfn.push_block("forcond");
+    let body_b = gctx.jfn.push_block("forbody");
+    let step_b = gctx.jfn.push_block("forstep");
+    let exit_b = gctx.jfn.push_block("forexit");
+    emit_br(gctx, cond_b);
+
+    gctx.current_block = cond_b;
+    let mut load_idx = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: idx_ty,
+            ..Default::default()
+        },
+    );
+    let mut end_ref = astgen_expr(gctx, end_idx, idx_ty)?;
+    let (ik_kind, ik_width, ik_signed) = {
+        let ik = gctx.ctx.type_pool.get(idx_ty);
+        (ik.kind, ik.a, ik.kind == TypeKind::Int && ik.b != 0)
+    };
+    let end_ty = gctx.jfn.get_inst(end_ref).ty;
+    if end_ty != idx_ty {
+        let (ek_kind, ek_width, ek_signed_bit) = {
+            let ek = gctx.ctx.type_pool.get(end_ty);
+            (ek.kind, ek.a, ek.b)
+        };
+        // Same width-class (signedness bit) but different width: widen the
+        // narrower side. Otherwise the bounds are genuinely incompatible.
+        let ik_signed_bit = if ik_signed { 1 } else { 0 };
+        if ik_kind == TypeKind::Int && ek_kind == TypeKind::Int && ik_signed_bit == ek_signed_bit {
+            let tag = if ik_signed {
+                JirTag::SExt
+            } else {
+                JirTag::ZExt
+            };
+            if ik_width > ek_width {
+                end_ref = emit(
+                    gctx,
+                    JirInst {
+                        tag,
+                        a: end_ref,
+                        ty: idx_ty,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                load_idx = emit(
+                    gctx,
+                    JirInst {
+                        tag,
+                        a: load_idx,
+                        ty: end_ty,
+                        ..Default::default()
+                    },
+                );
+            }
+        } else {
+            return Err("for-range bounds have mismatched types; cast one side \
+                        with `as` so both bounds agree"
+                .into());
+        }
+    }
+    let cmp_tag = if ik_signed {
+        JirTag::ICmpSlt
+    } else {
+        JirTag::ICmpUlt
+    };
+    let cmp_ref = emit(
+        gctx,
+        JirInst {
+            tag: cmp_tag,
+            a: load_idx,
+            b: end_ref,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    );
+    emit_cond_br(gctx, cmp_ref, body_b, exit_b);
+
+    // Body — `continue` jumps to the step block, `break` to exit.
+    gctx.current_block = body_b;
+    push_drop_scope(gctx);
+    let body_scope_idx = gctx.drop_scopes.len() - 1;
+    gctx.loop_stack.push(LoopFrame {
+        continue_block: step_b,
+        break_block: exit_b,
+        body_scope_idx,
+    });
+    gctx.runtime_cond_depth += 1;
+    for i in 0..body_count {
+        let s = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 4 + i)));
+        astgen_expr(gctx, s, TypeIdx::NONE)?;
+    }
+    gctx.runtime_cond_depth -= 1;
+    pop_drop_scope_emitting(gctx);
+    if !block_has_terminator(gctx) {
+        emit_br(gctx, step_b);
+    }
+    gctx.loop_stack.pop();
+
+    // Step: x = x + 1; br cond.
+    gctx.current_block = step_b;
+    let cur = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: idx_ty,
+            ..Default::default()
+        },
+    );
+    let one_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: 1,
+            ty: idx_ty,
+            ..Default::default()
+        },
+    );
+    let next = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Add,
+            a: cur,
+            b: one_ref,
+            ty: idx_ty,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: slot,
+            b: next,
+            ..Default::default()
+        },
+    );
+    emit_br(gctx, cond_b);
+
+    gctx.current_block = exit_b;
+    gctx.locals.remove(&var_name);
+    gctx.local_types.remove(&var_name);
+    Ok(())
+}
+
