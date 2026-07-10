@@ -8012,3 +8012,113 @@ pub fn astgen_function(
     Ok(jfn)
 }
 
+/// Pass-2 of generic instantiation (wired into `CodegenContext` via
+/// `set_method_instantiator`): lower each instantiated method's body under the
+/// active substitution so call-site method names + recursive sub-instantiations
+/// intern in the oracle's order. Bodies are NOT dumped — they run purely for the
+/// string-pool side effects. A conditional method (everything but `drop`) whose
+/// body fails to compile for these type args is WITHDRAWN (the C++ `withdraw`);
+/// strings its partial lowering already interned survive, matching the oracle.
+pub fn instantiate_methods(
+    ctx: &CodegenContext,
+    clones: &[FunctionAST],
+    body_subst: &std::collections::HashMap<String, TypeIdx>,
+) -> Result<(), String> {
+    ctx.push_subst(body_subst.clone());
+    // Pass-1: JIR metadata + LLVM prototype for every method (the C++ two-pass —
+    // all prototypes declared before any body so cross-method LLVM calls in
+    // Pass-2 resolve). jir_declare_prototype does not touch the string pool, so
+    // the --emit-jir dump is unaffected.
+    let mut built: Vec<(JirFunction, usize)> = Vec::with_capacity(clones.len());
+    for (i, clone) in clones.iter().enumerate() {
+        if clone.is_extern {
+            continue;
+        }
+        let jfn = astgen_metadata(clone, ctx);
+        let _ = jir_declare_prototype(&jfn, ctx);
+        built.push((jfn, i));
+    }
+    // Pass-2: JIR body + LLVM body. A non-`drop` method whose body fails to lower
+    // is the C++ conditional WITHDRAWAL; until clone-synthesis + nested-generic
+    // intern order are byte-exact, DEFER the whole instantiation on the first
+    // such method rather than ship a divergence. The instantiated LLVM body
+    // (jir_define_body) is what makes `--emit-ir` carry the method definitions;
+    // it's a no-op on the --emit-jir text dump.
+    // Withdraw-and-continue (the faithful C++ behavior): a non-`drop` method whose
+    // body fails to lower is a CONDITIONAL WITHDRAWAL — drop it from the registry
+    // and keep going; the rest of the instantiation still succeeds.
+    for (jfn, i) in &mut built {
+        let clone = &clones[*i];
+        let is_drop = clone.name.ends_with(".drop");
+        // The recorded reason is the bare diagnostic message (the C++ takes
+        // `diagnostics()[diagMark].message`), so strip the `file:line: error: `
+        // anchor a propagated astgen error carries.
+        let bare_reason = |e: &str| -> String {
+            match e.split_once(": error: ") {
+                Some((_, msg)) => msg.to_string(),
+                None => e.to_string(),
+            }
+        };
+        // (1) Body that fails to lower for these type args is a CONDITIONAL
+        // WITHDRAWAL (the C++ `withdraw`): drop it from the registry, record
+        // the reason for call-site replay, skip its body, keep going.
+        if let Err(e) = astgen_body_into(jfn, clone, ctx)
+            && !is_drop
+        {
+            ctx.unregister_function_ast(&clone.name);
+            ctx.record_withdrawn_method(&clone.name, bare_reason(&e));
+            continue;
+        }
+        // (2) Move/ownership WITHDRAWAL: even when the body lowers, a non-`drop`
+        // method whose move-analysis reports a diagnostic under these
+        // (substituted) type args is withdrawn to a bare `declare` — exactly the
+        // oracle's `init_analysis` -> `withdraw` for e.g. `Vec(T).filled`, which
+        // moves a by-value drop-bearing parameter in a loop. The subst pushed
+        // above is active, so a body-local `Self`/`Vec(T)` type resolves to its
+        // drop-bearing monomorph here.
+        if !is_drop {
+            let adiags = crate::init_analysis::analyze(clone, ctx);
+            if let Some(first) = adiags.first() {
+                ctx.unregister_function_ast(&clone.name);
+                ctx.record_withdrawn_method(&clone.name, first.message.clone());
+                continue;
+            }
+        }
+        // (3) Structural JIR verification (the C++ verifyJirFunction at
+        // instantiation, codegen.cpp:1846-1864): a malformed instantiated body
+        // (bad dispatch, missing terminator, OOB ref, cross-block use-before-def)
+        // is withdrawn for non-`drop` methods, the same as a move-analysis
+        // failure. The resolver resolves the clone's GenericCall / ArrayExpr type
+        // refs against the active substitution.
+        let resolver = |t: TypeIdx| -> TypeIdx {
+            let k = ctx.type_pool.get(t);
+            if k.kind == TypeKind::GenericCall {
+                let r = ctx.resolve_generic_call(t);
+                if !r.is_none() {
+                    return r;
+                }
+            }
+            if k.kind == TypeKind::ArrayExpr {
+                return ctx.resolve_array_expr(t);
+            }
+            t
+        };
+        let vdiags = crate::jir_verify::verify_jir_function(
+            jfn,
+            Some(&ctx.type_pool),
+            Some(&ctx.string_pool),
+            Some(&resolver),
+        );
+        if let Some(first) = vdiags.first()
+            && !is_drop
+        {
+            ctx.unregister_function_ast(&clone.name);
+            ctx.record_withdrawn_method(&clone.name, first.message.clone());
+            continue;
+        }
+        let _ = jir_define_body(jfn, ctx);
+    }
+    ctx.pop_subst();
+    Ok(())
+}
+
