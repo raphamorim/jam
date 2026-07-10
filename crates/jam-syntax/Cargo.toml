@@ -1,0 +1,16 @@
+[package]
+name = "jam_syntax"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Jam compiler frontend: token, lexer (number_literal, ast, parser to follow)"
+
+[lib]
+name = "jam_syntax"
+path = "src/lib.rs"
+
+[dependencies]
+jam_core = { path = "../jam-core" }
+float128 = { path = "../float128" }

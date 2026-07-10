@@ -1,0 +1,14 @@
+[package]
+name = "jam_sema"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Jam semantic analysis: typed JIR, ABI classification, and AstGen"
+
+[dependencies]
+jam_core = { path = "../jam-core" }
+float128 = { path = "../float128" }
+jam_syntax = { path = "../jam-syntax" }
+jam_llvm = { path = "../jam-llvm" }
