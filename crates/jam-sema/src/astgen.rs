@@ -7704,3 +7704,92 @@ fn astgen_for(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     Ok(())
 }
 
+/// Lower `break` — drop everything down through the loop body's scope, then
+/// branch to the loop's exit block.
+fn astgen_break(gctx: &mut AstGenCtx) -> Result<(), String> {
+    let frame = gctx
+        .loop_stack
+        .last()
+        .ok_or_else(|| "astgen: `break` outside of loop".to_string())?;
+    let (target, body_scope_idx) = (frame.break_block, frame.body_scope_idx);
+    emit_drops_through_scope(gctx, body_scope_idx);
+    emit_br(gctx, target);
+    Ok(())
+}
+
+/// Lower `continue` — drop through the loop body's scope, then branch to the
+/// loop's continue (cond/step) block.
+fn astgen_continue(gctx: &mut AstGenCtx) -> Result<(), String> {
+    let frame = gctx
+        .loop_stack
+        .last()
+        .ok_or_else(|| "astgen: `continue` outside of loop".to_string())?;
+    let (target, body_scope_idx) = (frame.continue_block, frame.body_scope_idx);
+    emit_drops_through_scope(gctx, body_scope_idx);
+    emit_br(gctx, target);
+    Ok(())
+}
+
+/// Count the predecessors of `target`: blocks (other than `target`) whose
+/// terminator branches to it. Used by the function-end fall-through check — a
+/// non-entry block with zero predecessors is unreachable, so the "non-void
+/// function falls through" diagnostic must not fire for it.
+fn predecessor_count(jfn: &JirFunction, target: JirBlockRef) -> usize {
+    let mut count = 0;
+    for b in 1..jfn.blocks.len() as JirBlockRef {
+        if b == target {
+            continue;
+        }
+        let Some(&last_ref) = jfn.blocks[b as usize].insts.last() else {
+            continue;
+        };
+        let last = *jfn.get_inst(last_ref);
+        match last.tag {
+            JirTag::Br => {
+                if last.a == target {
+                    count += 1;
+                }
+            }
+            JirTag::CondBr => {
+                let ex = last.b;
+                if (ex as usize) + 2 <= jfn.extra.len() {
+                    if jfn.get_extra(ex) == target {
+                        count += 1;
+                    }
+                    if jfn.get_extra(ex + 1) == target {
+                        count += 1;
+                    }
+                }
+            }
+            JirTag::Switch => {
+                let ex = last.b;
+                if (ex as usize) + 2 > jfn.extra.len() {
+                    continue;
+                }
+                if jfn.get_extra(ex) == target {
+                    count += 1;
+                }
+                let case_count = jfn.get_extra(ex + 1);
+                for i in 0..case_count {
+                    let case_slot = ex + 2 + i * 4 + 3;
+                    if (case_slot as usize) < jfn.extra.len() && jfn.get_extra(case_slot) == target
+                    {
+                        count += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
+fn block_has_terminator(gctx: &AstGenCtx) -> bool {
+    gctx.jfn
+        .get_block(gctx.current_block)
+        .insts
+        .last()
+        .map(|&r| gctx.jfn.get_inst(r).tag.is_terminator())
+        .unwrap_or(false)
+}
+
