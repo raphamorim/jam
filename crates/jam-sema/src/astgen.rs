@@ -8122,3 +8122,624 @@ pub fn instantiate_methods(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jir_codegen::{jir_declare_prototype, jir_define_body};
+    use crate::jir_verify::verify_jir_function;
+    use jam_llvm::Context;
+    use jam_syntax::lexer::Lexer;
+    use jam_syntax::parser::Parser;
+
+    /// Parse `src`, astgen its first function, run jir_verify, then lower it to
+    /// LLVM IR through jir_codegen and confirm the function verifies — the full
+    /// source → tokens → AST → JIR → LLVM-IR pipeline end to end.
+    fn lower_first_fn(src: &str) {
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+
+        // Parse into the context's pools so the function's body NodeIdxs index
+        // the same NodeStore astgen reads.
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        assert!(!module.functions.is_empty(), "no functions parsed");
+
+        // astgen the first function, then verify + lower.
+        let jfn = {
+            let func = &module.functions[0];
+            astgen_function(func, &mut cg).expect("astgen")
+        };
+        let diags = verify_jir_function(&jfn, Some(&cg.type_pool), Some(&cg.string_pool), None);
+        assert!(diags.is_empty(), "jir_verify: {diags:?}");
+
+        jir_declare_prototype(&jfn, &cg).expect("prototype");
+        jir_define_body(&jfn, &cg).expect("define body");
+        let f = cg.module().get_function(&jfn.name).unwrap();
+        assert!(f.verify(), "LLVM verify failed for `{}`", jfn.name);
+    }
+
+    #[test]
+    fn end_to_end_constant_arithmetic() {
+        lower_first_fn("fn five() i32 { return 2 + 3; }");
+    }
+
+    #[test]
+    fn end_to_end_params_and_binop() {
+        lower_first_fn("fn add(a: i32, b: i32) i32 { return a + b; }");
+    }
+
+    #[test]
+    fn end_to_end_comparison_returns_bool() {
+        lower_first_fn("fn lt(a: i32, b: i32) bool { return a < b; }");
+    }
+
+    #[test]
+    fn end_to_end_var_decl_declared() {
+        lower_first_fn("fn f() i32 { var x: i32 = 5; return x + 1; }");
+    }
+
+    #[test]
+    fn end_to_end_var_decl_inferred() {
+        lower_first_fn("fn g(a: i32) i32 { var y = a + 3; return y; }");
+    }
+
+    #[test]
+    fn end_to_end_assign_to_local() {
+        lower_first_fn("fn h() i32 { var x: i32 = 1; x = x + 2; return x; }");
+    }
+
+    #[test]
+    fn end_to_end_assign_to_mut_param() {
+        lower_first_fn("fn k(a: mut i32) i32 { a = a + 5; return a; }");
+    }
+
+    #[test]
+    fn end_to_end_if_else() {
+        lower_first_fn("fn mx(a: i32, b: i32) i32 { if (a > b) { return a; } else { return b; } }");
+    }
+
+    #[test]
+    fn end_to_end_if_no_else_falls_through() {
+        lower_first_fn("fn clampLow(a: mut i32) i32 { if (a < 0) { a = 0; } return a; }");
+    }
+
+    #[test]
+    fn end_to_end_while_loop() {
+        lower_first_fn(
+            "fn sumTo(n: i32) i32 { var i: i32 = 0; var s: i32 = 0; \
+             while (i < n) { s = s + i; i = i + 1; } return s; }",
+        );
+    }
+
+    #[test]
+    fn end_to_end_while_with_break_continue() {
+        lower_first_fn(
+            "fn f(n: i32) i32 { var i: i32 = 0; \
+             while (i < n) { i = i + 1; if (i > 5) { break; } continue; } return i; }",
+        );
+    }
+
+    #[test]
+    fn end_to_end_for_range() {
+        lower_first_fn(
+            "fn sumRange(n: i32) i32 { var s: i32 = 0; for i in 0:n { s = s + i; } return s; }",
+        );
+    }
+
+    #[test]
+    fn end_to_end_for_with_break() {
+        lower_first_fn(
+            "fn firstHit(n: i32) i32 { var r: i32 = 0; \
+             for i in 0:n { if (i > 3) { r = i; break; } } return r; }",
+        );
+    }
+
+    #[test]
+    fn end_to_end_unary_neg() {
+        lower_first_fn("fn neg(a: i32) i32 { return -a; }");
+    }
+
+    #[test]
+    fn end_to_end_unary_not() {
+        lower_first_fn("fn no(a: bool) bool { return !a; }");
+    }
+
+    #[test]
+    fn end_to_end_unary_bitnot() {
+        lower_first_fn("fn flip(a: u32) u32 { return ~a; }");
+    }
+
+    #[test]
+    fn end_to_end_cast_int_widen() {
+        lower_first_fn("fn widen(a: i32) i64 { return a as i64; }");
+    }
+
+    #[test]
+    fn end_to_end_cast_int_to_float() {
+        lower_first_fn("fn toF(a: i32) f64 { return a as f64; }");
+    }
+
+    #[test]
+    fn end_to_end_cast_float_trunc() {
+        lower_first_fn("fn narrow(a: f64) f32 { return a as f32; }");
+    }
+
+    /// Parse `src` and astgen its first function (no LLVM lowering) — for
+    /// asserting astgen-level diagnostics.
+    fn astgen_first_fn(src: &str) -> Result<(), String> {
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        astgen_function(&module.functions[0], &mut cg).map(|_| ())
+    }
+
+    /// Returned-value vs declared-return-type reconciliation (deliberate
+    /// divergence from the C++ oracle, which has no check and emits
+    /// LLVM-invalid `ret i8` from an i32 function for the inferred-literal
+    /// case): lossless narrower ints widen, lossy mismatches error.
+    #[test]
+    fn return_type_mismatch_widens_or_rejects() {
+        // `var x = 1` infers u8 (smallest fit); returning it at i32 now
+        // ZExt-widens and produces verifiable IR (the original bug shape).
+        lower_first_fn("fn f() i32 { var x = 1; return x; }");
+        // Signed widens into wider signed.
+        lower_first_fn("fn f2() i64 { var x: i32 = 1; return x; }");
+        // Declared at the return width / hinted literal / explicit cast: fine.
+        lower_first_fn("fn f3() i32 { var x: i32 = 1; return x; }");
+        lower_first_fn("fn g() u8 { return 200; }");
+        lower_first_fn("fn h() i64 { var x: i32 = 1; return x as i64; }");
+
+        // Narrowing is lossy: hard error.
+        let err = astgen_first_fn("fn n() u8 { var x: i32 = 300; return x; }").unwrap_err();
+        assert!(
+            err.contains("return value type does not match the declared return type of `n`"),
+            "unexpected error: {err}"
+        );
+        // Signed into wider UNSIGNED is lossy (negatives): hard error.
+        let err = astgen_first_fn("fn s() u32 { var x: i8 = 1; return x; }").unwrap_err();
+        assert!(
+            err.contains("return value type does not match the declared return type of `s`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Same-scope redeclaration is rejected; inner-block shadowing, sibling
+    /// blocks reusing a name, and param shadowing stay legal (the C++
+    /// `localScopes` check, astgen.cpp:1149).
+    #[test]
+    fn same_scope_redeclaration_rejected() {
+        let err = astgen_first_fn("fn f() { const a = 1; var a = 2; }").unwrap_err();
+        assert!(
+            err.contains("redeclaration of `a` in the same scope"),
+            "unexpected error: {err}"
+        );
+
+        // A comp binding occupies the scope's name too.
+        let err = astgen_first_fn("fn f() { comp const N = 1; var N = 2; }").unwrap_err();
+        assert!(
+            err.contains("redeclaration of `N` in the same scope"),
+            "unexpected error: {err}"
+        );
+
+        // Inner-block shadowing is intentional and allowed.
+        lower_first_fn(
+            "fn f(c: bool) i32 { var x: i32 = 1; if (c) { var x: i32 = 2; x = x + 1; } return x; }",
+        );
+
+        // Sibling blocks at the same level each get a fresh frame.
+        lower_first_fn(
+            "fn g(c: bool) i32 { if (c) { const op: i32 = 1; } if (c) { const op: i32 = 2; } return 0; }",
+        );
+
+        // Params are not in the decl frame — shadowing one is allowed.
+        lower_first_fn("fn h(a: i32) i32 { var a: i32 = 2; return a; }");
+    }
+
+    /// The comp-binding assignment rules (the C++ astgenAssign comp path,
+    /// astgen.cpp:1510-1565): const-ness, runtime-conditional depth, kind
+    /// stability, and int width/signedness fit.
+    #[test]
+    fn comp_binding_assignment_rules() {
+        // Legal reassignment at the declaration depth lowers end to end.
+        lower_first_fn("fn f() i32 { comp var N = 1; N = N + 2; return N; }");
+
+        let err = astgen_first_fn("fn f() { comp const N = 1; N = 2; }").unwrap_err();
+        assert!(
+            err.contains("cannot assign to comp const `N`"),
+            "unexpected error: {err}"
+        );
+
+        let err = astgen_first_fn("fn f(c: bool) { comp var N = 1; if (c) { N = 2; } }")
+            .unwrap_err();
+        assert!(
+            err.contains(
+                "cannot assign to comp binding `N` from inside runtime conditional \
+                 control flow — a comp value cannot depend on a runtime branch"
+            ),
+            "unexpected error: {err}"
+        );
+
+        let err = astgen_first_fn("fn f() { comp var N = 1; N = \"s\"; }").unwrap_err();
+        assert!(
+            err.contains("comp assignment changes the kind of `N` (e.g. int -> str)"),
+            "unexpected error: {err}"
+        );
+
+        let err = astgen_first_fn("fn f() { comp var N: u8 = 1; N = 300; }").unwrap_err();
+        assert!(
+            err.contains("comp assignment value 300 does not fit `N` (u8)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `materialize_comptime_value` chases the expected type through alias /
+    /// generic links (the C++ resolveScalarExpected at astgen.cpp:794): a comp
+    /// value flowing into an alias-typed slot gets the alias target's width and
+    /// fit-check, not a pass-through at its natural width.
+    #[test]
+    fn comp_value_into_alias_typed_slot_resolves_and_fit_checks() {
+        let astgen_with_byte_alias = |src: &str| {
+            let owner = Context::new();
+            let mut cg = CodegenContext::new(&owner, "m");
+            let module = {
+                let mut lexer = Lexer::new(src.as_bytes().to_vec());
+                lexer.scan_tokens().expect("lex");
+                let tokens = lexer.tokens().to_vec();
+                let mut diags = jam_core::diag::Diagnostics::new();
+                let mut parser = Parser::new(
+                    tokens,
+                    src.as_bytes().to_vec(),
+                    &mut cg.type_pool,
+                    &mut cg.string_pool,
+                    &mut cg.node_store,
+                    &mut diags,
+                    "test.jam",
+                );
+                let m = parser.parse().expect("parse");
+                assert!(!diags.has_errors(), "parse errors");
+                m
+            };
+            let byte = cg.type_pool.intern_int(8, false);
+            cg.register_type_alias("Byte", byte);
+            astgen_function(&module.functions[0], &mut cg).map(|_| ())
+        };
+
+        // 5 fits u8: materializes at the alias target's width, so the
+        // declared-type check (which resolves both sides) passes.
+        astgen_with_byte_alias("fn f() { comp const N = 5; var x: Byte = N; }")
+            .expect("fitting comp value through alias");
+
+        // 300 does not fit u8: the fit-check must fire against the resolved
+        // alias target, not silently materialize at the natural width.
+        let err = astgen_with_byte_alias("fn g() { comp const N = 300; var x: Byte = N; }")
+            .expect_err("misfit comp value through alias");
+        assert!(
+            err.contains("does not fit the expected u8"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Parse a multi-function module, register every function (so calls
+    /// resolve), then astgen + verify + declare every prototype, and finally
+    /// define + LLVM-verify every body (prototypes must all exist before any
+    /// body so cross-function `Call`s find their callee).
+    fn lower_all_fns(src: &str) {
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        for f in &module.functions {
+            cg.register_function_ast(f.name.clone(), f.clone());
+        }
+        let mut jfns = Vec::new();
+        for func in &module.functions {
+            let mut jfn = astgen_function(func, &mut cg).expect("astgen");
+            jfn.name = mangled_function_name(func, &cg.type_pool, &cg.string_pool);
+            let diags = verify_jir_function(&jfn, Some(&cg.type_pool), Some(&cg.string_pool), None);
+            assert!(diags.is_empty(), "jir_verify `{}`: {diags:?}", jfn.name);
+            jir_declare_prototype(&jfn, &cg).expect("prototype");
+            jfns.push(jfn);
+        }
+        for jfn in &jfns {
+            jir_define_body(jfn, &cg).expect("define body");
+            let f = cg.module().get_function(&jfn.name).unwrap();
+            assert!(f.verify(), "LLVM verify failed for `{}`", jfn.name);
+        }
+    }
+
+    #[test]
+    fn end_to_end_direct_call() {
+        lower_all_fns(
+            "fn add(a: i32, b: i32) i32 { return a + b; } \
+             fn double(x: i32) i32 { return add(x, x); }",
+        );
+    }
+
+    #[test]
+    fn end_to_end_nested_calls() {
+        lower_all_fns(
+            "fn add(a: i32, b: i32) i32 { return a + b; } \
+             fn chain(a: i32, b: i32, c: i32) i32 { return add(add(a, b), c); }",
+        );
+    }
+
+    #[test]
+    fn end_to_end_call_with_mut_ptr_arg() {
+        lower_all_fns(
+            "fn add(a: i32, b: i32) i32 { return a + b; } \
+             fn bump(n: mut i32) { n = add(n, 1); }",
+        );
+    }
+
+    #[test]
+    fn end_to_end_short_circuit_and() {
+        lower_first_fn("fn band(a: bool, b: bool) bool { return a && b; }");
+    }
+
+    #[test]
+    fn end_to_end_short_circuit_or_mixed() {
+        lower_first_fn("fn either(x: i32) bool { return x < 0 || x > 100; }");
+    }
+
+    #[test]
+    fn end_to_end_string_literal_ptr_decay() {
+        lower_first_fn("fn greeting() *const u8 { return \"hi\"; }");
+    }
+
+    #[test]
+    fn end_to_end_array_literal_return() {
+        lower_first_fn("fn mk() [3]i32 { return [10, 20, 30]; }");
+    }
+
+    #[test]
+    fn end_to_end_array_index() {
+        lower_first_fn("fn idx(a: [4]i32, i: u64) i32 { return a[i]; }");
+    }
+
+    #[test]
+    fn end_to_end_array_repeat_memset() {
+        lower_first_fn("fn zeros() [8]u8 { return [0; 8]; }");
+    }
+
+    #[test]
+    fn end_to_end_array_local_and_assign() {
+        lower_first_fn("fn f() i32 { var a: [3]i32 = [1, 2, 3]; a[0] = 9; return a[0] + a[2]; }");
+    }
+
+    #[test]
+    fn end_to_end_match_int_switch() {
+        lower_first_fn(
+            "fn classify(x: i32) u8 { match (x) { 0 { return 1; } 1 { return 2; } _ { return 0; } } }",
+        );
+    }
+
+    #[test]
+    fn end_to_end_match_range_and_or() {
+        lower_first_fn(
+            "fn band(x: i32) u8 { match (x) { 0 | 1 { return 9; } 2..=10 { return 5; } _ { return 0; } } }",
+        );
+    }
+
+    /// A `move` parameter of a drop-bearing type drops at function exit — the
+    /// body must contain a `DropBinding` to its registered `cfn drop` symbol.
+    #[test]
+    fn drop_binding_emitted_for_move_param() {
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let src = "const T = struct { x: u64 }; fn consume(t: move T) { }";
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        // Register T (named LLVM struct + body) and a (pretend) `cfn drop`.
+        let st = &module.structs[0];
+        let named = cg.context().named_struct(&st.name);
+        cg.register_struct(st.name.clone(), named, st.fields.clone());
+        named.set_body(&[cg.context().i64_type()], false);
+        cg.register_drop_fn(st.name.clone(), "T.drop");
+
+        let consume = &module.functions[0];
+        let jfn = astgen_function(consume, &mut cg).expect("astgen");
+        let drops: Vec<&JirInst> = jfn
+            .insts
+            .iter()
+            .filter(|i| i.tag == JirTag::DropBinding)
+            .collect();
+        assert_eq!(
+            drops.len(),
+            1,
+            "expected exactly one DropBinding for the move param"
+        );
+        // Its `b` operand is the StringIdx of the mangled drop symbol "T.drop".
+        let sym_bytes = cg.string_pool.get(StringIdx::new(drops[0].b));
+        let sym = String::from_utf8_lossy(&sym_bytes);
+        assert_eq!(sym, "T.drop");
+    }
+
+    /// `@emitPutByte` in a cfn replays as `dprintf(fd, "%c", byte)` at the call
+    /// site (the C++ handlePutByte, astgen.cpp:6276).
+    #[test]
+    fn cfn_emit_put_byte_replays_dprintf() {
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let src = "cfn putc(fd: i32, b: u8) { @emitPutByte(fd, b); }\n\
+                   fn f() { putc(1, 65); }";
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        for func in &module.functions {
+            cg.register_function_ast(func.name.clone(), func.clone());
+        }
+        let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+        let jfn = astgen_function(f, &mut cg).expect("astgen");
+
+        // The replay lands: Int 65 at i32 (`%c` expects an int), the "%c"
+        // format literal, and a Call to the lazily-declared dprintf.
+        let dp = cg.string_pool.intern(b"dprintf");
+        assert!(
+            jfn.insts
+                .iter()
+                .any(|i| i.tag == JirTag::Call && i.a == dp.raw()),
+            "expected a dprintf call"
+        );
+        let pc = cg.string_pool.intern(b"%c");
+        assert!(
+            jfn.insts
+                .iter()
+                .any(|i| i.tag == JirTag::Str && i.a == pc.raw()),
+            "expected the \"%c\" format literal"
+        );
+        assert!(
+            jfn.insts
+                .iter()
+                .any(|i| i.tag == JirTag::Int && i.a == 65 && i.ty == builtin::I32),
+            "expected the byte literal widened to i32"
+        );
+
+        // And the body lowers through JIR verify + LLVM.
+        let diags = verify_jir_function(&jfn, Some(&cg.type_pool), Some(&cg.string_pool), None);
+        assert!(diags.is_empty(), "jir_verify: {diags:?}");
+        jir_declare_prototype(&jfn, &cg).expect("prototype");
+        jir_define_body(&jfn, &cg).expect("define body");
+        let lf = cg.module().get_function(&jfn.name).unwrap();
+        assert!(lf.verify(), "LLVM verify failed");
+    }
+
+    /// A conditional method withdrawn for an instantiation replays the recorded
+    /// reason at the call site (the C++ `reportMethodMiss`), both for a dotted
+    /// method call and for the `v[i]` -> `at` index sugar.
+    #[test]
+    fn withdrawn_method_replays_reason_at_call_site() {
+        let run = |src: &str, withdrawn: &str| -> Result<(), String> {
+            let owner = Context::new();
+            let mut cg = CodegenContext::new(&owner, "m");
+            let module = {
+                let mut lexer = Lexer::new(src.as_bytes().to_vec());
+                lexer.scan_tokens().expect("lex");
+                let tokens = lexer.tokens().to_vec();
+                let mut diags = jam_core::diag::Diagnostics::new();
+                let mut parser = Parser::new(
+                    tokens,
+                    src.as_bytes().to_vec(),
+                    &mut cg.type_pool,
+                    &mut cg.string_pool,
+                    &mut cg.node_store,
+                    &mut diags,
+                    "test.jam",
+                );
+                let m = parser.parse().expect("parse");
+                assert!(!diags.has_errors(), "parse errors");
+                m
+            };
+            let st = &module.structs[0];
+            let named = cg.context().named_struct(&st.name);
+            cg.register_struct(st.name.clone(), named, st.fields.clone());
+            named.set_body(&[cg.context().i32_type()], false);
+            cg.record_withdrawn_method(withdrawn, "does not compile for these type arguments");
+            astgen_function(&module.functions[0], &mut cg).map(|_| ())
+        };
+
+        // Dotted method call on a local instance.
+        let err = run(
+            "const T = struct { x: i32 }; fn f(t: T) { t.foo(); }",
+            "T.foo",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(
+                "method `T.foo` is not available for this instantiation — \
+                 does not compile for these type arguments"
+            ),
+            "unexpected error: {err}"
+        );
+
+        // `v[i]` sugar whose `at` was withdrawn.
+        let err = run(
+            "const T = struct { x: i32 }; fn f(v: T) i32 { return v[0]; }",
+            "T.at",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("method `T.at` is not available for this instantiation"),
+            "unexpected error: {err}"
+        );
+    }
+}
