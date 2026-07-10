@@ -723,3 +723,97 @@ pub fn emit_ast(path: &str) -> i32 {
 
 // ---- --emit-jir: byte-exact mirror of the C++ emitJirFunctions dumper -------
 
+/// Print one `JirFunction` in the oracle's `emitJirFunctions` format.
+fn dump_jir_function(o: &mut Vec<u8>, tp: &TypePool, sp: &StringPool, f: &JirFunction) {
+    o.extend_from_slice(b"function ");
+    o.extend_from_slice(f.name.as_bytes());
+    o.extend_from_slice(b" pub=");
+    num(o, f.is_pub as u64);
+    o.extend_from_slice(b" export=");
+    num(o, f.is_export as u64);
+    o.extend_from_slice(b" extern=");
+    num(o, f.is_extern as u64);
+    o.extend_from_slice(b" test=");
+    num(o, f.is_test as u64);
+    o.extend_from_slice(b" varargs=");
+    num(o, f.is_var_args as u64);
+    o.extend_from_slice(b" module=\"");
+    o.extend_from_slice(f.module_path.as_bytes());
+    o.extend_from_slice(b"\"\n");
+
+    o.extend_from_slice(b"  return: ");
+    spell_type(o, tp, sp, f.return_type);
+    o.push(b'\n');
+
+    for (i, pty) in f.param_types.iter().enumerate() {
+        let mode = if i < f.param_modes.len() {
+            param_mode_name(f.param_modes[i])
+        } else {
+            "?"
+        };
+        o.extend_from_slice(b"  param ");
+        num(o, i as u64);
+        o.extend_from_slice(b": ");
+        spell_type(o, tp, sp, *pty);
+        o.push(b' ');
+        o.extend_from_slice(mode.as_bytes());
+        o.push(b'\n');
+    }
+
+    o.extend_from_slice(b"  extra:");
+    for v in &f.extra {
+        o.push(b' ');
+        num(o, *v as u64);
+    }
+    o.push(b'\n');
+
+    for (bi, blk) in f.blocks.iter().enumerate() {
+        o.extend_from_slice(b"  block ");
+        num(o, bi as u64);
+        o.extend_from_slice(b" \"");
+        o.extend_from_slice(blk.name.as_bytes());
+        o.extend_from_slice(b"\":\n");
+        for &r in &blk.insts {
+            let inst = &f.insts[r as usize];
+            o.extend_from_slice(b"    ");
+            num(o, r as u64);
+            o.extend_from_slice(b": ");
+            o.extend_from_slice(inst.tag.name().as_bytes());
+            o.extend_from_slice(b" a=");
+            num(o, inst.a as u64);
+            o.extend_from_slice(b" b=");
+            num(o, inst.b as u64);
+            o.extend_from_slice(b" ty=");
+            spell_type(o, tp, sp, inst.ty);
+            o.extend_from_slice(b" flags=");
+            num(o, inst.flags as u64);
+            // Name-carrying instructions append the referenced string (OOB-safe,
+            // unescaped — matches the oracle's `dumpStr`).
+            match inst.tag {
+                JirTag::Call | JirTag::FnRef | JirTag::Str => {
+                    o.extend_from_slice(b" str=\"");
+                    o.extend_from_slice(&sp.get(StringIdx::new(inst.a)));
+                    o.push(b'"');
+                }
+                JirTag::DropBinding => {
+                    o.extend_from_slice(b" str=\"");
+                    o.extend_from_slice(&sp.get(StringIdx::new(inst.b)));
+                    o.push(b'"');
+                }
+                _ => {}
+            }
+            o.push(b'\n');
+        }
+    }
+}
+
+/// Qualify a type/method name with its owning module (the C++
+/// `qualifyTypeName`): bare for the entry module, `module.name` otherwise.
+fn qualify_type_name(module_path: &str, name: &str) -> String {
+    if module_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{module_path}.{name}")
+    }
+}
+
