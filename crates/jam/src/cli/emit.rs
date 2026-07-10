@@ -1032,3 +1032,157 @@ fn fill_type_bodies<'ctx>(cg: &mut CodegenContext<'ctx>, modules: &[&'ctx Module
     }
 }
 
+/// Lex + parse `path`, lower each non-test, non-generic function to JIR, and
+/// print it in the oracle's `--emit-jir` format. This is the intermediate
+/// AST→JIR differential gate, sitting between `--emit-ast` and `--emit-ir`.
+///
+/// Resolve a const init expression AS A TYPE (the C++ `resolveExprAsType`): a
+/// `Variable` naming a builtin scalar or a user type, or a direct `Call` to a
+/// `type`-returning generic fn -> a `GenericCall`. NONE otherwise. Drives
+/// type-alias-const registration (`const CounterI32 = Counter(i32)`).
+fn resolve_expr_as_type(cg: &mut CodegenContext, expr: NodeIdx) -> TypeIdx {
+    use jam_syntax::ast_flat::builtin;
+    if expr.is_none() {
+        return TypeIdx::NONE;
+    }
+    let n = *cg.node_store.get(expr);
+    match n.tag {
+        AstTag::Variable => {
+            let name =
+                String::from_utf8_lossy(&cg.string_pool.get(StringIdx::new(n.lhs))).into_owned();
+            match name.as_str() {
+                "void" => builtin::VOID,
+                "bool" | "u1" => builtin::BOOL,
+                "u8" => builtin::U8,
+                "i8" => builtin::I8,
+                "u16" => builtin::U16,
+                "i16" => builtin::I16,
+                "u32" => builtin::U32,
+                "i32" => builtin::I32,
+                "u64" => builtin::U64,
+                "i64" => builtin::I64,
+                "f32" => builtin::F32,
+                "f64" => builtin::F64,
+                "type" => builtin::TYPE,
+                "noreturn" => builtin::NORETURN,
+                _ => {
+                    let sid = cg.string_pool.intern(name.as_bytes());
+                    cg.type_pool.intern_named(sid)
+                }
+            }
+        }
+        AstTag::Call => {
+            if n.flags & 1 != 0 {
+                return TypeIdx::NONE;
+            }
+            let callee =
+                String::from_utf8_lossy(&cg.string_pool.get(StringIdx::new(n.lhs))).into_owned();
+            match cg.get_function_ast(&callee) {
+                Some(f) if f.is_generic() && f.return_type == builtin::TYPE => {}
+                _ => return TypeIdx::NONE,
+            }
+            let args_extra = n.rhs;
+            let arg_count = cg.node_store.get_extra(ExtraIdx::new(args_extra));
+            let mut arg_types: Vec<TypeIdx> = Vec::with_capacity(arg_count as usize);
+            for i in 0..arg_count {
+                let arg_idx =
+                    NodeIdx::new(cg.node_store.get_extra(ExtraIdx::new(args_extra + 1 + i)));
+                let at = resolve_expr_as_type(cg, arg_idx);
+                if at.is_none() {
+                    return TypeIdx::NONE;
+                }
+                arg_types.push(at);
+            }
+            let sid = cg.string_pool.intern(callee.as_bytes());
+            cg.type_pool.intern_generic_call(sid, arg_types)
+        }
+        _ => TypeIdx::NONE,
+    }
+}
+
+/// What the driver emits after lowering: the JIR text dump (`--emit-jir`), the
+/// LLVM IR (`--emit-ir`), a linked native executable (`build`), a compile +
+/// run of the program (`jam run`), or a compile + run of the file's test
+/// harness (`jam test <file>`). `Run`/`Test` carry the linker libraries
+/// (`-l<name>`) to pass through to the link step.
+pub enum EmitMode {
+    Jir,
+    Ir,
+    Binary { output: String, libs: Vec<String> },
+    Run { output: String, libs: Vec<String> },
+    Test { output: String, libs: Vec<String> },
+}
+
+/// `-C strip=MODE`: how much to strip from the linked binary (the C++ `JamStrip`).
+/// Applied as linker flags at link time (main.cpp:2620-2631); no effect on the IR.
+#[derive(Copy, Clone, PartialEq, Eq, Default)]
+pub enum Strip {
+    /// Keep everything (`none`/`off`/`false`/`no`).
+    #[default]
+    None,
+    /// Strip DWARF / debug sections only (`debuginfo`).
+    DebugInfo,
+    /// Strip debug + local symbols (`symbols`).
+    Symbols,
+}
+
+impl EmitMode {
+    /// `true` for the test-harness build (`jam test <file>`): skip the user's
+    /// `fn main`, lower `tfn` test functions, and synthesize a harness `main`.
+    fn is_test(&self) -> bool {
+        matches!(self, EmitMode::Test { .. })
+    }
+}
+
+/// The C++ `bindDeclTypes` (Phase 1b, src/main.cpp:364-387): requalify + instantiate
+/// every decl-level GenericCall type (function/method return+params, struct/union
+/// fields, enum payloads) so the monomorph TYPE interns EARLY — at the oracle's
+/// position — while the deferral flag keeps each generic's method bodies stashed
+/// for the later method pre-pass. Each decl resolves in its OWN module's scope.
+fn bind_decl_module(cg: &CodegenContext, m: &ModuleAST, with_fns: bool) {
+    let inst = |ty: TypeIdx, mpath: &str| {
+        cg.push_body_module(mpath.to_string());
+        let q = cg.requalify_type(ty, mpath);
+        let _ = cg.resolve_generic_call_instantiate(q);
+        cg.pop_body_module();
+    };
+    // Function/method SIGNATURE types only run for imported modules: the entry's
+    // own functions resolve lazily during body lowering (see the caller). But the
+    // entry's aggregate TYPES (struct fields, enum payloads, union fields) ARE laid
+    // out here, like the oracle's analyzer, so e.g. an entry enum's `Many(Vec(u64))`
+    // payload requalifies to `std/collections.Vec(u64)` rather than staying bare.
+    if with_fns {
+        for f in &m.functions {
+            inst(f.return_type, &f.module_path);
+            for p in &f.args {
+                inst(p.ty, &f.module_path);
+            }
+        }
+    }
+    for s in &m.structs {
+        for (_, fty) in &s.fields {
+            inst(*fty, &s.module_path);
+        }
+        if with_fns {
+            for meth in &s.methods {
+                inst(meth.return_type, &meth.module_path);
+                for p in &meth.args {
+                    inst(p.ty, &meth.module_path);
+                }
+            }
+        }
+    }
+    for e in &m.enums {
+        for v in &e.variants {
+            for pt in &v.payload_types {
+                inst(*pt, &e.module_path);
+            }
+        }
+    }
+    for u in &m.unions {
+        for (_, fty) in &u.fields {
+            inst(*fty, &u.module_path);
+        }
+    }
+}
+
