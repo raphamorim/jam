@@ -568,3 +568,158 @@ fn dump_function(
     }
 }
 
+/// Lex + parse `path` and print the AST (byte-identical to the C++ oracle).
+pub fn emit_ast(path: &str) -> i32 {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("Could not open file: {path}");
+            return 1;
+        }
+    };
+    let mut lexer = Lexer::new(bytes);
+    if lexer.scan_tokens().is_err() {
+        eprintln!("lex error in {path}");
+        return 1;
+    }
+    let tokens = lexer.tokens().to_vec();
+    let source = lexer.source().to_vec();
+
+    let mut tp = TypePool::new();
+    let mut sp = StringPool::new();
+    let mut ns = NodeStore::new();
+    let mut diags = Diagnostics::new();
+    let module: ModuleAST = {
+        let mut p = Parser::new(tokens, source, &mut tp, &mut sp, &mut ns, &mut diags, path);
+        match p.parse() {
+            Ok(m) => m,
+            Err(_) => {
+                eprint!("{}", diags.render_to_string());
+                return 1;
+            }
+        }
+    };
+
+    let mut o: Vec<u8> = Vec::new();
+    o.extend_from_slice(b"module\n");
+    for imp in &module.imports {
+        o.extend_from_slice(b"  import ");
+        o.extend_from_slice(imp.name.as_bytes());
+        o.extend_from_slice(b" = \"");
+        o.extend_from_slice(imp.path.as_bytes());
+        o.push(b'"');
+        for c in &imp.chain {
+            o.push(b'.');
+            o.extend_from_slice(c.as_bytes());
+        }
+        if imp.is_pub {
+            o.extend_from_slice(b" pub");
+        }
+        o.push(b'\n');
+    }
+    for di in &module.destructuring_imports {
+        o.extend_from_slice(b"  destructuring-import {");
+        for (i, name) in di.names.iter().enumerate() {
+            if i > 0 {
+                o.extend_from_slice(b", ");
+            }
+            o.extend_from_slice(name.as_bytes());
+        }
+        o.extend_from_slice(b"} = \"");
+        o.extend_from_slice(di.path.as_bytes());
+        o.push(b'"');
+        for c in &di.chain {
+            o.push(b'.');
+            o.extend_from_slice(c.as_bytes());
+        }
+        o.push(b'\n');
+    }
+    for s in &module.structs {
+        o.extend_from_slice(b"  struct ");
+        o.extend_from_slice(s.name.as_bytes());
+        if s.is_pub {
+            o.extend_from_slice(b" pub");
+        }
+        o.push(b'\n');
+        for (fname, fty) in &s.fields {
+            o.extend_from_slice(b"    field ");
+            o.extend_from_slice(fname.as_bytes());
+            o.extend_from_slice(b": ");
+            spell_type(&mut o, &tp, &sp, *fty);
+            o.push(b'\n');
+        }
+        for m in &s.methods {
+            dump_function(&mut o, &ns, &tp, &sp, m, 4);
+        }
+    }
+    for u in &module.unions {
+        o.extend_from_slice(b"  union ");
+        o.extend_from_slice(u.name.as_bytes());
+        if u.is_pub {
+            o.extend_from_slice(b" pub");
+        }
+        o.push(b'\n');
+        for (fname, fty) in &u.fields {
+            o.extend_from_slice(b"    field ");
+            o.extend_from_slice(fname.as_bytes());
+            o.extend_from_slice(b": ");
+            spell_type(&mut o, &tp, &sp, *fty);
+            o.push(b'\n');
+        }
+    }
+    for e in &module.enums {
+        o.extend_from_slice(b"  enum ");
+        o.extend_from_slice(e.name.as_bytes());
+        if e.is_pub {
+            o.extend_from_slice(b" pub");
+        }
+        o.push(b'\n');
+        for v in &e.variants {
+            o.extend_from_slice(b"    variant ");
+            o.extend_from_slice(v.name.as_bytes());
+            if !v.payload_types.is_empty() {
+                o.push(b'(');
+                for (i, t) in v.payload_types.iter().enumerate() {
+                    if i > 0 {
+                        o.extend_from_slice(b", ");
+                    }
+                    spell_type(&mut o, &tp, &sp, *t);
+                }
+                o.push(b')');
+            }
+            o.extend_from_slice(b" = ");
+            num(&mut o, v.discriminant as u64);
+            o.push(b'\n');
+        }
+    }
+    for c in &module.consts {
+        o.extend_from_slice(b"  const ");
+        o.extend_from_slice(c.name.as_bytes());
+        o.extend_from_slice(b": ");
+        spell_type(&mut o, &tp, &sp, c.declared_type);
+        if c.is_pub {
+            o.extend_from_slice(b" pub");
+        }
+        if c.is_comp {
+            o.extend_from_slice(b" comp");
+        }
+        if c.aliased_type != TypeIdx::NONE {
+            o.extend_from_slice(b" alias=");
+            spell_type(&mut o, &tp, &sp, c.aliased_type);
+        }
+        o.push(b'\n');
+        dump_child(&mut o, &ns, &tp, &sp, c.init_expr.raw(), 4);
+    }
+    for f in &module.functions {
+        dump_function(&mut o, &ns, &tp, &sp, f, 2);
+    }
+
+    let stdout = io::stdout();
+    let mut w = stdout.lock();
+    let _ = w.write_all(&o);
+    let _ = w.flush();
+    0
+}
+
+// ---- --emit-jir: byte-exact mirror of the C++ emitJirFunctions dumper -------
+
