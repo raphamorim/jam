@@ -9,3 +9,9 @@ description = "Jam programming language compiler"
 
 [[bin]]
 name = "jam"
+
+[dependencies]
+jam_core = { path = "../jam-core" }
+jam_syntax = { path = "../jam-syntax" }
+jam_sema = { path = "../jam-sema" }
+jam_llvm = { path = "../jam-llvm" }
