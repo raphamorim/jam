@@ -7333,3 +7333,138 @@ fn emit_return_drops(gctx: &mut AstGenCtx, moved_var: Option<&str>) {
     }
 }
 
+/// Emit an unconditional `Br` to `target`.
+fn emit_br(gctx: &mut AstGenCtx, target: JirBlockRef) {
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Br,
+            a: target,
+            ..Default::default()
+        },
+    );
+}
+
+/// Emit a `CondBr` on `cond` to `then_b`/`else_b`. A constant `Bool` condition
+/// folds to a plain `Br` to the live branch — this keeps the dead branch from
+/// looking reachable, which matters for the function-end fall-through check on
+/// `while (true)` patterns. The successor block refs are packed into the
+/// function's extra array (`b` is the extra index).
+fn emit_cond_br(gctx: &mut AstGenCtx, cond: JirRef, then_b: JirBlockRef, else_b: JirBlockRef) {
+    let c = *gctx.jfn.get_inst(cond);
+    if c.tag == JirTag::Bool {
+        emit_br(gctx, if c.a != 0 { then_b } else { else_b });
+        return;
+    }
+    let extra = gctx.jfn.push_extra(&[then_b, else_b]);
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::CondBr,
+            a: cond,
+            b: extra,
+            ..Default::default()
+        },
+    );
+}
+
+/// Lower an `if`/`else` statement. Builds then/else/merge blocks; `else` is
+/// optional. After both arms, the merge block becomes the insertion point —
+/// dead (zero predecessors) if both arms diverged, which the verifier tolerates.
+///
+/// Deferred: the `comp if` (flags bit 0) conditional-compilation path, per-arm
+/// drop scopes, and the `runtimeCondDepth` bookkeeping (only observable through
+/// comp-binding mutation rules, which error today).
+fn astgen_if(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
+    let cond_idx = NodeIdx::new(n.lhs);
+    let extra = n.rhs;
+    let then_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra));
+    let else_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 1));
+
+    // `comp if`: fold the condition at compile time and lower ONLY the taken
+    // branch inline (the dead branch is never analyzed — it may reference
+    // symbols that don't exist on this target). Code after the `comp if` goes in
+    // a fresh `compifend` block, matching the oracle.
+    if n.flags & 1 != 0 {
+        let taken = match gctx.ctx.fold_comptime_expr_in(cond_idx, &gctx.comp_scope) {
+            ComptimeValue::Bool(b) => b,
+            _ => return Err("astgen: comp-if condition is not a comptime bool".into()),
+        };
+        let (start, count) = if taken {
+            (extra + 2, then_count)
+        } else {
+            (extra + 2 + then_count, else_count)
+        };
+        // The taken arm runs at the surrounding runtime depth but keeps its own
+        // lexical scope, so its locals (and their drops) stay arm-local.
+        push_drop_scope(gctx);
+        for i in 0..count {
+            let s = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(start + i)));
+            astgen_expr(gctx, s, TypeIdx::NONE)?;
+        }
+        pop_drop_scope_emitting(gctx);
+        // Only open a continuation block if the arm DIVERGED (return/break/
+        // continue): statements after the comp-if would otherwise append after the
+        // terminator. A non-terminating arm just continues in the current block —
+        // no `compifend`, no branch (matches the C++ astgen.cpp:3382-3385).
+        if block_has_terminator(gctx) {
+            gctx.current_block = gctx.jfn.push_block("compifend");
+        }
+        return Ok(());
+    }
+
+    let cond_ref = astgen_expr(gctx, cond_idx, builtin::BOOL)?;
+    let then_b = gctx.jfn.push_block("then");
+    let else_b = if else_count > 0 {
+        gctx.jfn.push_block("else")
+    } else {
+        NO_JIR_BLOCK
+    };
+    let merge_b = gctx.jfn.push_block("ifend");
+
+    emit_cond_br(
+        gctx,
+        cond_ref,
+        then_b,
+        if else_count > 0 { else_b } else { merge_b },
+    );
+
+    // Then arm — its own drop scope so locals declared inside drop at branch
+    // exit (popDropScopeEmitting drops them before the fall-through Br).
+    // Arm bodies run at +1 runtime-conditional depth (comp bindings declared
+    // outside may not be mutated inside).
+    gctx.runtime_cond_depth += 1;
+    gctx.current_block = then_b;
+    push_drop_scope(gctx);
+    for i in 0..then_count {
+        let s = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 2 + i)));
+        astgen_expr(gctx, s, TypeIdx::NONE)?;
+    }
+    pop_drop_scope_emitting(gctx);
+    if !block_has_terminator(gctx) {
+        emit_br(gctx, merge_b);
+    }
+
+    // Else arm (if present).
+    if else_count > 0 {
+        gctx.current_block = else_b;
+        push_drop_scope(gctx);
+        for i in 0..else_count {
+            let s = NodeIdx::new(
+                gctx.ctx
+                    .node_store
+                    .get_extra(ExtraIdx::new(extra + 2 + then_count + i)),
+            );
+            astgen_expr(gctx, s, TypeIdx::NONE)?;
+        }
+        pop_drop_scope_emitting(gctx);
+        if !block_has_terminator(gctx) {
+            emit_br(gctx, merge_b);
+        }
+    }
+    gctx.runtime_cond_depth -= 1;
+
+    gctx.current_block = merge_b;
+    Ok(())
+}
+
