@@ -7793,3 +7793,222 @@ fn block_has_terminator(gctx: &AstGenCtx) -> bool {
         .unwrap_or(false)
 }
 
+/// Build a signature-only `JirFunction` (name, return + param types/modes,
+/// extern/test/pub bookkeeping) without walking the body.
+pub fn astgen_metadata(fn_ast: &FunctionAST, ctx: &CodegenContext) -> JirFunction {
+    let mut jfn = JirFunction::new();
+    jfn.name = fn_ast.name.clone();
+    jfn.module_path = fn_ast.module_path.clone();
+    // Signature types qualify a bare imported type AND a generic-call callee/args
+    // to their modules; a signature generic is instantiated eagerly so layout /
+    // sret classification can resolve it (body/local-slot types stay bare).
+    let rt = ctx.requalify_type(fn_ast.return_type, &fn_ast.module_path);
+    let rt = ctx.qualify_generic_callee(rt, &fn_ast.module_path);
+    let _ = ctx.resolve_generic_call_instantiate(rt);
+    jfn.return_type = rt;
+    jfn.is_extern = fn_ast.is_extern;
+    jfn.is_export = fn_ast.is_export;
+    jfn.is_pub = fn_ast.is_pub;
+    jfn.is_test = fn_ast.is_test;
+    jfn.is_var_args = fn_ast.is_var_args;
+    for p in &fn_ast.args {
+        let pt = ctx.requalify_type(p.ty, &fn_ast.module_path);
+        let pt = ctx.qualify_generic_callee(pt, &fn_ast.module_path);
+        let _ = ctx.resolve_generic_call_instantiate(pt);
+        jfn.param_types.push(pt);
+        jfn.param_modes.push(p.mode);
+    }
+    jfn
+}
+
+/// Append the body of `fn_ast` to a pre-populated metadata `JirFunction`.
+pub fn astgen_body_into(
+    jfn: &mut JirFunction,
+    fn_ast: &FunctionAST,
+    ctx: &CodegenContext,
+) -> Result<(), String> {
+    if fn_ast.is_extern {
+        return Ok(());
+    }
+    let entry = jfn.push_block("entry");
+    let mut gctx = AstGenCtx {
+        jfn,
+        ctx,
+        current_block: entry,
+        locals: HashMap::new(),
+        local_types: HashMap::new(),
+        current_node: NodeIdx::NONE,
+        loop_stack: Vec::new(),
+        drop_scopes: Vec::new(),
+        local_scopes: Vec::new(),
+        comp_scope: crate::comptime::ComptimeScope::new(),
+        comp_bind_info: Vec::new(),
+        runtime_cond_depth: 0,
+        recovered: Vec::new(),
+    };
+    // Seed the root comp frame with any active comp-param substitutions, so a
+    // body reference to a comp param (`k`) folds to the call-site constant (the
+    // C++ `seedComptimeScope` tail). No-op for ordinary (non-comp) bodies.
+    ctx.seed_comp_subst_into(&mut gctx.comp_scope);
+    // The function-body drop scope (frame 0). Params register into it so the
+    // reverse drop walk fires body locals first, params last.
+    push_drop_scope(&mut gctx);
+
+    // Lower each parameter. ByValue: alloca + store + register the alloca as
+    // the local (reads Load it). ByPointer: register the param JirRef directly.
+    for (i, p) in fn_ast.args.iter().enumerate() {
+        // Requalify a bare imported-module type (`Counter`→`mod_x.Counter`) so
+        // the ABI classifier + the Param inst's type match the registry.
+        let bm = gctx.ctx.current_body_module();
+        // requalify_type now qualifies a GenericCall callee+args itself, so the
+        // Param/Alloca/Load instruction types match the oracle's qualified spelling.
+        let mut pty = gctx.ctx.requalify_type(p.ty, &bm);
+        // An `[expr]T` param resolves its comptime length for the Param inst +
+        // ABI (the signature header keeps the unresolved ArrayExpr spelling).
+        if gctx.ctx.type_pool.get(pty).kind == TypeKind::ArrayExpr {
+            match gctx.ctx.resolve_array_expr_instantiate(pty) {
+                Ok(t) => pty = t,
+                Err(e) => return finish(&gctx, Some(e)),
+            }
+        }
+        let pabi = match classify_param(p.mode, pty, gctx.ctx) {
+            Ok(p) => p,
+            Err(e) => return finish(&gctx, Some(e)),
+        };
+        let by_ptr = pabi.kind == ParamAbiKind::ByPointer;
+        let param_ref = emit(
+            &mut gctx,
+            JirInst {
+                tag: JirTag::Param,
+                a: i as u32,
+                ty: pty,
+                flags: if by_ptr { 1 } else { 0 },
+                ..Default::default()
+            },
+        );
+        let slot_ref = if by_ptr {
+            gctx.locals.insert(p.name.clone(), param_ref);
+            param_ref
+        } else {
+            let alloca_ref = emit_alloca_hoisted(
+                &mut gctx,
+                JirInst {
+                    tag: JirTag::Alloca,
+                    ty: pty,
+                    ..Default::default()
+                },
+            );
+            emit(
+                &mut gctx,
+                JirInst {
+                    tag: JirTag::Store,
+                    a: alloca_ref,
+                    b: param_ref,
+                    ..Default::default()
+                },
+            );
+            gctx.locals.insert(p.name.clone(), alloca_ref);
+            alloca_ref
+        };
+        gctx.local_types.insert(p.name.clone(), pty);
+        // A `move` parameter is callee-OWNED: it drops at function exit unless
+        // the body moves it onward (which consumes the track). `let`/`mut` stay
+        // caller-owned and never drop here.
+        if p.mode == jam_core::param_mode::ParamMode::Move && gctx.ctx.type_needs_drop(pty) {
+            gctx.drop_scopes.last_mut().unwrap().push(DropTrack {
+                var_name: p.name.clone(),
+                slot: slot_ref,
+                ty: pty,
+            });
+        }
+    }
+
+    // Walk the body statements (statements dispatch through astgen_expr too).
+    // A hard error (`failHere`/`failNode` analogue) propagates out, but any
+    // recoverable diagnostics already collected must surface first — the C++
+    // pushes both to the shared Diagnostics, so the hard one trails the
+    // recovered ones in source order. `finish` folds the two streams together.
+    fn finish(gctx: &AstGenCtx, hard: Option<String>) -> Result<(), String> {
+        let mut all: Vec<String> = gctx.recovered.clone();
+        if let Some(h) = hard {
+            all.push(prefix_hard_error(gctx, h));
+        }
+        if all.is_empty() {
+            Ok(())
+        } else {
+            Err(all.join("\n"))
+        }
+    }
+    let body = fn_ast.body.clone();
+    for stmt in body {
+        if let Err(e) = astgen_expr(&mut gctx, stmt, TypeIdx::NONE) {
+            return finish(&gctx, Some(e));
+        }
+    }
+
+    // Implicit fall-through terminator. Three cases for a tail block without an
+    // explicit terminator:
+    //   1. Unreachable (zero predecessors and not the entry block): a dead
+    //      post-merge / post-loop block left behind because every arm /
+    //      iteration diverged — give it an `Unreachable` terminator so the JIR
+    //      is well-formed, without spuriously erroring.
+    //   2. Reachable and the function returns a value (or is `noreturn`): a
+    //      real bug — a path reaches the end without returning.
+    //   3. Reachable and the function returns void: drop every active scope,
+    //      then emit `Ret`.
+    if !block_has_terminator(&gctx) {
+        let is_entry = gctx.current_block == 1;
+        let reachable = is_entry || predecessor_count(gctx.jfn, gctx.current_block) > 0;
+        if !reachable {
+            emit(
+                &mut gctx,
+                JirInst {
+                    tag: JirTag::Unreachable,
+                    ..Default::default()
+                },
+            );
+        } else if fn_ast.return_type == builtin::NORETURN {
+            // The C++ `failHere`s (anchored at the last-entered node), so the
+            // diagnostic carries the `file:line: error:` prefix.
+            let msg = format!(
+                "fn `{}` is declared `noreturn` but its body falls through without diverging",
+                fn_ast.name
+            );
+            let hard = fail_node(&gctx, gctx.current_node, &msg);
+            return finish(&gctx, Some(hard));
+        } else if !fn_ast.return_type.is_none() {
+            // C++ body: "has non-void return type" (no "a"), `failHere`-anchored.
+            let msg = format!(
+                "fn `{}` has non-void return type but a path reaches the \
+                 function end without returning a value",
+                fn_ast.name
+            );
+            let hard = fail_node(&gctx, gctx.current_node, &msg);
+            return finish(&gctx, Some(hard));
+        } else {
+            emit_drops_through_scope(&mut gctx, 0);
+            emit(
+                &mut gctx,
+                JirInst {
+                    tag: JirTag::Ret,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    finish(&gctx, None)
+}
+
+/// Lower a function from scratch: metadata + body.
+pub fn astgen_function(
+    fn_ast: &FunctionAST,
+    ctx: &mut CodegenContext,
+) -> Result<JirFunction, String> {
+    let mut jfn = astgen_metadata(fn_ast, ctx);
+    if fn_ast.is_extern {
+        return Ok(jfn);
+    }
+    astgen_body_into(&mut jfn, fn_ast, ctx)?;
+    Ok(jfn)
+}
+
