@@ -5,7 +5,9 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
+pub mod emit;
 pub mod progress;
+pub mod run;
 
 pub fn display_help() {
     println!(
@@ -42,8 +44,9 @@ Options:
   --emit-ir       Print LLVM IR to stdout
   --target-info   Show host target info (arch, triple, ...)
   --std-path <dir>
-                  Override the standard-library root used to
-                  takes precedence over the JAM_STD_PATH env var
+                  Override the standard-library root used to resolve
+                  `import("std/...")`; takes precedence over the
+                  JAM_STD_PATH env var.
   -l<name>, --library <name>
                   Link against system library <name>
 
