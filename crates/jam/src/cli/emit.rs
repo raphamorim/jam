@@ -817,3 +817,218 @@ fn qualify_type_name(module_path: &str, name: &str) -> String {
     }
 }
 
+/// Register a value const under both its qualified key (for imports) and its
+/// bare name. The bare name is the per-module body's spelling, so when the ENTRY
+/// and an imported module both define `const N` the entry's value must win the
+/// bare slot (the entry body's `current_body_module()==""` reads the bare key).
+/// The C++ avoids this by keying every const under its qualified identity (the
+/// entry's modulePath is its non-empty filename) and resolving the bare spelling
+/// through a per-module owner map (main.cpp:1847). We mirror the OUTCOME: the
+/// entry const (empty module_path) is authoritative for the bare key — it always
+/// writes it — while an imported const claims the bare key only if no const is
+/// registered there yet, so it never clobbers an entry const regardless of the
+/// registration order across the two passes (entry-first vs entry-last).
+fn register_const_keyed(
+    cg: &CodegenContext,
+    c: &jam_syntax::ast::ConstDeclAST,
+    info: ModuleConstInfo,
+) {
+    if c.module_path.is_empty() {
+        // Entry const: own the bare key unconditionally.
+        cg.register_module_const(c.name.clone(), info);
+    } else {
+        cg.register_module_const(format!("{}.{}", c.module_path, c.name), info.clone());
+        if !cg.has_module_const(&c.name) {
+            cg.register_module_const(c.name.clone(), info);
+        }
+    }
+}
+
+/// Register the module's struct/union/enum types into the context (creating the
+/// named LLVM struct handles the analyzer fills) and drive the analyzer over
+/// every type decl, materialising the LLVM layouts that AstGen's `Named` field /
+/// param / return types resolve through. Mirrors the C++ register pass
+/// (`declareStructs`/`declareUnions`/`declareEnums`) + the analyzer loop.
+///
+/// `modules: &'ctx` — the decl table borrows the module ASTs for the context's
+/// (invariant) lifetime; the caller guarantees they outlive the context. Each
+/// module's types register under their module-qualified name (bare for the
+/// entry module, `module.Name` for imports), and imported bare names get a
+/// pre-interned `requalify` entry so a module body's bare type references
+/// resolve to their qualified identity.
+fn register_and_analyze<'ctx>(cg: &mut CodegenContext<'ctx>, modules: &[&'ctx ModuleAST]) {
+    // -1. Register value consts FIRST so a const-sized array field
+    //     (`cells: [RAM_END]u8`) folds during the layout pass below.
+    for m in modules {
+        for c in &m.consts {
+            // A type-alias const (`const CounterI32 = Counter(i32)`): register it
+            // in the type-alias table (qualified to its own module), so
+            // `name_for_kinds`' chase resolves `CounterI32` -> `Counter(i32)` ->
+            // the monomorphized struct. The C++ registerConsts (main.cpp:891-915).
+            if !c.aliased_type.is_none() {
+                let target = cg.requalify_type(c.aliased_type, &c.module_path);
+                cg.register_type_alias(c.name.clone(), target);
+                if !c.module_path.is_empty() {
+                    cg.register_type_alias(format!("{}.{}", c.module_path, c.name), target);
+                }
+                continue;
+            }
+            if c.init_expr.is_none() {
+                continue;
+            }
+            let info = ModuleConstInfo {
+                init_expr: c.init_expr,
+                declared_type: c.declared_type,
+                is_comp: c.is_comp,
+                bare_name: c.name.clone(),
+                module_path: c.module_path.clone(),
+            };
+            register_const_keyed(cg, c, info);
+        }
+    }
+    // 0. Pre-intern the qualified `Named` TypeIdx for every imported type +
+    //    record it in the requalify map. Done FIRST (before fields) so field
+    //    requalification below resolves forward references.
+    for m in modules {
+        let stamp = |cg: &mut CodegenContext, module_path: &str, name: &str| {
+            if !module_path.is_empty() {
+                let q = qualify_type_name(module_path, name);
+                let sid = cg.string_pool.intern(q.as_bytes());
+                let qty = cg.type_pool.intern_named(sid);
+                cg.register_requalify(module_path, name, qty);
+            }
+        };
+        for s in &m.structs {
+            stamp(cg, &s.module_path, &s.name);
+        }
+        for u in &m.unions {
+            stamp(cg, &u.module_path, &u.name);
+        }
+        for e in &m.enums {
+            stamp(cg, &e.module_path, &e.name);
+        }
+    }
+
+    // 1. Register every module's types under their qualified name, with field /
+    //    payload types REQUALIFIED (so a struct field of an imported sibling
+    //    type carries its qualified identity — the C++ `requalFields`).
+    // NOTE: struct/union/enum field types are requalified but NOT array-length-
+    // resolved here — a struct-field array `cells: [N]u8` is left as the deferred
+    // ArrayExpr (so const-sized struct fields stay cleanly unported) because
+    // indexing such a field (`self.cells[i]`) needs a Load-array-then-Index
+    // lowering in astgen_index that isn't ported yet.
+    for m in modules {
+        for s in &m.structs {
+            let q = qualify_type_name(&s.module_path, &s.name);
+            let fields = s
+                .fields
+                .iter()
+                .map(|(n, t)| (n.clone(), cg.requalify_type(*t, &s.module_path)))
+                .collect();
+            let named = cg.context().named_struct(&q);
+            cg.register_struct(q, named, fields);
+        }
+        for u in &m.unions {
+            let q = qualify_type_name(&u.module_path, &u.name);
+            let fields = u
+                .fields
+                .iter()
+                .map(|(n, t)| (n.clone(), cg.requalify_type(*t, &u.module_path)))
+                .collect();
+            let named = cg.context().named_struct(&q);
+            cg.register_union(q, named, fields);
+        }
+        for e in &m.enums {
+            let q = qualify_type_name(&e.module_path, &e.name);
+            let variants = e
+                .variants
+                .iter()
+                .map(|v| EnumVariantInfo {
+                    name: v.name.clone(),
+                    payload_types: v
+                        .payload_types
+                        .iter()
+                        .map(|t| cg.requalify_type(*t, &e.module_path))
+                        .collect(),
+                    discriminant: v.discriminant,
+                })
+                .collect();
+            cg.register_enum(q, variants);
+        }
+    }
+
+    // 1b. POPULATE the array-expr resolution cache for `[expr]T` field/payload
+    // types (without changing the registered ArrayExpr — `peek` must still see
+    // ArrayExpr so a field-array index takes the value path, like the oracle).
+    // get_llvm_type/type_size/type_align then resolve via the cache.
+    let cache_array_fields = |cg: &mut CodegenContext, module_path: &str, tys: Vec<TypeIdx>| {
+        cg.push_body_module(module_path.to_string());
+        for t in tys {
+            if cg.type_pool.get(t).kind == TypeKind::ArrayExpr {
+                let _ = cg.resolve_array_expr_instantiate(t);
+            }
+        }
+        cg.pop_body_module();
+    };
+    for m in modules {
+        for s in &m.structs {
+            cache_array_fields(
+                cg,
+                &s.module_path,
+                s.fields.iter().map(|(_, t)| *t).collect(),
+            );
+        }
+        for u in &m.unions {
+            cache_array_fields(
+                cg,
+                &u.module_path,
+                u.fields.iter().map(|(_, t)| *t).collect(),
+            );
+        }
+        for e in &m.enums {
+            let tys = e
+                .variants
+                .iter()
+                .flat_map(|v| v.payload_types.iter().copied())
+                .collect();
+            cache_array_fields(cg, &e.module_path, tys);
+        }
+    }
+}
+
+/// Materialise every type's LLVM body (the C++ demand-driven body-fill pass,
+/// main.cpp:1877-1884). Split out of `register_and_analyze` and run LATER —
+/// AFTER import handles + module namespaces are registered — so a struct/enum
+/// whose field/payload is a CHAINED type (`w.leaf.Point`) can resolve through
+/// the re-export chain when its body lays out. The C++ runs this pass after the
+/// namespace registration too; running it eagerly inside `register_and_analyze`
+/// (before namespaces existed) left chained-typed fields unresolved (stub body).
+fn fill_type_bodies<'ctx>(cg: &mut CodegenContext<'ctx>, modules: &[&'ctx ModuleAST]) {
+    // One decl table over all modules' type decls (keyed by qualified name).
+    let mut decls = DeclTable::new();
+    let mut type_idxs: Vec<DeclIndex> = Vec::new();
+    for m in modules {
+        for s in &m.structs {
+            let idx = decls.create(DeclKind::Struct, qualify_type_name(&s.module_path, &s.name));
+            decls.get_mut(idx).struct_ast = Some(s);
+            type_idxs.push(idx);
+        }
+        for e in &m.enums {
+            let idx = decls.create(DeclKind::Enum, qualify_type_name(&e.module_path, &e.name));
+            decls.get_mut(idx).enum_ast = Some(e);
+            type_idxs.push(idx);
+        }
+        for u in &m.unions {
+            let idx = decls.create(DeclKind::Union, qualify_type_name(&u.module_path, &u.name));
+            decls.get_mut(idx).union_ast = Some(u);
+            type_idxs.push(idx);
+        }
+    }
+
+    // Force analysis of every type body (re-entrant via field deps).
+    let mut az = Analyzer::new(cg, &mut decls);
+    for idx in type_idxs {
+        az.ensure_decl_analyzed(idx);
+    }
+}
+
