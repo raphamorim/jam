@@ -221,3 +221,66 @@ fn pick_output_name(name: &str) -> String {
     }
 }
 
+/// Parse `-l<name>` libs, `-o <name>` output, and the positional `<file>` from a
+/// compile/test invocation. `start` is the first arg index to consider: 2 after
+/// the `build`/`test` subcommand token, 1 for the bare `jam [FLAGS] <file>`
+/// form. Like the C++ loop (main.cpp:2059-2073), any unmatched argument —
+/// flag-shaped or not — is a positional, and a SECOND positional is an error.
+fn parse_compile_args(
+    args: &[String],
+    start: usize,
+) -> Result<(Vec<String>, Option<String>, Option<String>), i32> {
+    let mut libs: Vec<String> = Vec::new();
+    let mut output: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut i = start;
+    while i < args.len() {
+        let arg = &args[i];
+        if (arg == "-l" || arg == "--library") && i + 1 < args.len() {
+            libs.push(args[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        if arg.len() > 2 && arg.starts_with("-l") {
+            libs.push(arg[2..].to_string());
+            i += 1;
+            continue;
+        }
+        if arg == "-o" && i + 1 < args.len() {
+            output = Some(args[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        if let Some(prev) = &path {
+            eprintln!("Error: unexpected extra argument `{arg}` (already have `{prev}`)");
+            return Err(1);
+        }
+        path = Some(arg.clone());
+        i += 1;
+    }
+    Ok((libs, output, path))
+}
+
+/// `jam build [LINKER-FLAGS] [-o <name>] <file>` and the bare `jam [FLAGS] <file>`
+/// form: compile `<file>` to a native executable (default name `output`, with the
+/// directory-collision `.bin` fallback), linking `-l<name>` libraries — matching
+/// the C++'s default-compile path. `start` is 2 for the `build` subcommand, 1 for
+/// the bare form (no subcommand token).
+pub fn build_command(args: &[String], start: usize, opt: OptLevel, lto: Lto, strip: Strip) -> i32 {
+    let (libs, output, path) = match parse_compile_args(args, start) {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
+    let Some(file) = path else {
+        eprintln!("Error: No input file specified. Run `jam --help` for usage.");
+        return 1;
+    };
+    // Directory input is only meaningful with `test` (main.cpp:2112-2118).
+    if Path::new(&file).is_dir() {
+        eprintln!("Error: directory input is only supported with `test` (got '{file}')");
+        return 1;
+    }
+    let output = output.unwrap_or_else(|| pick_output_name("output"));
+    emit::emit_jir(&file, EmitMode::Binary { output, libs }, opt, lto, strip)
+}
+
