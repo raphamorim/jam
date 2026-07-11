@@ -284,3 +284,56 @@ pub fn build_command(args: &[String], start: usize, opt: OptLevel, lto: Lto, str
     emit::emit_jir(&file, EmitMode::Binary { output, libs }, opt, lto, strip)
 }
 
+/// Recursively discover `*.jam` files under `dir`, sorted (main.cpp's
+/// `collectJamFiles`). Returns paths as strings.
+fn collect_jam_files(dir: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    collect_jam_files_into(Path::new(dir), &mut files);
+    files.sort();
+    files
+}
+
+fn collect_jam_files_into(dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_jam_files_into(&p, out);
+        } else if p.extension().and_then(|e| e.to_str()) == Some("jam")
+            && let Some(s) = p.to_str()
+        {
+            out.push(s.to_string());
+        }
+    }
+}
+
+/// Cheap `tfn` substring scan — avoids lowering files with no test functions
+/// (main.cpp's `fileHasTests`). Matches `tfn` at line start or after whitespace,
+/// followed by whitespace or `(`.
+fn file_has_tests(path: &str) -> bool {
+    let Ok(src) = std::fs::read(path) else {
+        return false;
+    };
+    let mut pos = 0usize;
+    while let Some(rel) = find_subslice(&src[pos..], b"tfn") {
+        let idx = pos + rel;
+        let start_ok = idx == 0 || src[idx - 1].is_ascii_whitespace();
+        let after = idx + 3;
+        let end_ok = after < src.len() && (src[after].is_ascii_whitespace() || src[after] == b'(');
+        if start_ok && end_ok {
+            return true;
+        }
+        pos = idx + 3;
+    }
+    false
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
