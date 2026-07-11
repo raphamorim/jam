@@ -19,7 +19,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "float128"
+version = "0.0.1"
+
+[[package]]
 name = "jam"
+version = "0.0.1"
+dependencies = [
+ "jam_core",
+ "jam_llvm",
+ "jam_sema",
+ "jam_syntax",
+]
+
+[[package]]
+name = "jam_core"
 version = "0.0.1"
 
 [[package]]
@@ -27,6 +41,26 @@ name = "jam_llvm"
 version = "0.0.1"
 dependencies = [
  "cc",
+ "float128",
+ "jam_core",
+]
+
+[[package]]
+name = "jam_sema"
+version = "0.0.1"
+dependencies = [
+ "float128",
+ "jam_core",
+ "jam_llvm",
+ "jam_syntax",
+]
+
+[[package]]
+name = "jam_syntax"
+version = "0.0.1"
+dependencies = [
+ "float128",
+ "jam_core",
 ]
 
 [[package]]

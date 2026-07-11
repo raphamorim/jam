@@ -1,7 +1,11 @@
 [workspace]
 members = [
     "crates/jam",
-    "crates/jam-llvm"
+    "crates/jam-llvm",
+    "crates/jam-core",
+    "crates/jam-syntax",
+    "crates/jam-sema",
+    "crates/float128",
 ]
 resolver = "2"
 
