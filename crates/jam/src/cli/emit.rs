@@ -1186,3 +1186,29 @@ fn bind_decl_module(cg: &CodegenContext, m: &ModuleAST, with_fns: bool) {
     }
 }
 
+/// Single-file, function-only slice: struct/enum registration, the analyzer
+/// pass, and cross-function calls arrive with their astgen handlers (a
+/// not-yet-ported node lowers to a per-function diagnostic and a non-zero exit,
+/// the same shape the oracle uses to batch-report decl failures).
+///
+/// `--target-info`: print the host target's properties (the C++ `showTarget`
+/// block, main.cpp:3072). Standalone — prints; the caller exits 0.
+pub fn print_target_info() {
+    let t = Target::from_triple_str(&default_target_triple());
+    println!("Target Information:");
+    println!("  Name: {}", t.name());
+    println!("  Triple: {}", t.to_llvm_triple());
+    println!("  Pointer size: {} bytes", t.pointer_size());
+    println!("  Libc: {}", t.libc_name());
+    println!(
+        "  Requires PIC: {}",
+        if t.requires_pic() { "yes" } else { "no" }
+    );
+    println!(
+        "  Requires PIE: {}",
+        if t.requires_pie() { "yes" } else { "no" }
+    );
+    println!("  Uses C ABI: {}", if t.uses_cabi() { "yes" } else { "no" });
+    println!();
+}
+
