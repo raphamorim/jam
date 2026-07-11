@@ -337,3 +337,164 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Worker-pool size for `jam test <dir>` (the C++ main.cpp:2143-2148):
+/// min(cpu count, 8), overridable via `JAM_TEST_JOBS` (>= 1). `JAM_TEST_JOBS=1`
+/// forces the serial in-process path (useful under a debugger).
+fn test_jobs() -> usize {
+    let hw = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let mut jobs = if hw > 1 { hw.min(8) } else { 1 };
+    if let Ok(env) = std::env::var("JAM_TEST_JOBS")
+        && let Ok(v) = env.trim().parse::<i64>()
+        && v >= 1
+    {
+        jobs = v as usize;
+    }
+    jobs
+}
+
+/// The `-C opt-level=` value spelling for a re-invoked worker (main.cpp:2150).
+fn opt_name(opt: OptLevel) -> &'static str {
+    match opt {
+        OptLevel::Less => "1",
+        OptLevel::Default => "2",
+        OptLevel::Aggressive => "3",
+        OptLevel::Size => "s",
+        OptLevel::Small => "z",
+        _ => "0",
+    }
+}
+
+/// A `jam test <file>` re-invocation of this binary with stdout+stderr merged
+/// into one buffered pipe (the C++ spawnAsync, main.cpp:113): the drain thread
+/// keeps the pipe from filling while the parent polls for completion.
+struct TestWorker {
+    child: std::process::Child,
+    file: String,
+    drain: std::thread::JoinHandle<Vec<u8>>,
+}
+
+fn spawn_test_worker(
+    exe: &Path,
+    file: &str,
+    libs: &[String],
+    opt: OptLevel,
+) -> Option<TestWorker> {
+    let stem = Path::new(file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out");
+    let (reader, writer) = std::io::pipe().ok()?;
+    let writer2 = writer.try_clone().ok()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("test")
+        .arg(file)
+        .arg("-o")
+        .arg(format!("jam_test_{stem}"));
+    // Only the opt level is forwarded (the C++ childArgv, main.cpp:2178-2183).
+    if !matches!(opt, OptLevel::None) {
+        cmd.arg("-C").arg(format!("opt-level={}", opt_name(opt)));
+    }
+    for lib in libs {
+        cmd.arg(format!("-l{lib}"));
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::from(writer));
+    cmd.stderr(std::process::Stdio::from(writer2));
+    let child = cmd.spawn().ok()?;
+    let drain = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut reader = reader;
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf);
+        buf
+    });
+    Some(TestWorker {
+        child,
+        file: file.to_string(),
+        drain,
+    })
+}
+
+/// Decode a finished worker's status the shell way: exit code, or 128 + signal.
+fn worker_exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(|s| 128 + s).unwrap_or(1)
+    }
+    #[cfg(not(unix))]
+    {
+        1
+    }
+}
+
+/// The parallel worker pool (the C++ main.cpp:2165-2242): per-file work is
+/// ~98% blocked subprocess waits (clang link + first-exec assessment of the
+/// freshly linked test binary), so a small pool of `jam test <file>`
+/// re-invocations gives near-linear speedup. Each worker's output prints as a
+/// coherent block on completion, in completion order.
+fn run_tests_parallel(
+    runnable: &[String],
+    libs: &[String],
+    opt: OptLevel,
+    jobs: usize,
+    passed: &mut i32,
+    failed: &mut i32,
+) {
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("jam"));
+    let mut active: Vec<TestWorker> = Vec::new();
+    let mut next = 0usize;
+    while next < runnable.len() || !active.is_empty() {
+        while active.len() < jobs && next < runnable.len() {
+            let f = &runnable[next];
+            next += 1;
+            match spawn_test_worker(&exe, f, libs, opt) {
+                Some(w) => active.push(w),
+                None => {
+                    println!();
+                    println!("@{f}");
+                    println!("error: failed to spawn test worker");
+                    *failed += 1;
+                }
+            }
+        }
+        let mut reaped = false;
+        let mut i = 0;
+        while i < active.len() {
+            match active[i].child.try_wait() {
+                Ok(Some(status)) => {
+                    let w = active.remove(i);
+                    let out = w.drain.join().unwrap_or_default();
+                    println!();
+                    println!("@{}", w.file);
+                    print!("{}", String::from_utf8_lossy(&out));
+                    if worker_exit_code(status) != 0 {
+                        *failed += 1;
+                    } else {
+                        *passed += 1;
+                    }
+                    reaped = true;
+                }
+                Ok(None) => i += 1,
+                Err(_) => {
+                    let w = active.remove(i);
+                    let _ = w.drain.join();
+                    println!();
+                    println!("@{}", w.file);
+                    println!("error: failed to wait on test worker");
+                    *failed += 1;
+                    reaped = true;
+                }
+            }
+        }
+        if !reaped && !active.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
