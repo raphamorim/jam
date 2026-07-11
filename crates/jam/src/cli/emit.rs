@@ -2457,3 +2457,63 @@ fn link_and_run_test(
     run_binary(output)
 }
 
+/// Synthesize the `jam test` harness `main` (the C++ test-mode codegen,
+/// main.cpp:2436-2524). For each `tfn` (in source order) it prints
+/// `"testing <name>... "`, calls the test fn, then prints `"ok\n"`; after the
+/// loop it prints `"<N> test(s) passed\n"` and returns 0. A failing `assert`
+/// inside a test calls `exit(1)` before its `ok\n` ever prints — that IS the
+/// fail path, no extra logic. `entries` = (display name, mangled symbol) pairs.
+fn synthesize_test_main(cg: &CodegenContext, entries: &[(String, String)]) {
+    let ctx = cg.context();
+    let module = cg.module();
+    let builder = cg.builder();
+
+    let i32_ty = ctx.i32_type();
+    // `main` is `i32()` with the C calling convention + external linkage.
+    let main_ty = i32_ty.fn_type(&[], false);
+    let main_func = module.add_function("main", main_ty);
+    main_func.apply_default_attrs(false);
+    main_func.set_linkage(Linkage::External);
+    main_func.set_call_conv(CallConv::C);
+
+    let entry_bb = main_func.append_basic_block("entry");
+    builder.position_at_end(entry_bb);
+
+    // Declare `printf` (`i32(ptr, ...)` varargs) if it isn't already present.
+    let printf = match module.get_function("printf") {
+        Some(f) => f,
+        None => {
+            let i8ptr = ctx.pointer_type(0);
+            let printf_ty = i32_ty.fn_type(&[i8ptr], true);
+            let f = module.add_function("printf", printf_ty);
+            f.apply_default_attrs(true);
+            f
+        }
+    };
+
+    for (display, mangled) in entries {
+        let Some(test_func) = module.get_function(mangled) else {
+            // A test whose body failed to lower never got a prototype; the
+            // C++ guards the same way (`if (testFunc)`), silently skipping it.
+            continue;
+        };
+        // "testing <name>... "
+        let msg = format!("testing {display}... ");
+        let msg_str = builder.global_string_ptr(&msg, "test_msg");
+        builder.call(printf, &[msg_str], "");
+        // Run the test (no args).
+        builder.call(test_func, &[], "");
+        // "ok\n" — reached only if the test didn't `exit(1)` via a failed assert.
+        let ok_str = builder.global_string_ptr("ok\n", "test_pass");
+        builder.call(printf, &[ok_str], "");
+    }
+
+    // "<N> test(s) passed\n"
+    let summary = format!("{} test(s) passed\n", entries.len());
+    let summary_str = builder.global_string_ptr(&summary, "test_summary");
+    builder.call(printf, &[summary_str], "");
+
+    builder.ret(i32_ty.const_int(0, false));
+    let _ = main_func.verify();
+}
+
