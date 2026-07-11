@@ -137,3 +137,87 @@ pub fn extract_codegen_opts(args: &[String]) -> Result<(Vec<String>, OptLevel, L
     Ok((out, opt, lto, strip))
 }
 
+/// Strict `run` argument parsing (the C++ run branch, main.cpp:2024-2038):
+/// only linker flags are permitted alongside `run`, and only ONE source file.
+fn parse_run_args(args: &[String]) -> Result<(Vec<String>, Option<String>), i32> {
+    let mut libs: Vec<String> = Vec::new();
+    let mut path: Option<String> = None;
+    let mut i = 2; // skip program name + subcommand
+    while i < args.len() {
+        let arg = &args[i];
+        if (arg == "-l" || arg == "--library") && i + 1 < args.len() {
+            libs.push(args[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        if arg.len() > 2 && arg.starts_with("-l") {
+            libs.push(arg[2..].to_string());
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            eprintln!(
+                "Error: `run` only accepts linker flags (-l<name>, -l <name>, --library <name>); got `{arg}`"
+            );
+            return Err(1);
+        }
+        if let Some(prev) = &path {
+            eprintln!("Error: `run` accepts only one source file; got `{arg}` after `{prev}`");
+            return Err(1);
+        }
+        path = Some(arg.clone());
+        i += 1;
+    }
+    Ok((libs, path))
+}
+
+/// `jam run [LINKER-FLAGS] <file>`: compile `<file>` to a temp executable, run
+/// it, propagate its exit code, and delete the binary.
+pub fn run_command(args: &[String], opt: OptLevel, lto: Lto, strip: Strip) -> i32 {
+    let (libs, path) = match parse_run_args(args) {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
+    let Some(file) = path else {
+        eprintln!("Error: No input file specified. Run `jam --help` for usage.");
+        return 1;
+    };
+    // Directory input is only meaningful with `test` (main.cpp:2112-2118).
+    if Path::new(&file).is_dir() {
+        eprintln!("Error: directory input is only supported with `test` (got '{file}')");
+        return 1;
+    }
+    let output = pick_output_name("output");
+    emit::emit_jir(&file, EmitMode::Run { output, libs }, opt, lto, strip)
+}
+
+/// `jam test [<file|directory>]`: with no arg, test the current directory.
+pub fn test_command(args: &[String], opt: OptLevel, lto: Lto, strip: Strip) -> i32 {
+    let (libs, output, path) = match parse_compile_args(args, 2) {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
+    // `jam test` with no path means "run every test under cwd" (main.cpp:3060).
+    let target = path.unwrap_or_else(|| ".".to_string());
+
+    if Path::new(&target).is_dir() {
+        return test_directory(&target, &libs, opt, lto, strip);
+    }
+
+    let output = output.unwrap_or_else(|| pick_output_name("output"));
+    emit::emit_jir(&target, EmitMode::Test { output, libs }, opt, lto, strip)
+}
+
+/// The default output name `output` collides with a same-named directory (this
+/// repo has one): clang's link fails cryptically. Fall back to `<name>.bin`
+/// (main.cpp:3245-3253). The note goes to stderr (the behavioral gate drops it).
+fn pick_output_name(name: &str) -> String {
+    if Path::new(name).is_dir() {
+        let fallback = format!("{name}.bin");
+        eprintln!("note: output name '{name}' is a directory; writing '{fallback}'");
+        fallback
+    } else {
+        name.to_string()
+    }
+}
+
