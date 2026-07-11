@@ -2517,3 +2517,46 @@ fn synthesize_test_main(cg: &CodegenContext, entries: &[(String, String)]) {
     let _ = main_func.verify();
 }
 
+/// Run the freshly-linked `output` binary, delete it, and propagate its exit
+/// status as jam's own (the C++ test/run execution path, main.cpp:2715-2728).
+/// A signal-killed child decodes to `128 + signal` (shell convention) so a
+/// crashed test binary never silently reports success.
+fn run_binary(output: &str) -> i32 {
+    run_binary_at(output, true)
+}
+
+/// Run `output`; `remove_after=false` keeps the binary (the cached-inode test
+/// path re-execs the same file on the next identical run).
+fn run_binary_at(output: &str, remove_after: bool) -> i32 {
+    let path = if output.starts_with('/') || output.starts_with("./") || output.contains('/') {
+        output.to_string()
+    } else {
+        format!("./{output}")
+    };
+    let status = std::process::Command::new(&path).status();
+    if remove_after {
+        let _ = std::fs::remove_file(output);
+    }
+    match status {
+        Ok(s) => {
+            if let Some(code) = s.code() {
+                code
+            } else {
+                // No exit code => terminated by a signal (Unix only).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    s.signal().map(|sig| 128 + sig).unwrap_or(1)
+                }
+                #[cfg(not(unix))]
+                {
+                    1
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to run {path}: {e}");
+            1
+        }
+    }
+}
