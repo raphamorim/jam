@@ -2242,3 +2242,145 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     0
 }
 
+/// Emit the lowered module to an object file and link it into a native
+/// executable via the system `clang` (the C++ default-mode object-emit + link,
+/// main.cpp:1585-1660). Opt/LTO default to off; libm is linked on glibc.
+/// Run the LLVM IR optimization pipeline on the module in place. A no-op at
+/// `OptLevel::None` (the default), matching the oracle, which only invokes the
+/// optimizer at a non-zero level. The pass pipeline lives in the C++ shim
+/// (`jam_shim_optimize`) and is the C++ optimizer verbatim, so the optimized IR
+/// is byte-identical to the oracle's on the same LLVM.
+/// Optimize the module and emit the intermediate object (or bitcode, under
+/// LTO) next to `output`. Returns the intermediate's path.
+fn emit_object(cg: &CodegenContext, output: &str, opt: OptLevel, lto: Lto) -> Result<String, i32> {
+    // Initialize the native target + asm printer before creating the target
+    // machine (object emission needs the backend registered).
+    jam_llvm::init_native_target();
+    jam_llvm::init_native_asm_printer();
+    let triple = default_target_triple();
+    cg.module().set_target_triple(&triple);
+    let host = Target::from_triple_str(&triple);
+    let pic = host.requires_pie() || host.requires_pic();
+    let Some(tm) = TargetMachine::new(&triple, "generic", "", pic, opt, lto) else {
+        eprintln!("Failed to create target machine");
+        return Err(1);
+    };
+    tm.configure_module(cg.module());
+    // Run the IR optimization pipeline before object emit (the C++ runs it here,
+    // main.cpp:2598, only at a non-zero level; `--emit-ir` never optimizes).
+    if !matches!(opt, OptLevel::None) {
+        tm.run_optimization(cg.module());
+    }
+    // LTO emits LLVM bitcode (.bc) instead of a native object; clang's LTO
+    // plugin re-runs the optimization at link time (the C++ main.cpp:2548).
+    let obj = format!("{output}.{}", if lto == Lto::Off { "o" } else { "bc" });
+    if let Err(e) = tm.emit_to_file(cg.module(), &obj) {
+        eprintln!("Failed to emit object file: {e}");
+        return Err(1);
+    }
+    Ok(obj)
+}
+
+/// The link flags that follow `clang <obj> -o <out>` — libm, user `-l` libs,
+/// LTO, dead-strip, and `-C strip` plumbing. Shared between the normal link
+/// and the test-cache link (and FNV-mixed into the cache key, like the C++
+/// hashes linkArgs[4..]).
+fn link_flags(host: &Target, libs: &[String], opt: OptLevel, lto: Lto, strip: Strip) -> Vec<String> {
+    let mut flags: Vec<String> = Vec::new();
+    // libm: `frem` on floats lowers to a `fmod` libcall. glibc keeps math in
+    // libm.so (pass `-lm`); macOS/Windows/musl bundle it into libc.
+    if matches!(host.os, Os::Linux | Os::FreeBsd) && host.abi != Abi::Musl {
+        flags.push("-lm".to_string());
+    }
+    // User-requested `-l<name>` libraries pass through to the link step (the
+    // C++ linkLibs forwarding, e.g. `jam run -lncurses tetris.jam`).
+    for lib in libs {
+        flags.push(format!("-l{lib}"));
+    }
+    // Hand the bitcode to clang's LTO driver so it selects the right linker
+    // plugin (the C++ main.cpp:2569-2570).
+    match lto {
+        Lto::Thin => flags.push("-flto=thin".to_string()),
+        Lto::Fat => flags.push("-flto=full".to_string()),
+        Lto::Off => {}
+    }
+    // Strip unreferenced functions/data at link time (the C++ main.cpp:1632).
+    // Pairs with FunctionSections/DataSections on the TargetMachine, which
+    // split each symbol into its own section so the linker can GC them
+    // individually. Mach-O uses -dead_strip; ELF (Linux/FreeBSD) uses
+    // --gc-sections. Skipped in debug to keep link fast.
+    if !matches!(opt, OptLevel::None) {
+        match host.os {
+            Os::MacOs => flags.push("-Wl,-dead_strip".to_string()),
+            Os::Linux | Os::FreeBsd => flags.push("-Wl,--gc-sections".to_string()),
+            // PE/COFF link.exe uses /OPT:REF; the safer minimum is to not
+            // pass anything from here.
+            _ => {}
+        }
+    }
+    // `-C strip`: drop debug info / local symbols via linker flags (the C++
+    // main.cpp:2620-2631). Mach-O: `-Wl,-S` strips DWARF, `-Wl,-x` removes local
+    // symbols; ELF: `--strip-debug` for debug only, `-s` for everything.
+    if strip != Strip::None {
+        match host.os {
+            Os::MacOs => {
+                flags.push("-Wl,-S".to_string());
+                if strip == Strip::Symbols {
+                    flags.push("-Wl,-x".to_string());
+                }
+            }
+            Os::Linux | Os::FreeBsd => {
+                flags.push(
+                    if strip == Strip::Symbols {
+                        "-Wl,-s"
+                    } else {
+                        "-Wl,--strip-debug"
+                    }
+                    .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    flags
+}
+
+/// `clang <obj> -o <out> <flags..>`. Does NOT remove the object.
+fn run_clang_link(obj: &str, out: &str, flags: &[String]) -> i32 {
+    let mut cmd = std::process::Command::new("clang");
+    cmd.arg(obj).arg("-o").arg(out);
+    for f in flags {
+        cmd.arg(f);
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => 0,
+        Ok(s) => {
+            eprintln!("link failed: clang exited with {s}");
+            1
+        }
+        Err(e) => {
+            eprintln!("failed to invoke clang: {e}");
+            1
+        }
+    }
+}
+
+fn link_binary(
+    cg: &CodegenContext,
+    output: &str,
+    libs: &[String],
+    opt: OptLevel,
+    lto: Lto,
+    strip: Strip,
+) -> i32 {
+    let obj = match emit_object(cg, output, opt, lto) {
+        Ok(o) => o,
+        Err(rc) => return rc,
+    };
+    let host = Target::from_triple_str(&default_target_triple());
+    let flags = link_flags(&host, libs, opt, lto, strip);
+    let rc = run_clang_link(&obj, output, &flags);
+    let _ = std::fs::remove_file(&obj);
+    rc
+}
+
