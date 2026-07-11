@@ -2384,3 +2384,76 @@ fn link_binary(
     rc
 }
 
+/// FNV-1a over a file's bytes (the C++ hashFileFNV, main.cpp:139). Keys the
+/// linked-test-binary cache: macOS assesses every fresh executable inode on
+/// first exec (60-290ms), so re-running a byte-identical test binary from a
+/// cached inode instead of relinking a new one is the difference between ~1ms
+/// and ~100ms per test file.
+fn hash_file_fnv(path: &str) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut h: u64 = 1469598103934665603;
+    for b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    Some(h)
+}
+
+fn hash_mix_string(h: &mut u64, s: &str) {
+    for b in s.bytes() {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(1099511628211);
+    }
+}
+
+/// Test-mode link + run with the cached-inode fast path (the C++
+/// main.cpp:1691-1725): key the linked binary by the object bytes + link
+/// flags, link once into `output/testcache/t<hex>`, and re-exec the CACHED
+/// INODE when nothing changed. The cached binary is deliberately NOT removed
+/// after the run, and the link is skipped entirely on a cache hit. Falls back
+/// to the ordinary link+run when the object can't be hashed.
+fn link_and_run_test(
+    cg: &CodegenContext,
+    output: &str,
+    libs: &[String],
+    opt: OptLevel,
+    lto: Lto,
+    strip: Strip,
+    progress: &mut ProgressGuard,
+) -> i32 {
+    let obj = match emit_object(cg, output, opt, lto) {
+        Ok(o) => o,
+        Err(rc) => return rc,
+    };
+    let host = Target::from_triple_str(&default_target_triple());
+    let flags = link_flags(&host, libs, opt, lto, strip);
+
+    if let Some(mut h) = hash_file_fnv(&obj) {
+        for f in &flags {
+            hash_mix_string(&mut h, f);
+        }
+        let cache_dir = std::path::Path::new("output").join("testcache");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let cache_path = cache_dir.join(format!("t{h:016x}"));
+        let cache_path = cache_path.to_string_lossy().into_owned();
+        if !std::path::Path::new(&cache_path).exists()
+            && run_clang_link(&obj, &cache_path, &flags) != 0
+        {
+            eprintln!("Linking failed");
+            let _ = std::fs::remove_file(&obj);
+            return 1;
+        }
+        let _ = std::fs::remove_file(&obj);
+        progress.stop();
+        return run_binary_at(&cache_path, false);
+    }
+
+    let rc = run_clang_link(&obj, output, &flags);
+    let _ = std::fs::remove_file(&obj);
+    if rc != 0 {
+        return rc;
+    }
+    progress.stop();
+    run_binary(output)
+}
+
