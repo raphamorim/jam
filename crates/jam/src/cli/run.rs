@@ -498,3 +498,68 @@ fn run_tests_parallel(
     }
 }
 
+/// `jam test <dir>`: run each file's tests, tracking passed/failed/skipped,
+/// then print the `Summary:` line (main.cpp:3094-3243). Files run through the
+/// parallel worker pool when more than one job is available; `JAM_TEST_JOBS=1`
+/// (or a single runnable file) takes the serial in-process path, whose sorted,
+/// deterministic output is what a differential comparison can rely on.
+fn test_directory(dir: &str, libs: &[String], opt: OptLevel, lto: Lto, strip: Strip) -> i32 {
+    let files = collect_jam_files(dir);
+    if files.is_empty() {
+        println!("No .jam files found under {dir}");
+        return 0;
+    }
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut skipped = 0;
+    let mut runnable: Vec<String> = Vec::new();
+    for f in &files {
+        if file_has_tests(f) {
+            runnable.push(f.clone());
+        } else {
+            skipped += 1;
+        }
+    }
+
+    let jobs = test_jobs();
+    if jobs > 1 && runnable.len() > 1 {
+        run_tests_parallel(&runnable, libs, opt, jobs, &mut passed, &mut failed);
+    } else {
+        for f in &runnable {
+            // Per-file block header: a leading blank line then `@<file>`.
+            println!();
+            println!("@{f}");
+            // Flush so the header precedes the test binary's own stdout.
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let stem = Path::new(f)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("out");
+            let output = format!("jam_test_{stem}");
+            let rc = emit::emit_jir(
+                f,
+                EmitMode::Test {
+                    output,
+                    libs: libs.to_vec(),
+                },
+                opt,
+                lto,
+                strip,
+            );
+            if rc != 0 {
+                failed += 1;
+            } else {
+                passed += 1;
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "Summary: {passed} file(s) passed, {failed} file(s) failed, {skipped} file(s) without tests, {} file(s) scanned",
+        files.len()
+    );
+    if failed == 0 { 0 } else { 1 }
+}
