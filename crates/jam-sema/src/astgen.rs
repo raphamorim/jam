@@ -2936,9 +2936,35 @@ fn astgen_as_cast(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
 /// params (`mut`, or any aggregate) take an address — the caller's storage for
 /// an lvalue arg, or a fresh spill slot for an rvalue.
 ///
+/// Reject `&x` passed to a MODE parameter (the C++ rejectAddrOfOnModeArg,
+/// astgen.cpp:5999): `&` makes a pointer, but a non-pointer param takes its
+/// argument by mode — the signature's `mut`/`move` already grants access.
+fn reject_addr_of_on_mode_arg(
+    gctx: &AstGenCtx,
+    arg_idx: NodeIdx,
+    p: &Param,
+) -> Result<(), String> {
+    let n = gctx.ctx.node_store.get(arg_idx);
+    if n.tag != AstTag::AddressOf {
+        return Ok(());
+    }
+    let k = gctx.ctx.type_pool.get(p.ty);
+    if k.kind == TypeKind::PtrSingle || k.kind == TypeKind::PtrMany {
+        return Ok(());
+    }
+    Err(fail_node(
+        gctx,
+        arg_idx,
+        &format!(
+            "`&` makes a pointer, but parameter `{}` takes its argument by mode — \
+             pass it plainly (the signature's `mut`/`move` already grants access)",
+            p.name
+        ),
+    ))
+}
+
 /// A `move`-mode arg transfers ownership to the callee — the source's drop is
-/// consumed. Deferred: the `AddressOf`-on-mode validation and the
-/// place-into-destination spill optimization (`astgenExprIntoPtr`).
+/// consumed.
 /// True when `n` is a `MemberAccess` whose base is a non-local Variable — i.e. a
 /// `Type.Variant` / `handle.X` constructor expression rather than an addressable
 /// lvalue (a local's `s.field` has its base in `locals`). lower_arg spills these.
@@ -2951,6 +2977,7 @@ fn member_access_is_ctor(gctx: &AstGenCtx, n: &AstNode) -> bool {
 }
 
 fn lower_arg(gctx: &mut AstGenCtx, arg_idx: NodeIdx, p: &Param) -> Result<JirRef, String> {
+    reject_addr_of_on_mode_arg(gctx, arg_idx, p)?;
     // A `move`-mode arg that extracts a drop-bearing field out of an owned
     // aggregate is rejected — the callee and the parent's glue would both drop it
     // (the C++ lowerArg's rejectDropBearingFieldExtract, astgen.cpp:5933).
