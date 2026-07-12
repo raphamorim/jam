@@ -1,0 +1,23 @@
+// Ports "Move - conditional method-call move rejected" in its ORIGINAL
+// C++ shape: a generic method call that moves on only one branch.
+// expect-error: move it on all control-flow paths or none
+// expect-error: is moved on some control-flow paths but not others
+
+const { Vec } = import("std/collections");
+
+const Counter = struct { value: u32, sink: *mut u32 };
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn bad(sink: *mut u32, cond: bool) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    var c: Counter = Counter { value: 1, sink: sink };
+    if (cond) {
+        v.push(c);
+    }
+}
+
+fn main() {}

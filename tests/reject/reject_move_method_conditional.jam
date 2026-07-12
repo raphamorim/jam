@@ -1,9 +1,8 @@
 // Ported from tests/cpp/test_codegen_errors.cpp "Move - conditional
 // method-call move rejected": a method-call move inside an if-arm is a
 // maybe-move of the outer binding.
-// ADAPTED: the C++ test used Vec(Counter).push; methods of GENERIC
-// instantiations currently escape the move analysis (recorded as a
-// gap), so this pins the non-generic receiver shape.
+// This pins the non-generic receiver shape; the original generic
+// Vec(Counter).push shape lives in reject_move_generic_*.jam.
 // expect-error: move it on all control-flow paths or none
 
 const Counter = struct {
