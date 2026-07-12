@@ -1854,6 +1854,15 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         fill_type_bodies(&mut cg, &reg_modules);
         register_drop_clone(&mut cg, &all_modules);
     }
+    // The analyzer pushes type-cycle diagnostics ("struct `A` depends on
+    // itself", with the reference-trace chain) onto the context's GLOBAL
+    // collector — flush them before lowering walks the infinite-sized types
+    // (the C++ hasErrors gate after the analysis passes, main.cpp:1341).
+    if cg.has_errors() {
+        progress.error();
+        eprint!("{}", cg.diagnostics().render_to_string());
+        return 1;
+    }
 
     let mut jir_functions: Vec<JirFunction> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -1994,6 +2003,13 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     if !matches!(mode, EmitMode::Jir) {
         fill_type_bodies(&mut cg, &reg_modules);
         register_drop_clone(&mut cg, &all_modules);
+        // Same global-collector flush as the JIR path: a type cycle must stop
+        // the compile before codegen recurses into the cyclic layout.
+        if cg.has_errors() {
+            progress.error();
+            eprint!("{}", cg.diagnostics().render_to_string());
+            return 1;
+        }
     }
     // Method-signature metadata pre-pass (the C++ Phase 1k `registerStructMethods`,
     // main.cpp:1144-1219). Run astgen_metadata() on every struct method BEFORE any
