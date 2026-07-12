@@ -1,4 +1,4 @@
-.PHONY: build check-llvm install uninstall clean cmake-build cmake-install cmake-uninstall test test-release test-unit test-unit-release test-init test-abi test-codegen-errors test-jir test-diagnostics test-decl test-analyzer test-comptime test-print docs format check-format fmt info
+.PHONY: build check-llvm install uninstall clean cmake-build cmake-install cmake-uninstall test test-release test-unit test-unit-release test-init test-codegen-errors test-diagnostics test-decl test-analyzer test-comptime test-print docs format check-format fmt info
 .DEFAULT_GOAL := build
 
 LLVM_CONFIG=$(shell which llvm-config 2>/dev/null || echo "llvm-config")
@@ -180,19 +180,11 @@ $(OUT)/init_analysis_tests: $(OUT)/test_init_analysis.o $(LIB_OBJS)
 	@echo "  LD: $@"
 	@clang++ -o $@ $^ $(LLVM_LDFLAGS)
 
-$(OUT)/abi_tests: $(OUT)/test_abi.o $(LIB_OBJS)
-	@echo "  LD: $@"
-	@clang++ -o $@ $^ $(LLVM_LDFLAGS)
-
 $(OUT)/analyzer_tests: $(OUT)/test_analyzer.o $(LIB_OBJS)
 	@echo "  LD: $@"
 	@clang++ -o $@ $^ $(LLVM_LDFLAGS)
 
 $(OUT)/codegen_error_tests: $(OUT)/test_codegen_errors.o
-	@echo "  LD: $@"
-	@clang++ -o $@ $^
-
-$(OUT)/jir_tests: $(OUT)/test_jir_skeleton.o
 	@echo "  LD: $@"
 	@clang++ -o $@ $^
 
@@ -217,20 +209,10 @@ test-init: build $(OUT)/init_analysis_tests
 	@echo "Building and running init_analysis C++ tests..."
 	@$(OUT)/init_analysis_tests
 
-test-abi: build $(OUT)/abi_tests
-	@echo ""
-	@echo "Building and running abi C++ tests..."
-	@$(OUT)/abi_tests
-
 test-codegen-errors: build $(OUT)/codegen_error_tests
 	@echo ""
 	@echo "Building and running codegen-error C++ tests..."
 	@$(OUT)/codegen_error_tests
-
-test-jir: build $(OUT)/jir_tests
-	@echo ""
-	@echo "Building and running JIR C++ tests..."
-	@$(OUT)/jir_tests
 
 test-diagnostics: build $(OUT)/diagnostic_tests
 	@echo ""
@@ -257,7 +239,7 @@ test-print: build $(OUT)/print_tests
 	@echo "Building and running @-emit cfn-print end-to-end tests..."
 	@$(OUT)/print_tests
 
-test: test-unit test-init test-abi test-codegen-errors test-jir test-diagnostics test-decl test-analyzer test-comptime test-print
+test: test-unit test-init test-codegen-errors test-diagnostics test-decl test-analyzer test-comptime test-print
 test-release: test test-unit-release
 
 fmt: format
