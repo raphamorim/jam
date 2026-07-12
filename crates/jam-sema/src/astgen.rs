@@ -107,14 +107,21 @@ struct AstGenCtx<'a, 'ctx> {
     recovered: Vec<String>,
 }
 
+/// Append a recoverable diagnostic WITHOUT emitting a Poison (the C++
+/// `appendErrorHere`) — for skip-and-continue loops like struct-literal fields,
+/// where the offending item is simply dropped.
+fn append_error_here(gctx: &mut AstGenCtx, message: String) {
+    let prefixed = fail_node(gctx, gctx.current_node, &message);
+    gctx.recovered.push(prefixed);
+}
+
 /// Append a recoverable diagnostic (already prefixed `file:line: error:` via
 /// [`fail_node`]) anchored at `gctx.current_node` and hand back a `Poison`
 /// placeholder so the walk continues. Mirrors the C++ `recoverHere`
 /// (astgen.cpp:243): the driver short-circuits before codegen whenever any
 /// error was recorded, so the Poison never reaches a real backend.
 fn recover_here(gctx: &mut AstGenCtx, message: String, ty: TypeIdx) -> JirRef {
-    let prefixed = fail_node(gctx, gctx.current_node, &message);
-    gctx.recovered.push(prefixed);
+    append_error_here(gctx, message);
     emit(
         gctx,
         JirInst {
@@ -1499,8 +1506,11 @@ fn astgen_variable(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Resu
     // at here.)
     if let Some(f) = gctx.ctx.get_function_ast(&name) {
         if f.is_generic() {
-            return Err(format!(
-                "astgen: cannot take address of generic fn `{name}`"
+            // Recoverable (the C++ astgen.cpp:1444).
+            return Ok(recover_here(
+                gctx,
+                format!("cannot take address of generic fn `{name}`"),
+                TypeIdx::NONE,
             ));
         }
         let sid = gctx.ctx.string_pool.intern(name.as_bytes());
@@ -1517,7 +1527,13 @@ fn astgen_variable(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Resu
             },
         ));
     }
-    Err(format!("unknown variable `{name}`"))
+    // Recoverable (the C++ astgen.cpp:1466): emit a Poison so the rest of the
+    // function still gets analyzed and additional errors report in one pass.
+    Ok(recover_here(
+        gctx,
+        format!("unknown variable `{name}`"),
+        TypeIdx::NONE,
+    ))
 }
 
 /// Emit a JIR constant for a folded compile-time value, narrowed to `expected`
@@ -1688,11 +1704,16 @@ fn materialize_comptime_value(
                     // hard error, not a silent truncation (the C++
                     // materializeComptimeValue fit-check, astgen.cpp:785+).
                     if !comp_int_fits(*bits, *is_signed, ew, es) {
-                        return Err(format!(
-                            "{what} has value {}, which does not fit the expected {}{}",
-                            comp_int_to_string(*bits, *is_signed),
-                            if es { "i" } else { "u" },
-                            ew
+                        // Recoverable (the C++ astgen.cpp:800).
+                        return Ok(recover_here(
+                            gctx,
+                            format!(
+                                "{what} has value {}, which does not fit the expected {}{}",
+                                comp_int_to_string(*bits, *is_signed),
+                                if es { "i" } else { "u" },
+                                ew
+                            ),
+                            resolved,
                         ));
                     }
                     w = ew;
@@ -1769,7 +1790,18 @@ fn materialize_comptime_value(
                 },
             ))
         }
-        _ => Err("astgen: comptime value kind not yet materializable".into()),
+        // Type values have no runtime representation — a value position
+        // consuming one is an error, not a lowering (the C++ astgen.cpp:860).
+        ComptimeValue::Type(_) => Ok(recover_here(
+            gctx,
+            format!("{what} is of type `type` and has no runtime representation"),
+            TypeIdx::NONE,
+        )),
+        _ => Ok(recover_here(
+            gctx,
+            format!("{what} has no runtime lowering yet"),
+            TypeIdx::NONE,
+        )),
     }
 }
 
@@ -2272,10 +2304,16 @@ fn astgen_lvalue(gctx: &mut AstGenCtx, node: NodeIdx) -> Result<(JirRef, TypeIdx
                 .ctx
                 .struct_fields(base_ty)
                 .ok_or_else(|| "astgen: lvalue field access on non-struct".to_string())?;
-            let idx = fields
-                .iter()
-                .position(|(nm, _)| *nm == member)
-                .ok_or_else(|| format!("astgen: unknown field `{member}`"))?;
+            let Some(idx) = fields.iter().position(|(nm, _)| *nm == member) else {
+                // Recoverable (the C++ astgen.cpp:2172).
+                let sname = gctx.ctx.struct_name_of(base_ty).unwrap_or_default();
+                let p = recover_here(
+                    gctx,
+                    format!("unknown field `{member}` on `{sname}`"),
+                    TypeIdx::NONE,
+                );
+                return Ok((p, TypeIdx::NONE));
+            };
             let mut field_ty = fields[idx].1;
             if gctx.ctx.type_pool.get(field_ty).kind == TypeKind::ArrayExpr {
                 let r = gctx.ctx.resolve_array_expr(field_ty);
@@ -3045,9 +3083,14 @@ fn astgen_comp_instantiated_call(
             Some(p) if p.is_comp => {
                 let v = gctx.ctx.fold_comptime_expr_in(arg_idx, &gctx.comp_scope);
                 if matches!(v, ComptimeValue::None) {
-                    return Err(format!(
-                        "astgen: argument for comp param `{}` must be a compile-time constant",
-                        p.name
+                    // Recoverable (the C++ astgen.cpp:6530).
+                    return Ok(recover_here(
+                        gctx,
+                        format!(
+                            "argument for comp param `{}` must be a compile-time constant",
+                            p.name
+                        ),
+                        TypeIdx::NONE,
                     ));
                 }
                 suffix.push_str("__");
@@ -4132,11 +4175,16 @@ fn astgen_comptime_fn_call(
     arg_count: u32,
 ) -> Result<JirRef, String> {
     if arg_count as usize != fn_ast.args.len() {
-        return Err(format!(
-            "cfn `{}` expects {} arg(s), got {}",
-            fn_ast.name,
-            fn_ast.args.len(),
-            arg_count
+        // Recoverable (the C++ astgen.cpp:6432) — cfn doesn't support varargs.
+        return Ok(recover_here(
+            gctx,
+            format!(
+                "cfn `{}` expects {} arg(s), got {}",
+                fn_ast.name,
+                fn_ast.args.len(),
+                arg_count
+            ),
+            TypeIdx::NONE,
         ));
     }
     let line = gctx.ctx.node_store.get_line(gctx.current_node);
@@ -4160,10 +4208,15 @@ fn astgen_comptime_fn_call(
             .ctx
             .eval_cfn_call(fn_ast, &arg_exprs, &gctx.comp_scope, line)?;
         if returned.is_none() {
-            return Err(format!(
-                "cfn `{}` declares a return type but its body did not `return` a \
-                 compile-time value on every path",
-                fn_ast.name
+            // Recoverable (the C++ astgen.cpp:6501).
+            return Ok(recover_here(
+                gctx,
+                format!(
+                    "cfn `{}` declares a return type but its body did not `return` a \
+                     compile-time value on every path",
+                    fn_ast.name
+                ),
+                fn_ast.return_type,
             ));
         }
         return materialize_comptime_value(
@@ -4205,10 +4258,12 @@ fn astgen_comptime_fn_call(
             );
             let v = ev.eval(arg_idx, &gctx.comp_scope, &mut ctx);
             if v.is_none() {
-                return Err(format!(
+                // Recoverable (the C++ astgen.cpp:6462).
+                let msg = format!(
                     "argument to cfn `{}` (param `{}`) must be a compile-time constant",
                     fn_ast.name, fn_ast.args[i as usize].name
-                ));
+                );
+                return Ok(recover_here(gctx, msg, TypeIdx::NONE));
             }
             outer.bind(fn_ast.args[i as usize].name.clone(), v);
         }
@@ -4239,10 +4294,10 @@ fn astgen_comptime_fn_call(
             &mut ctx,
         );
         if matches!(r, ExecResult::Error | ExecResult::IterationCap) {
-            return Err(format!(
-                "cfn `{}` failed to evaluate at compile time",
-                fn_ast.name
-            ));
+            // Recoverable (the C++ astgen.cpp:6488) — return a poison so the
+            // rest of the caller still gets analyzed.
+            let msg = format!("cfn `{}` failed during compile-time evaluation", fn_ast.name);
+            return Ok(recover_here(gctx, msg, TypeIdx::NONE));
         }
     }
     replay_cfn_emits(gctx, &emitter)?;
@@ -5101,7 +5156,12 @@ fn astgen_at_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
                 },
             ))
         }
-        other => Err(format!("astgen: @{other} intrinsic not yet ported")),
+        // Recoverable (the C++ astgen.cpp:5574).
+        other => Ok(recover_here(
+            gctx,
+            format!("unknown intrinsic `@{other}`"),
+            TypeIdx::NONE,
+        )),
     }
 }
 
@@ -6377,7 +6437,12 @@ fn astgen_slice(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     let base = astgen_expr(gctx, base_idx, TypeIdx::NONE)?;
     let bk = gctx.ctx.type_pool.get(gctx.jfn.get_inst(base).ty);
     if bk.kind != TypeKind::PtrMany && bk.kind != TypeKind::PtrSingle {
-        return Err("astgen: slice expression `base[a..b]` needs a many-item pointer base".into());
+        // Recoverable (the C++ astgen.cpp:2742).
+        return Ok(recover_here(
+            gctx,
+            "slice expression `base[a..b]` needs a many-item pointer base".to_string(),
+            TypeIdx::NONE,
+        ));
     }
     let elem = TypeIdx::new(bk.a);
 
@@ -6670,10 +6735,14 @@ fn astgen_member_access(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Str
         }
         if let Some(fields) = gctx.ctx.struct_fields(base_leaf) {
             let sname = gctx.ctx.struct_name_of(base_leaf).unwrap_or_default();
-            let idx = fields
-                .iter()
-                .position(|(nm, _)| *nm == member)
-                .ok_or_else(|| format!("unknown field `{member}` on `{sname}`"))?;
+            let Some(idx) = fields.iter().position(|(nm, _)| *nm == member) else {
+                // Recoverable (the C++ astgen.cpp:2172).
+                return Ok(recover_here(
+                    gctx,
+                    format!("unknown field `{member}` on `{sname}`"),
+                    TypeIdx::NONE,
+                ));
+            };
             let mut field_ty = fields[idx].1;
             // An `[expr]T` field resolves to its concrete `[n]T` (cached at
             // registration) for the FieldAddr/Load types.
@@ -6775,10 +6844,14 @@ fn astgen_member_access(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Str
         .struct_fields(base_ty)
         .ok_or_else(|| "astgen: cannot access field of non-struct type".to_string())?;
     let sname = gctx.ctx.struct_name_of(base_ty).unwrap_or_default();
-    let idx = fields
-        .iter()
-        .position(|(nm, _)| *nm == member)
-        .ok_or_else(|| format!("unknown field `{member}` on `{sname}`"))?;
+    let Some(idx) = fields.iter().position(|(nm, _)| *nm == member) else {
+        // Recoverable (the C++ astgen.cpp:2258).
+        return Ok(recover_here(
+            gctx,
+            format!("unknown field `{member}` on `{sname}`"),
+            TypeIdx::NONE,
+        ));
+    };
     let field_ty = fields[idx].1;
     Ok(emit(
         gctx,
@@ -6889,7 +6962,13 @@ fn astgen_struct_lit(
         let field_name = str_at(gctx, name_id);
         let idx = match fields.iter().position(|(nm, _)| *nm == field_name) {
             Some(p) => p,
-            None => return Err(format!("unknown struct field `{field_name}`")),
+            None => {
+                // Recoverable (the C++ astgen.cpp:1749): record the bad field
+                // name and skip it so other malformed fields in the same
+                // literal still get reported in this pass.
+                append_error_here(gctx, format!("unknown struct field `{field_name}`"));
+                continue;
+            }
         };
         let expected_field = fields[idx].1;
         // Capturing a drop-bearing field extracted out of an aggregate would leave
@@ -7141,7 +7220,10 @@ fn astgen_struct_lit_into(
                 expr_by_idx[p] = expr_idx;
                 has_field[p] = true;
             }
-            None => return Err(format!("unknown struct field `{field_name}`")),
+            None => {
+                // Recoverable (the C++ astgen.cpp:1854).
+                append_error_here(gctx, format!("unknown struct field `{field_name}`"));
+            }
         }
     }
 
