@@ -1,0 +1,10 @@
+// Both bad fields in one literal must report (recover-and-continue).
+// expect-error: unknown struct field `a`
+// expect-error: unknown struct field `b`
+
+const P = struct { x: i32 };
+
+fn main() i32 {
+    var p = P { a: 1, b: 2, x: 3 };
+    return 0;
+}

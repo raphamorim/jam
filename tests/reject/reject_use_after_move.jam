@@ -1,0 +1,13 @@
+// Reading a binding after a `move` arg drained it must be rejected.
+// expect-error: use of moved binding `x`
+
+fn consume(buf: move u32) u32 {
+    return buf;
+}
+
+fn main() i32 {
+    var x: u32 = 100;
+    consume(x);
+    var y: u32 = x;
+    return 0;
+}

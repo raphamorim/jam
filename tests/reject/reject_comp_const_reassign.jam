@@ -1,0 +1,8 @@
+// `comp const` bindings are immutable.
+// expect-error: cannot assign to comp const `N`
+
+fn main() i32 {
+    comp const N = 1;
+    N = 2;
+    return 0;
+}

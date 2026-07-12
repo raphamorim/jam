@@ -1,0 +1,11 @@
+// A lossy narrowing return needs an explicit cast.
+// expect-error: return value type does not match the declared return type of `narrow`
+
+fn narrow() u8 {
+    var x: i32 = 300;
+    return x;
+}
+
+fn main() i32 {
+    return 0;
+}

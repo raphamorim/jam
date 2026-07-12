@@ -1,0 +1,9 @@
+// Re-declaring a name in the same lexical scope is an error; inner-block
+// shadowing stays legal (covered by the must-pass corpus).
+// expect-error: redeclaration of `a` in the same scope
+
+fn main() i32 {
+    const a = 1;
+    var a = 2;
+    return 0;
+}
