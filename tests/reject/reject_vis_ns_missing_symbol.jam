@@ -1,0 +1,9 @@
+// Ported from C++ "Codegen - namespace access to missing symbol rejected"
+// (tests/cpp/test_codegen_errors.cpp): `mod.Nope` where Nope doesn't
+// exist in the module at all. (C++ asserted "does not exist in module";
+// the Rust compiler reports an unresolved Named type.)
+// expect-error: unresolved Named type `lib.Nope`
+
+const lib = import("reject_vis_helper");
+fn takes(p: lib.Nope) {}
+fn main() {}

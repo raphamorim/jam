@@ -1,0 +1,12 @@
+// Ported from C++ "Comptime - comp var runtime-cond assign rejected"
+// (tests/cpp/test_codegen_errors.cpp): mutating a comp var from inside
+// runtime conditional control flow is rejected.
+// expect-error: cannot assign to comp binding `x` from inside runtime conditional control flow
+
+fn flag() bool { return true; }
+fn main() {
+    comp var x = 1;
+    if (flag()) {
+        x = 2;
+    }
+}

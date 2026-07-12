@@ -1,0 +1,10 @@
+// Ported from C++ "Comptime - comp local runtime init rejected"
+// (tests/cpp/test_codegen_errors.cpp): a function-local comp binding
+// whose initializer isn't foldable is rejected at the declaration.
+// expect-error: comp initializer of `x` must be a compile-time-known value
+
+fn rt() u64 { return 5; }
+fn main() {
+    comp const x = rt();
+    var y: u64 = x;
+}

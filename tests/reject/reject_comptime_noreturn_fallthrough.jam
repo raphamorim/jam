@@ -1,0 +1,10 @@
+// Ported from C++ "Codegen - noreturn fn whose body may fall through is rejected"
+// (tests/cpp/test_codegen_errors.cpp): a `noreturn` function must
+// diverge on every path; a body that could complete normally is
+// rejected.
+// expect-error: fn `faker` is declared `noreturn` but its body falls through without diverging
+
+fn faker() noreturn {
+    var x: i32 = 1;
+}
+fn main() {}

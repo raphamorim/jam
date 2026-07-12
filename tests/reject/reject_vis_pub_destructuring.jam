@@ -1,0 +1,8 @@
+// Ported from C++ "Codegen - `pub` on destructuring import rejected"
+// (tests/cpp/test_codegen_errors.cpp): `pub const { X } = import(...)`
+// is rejected explicitly so the destructuring path doesn't silently
+// drop the pub modifier.
+// expect-error: `pub` is not allowed on destructuring imports
+
+pub const { Val } = import("reject_vis_helper");
+fn main() {}

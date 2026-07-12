@@ -1,0 +1,11 @@
+// Ported from C++ "Comptime - cfn missing return rejected"
+// (tests/cpp/test_codegen_errors.cpp): a value-returning cfn whose body
+// doesn't `return` a value is rejected at the call site.
+// expect-error: cfn `noReturn` declares a return type but its body did not `return` a compile-time value on every path
+
+cfn noReturn(x: u64) u64 {
+    var y: u64 = x + 1;
+}
+fn main() {
+    var z: u64 = noReturn(5);
+}

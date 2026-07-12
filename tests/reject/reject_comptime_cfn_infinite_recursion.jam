@@ -1,0 +1,12 @@
+// Ported from C++ "Comptime - cfn infinite recursion rejected"
+// (tests/cpp/test_codegen_errors.cpp): infinite cfn recursion is caught
+// (C++ asserted "depth cap"; the Rust compiler reports a comptime
+// evaluation failure for the cfn).
+// expect-error: cfn `forever` failed to evaluate at compile time
+
+cfn forever(n: u64) u64 {
+    return forever(n + 1);
+}
+fn main() {
+    var z: u64 = forever(0);
+}

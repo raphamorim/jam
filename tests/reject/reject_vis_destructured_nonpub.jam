@@ -1,0 +1,7 @@
+// Ported from C++ "Codegen - destructured non-pub symbol rejected"
+// (tests/cpp/test_codegen_errors.cpp): `const { X } = import("lib")`
+// requires X to be `pub` in lib.
+// expect-error: symbol `Hidden` is not exported from module `reject_vis_helper`
+
+const { Hidden } = import("reject_vis_helper");
+fn main() {}

@@ -1,0 +1,13 @@
+// Helper module for the reject_vis_* fixtures (no expect-error lines
+// and no tfns, so the test runner skips it). Provides non-pub and pub
+// symbols that the fixtures try (and fail) to reach.
+const Hidden = struct {
+    n: i32,
+};
+const Private = struct {
+    n: i32,
+};
+pub const Val = struct {
+    n: i32,
+};
+fn priv(x: i32) i32 { return x; }

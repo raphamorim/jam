@@ -1,0 +1,13 @@
+// Ported from C++ "Comptime - cfn calls runtime fn rejected"
+// (tests/cpp/test_codegen_errors.cpp): calling a plain (runtime) fn
+// from comptime is rejected (C++ asserted "runtime function"; the Rust
+// compiler reports a comptime evaluation failure for the cfn).
+// expect-error: cfn `wrap` failed to evaluate at compile time
+
+fn runtimeFn(x: u64) u64 { return x * 2; }
+cfn wrap(x: u64) u64 {
+    return runtimeFn(x);
+}
+fn main() {
+    var z: u64 = wrap(5);
+}

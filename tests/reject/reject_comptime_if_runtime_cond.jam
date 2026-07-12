@@ -1,0 +1,13 @@
+// Ported from C++ "Comptime - comp if runtime cond rejected"
+// (tests/cpp/test_codegen_errors.cpp): `comp if` with a non-comptime
+// condition is rejected.
+// expect-error: comp-if condition is not a comptime bool
+
+fn flag() bool { return true; }
+fn main() {
+    comp if (flag()) {
+        var x: u64 = 1;
+    } else {
+        var y: u64 = 2;
+    }
+}

@@ -1,0 +1,8 @@
+// Ported from C++ "Comptime - comp const runtime init rejected"
+// (tests/cpp/test_codegen_errors.cpp): a `comp const` whose initializer
+// depends on a runtime value is rejected eagerly at the declaration.
+// expect-error: comp const `BAD` must be compile-time evaluable
+
+fn rt() u64 { return 5; }
+comp const BAD = rt();
+fn main() {}

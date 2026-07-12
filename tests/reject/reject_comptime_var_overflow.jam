@@ -1,0 +1,9 @@
+// Ported from C++ "Comptime - comp var overflow rejected"
+// (tests/cpp/test_codegen_errors.cpp): a comp var value that overflows
+// its established int width is rejected at the assignment.
+// expect-error: comp assignment value 300 does not fit `x` (u8)
+
+fn main() {
+    comp var x: u8 = 1;
+    x = 300;
+}

@@ -1,0 +1,8 @@
+// Ported from C++ "Codegen - bare-name access to non-pub imported type blocked"
+// (tests/cpp/test_codegen_errors.cpp): non-pub structs from imported
+// modules must not leak via the bare-name path.
+// expect-error: unresolved Named type `Private`
+
+const lib = import("reject_vis_helper");
+fn takes(p: Private) {}
+fn main() {}

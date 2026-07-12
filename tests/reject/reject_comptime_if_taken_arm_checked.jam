@@ -1,0 +1,13 @@
+// Ported from C++ "Comptime - comp if taken arm still checked"
+// (tests/cpp/test_codegen_errors.cpp): a symbol referenced only in the
+// TAKEN arm of a comp-if is a real reference and must still resolve
+// (the elision only spares the dead arm).
+// expect-error: unknown function `doesNotExist`
+
+fn main() {
+    comp if (true) {
+        var x: u64 = doesNotExist();
+    } else {
+        var y: u64 = 0;
+    }
+}

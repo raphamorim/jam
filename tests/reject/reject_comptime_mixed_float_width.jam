@@ -1,0 +1,7 @@
+// Ported from C++ "Codegen - mixed-width float binary op without cast"
+// (tests/cpp/test_codegen_errors.cpp): binary ops over mismatched float
+// widths (f32 + f64) need an explicit `as` cast on the narrower side.
+// expect-error: mismatched float widths; use an explicit `as` cast
+
+fn add(a: f32, b: f64) f64 { return a + b; }
+fn main() {}

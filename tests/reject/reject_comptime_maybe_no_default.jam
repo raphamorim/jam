@@ -1,0 +1,26 @@
+// Ported from C++ "Codegen - Maybe(T) where T lacks default()"
+// (tests/cpp/test_codegen_errors.cpp): instantiating Maybe(T) with a T
+// that has no default() method fails when the generic body calls
+// T.default().
+// expect-error: type `Maybe__NoDefault` has no method `default`
+
+const NoDefault = struct {
+    n: i32,
+};
+
+fn Maybe(T: type) type {
+    return struct {
+        storage: T,
+        valid: bool,
+        fn default() Self {
+            return Self { storage: T.default(), valid: false };
+        }
+    };
+}
+
+const MaybeND = Maybe(NoDefault);
+
+fn main() i32 {
+    var m: MaybeND = MaybeND.default();
+    return m.storage.n;
+}

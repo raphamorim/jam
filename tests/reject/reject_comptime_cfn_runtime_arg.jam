@@ -1,0 +1,10 @@
+// Ported from C++ "Comptime - cfn runtime arg rejected"
+// (tests/cpp/test_codegen_errors.cpp): a cfn arg that isn't
+// comptime-known is rejected.
+// expect-error: argument to cfn `dbl` (param `x`) must be a compile-time constant
+
+cfn dbl(x: u64) u64 { return x * 2; }
+fn main() {
+    var n: u64 = 3;
+    var z: u64 = dbl(n);
+}

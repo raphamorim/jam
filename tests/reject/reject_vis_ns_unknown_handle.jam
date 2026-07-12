@@ -1,0 +1,8 @@
+// Ported from C++ "Codegen - namespace access via unknown handle rejected"
+// (tests/cpp/test_codegen_errors.cpp): `unknown.X` where `unknown` was
+// never bound to an import. (C++ asserted "unknown module handle"; the
+// Rust compiler reports an unresolved Named type.)
+// expect-error: unresolved Named type `unknown.X`
+
+fn takes(p: unknown.X) {}
+fn main() {}

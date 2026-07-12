@@ -1,0 +1,9 @@
+// Ported from C++ "Codegen - int literal in float-typed destination"
+// (tests/cpp/test_codegen_errors.cpp): float-typed destinations need a
+// float literal or an explicit `as` cast; implicit int->float coercion
+// is rejected.
+// expect-error: cannot assign integer to float-typed `x`; use a float literal (e.g. `3.0`) or an explicit `as` cast
+
+fn main() {
+    var x: f32 = 3;
+}

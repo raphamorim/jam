@@ -1,0 +1,10 @@
+// Ported from C++ "Codegen - non-void fn with missing else branch is rejected"
+// (tests/cpp/test_codegen_errors.cpp): `if (cond) { return X; }` with no
+// else falls through on the false branch; the missing-return diagnostic
+// fires even though the body contains a `return`.
+// expect-error: fn `maybe` has non-void return type but a path reaches the function end without returning a value
+
+fn maybe(cond: bool) i32 {
+    if (cond) { return 1; }
+}
+fn main() i32 { return maybe(true); }
