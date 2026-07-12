@@ -1288,4 +1288,351 @@ mod tests {
         let mut mac = CompCtx::bare(Os::MacOs);
         assert_eq!(ev.eval(at, &scope, &mut mac), ComptimeValue::Bool(false));
     }
+    fn unop(s: &mut NodeStore, op: UnaryOp, operand: NodeIdx) -> NodeIdx {
+        s.add_node(AstNode {
+            tag: AstTag::UnaryOp,
+            op: op as u8,
+            flags: 0,
+            main_token: 0,
+            lhs: operand.raw(),
+            rhs: 0,
+        })
+    }
+    fn strlit(s: &mut NodeStore, sid: u32) -> NodeIdx {
+        s.add_node(AstNode {
+            tag: AstTag::StringLit,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: sid,
+            rhs: 0,
+        })
+    }
+    fn index(s: &mut NodeStore, base: NodeIdx, idx: NodeIdx) -> NodeIdx {
+        s.add_node(AstNode {
+            tag: AstTag::Index,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: base.raw(),
+            rhs: idx.raw(),
+        })
+    }
+    fn assign(s: &mut NodeStore, target: NodeIdx, value: NodeIdx) -> NodeIdx {
+        s.add_node(AstNode {
+            tag: AstTag::Assign,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: target.raw(),
+            rhs: value.raw(),
+        })
+    }
+
+    /// The C++ testBitwise: and/or/xor over 0b1100 and 0b1010.
+    #[test]
+    fn bitwise_and_or_xor() {
+        let mut s = NodeStore::new();
+        let ops = [
+            (BinOp::BitAnd, 0b1000u64),
+            (BinOp::BitOr, 0b1110),
+            (BinOp::BitXor, 0b0110),
+        ];
+        for (op, want) in ops {
+            let (a, b) = (num(&mut s, 0b1100, false), num(&mut s, 0b1010, false));
+            let n = binop(&mut s, op, a, b);
+            assert_eq!(eval1(&s, n).as_u64(), want, "{op:?}");
+        }
+    }
+
+    /// The C++ testLogAndShortCircuits: LHS=false never evaluates the RHS
+    /// (a missing variable that would fold to None).
+    #[test]
+    fn logand_short_circuits_without_evaluating_rhs() {
+        let sp = StringPool::new();
+        let zid = sp.intern(b"z").raw();
+        let mut s = NodeStore::new();
+        let f = boollit(&mut s, false);
+        let missing = var(&mut s, zid);
+        let n = binop(&mut s, BinOp::LogAnd, f, missing);
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let scope = ComptimeScope::new();
+        let mut ctx = CompCtx::bare(Os::Linux);
+        assert_eq!(ev.eval(n, &scope, &mut ctx), ComptimeValue::Bool(false));
+    }
+
+    /// The C++ testUnaryNegateInt / testUnaryLogNotBool.
+    #[test]
+    fn unary_negate_and_lognot() {
+        let mut s = NodeStore::new();
+        let five = num(&mut s, 5, false);
+        let neg = unop(&mut s, UnaryOp::Neg, five);
+        assert_eq!(eval1(&s, neg).as_i64(), -5);
+        let t = boollit(&mut s, true);
+        let ln = unop(&mut s, UnaryOp::LogNot, t);
+        assert_eq!(eval1(&s, ln), ComptimeValue::Bool(false));
+    }
+
+    /// The C++ testStringIndexReturnsByte / ...OutOfBoundsIsNone.
+    #[test]
+    fn string_index_byte_and_out_of_bounds() {
+        let sp = StringPool::new();
+        let sid = sp.intern(b"abc").raw();
+        let mut s = NodeStore::new();
+        let base = strlit(&mut s, sid);
+        let one = num(&mut s, 1, false);
+        let ok = index(&mut s, base, one);
+        let base2 = strlit(&mut s, sid);
+        let big = num(&mut s, 99, false);
+        let oob = index(&mut s, base2, big);
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let scope = ComptimeScope::new();
+        let mut ctx = CompCtx::bare(Os::Linux);
+        assert_eq!(ev.eval(ok, &scope, &mut ctx).as_u64(), b'b' as u64);
+        assert!(ev.eval(oob, &scope, &mut ctx).is_none());
+    }
+
+    /// The C++ testTypeEquality: `type` values compare by TypeIdx.
+    #[test]
+    fn type_equality() {
+        use jam_syntax::ast_flat::builtin;
+        let sp = StringPool::new();
+        let (tid, uid, vid) = (
+            sp.intern(b"T").raw(),
+            sp.intern(b"U").raw(),
+            sp.intern(b"V").raw(),
+        );
+        let mut s = NodeStore::new();
+        let (t1, u1) = (var(&mut s, tid), var(&mut s, uid));
+        let eq_tu = binop(&mut s, BinOp::Eq, t1, u1);
+        let (t2, v2) = (var(&mut s, tid), var(&mut s, vid));
+        let eq_tv = binop(&mut s, BinOp::Eq, t2, v2);
+        let (t3, v3) = (var(&mut s, tid), var(&mut s, vid));
+        let ne_tv = binop(&mut s, BinOp::Ne, t3, v3);
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let mut scope = ComptimeScope::new();
+        scope.bind("T", ComptimeValue::Type(builtin::I32));
+        scope.bind("U", ComptimeValue::Type(builtin::I32));
+        scope.bind("V", ComptimeValue::Type(builtin::F32));
+        let mut ctx = CompCtx::bare(Os::Linux);
+        assert_eq!(ev.eval(eq_tu, &scope, &mut ctx), ComptimeValue::Bool(true));
+        assert_eq!(ev.eval(eq_tv, &scope, &mut ctx), ComptimeValue::Bool(false));
+        assert_eq!(ev.eval(ne_tv, &scope, &mut ctx), ComptimeValue::Bool(true));
+    }
+
+    /// The C++ testAggregateIndexing: index into an Aggregate binding.
+    #[test]
+    fn aggregate_indexing() {
+        let sp = StringPool::new();
+        let tid = sp.intern(b"t").raw();
+        let mut s = NodeStore::new();
+        let base = var(&mut s, tid);
+        let one = num(&mut s, 1, false);
+        let n = index(&mut s, base, one);
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let mut scope = ComptimeScope::new();
+        let mk = |v: u64| ComptimeValue::Int {
+            bits: v,
+            width: 32,
+            is_signed: true,
+        };
+        scope.bind("t", ComptimeValue::Aggregate(vec![mk(10), mk(20), mk(30)]));
+        let mut ctx = CompCtx::bare(Os::Linux);
+        assert_eq!(ev.eval(n, &scope, &mut ctx).as_u64(), 20);
+    }
+
+    /// The C++ testEvalRequiredPushesDiagnosticOnFail / ...SilentOnSuccess.
+    #[test]
+    fn eval_required_diagnostics() {
+        let sp = StringPool::new();
+        let mid = sp.intern(b"missing").raw();
+        let mut s = NodeStore::new();
+        let miss = var(&mut s, mid);
+        let n42 = num(&mut s, 42, false);
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let scope = ComptimeScope::new();
+
+        let mut diags = Diagnostics::new();
+        let mut ctx = CompCtx {
+            resolver: None,
+            emitter: None,
+            diags: Some(&mut diags),
+            loc: SrcLoc::new("test.jam", 1),
+            host_os: Os::Linux,
+        };
+        assert!(ev.eval_required(miss, &scope, &mut ctx).is_none());
+        drop(ctx);
+        assert!(diags.has_errors());
+        assert_eq!(diags.error_count(), 1);
+
+        let mut diags2 = Diagnostics::new();
+        let mut ctx2 = CompCtx {
+            resolver: None,
+            emitter: None,
+            diags: Some(&mut diags2),
+            loc: SrcLoc::new("test.jam", 1),
+            host_os: Os::Linux,
+        };
+        assert!(ev.eval_required(n42, &scope, &mut ctx2).is_int());
+        drop(ctx2);
+        assert!(!diags2.has_errors());
+    }
+
+    /// The C++ testExecAssignToUndeclaredErrors.
+    #[test]
+    fn exec_assign_to_undeclared_errors() {
+        let sp = StringPool::new();
+        let nid = sp.intern(b"neverDeclared").raw();
+        let mut s = NodeStore::new();
+        let tgt = var(&mut s, nid);
+        let one = num(&mut s, 1, false);
+        let asn = assign(&mut s, tgt, one);
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let mut scope = ComptimeScope::new();
+        let mut diags = Diagnostics::new();
+        let mut ctx = CompCtx {
+            resolver: None,
+            emitter: None,
+            diags: Some(&mut diags),
+            loc: SrcLoc::new("test.jam", 1),
+            host_os: Os::Linux,
+        };
+        let mut iter = 0u32;
+        let mut ret = ComptimeValue::None;
+        let r = ev.exec_stmt(asn, &mut scope, &mut iter, 1000, &mut ret, &mut ctx);
+        assert!(matches!(r, ExecResult::Error));
+        drop(ctx);
+        assert!(diags.has_errors());
+    }
+
+    /// The C++ testExecWhileIterationCapTrips: the cap trips BEFORE the
+    /// 101st body run, leaving i == 100, and pushes a diagnostic.
+    #[test]
+    fn exec_while_iteration_cap_trips() {
+        let sp = StringPool::new();
+        let iid = sp.intern(b"i").raw();
+        let mut s = NodeStore::new();
+        let vi_b = var(&mut s, iid);
+        let one = num(&mut s, 1, false);
+        let inc = binop(&mut s, BinOp::Add, vi_b, one);
+        let vi_t = var(&mut s, iid);
+        let asn = assign(&mut s, vi_t, inc);
+        let w_extra = s.reserve_extra(2);
+        s.set_extra(w_extra, 1);
+        s.set_extra(ExtraIdx::new(w_extra.raw() + 1), asn.raw());
+        let t = boollit(&mut s, true);
+        let w = s.add_node(AstNode {
+            tag: AstTag::WhileNode,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: t.raw(),
+            rhs: w_extra.raw(),
+        });
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let mut scope = ComptimeScope::new();
+        scope.bind(
+            "i",
+            ComptimeValue::Int {
+                bits: 0,
+                width: 64,
+                is_signed: false,
+            },
+        );
+        let mut diags = Diagnostics::new();
+        let mut ctx = CompCtx {
+            resolver: None,
+            emitter: None,
+            diags: Some(&mut diags),
+            loc: SrcLoc::new("test.jam", 1),
+            host_os: Os::Linux,
+        };
+        let mut iter = 0u32;
+        let mut ret = ComptimeValue::None;
+        let r = ev.exec_stmt(w, &mut scope, &mut iter, 100, &mut ret, &mut ctx);
+        assert!(matches!(r, ExecResult::IterationCap));
+        drop(ctx);
+        assert!(diags.has_errors());
+        assert_eq!(scope.lookup("i").unwrap().as_u64(), 100);
+    }
+
+    /// The C++ testExecBlockShortCircuitsOnError: a failing statement stops
+    /// the block before later statements run.
+    #[test]
+    fn exec_block_short_circuits_on_error() {
+        let sp = StringPool::new();
+        let xid = sp.intern(b"x").raw();
+        let yid = sp.intern(b"y").raw();
+        let mut s = NodeStore::new();
+        // var x = 0
+        let zero = num(&mut s, 0, false);
+        let vd_extra = s.reserve_extra(3);
+        s.set_extra(vd_extra, xid);
+        s.set_extra(ExtraIdx::new(vd_extra.raw() + 1), 0);
+        s.set_extra(ExtraIdx::new(vd_extra.raw() + 2), zero.raw());
+        let vardecl = s.add_node(AstNode {
+            tag: AstTag::VarDecl,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: vd_extra.raw(),
+            rhs: 0,
+        });
+        // y = 1 (y never declared -> Error)
+        let ty = var(&mut s, yid);
+        let one = num(&mut s, 1, false);
+        let bad = assign(&mut s, ty, one);
+        // x = 99 (must never run)
+        let tx = var(&mut s, xid);
+        let n99 = num(&mut s, 99, false);
+        let good = assign(&mut s, tx, n99);
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let mut scope = ComptimeScope::new();
+        let mut ctx = CompCtx::bare(Os::Linux);
+        let mut iter = 0u32;
+        let mut ret = ComptimeValue::None;
+        let r = ev.exec_block(
+            &[vardecl, bad, good],
+            &mut scope,
+            &mut iter,
+            1000,
+            &mut ret,
+            &mut ctx,
+        );
+        assert!(matches!(r, ExecResult::Error));
+        assert_eq!(scope.lookup("x").unwrap().as_u64(), 0);
+    }
+
+    /// The C++ testMemberAccessStrLength.
+    #[test]
+    fn member_access_str_length() {
+        let sp = StringPool::new();
+        let sid = sp.intern(b"s").raw();
+        let hello = sp.intern(b"hello").raw();
+        let mut s = NodeStore::new();
+        let base = var(&mut s, sid);
+        let access = s.add_node(AstNode {
+            tag: AstTag::MemberAccess,
+            op: 0,
+            flags: 0,
+            main_token: 0,
+            lhs: base.raw(),
+            rhs: sp.intern(b"length").raw(),
+        });
+        let tp = TypePool::new();
+        let ev = ComptimeEvaluator::new(&s, &sp, &tp);
+        let mut scope = ComptimeScope::new();
+        scope.bind("s", ComptimeValue::Str(StringIdx::new(hello)));
+        let mut ctx = CompCtx::bare(Os::Linux);
+        assert_eq!(ev.eval(access, &scope, &mut ctx).as_u64(), 5);
+    }
 }
+
