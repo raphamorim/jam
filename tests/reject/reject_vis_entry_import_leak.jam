@@ -1,0 +1,13 @@
+// Ports "XMod - imported body cannot see entry imports"
+// (test_codegen_errors.cpp): the entry importing `pingmod` under handle `p`
+// must not make `p` resolvable inside another module's body.
+// expect-error: reject_vis_entry_leak_lib.jam:
+// expect-error: unknown module handle `p` in `p.ping`
+
+const p = import("reject_vis_entry_leak_ping");
+const { makeThing } = import("reject_vis_entry_leak_lib");
+
+fn main() {
+    var n: u32 = 0;
+    var t = makeThing(&n);
+}

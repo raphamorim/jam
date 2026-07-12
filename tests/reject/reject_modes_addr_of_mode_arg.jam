@@ -1,0 +1,12 @@
+// Ports "Modes - `&` on a mode argument rejected" (test_codegen_errors.cpp):
+// `&` makes a pointer, but a mode parameter takes its argument plainly.
+// expect-error: `&` makes a pointer, but parameter `x` takes its argument by mode
+
+fn bump(x: mut u32) {
+    x = x + 1;
+}
+
+fn main() {
+    var n: u32 = 1;
+    bump(&n);
+}

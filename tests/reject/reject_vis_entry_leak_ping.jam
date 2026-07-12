@@ -1,0 +1,2 @@
+// Helper for reject_vis_entry_import_leak.jam (no directives, no tfns).
+pub fn ping() u32 { return 7; }

@@ -1,0 +1,7 @@
+// Ports "Array - float array size rejected" (test_codegen_errors.cpp): a
+// float literal size must not silently fold to a zero-length array.
+// expect-error: array size must be a non-negative integer
+
+fn main() {
+    var a: [1.5]u8 = [0; 0];
+}

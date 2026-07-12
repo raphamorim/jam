@@ -1,0 +1,12 @@
+// Helper for reject_vis_entry_import_leak.jam: the drop body references a
+// handle `p` this module never imported (no directives, no tfns).
+pub const Thing = struct { q: *mut u32 };
+
+pub fn makeThing(n: *mut u32) Thing {
+    return Thing { q: n };
+}
+
+cfn drop(self: mut Thing) {
+    var q: *mut u32 = self.q;
+    q.* = p.ping();
+}

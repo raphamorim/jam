@@ -1,0 +1,7 @@
+// Ports "Array - array size beyond u32 rejected" (test_codegen_errors.cpp):
+// a literal size past 2^32 must not silently wrap to zero.
+// expect-error: array size `0x1_0000_0000` exceeds u32 range
+
+fn main() {
+    var a: [0x1_0000_0000]u8 = [0; 0];
+}
