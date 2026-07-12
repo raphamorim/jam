@@ -1,0 +1,9 @@
+// Ported from C++ test: "FnRef - truly unknown variable still errors (no fn fallback)"
+// (tests/cpp/test_codegen_errors.cpp testUnknownVariableStillErrors)
+// The fn-name fallback in variable resolution must not swallow the
+// "unknown variable" diagnostic for names that are neither locals,
+// consts, nor functions.
+// expect-error: unknown variable `nonexistent_thing`
+fn main() {
+    var a: u64 = nonexistent_thing;
+}

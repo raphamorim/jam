@@ -1,0 +1,8 @@
+// Ported from C++ test: "Array - empty literal into sized array rejected"
+// (tests/cpp/test_codegen_errors.cpp testEmptyLitIntoSizedArrayRejected)
+// Zig errors `expected 8 array elements; found 0` here; jam's `[]` empty
+// literal must hit the same wall instead of leaving the array uninitialized.
+// expect-error: array literal has 0 element(s) but the array type expects 8
+fn main() {
+    const a: [8]u8 = [];
+}

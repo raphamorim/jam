@@ -1,0 +1,9 @@
+// Ported from C++ test: "FnRef - ptr as u32 (narrower than u64) is rejected"
+// (tests/cpp/test_codegen_errors.cpp testPtrAsNarrowIntRejected)
+// Pointers are 64-bit; casting to a narrower int would silently truncate.
+// expect-error: unsupported `as` cast
+extern fn malloc(size: u64) *mut[] u8;
+fn main() {
+    var p: *mut[] u8 = malloc(8);
+    var a: u32 = p as u32;
+}

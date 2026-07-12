@@ -1,0 +1,9 @@
+// Ported from C++ test: "Array - length mismatch via const size rejected"
+// (tests/cpp/test_codegen_errors.cpp testConstSizeMismatchRejected)
+// The folded const length feeds the same literal-length checks as a
+// written-out size, and the diagnostic reports the RESOLVED length.
+// expect-error: array literal has 3 element(s) but the array type expects 4
+const N = 4;
+fn main() {
+    const a: [N]u8 = [1, 2, 3];
+}

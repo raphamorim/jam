@@ -1,0 +1,8 @@
+// Ported from C++ test: "Array - non-comptime size rejected"
+// (tests/cpp/test_codegen_errors.cpp testNonComptimeSizeRejected, case 2/2)
+// A runtime variable in the size position can't fold — rejected.
+// expect-error: array length must be comptime-known
+fn main() {
+    var n: u32 = 5;
+    var a: [n]u8 = [0; 5];
+}

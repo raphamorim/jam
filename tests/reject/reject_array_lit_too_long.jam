@@ -1,0 +1,6 @@
+// Ported from C++ test: "Array - list literal longer than array rejected"
+// (tests/cpp/test_codegen_errors.cpp testArrayLitTooLongRejected)
+// expect-error: array literal has 3 element(s) but the array type expects 2
+fn main() {
+    const a: [2]u8 = [1, 2, 3];
+}

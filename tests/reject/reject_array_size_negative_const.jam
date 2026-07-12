@@ -1,0 +1,9 @@
+// Ported from C++ test: "Array - negative const size rejected"
+// (tests/cpp/test_codegen_errors.cpp testNegativeConstSizeRejected)
+// C++ compiler said "array size must be a non-negative integer"; the Rust
+// compiler rejects the same program with "array size out of range".
+// expect-error: array size out of range
+const NEG = 0 - 4;
+fn main() {
+    var a: [NEG]u8 = [0; 4];
+}

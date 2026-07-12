@@ -1,0 +1,7 @@
+// Ported from C++ test: "Array - size literal grammar matches value position"
+// (tests/cpp/test_codegen_errors.cpp testArraySizeLiteralGrammarParity, case 3/3)
+// C-style leading zeros are rejected in the size position.
+// expect-error: leading zero is not allowed
+fn main() {
+    var a: [07]u8 = [0; 7];
+}

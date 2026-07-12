@@ -1,0 +1,8 @@
+// Ported from C++ test: "Array - size literal grammar matches value position"
+// (tests/cpp/test_codegen_errors.cpp testArraySizeLiteralGrammarParity, case 2/3)
+// An underscore glued to the base prefix is rejected in the size position
+// with the same diagnostic value position produces.
+// expect-error: underscore not allowed immediately after
+fn main() {
+    var a: [0x_800]u8 = [0; 2048];
+}

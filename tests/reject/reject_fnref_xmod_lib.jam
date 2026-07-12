@@ -1,0 +1,11 @@
+// Companion module for reject_fnref_xmod_body_blame.jam (not a test itself:
+// no tfn, no expect-error directives, so the directory runner skips it).
+// The bad reference below must sit on line 8 — the importing fixture
+// asserts the diagnostic's file:line points HERE, at the defining file.
+pub const Bad = struct {
+    x: u32,
+    cfn drop(self: mut Self) {
+        self.x = unknownNameXyz;
+    }
+};
+pub fn makeBad() Bad { return Bad { x: 0 }; }

@@ -1,0 +1,12 @@
+// Ported from C++ test: "XMod - error in imported body blames the DEFINING file"
+// (tests/cpp/test_codegen_errors.cpp testImportedBodyErrorBlamesDefiningFile)
+// An error inside an imported module's body (a `cfn drop` in the lib) must be
+// attributed to the file the code was written in — with the correct line —
+// not to this entry file. (The C++ test also asserted the entry file is NOT
+// named; expect-error can only assert presence, so the file:line check below
+// carries the essence.)
+// expect-error: reject_fnref_xmod_lib.jam:8: error: unknown variable `unknownNameXyz`
+const { makeBad } = import("reject_fnref_xmod_lib");
+fn main() {
+    var b = makeBad();
+}

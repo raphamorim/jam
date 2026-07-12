@@ -1,0 +1,6 @@
+// Ported from C++ test: "Array - repeat count != array length rejected"
+// (tests/cpp/test_codegen_errors.cpp testArrayRepeatCountMismatchRejected)
+// expect-error: array repeat count 2048 does not match array type length 4
+fn main() {
+    const a: [4]u8 = [0; 0x800];
+}

@@ -1,0 +1,8 @@
+// Ported from C++ test: "Array - size literal grammar matches value position"
+// (tests/cpp/test_codegen_errors.cpp testArraySizeLiteralGrammarParity, case 1/3)
+// The size token in `[N]T` uses the full number-literal grammar: an
+// uppercase base prefix is rejected like it would be in value position.
+// expect-error: base prefix must be lowercase
+fn main() {
+    var a: [0X800]u8 = [0; 2048];
+}

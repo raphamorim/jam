@@ -1,0 +1,6 @@
+// Ported from C++ test: "Array - list literal shorter than array rejected"
+// (tests/cpp/test_codegen_errors.cpp testArrayLitTooShortRejected)
+// expect-error: array literal has 2 element(s) but the array type expects 4
+fn main() {
+    const a: [4]u8 = [1, 2];
+}

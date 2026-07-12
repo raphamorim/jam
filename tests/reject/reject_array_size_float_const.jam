@@ -1,0 +1,9 @@
+// Ported from C++ test: "Array - float const size rejected"
+// (tests/cpp/test_codegen_errors.cpp testFloatConstSizeRejected)
+// C++ compiler said "array size must be a non-negative integer"; the Rust
+// compiler rejects a float const in the size position as non-comptime-known.
+// expect-error: array length must be comptime-known
+const F = 1.5;
+fn main() {
+    var a: [F]u8 = [0; 1];
+}

@@ -1,0 +1,8 @@
+// Ported from C++ test: "FnRef - generic fn rejected with `cannot take address` diagnostic"
+// (tests/cpp/test_codegen_errors.cpp testFnRefGenericRejected)
+// Taking the address of a generic fn is meaningless before monomorphization.
+// expect-error: cannot take address of generic fn `identity`
+fn identity(T: type, x: T) T { return x; }
+fn main() {
+    var a: u64 = identity as u64;
+}

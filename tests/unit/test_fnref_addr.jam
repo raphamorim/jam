@@ -1,0 +1,63 @@
+// Fn references as addresses, and ptr <-> integer casts. Runtime port of the
+// C++ IR-shape tests in tests/cpp/test_codegen_errors.cpp:
+//   - "FnRef - bare fn name lowers to ptrtoint @fn"        (testFnRefBareName)
+//   - "FnRef - explicit `fn as u64` lowers to ptrtoint"    (testFnRefAsU64)
+//   - "FnRef - ptr <-> u64 round-trips ptrtoint/inttoptr"  (testPtrU64RoundTrip)
+//   - "FnRef - extern fn name resolves to its address"     (testFnRefExternFn)
+//   - "FnRef - u32 as *mut[] u8 zero-extends + inttoptr"   (testNarrowIntAsPtrZeroExtends)
+// The C++ suite grepped LLVM IR for ptrtoint/inttoptr/zext; here the same
+// lowering is asserted through observable behavior: addresses are non-zero,
+// both spellings agree, pointers survive a u64 round-trip, and a narrow int
+// widens to pointer width with ZERO extension.
+
+const { assert } = import("test");
+
+extern fn malloc(size: u64) *mut[] u8;
+extern fn free(p: *mut[] u8);
+
+export fn cb(ud: u64, s: *mut[] u8, len: i32) { s[0] = 1; }
+
+tfn bareFnNameIsNonZeroAddress() {
+    // Bare fn name in a u64 destination takes the function's address.
+    var addr: u64 = cb;
+    var nonzero: u64 = 0;
+    if (addr != 0) { nonzero = 1; }
+    assert(nonzero, 1);
+}
+
+tfn bareNameAndExplicitCastAgree() {
+    // `cb` and `cb as u64` are the same ptrtoint — identical values.
+    var bare: u64 = cb;
+    var cast: u64 = cb as u64;
+    assert(bare - cast, 0);
+}
+
+tfn externFnNameResolvesToAddress() {
+    // A body-less extern fn is still referenceable by name.
+    var addr: u64 = malloc;
+    var nonzero: u64 = 0;
+    if (addr != 0) { nonzero = 1; }
+    assert(nonzero, 1);
+}
+
+tfn ptrU64RoundTrip() {
+    // ptr -> u64 -> ptr: the round-tripped pointer aliases the original.
+    var p: *mut[] u8 = malloc(16);
+    var a: u64 = p as u64;
+    var p2: *mut[] u8 = a as *mut[] u8;
+    p2[0] = 99;
+    assert(p[0], 99);
+    // Same address both ways.
+    assert((p2 as u64) - a, 0);
+    free(p);
+}
+
+tfn narrowIntAsPtrZeroExtends() {
+    // u32 -> thin ptr is legal: the int is an address, widened to pointer
+    // width by ZERO extension. 0xFFFF_FFFF must stay 0xFFFF_FFFF (a sign
+    // extension would produce 0xFFFF_FFFF_FFFF_FFFF). Never dereferenced.
+    var n: u32 = 0xFFFF_FFFF;
+    var p: *mut[] u8 = n as *mut[] u8;
+    var back: u64 = p as u64;
+    assert(back, 0xFFFF_FFFF);
+}
