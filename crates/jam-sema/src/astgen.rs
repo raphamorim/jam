@@ -8388,6 +8388,59 @@ mod tests {
         astgen_function(&module.functions[0], &mut cg).map(|_| ())
     }
 
+    /// Recoverable diagnostics accumulate: one pass over a body reports every
+    /// independent error (the C++ recoverHere/appendErrorHere contract), not
+    /// just the first.
+    #[test]
+    fn multiple_errors_report_in_one_pass() {
+        let err = astgen_first_fn("fn f() { foo1(); foo2(); @nosuch(i32); }").unwrap_err();
+        assert!(
+            err.contains("unknown function `foo1`"),
+            "first error missing: {err}"
+        );
+        assert!(
+            err.contains("unknown function `foo2`"),
+            "second error missing: {err}"
+        );
+        assert!(
+            err.contains("unknown intrinsic `@nosuch`"),
+            "third error missing: {err}"
+        );
+
+        // Two bad fields in ONE struct literal both report (skip-and-continue).
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let src = "const P = struct { x: i32 };\n\
+                   fn g() { var p = P { a: 1, b: 2 }; }";
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        let st = &module.structs[0];
+        let named = cg.context().named_struct(&st.name);
+        cg.register_struct(st.name.clone(), named, st.fields.clone());
+        named.set_body(&[cg.context().i32_type()], false);
+        let err = astgen_function(&module.functions[0], &mut cg).unwrap_err();
+        assert!(
+            err.contains("unknown struct field `a`") && err.contains("unknown struct field `b`"),
+            "both bad fields should report: {err}"
+        );
+    }
+
     /// Returned-value vs declared-return-type reconciliation (deliberate
     /// divergence from the C++ oracle, which has no check and emits
     /// LLVM-invalid `ret i8` from an i32 function for the inferred-literal
