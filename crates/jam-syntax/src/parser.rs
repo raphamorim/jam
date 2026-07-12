@@ -1894,7 +1894,19 @@ impl<'a> Parser<'a> {
             {
                 self.advance(); // number
                 let raw = self.prev_text().to_vec();
-                let (mag, _neg, _is_float) = self.parse_num_lexeme(&raw)?;
+                let (mag, neg, is_float) = self.parse_num_lexeme(&raw)?;
+                // Literal sizes validate here, exactly like the C++
+                // (parser.cpp:706-713) — a float or negative size must not
+                // silently fold, and an over-u32 size must not truncate.
+                if neg || is_float {
+                    return Err(self.parse_error("array size must be a non-negative integer"));
+                }
+                if mag > u32::MAX as u64 {
+                    return Err(self.parse_error(format!(
+                        "array size `{}` exceeds u32 range",
+                        String::from_utf8_lossy(&raw)
+                    )));
+                }
                 self.consume(TokenType::CloseBracket, "Expected `]` after array size")?;
                 let elem = self.parse_type()?;
                 return Ok(self.type_pool.intern_array(elem, mag as u32));
