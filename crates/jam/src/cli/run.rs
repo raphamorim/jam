@@ -5,12 +5,15 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! `jam run` and `jam test` subcommands. Behaviorally identical to the C++
-//! oracle (src/main.cpp): `run` compiles a file, runs it, propagates its exit
-//! code, and deletes the temp binary; `test` compiles in test mode (synthesizing
-//! a harness `main` over the file's `tfn`s), runs it, and propagates its output +
+//! The compile driver: one single-pass argument loop transliterated from the
+//! C++ oracle (src/main.cpp:1904-2286), so flag interplay — position relative
+//! to `run`, values that look like flags, trailing options — resolves
+//! identically. `run` compiles a file, runs it, propagates its exit code, and
+//! deletes the temp binary; `test` compiles in test mode (synthesizing a
+//! harness `main` over the file's `tfn`s), runs it, and propagates its output +
 //! exit. `test <dir>` (or no arg → cwd) walks `*.jam` files, runs each one's
-//! tests, and prints a `Summary:` line.
+//! tests, and prints a `Summary:` line. The `build` subcommand reuses the same
+//! loop with `run`/`test` demoted to ordinary positionals.
 
 use std::path::Path;
 
@@ -33,255 +36,296 @@ fn opt_level_from_value(value: &str) -> Option<OptLevel> {
     }
 }
 
-/// Pre-scan `argv` (skipping `argv[0]`) for a GLOBAL `-C opt-level=N` codegen
-/// flag, which the C++ accepts ANYWHERE — before or after the subcommand
-/// (`jam -C opt-level=3 test tests/unit` AND `jam test -C opt-level=3 …`). Both
-/// the spaced `-C opt-level=3` and the joined `-Copt-level=3` forms are honored
-/// (matching rustc / the C++ `-C` loop, src/main.cpp:2925-2953).
+/// Parse one `-C key=value` payload into the opt/lto/strip slots — the C++ key
+/// mappings + error texts (main.cpp:1965-2020). Returns the process exit code
+/// on a malformed or unknown option.
+fn parse_codegen_opt(
+    codegen: &str,
+    opt: &mut OptLevel,
+    lto: &mut Lto,
+    strip: &mut Strip,
+) -> Result<(), i32> {
+    let (key, value) = match codegen.split_once('=') {
+        Some((k, v)) => (k, v),
+        None => {
+            eprintln!("Error: -C expects key=value, got `{codegen}`");
+            return Err(1);
+        }
+    };
+    match key {
+        "opt-level" => match opt_level_from_value(value) {
+            Some(l) => *opt = l,
+            None => {
+                eprintln!("Error: -C opt-level expects one of 0|1|2|3|s|z, got `{value}`");
+                return Err(1);
+            }
+        },
+        "lto" => {
+            *lto = match value {
+                "off" | "false" | "no" => Lto::Off,
+                "thin" => Lto::Thin,
+                "fat" | "full" | "true" | "yes" => Lto::Fat,
+                _ => {
+                    eprintln!("Error: -C lto expects one of off|thin|fat, got `{value}`");
+                    return Err(1);
+                }
+            }
+        }
+        "strip" => {
+            *strip = match value {
+                "none" | "off" | "false" | "no" => Strip::None,
+                "debuginfo" => Strip::DebugInfo,
+                "symbols" => Strip::Symbols,
+                _ => {
+                    eprintln!(
+                        "Error: -C strip expects one of none|debuginfo|symbols, got `{value}`"
+                    );
+                    return Err(1);
+                }
+            }
+        }
+        _ => {
+            eprintln!("Error: unknown -C key `{key}` (supported: opt-level, lto, strip)");
+            return Err(1);
+        }
+    }
+    Ok(())
+}
+
+/// Lexer/AST/JIR text dumps — flags the differential harness drives. They slot
+/// beside `--emit-ir` in the driver loop so they obey the same position rules.
+enum OracleEmit {
+    Tokens,
+    Ast,
+    Jir,
+}
+
+/// The compile driver: the C++ argument loop (main.cpp:1917-2074) plus its
+/// post-parse sequence (main.cpp:2076-2286), transliterated token for token so
+/// every interplay — flag position relative to `run`, option values that look
+/// like flags, trailing options falling through as positionals — resolves
+/// identically.
 ///
-/// Returns the stripped argv (with the `-C` token(s) removed) and the parsed
-/// [`OptLevel`] (default [`OptLevel::None`] when absent). On a bad `opt-level`
-/// value it prints the C++'s error (src/main.cpp:2948-2952) and returns `Err`
-/// with the process exit code.
-pub fn extract_codegen_opts(args: &[String]) -> Result<(Vec<String>, OptLevel, Lto, Strip), i32> {
+/// `start` is the first argv index to consider: 1 for the bare
+/// `jam [FLAGS] <file>` form (where `run`/`test` toggle modes anywhere in
+/// argv, like the C++), 2 under the `build` subcommand. `mode_tokens` is
+/// false under `build`, demoting `run`/`test` to ordinary positionals.
+pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
+    let mut run_flag = false;
+    let mut test_mode = false;
+    let mut emit_ir = false;
+    let mut oracle: Option<OracleEmit> = None;
+    let mut show_target = false;
     let mut opt = OptLevel::None;
     let mut lto = Lto::Off;
     let mut strip = Strip::None;
-    let mut out: Vec<String> = Vec::with_capacity(args.len());
-    out.push(args[0].clone());
-    let mut i = 1;
+    let mut filename = String::new();
+    let mut output_name = String::from("output");
+    let mut std_path_override = String::new();
+    let mut libs: Vec<String> = Vec::new();
+
+    let mut i = start;
     while i < args.len() {
         let arg = &args[i];
-        // `--release` / `--release-small` were removed in favor of `-C opt-level`
-        // (the C++ prints the same guidance, main.cpp:2906-2918).
-        if arg == "--release" {
-            eprintln!("Error: `--release` was removed; use `-C opt-level=3` instead");
-            return Err(1);
+        // `run`/`test` mode tokens — recognized anywhere in argv
+        // (main.cpp:1919-1926).
+        if mode_tokens && arg == "run" {
+            run_flag = true;
+            i += 1;
+            continue;
         }
-        if arg == "--release-small" {
-            eprintln!("Error: `--release-small` was removed; use `-C opt-level=z` instead");
-            return Err(1);
+        if mode_tokens && arg == "test" {
+            test_mode = true;
+            i += 1;
+            continue;
         }
-        // `--std-path <dir>`: set the std-lib root (takes precedence over the
-        // `JAM_STD_PATH` env, which the resolver reads — module_resolver.rs
-        // std_root); stripped from argv so it isn't taken as the input file.
-        if arg == "--std-path" && i + 1 < args.len() {
-            // SAFETY: CLI startup is single-threaded; the resolver reads it later.
-            unsafe { std::env::set_var("JAM_STD_PATH", &args[i + 1]) };
+        // Linker flags — accepted in every mode (main.cpp:1928-1935). The
+        // spaced forms consume the next token unconditionally, so a value that
+        // looks like a flag (`-l --release`) is still a library name.
+        if (arg == "-l" || arg == "--library") && i + 1 < args.len() {
+            libs.push(args[i + 1].clone());
             i += 2;
             continue;
         }
-        // `-C key=value` (spaced) or `-Ckey=value` (joined).
+        if arg.len() > 2 && arg.starts_with("-l") {
+            libs.push(arg[2..].to_string());
+            i += 1;
+            continue;
+        }
+        // `--release` / `--release-small` were removed in favor of `-C
+        // opt-level` (main.cpp:1939-1950).
+        if arg == "--release" {
+            eprintln!("Error: `--release` was removed; use `-C opt-level=3` instead");
+            return 1;
+        }
+        if arg == "--release-small" {
+            eprintln!("Error: `--release-small` was removed; use `-C opt-level=z` instead");
+            return 1;
+        }
+        // `-C key=value` (spaced) or `-Ckey=value` (joined) codegen options
+        // (main.cpp:1958-2023). Handled BEFORE the `run` strictness check, so
+        // `jam run -C opt-level=3 file` is accepted — as in the C++.
         let codegen: Option<String> = if arg == "-C" && i + 1 < args.len() {
-            let v = args[i + 1].clone();
-            i += 1; // consume the value token too
-            Some(v)
+            i += 1;
+            Some(args[i].clone())
         } else if arg.len() > 2 && arg.starts_with("-C") {
             Some(arg[2..].to_string())
         } else {
             None
         };
         if let Some(codegen) = codegen {
-            let (key, value) = match codegen.split_once('=') {
-                Some((k, v)) => (k, v),
-                None => {
-                    // The C++ dedicated malformed `-C` error (main.cpp:1966).
-                    eprintln!("Error: -C expects key=value, got `{codegen}`");
-                    return Err(1);
-                }
-            };
-            // The C++ -C key mappings + error text (main.cpp:2941-2985).
-            match key {
-                "opt-level" => match opt_level_from_value(value) {
-                    Some(l) => opt = l,
-                    None => {
-                        eprintln!("Error: -C opt-level expects one of 0|1|2|3|s|z, got `{value}`");
-                        return Err(1);
-                    }
-                },
-                "lto" => {
-                    lto = match value {
-                        "off" | "false" | "no" => Lto::Off,
-                        "thin" => Lto::Thin,
-                        "fat" | "full" | "true" | "yes" => Lto::Fat,
-                        _ => {
-                            eprintln!("Error: -C lto expects one of off|thin|fat, got `{value}`");
-                            return Err(1);
-                        }
-                    }
-                }
-                "strip" => {
-                    strip = match value {
-                        "none" | "off" | "false" | "no" => Strip::None,
-                        "debuginfo" => Strip::DebugInfo,
-                        "symbols" => Strip::Symbols,
-                        _ => {
-                            eprintln!(
-                                "Error: -C strip expects one of none|debuginfo|symbols, got `{value}`"
-                            );
-                            return Err(1);
-                        }
-                    }
-                }
-                _ => {
-                    eprintln!("Error: unknown -C key `{key}` (supported: opt-level, lto, strip)");
-                    return Err(1);
-                }
+            if let Err(rc) = parse_codegen_opt(&codegen, &mut opt, &mut lto, &mut strip) {
+                return rc;
             }
             i += 1;
             continue;
         }
-        out.push(arg.clone());
-        i += 1;
-    }
-    Ok((out, opt, lto, strip))
-}
-
-/// Strict `run` argument parsing (the C++ run branch, main.cpp:2024-2038):
-/// only linker flags are permitted alongside `run`, and only ONE source file.
-fn parse_run_args(args: &[String]) -> Result<(Vec<String>, Option<String>), i32> {
-    let mut libs: Vec<String> = Vec::new();
-    let mut path: Option<String> = None;
-    let mut i = 2; // skip program name + subcommand
-    while i < args.len() {
-        let arg = &args[i];
-        if (arg == "-l" || arg == "--library") && i + 1 < args.len() {
-            libs.push(args[i + 1].clone());
-            i += 2;
-            continue;
-        }
-        if arg.len() > 2 && arg.starts_with("-l") {
-            libs.push(arg[2..].to_string());
+        // Inside `run`, anything else flag-shaped is an error
+        // (main.cpp:2024-2038) — including the flags parsed below, which are
+        // honored only BEFORE the `run` token.
+        if run_flag {
+            if arg.starts_with('-') {
+                eprintln!(
+                    "Error: `run` only accepts linker flags (-l<name>, -l <name>, --library <name>); got `{arg}`"
+                );
+                return 1;
+            }
+            if !filename.is_empty() {
+                eprintln!(
+                    "Error: `run` accepts only one source file; got `{arg}` after `{filename}`"
+                );
+                return 1;
+            }
+            filename = arg.clone();
             i += 1;
             continue;
         }
-        if arg.starts_with('-') {
-            eprintln!(
-                "Error: `run` only accepts linker flags (-l<name>, -l <name>, --library <name>); got `{arg}`"
-            );
-            return Err(1);
+        // Compile-only / test-mode flags (main.cpp:2040-2064).
+        if arg == "--help" || arg == "-h" {
+            crate::cli::display_help();
+            return 0;
         }
-        if let Some(prev) = &path {
-            eprintln!("Error: `run` accepts only one source file; got `{arg}` after `{prev}`");
-            return Err(1);
+        if arg == "--version" || arg == "-V" {
+            println!("{}-{}", env!("CARGO_PKG_VERSION"), env!("JAM_VERSION_SHA"));
+            return 0;
         }
-        path = Some(arg.clone());
-        i += 1;
-    }
-    Ok((libs, path))
-}
-
-/// `jam run [LINKER-FLAGS] <file>`: compile `<file>` to a temp executable, run
-/// it, propagate its exit code, and delete the binary.
-pub fn run_command(args: &[String], opt: OptLevel, lto: Lto, strip: Strip) -> i32 {
-    let (libs, path) = match parse_run_args(args) {
-        Ok(v) => v,
-        Err(rc) => return rc,
-    };
-    let Some(file) = path else {
-        eprintln!("Error: No input file specified. Run `jam --help` for usage.");
-        return 1;
-    };
-    // Directory input is only meaningful with `test` (main.cpp:2112-2118).
-    if Path::new(&file).is_dir() {
-        eprintln!("Error: directory input is only supported with `test` (got '{file}')");
-        return 1;
-    }
-    let output = pick_output_name("output");
-    emit::emit_jir(&file, EmitMode::Run { output, libs }, opt, lto, strip)
-}
-
-/// `jam test [<file|directory>]`: with no arg, test the current directory.
-pub fn test_command(args: &[String], opt: OptLevel, lto: Lto, strip: Strip) -> i32 {
-    let (libs, output, path) = match parse_compile_args(args, 2) {
-        Ok(v) => v,
-        Err(rc) => return rc,
-    };
-    // `jam test` with no path means "run every test under cwd" (main.cpp:3060).
-    let target = path.unwrap_or_else(|| ".".to_string());
-
-    if Path::new(&target).is_dir() {
-        return test_directory(&target, &libs, opt, lto, strip);
-    }
-
-    let output = output.unwrap_or_else(|| pick_output_name("output"));
-    emit::emit_jir(&target, EmitMode::Test { output, libs }, opt, lto, strip)
-}
-
-/// The default output name `output` collides with a same-named directory (this
-/// repo has one): clang's link fails cryptically. Fall back to `<name>.bin`
-/// (main.cpp:3245-3253). The note goes to stderr (the behavioral gate drops it).
-fn pick_output_name(name: &str) -> String {
-    if Path::new(name).is_dir() {
-        let fallback = format!("{name}.bin");
-        eprintln!("note: output name '{name}' is a directory; writing '{fallback}'");
-        fallback
-    } else {
-        name.to_string()
-    }
-}
-
-/// Parse `-l<name>` libs, `-o <name>` output, and the positional `<file>` from a
-/// compile/test invocation. `start` is the first arg index to consider: 2 after
-/// the `build`/`test` subcommand token, 1 for the bare `jam [FLAGS] <file>`
-/// form. Like the C++ loop (main.cpp:2059-2073), any unmatched argument —
-/// flag-shaped or not — is a positional, and a SECOND positional is an error.
-fn parse_compile_args(
-    args: &[String],
-    start: usize,
-) -> Result<(Vec<String>, Option<String>, Option<String>), i32> {
-    let mut libs: Vec<String> = Vec::new();
-    let mut output: Option<String> = None;
-    let mut path: Option<String> = None;
-    let mut i = start;
-    while i < args.len() {
-        let arg = &args[i];
-        if (arg == "-l" || arg == "--library") && i + 1 < args.len() {
-            libs.push(args[i + 1].clone());
-            i += 2;
+        if arg == "--target-info" {
+            show_target = true;
+            i += 1;
             continue;
         }
-        if arg.len() > 2 && arg.starts_with("-l") {
-            libs.push(arg[2..].to_string());
+        if arg == "--emit-ir" {
+            emit_ir = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--emit-tokens" {
+            oracle = Some(OracleEmit::Tokens);
+            i += 1;
+            continue;
+        }
+        if arg == "--emit-ast" {
+            oracle = Some(OracleEmit::Ast);
+            i += 1;
+            continue;
+        }
+        if arg == "--emit-jir" {
+            oracle = Some(OracleEmit::Jir);
             i += 1;
             continue;
         }
         if arg == "-o" && i + 1 < args.len() {
-            output = Some(args[i + 1].clone());
+            output_name = args[i + 1].clone();
             i += 2;
             continue;
         }
-        if let Some(prev) = &path {
-            eprintln!("Error: unexpected extra argument `{arg}` (already have `{prev}`)");
-            return Err(1);
+        if arg == "--std-path" && i + 1 < args.len() {
+            std_path_override = args[i + 1].clone();
+            i += 2;
+            continue;
         }
-        path = Some(arg.clone());
+        // Positional: source file or directory. Flags may follow it; a second
+        // positional is an error (main.cpp:2065-2073). A trailing option with
+        // no value (`jam file -o`) falls through here, like the C++.
+        if !filename.is_empty() {
+            eprintln!("Error: unexpected extra argument `{arg}` (already have `{filename}`)");
+            return 1;
+        }
+        filename = arg.clone();
         i += 1;
     }
-    Ok((libs, output, path))
-}
 
-/// `jam build [LINKER-FLAGS] [-o <name>] <file>` and the bare `jam [FLAGS] <file>`
-/// form: compile `<file>` to a native executable (default name `output`, with the
-/// directory-collision `.bin` fallback), linking `-l<name>` libraries — matching
-/// the C++'s default-compile path. `start` is 2 for the `build` subcommand, 1 for
-/// the bare form (no subcommand token).
-pub fn build_command(args: &[String], start: usize, opt: OptLevel, lto: Lto, strip: Strip) -> i32 {
-    let (libs, output, path) = match parse_compile_args(args, start) {
-        Ok(v) => v,
-        Err(rc) => return rc,
-    };
-    let Some(file) = path else {
-        eprintln!("Error: No input file specified. Run `jam --help` for usage.");
-        return 1;
-    };
-    // Directory input is only meaningful with `test` (main.cpp:2112-2118).
-    if Path::new(&file).is_dir() {
-        eprintln!("Error: directory input is only supported with `test` (got '{file}')");
+    // `jam test` with no path means "run every test under cwd" (main.cpp:2077).
+    if test_mode && filename.is_empty() {
+        filename = ".".to_string();
+    }
+    if filename.is_empty() {
+        eprintln!(
+            "Error: No input file specified. Run `{} --help` for usage.",
+            args[0]
+        );
         return 1;
     }
-    let output = output.unwrap_or_else(|| pick_output_name("output"));
-    emit::emit_jir(&file, EmitMode::Binary { output, libs }, opt, lto, strip)
+    if !std_path_override.is_empty() {
+        // Takes precedence over a caller-set JAM_STD_PATH env var, which the
+        // module resolver reads (module_resolver.rs std_root).
+        // SAFETY: CLI startup is single-threaded; the resolver reads it later.
+        unsafe { std::env::set_var("JAM_STD_PATH", &std_path_override) };
+    }
+    // `--target-info` prints the host target block, then CONTINUES into the
+    // normal compile (main.cpp:2089-2103). It still requires an input file —
+    // the emptiness check above runs first, as in the C++.
+    if show_target {
+        emit::print_target_info();
+    }
+    // Directory input: only meaningful with `test` (main.cpp:2110-2118).
+    if Path::new(&filename).is_dir() {
+        if !test_mode {
+            eprintln!("Error: directory input is only supported with `test` (got '{filename}')");
+            return 1;
+        }
+        return test_directory(&filename, &libs, emit_ir, opt, lto, strip);
+    }
+    // The default output name `output` collides with a same-named directory
+    // (this repo has one): the link fails with a cryptic `ld: errno=21`. Fall
+    // back to a usable name instead (main.cpp:2265-2274). Applies to an
+    // explicit `-o` name too, and the note prints even under `--emit-ir`,
+    // which resolves the name it will never write — as in the C++.
+    if Path::new(&output_name).is_dir() {
+        let fallback = format!("{output_name}.bin");
+        eprintln!("note: output name '{output_name}' is a directory; writing '{fallback}'");
+        output_name = fallback;
+    }
+    match oracle {
+        Some(OracleEmit::Tokens) => return emit::emit_tokens(&filename),
+        Some(OracleEmit::Ast) => return emit::emit_ast(&filename),
+        Some(OracleEmit::Jir) => {
+            return emit::emit_jir(&filename, EmitMode::Jir, opt, lto, strip);
+        }
+        None => {}
+    }
+    let mode = if emit_ir {
+        // Print-IR-and-exit wins over run/test execution (the early return
+        // inside compileAndRun, main.cpp:1547-1553); under `test` the dump
+        // includes the synthesized harness main.
+        EmitMode::Ir { test: test_mode }
+    } else if test_mode {
+        EmitMode::Test {
+            output: output_name,
+            libs,
+        }
+    } else if run_flag {
+        EmitMode::Run {
+            output: output_name,
+            libs,
+        }
+    } else {
+        EmitMode::Binary {
+            output: output_name,
+            libs,
+        }
+    };
+    emit::emit_jir(&filename, mode, opt, lto, strip)
 }
 
 /// Recursively discover `*.jam` files under `dir`, sorted (main.cpp's
@@ -375,12 +419,7 @@ struct TestWorker {
     drain: std::thread::JoinHandle<Vec<u8>>,
 }
 
-fn spawn_test_worker(
-    exe: &Path,
-    file: &str,
-    libs: &[String],
-    opt: OptLevel,
-) -> Option<TestWorker> {
+fn spawn_test_worker(exe: &Path, file: &str, libs: &[String], opt: OptLevel) -> Option<TestWorker> {
     let stem = Path::new(file)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -503,7 +542,14 @@ fn run_tests_parallel(
 /// parallel worker pool when more than one job is available; `JAM_TEST_JOBS=1`
 /// (or a single runnable file) takes the serial in-process path, whose sorted,
 /// deterministic output is what a differential comparison can rely on.
-fn test_directory(dir: &str, libs: &[String], opt: OptLevel, lto: Lto, strip: Strip) -> i32 {
+fn test_directory(
+    dir: &str,
+    libs: &[String],
+    emit_ir: bool,
+    opt: OptLevel,
+    lto: Lto,
+    strip: Strip,
+) -> i32 {
     let files = collect_jam_files(dir);
     if files.is_empty() {
         println!("No .jam files found under {dir}");
@@ -538,16 +584,18 @@ fn test_directory(dir: &str, libs: &[String], opt: OptLevel, lto: Lto, strip: St
                 .and_then(|s| s.to_str())
                 .unwrap_or("out");
             let output = format!("jam_test_{stem}");
-            let rc = emit::emit_jir(
-                f,
+            // The serial walker threads `--emit-ir` into each per-file compile
+            // (the C++ passes emitIR through, main.cpp:2249-2251); the parallel
+            // pool does not forward it, also as in the C++ (main.cpp:2178-2183).
+            let mode = if emit_ir {
+                EmitMode::Ir { test: true }
+            } else {
                 EmitMode::Test {
                     output,
                     libs: libs.to_vec(),
-                },
-                opt,
-                lto,
-                strip,
-            );
+                }
+            };
+            let rc = emit::emit_jir(f, mode, opt, lto, strip);
             if rc != 0 {
                 failed += 1;
             } else {

@@ -2832,7 +2832,10 @@ mod tests {
     fn module_enum_over_256_variants_rejected() {
         // 257 variants exceeds the u8 tag; 256 is the last accepted count.
         let variants = |n: usize| {
-            (0..n).map(|i| format!("V{i}")).collect::<Vec<_>>().join(", ")
+            (0..n)
+                .map(|i| format!("V{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         let ok = format!("const Big = enum {{ {} }};", variants(256));
         assert_eq!(parse_module(&ok).enums[0].variants.len(), 256);

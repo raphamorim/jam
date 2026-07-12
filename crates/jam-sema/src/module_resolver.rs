@@ -64,6 +64,7 @@ impl ModuleResolver {
     ///      the FHS install layout (`$PREFIX/bin/jam` + `$PREFIX/lib/jam/std`)
     ///      and a relocatable tarball (`<dir>/jam` + `<dir>/lib/jam/std`) with
     ///      one rule.
+    ///
     /// (The `<CWD>/std` dev fallback lives in `resolve_uncached`.)
     fn std_root() -> Option<PathBuf> {
         static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();

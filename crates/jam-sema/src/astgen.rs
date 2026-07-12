@@ -3466,7 +3466,10 @@ enum CfnEmitCmd {
         start: u32,
         end: u32,
     },
-    PutByte { fd: u32, byte: u8 },
+    PutByte {
+        fd: u32,
+        byte: u8,
+    },
 }
 
 #[derive(Default)]
@@ -4296,7 +4299,10 @@ fn astgen_comptime_fn_call(
         if matches!(r, ExecResult::Error | ExecResult::IterationCap) {
             // Recoverable (the C++ astgen.cpp:6488) — return a poison so the
             // rest of the caller still gets analyzed.
-            let msg = format!("cfn `{}` failed during compile-time evaluation", fn_ast.name);
+            let msg = format!(
+                "cfn `{}` failed during compile-time evaluation",
+                fn_ast.name
+            );
             return Ok(recover_here(gctx, msg, TypeIdx::NONE));
         }
     }
@@ -7378,7 +7384,11 @@ fn astgen_return(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
                     val_ref = emit(
                         gctx,
                         JirInst {
-                            tag: if gk.b != 0 { JirTag::SExt } else { JirTag::ZExt },
+                            tag: if gk.b != 0 {
+                                JirTag::SExt
+                            } else {
+                                JirTag::ZExt
+                            },
                             a: val_ref,
                             ty: want,
                             ..Default::default()
@@ -8517,8 +8527,8 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        let err = astgen_first_fn("fn f(c: bool) { comp var N = 1; if (c) { N = 2; } }")
-            .unwrap_err();
+        let err =
+            astgen_first_fn("fn f(c: bool) { comp var N = 1; if (c) { N = 2; } }").unwrap_err();
         assert!(
             err.contains(
                 "cannot assign to comp binding `N` from inside runtime conditional \

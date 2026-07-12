@@ -1107,10 +1107,25 @@ fn resolve_expr_as_type(cg: &mut CodegenContext, expr: NodeIdx) -> TypeIdx {
 /// (`-l<name>`) to pass through to the link step.
 pub enum EmitMode {
     Jir,
-    Ir,
-    Binary { output: String, libs: Vec<String> },
-    Run { output: String, libs: Vec<String> },
-    Test { output: String, libs: Vec<String> },
+    /// `--emit-ir`: print the LLVM IR and exit before the object/link step.
+    /// `test` is set when `test` accompanies the flag — the C++ threads both
+    /// through `compileAndRun`, so the dump then includes the synthesized
+    /// harness `main` (main.cpp:1449-1553).
+    Ir {
+        test: bool,
+    },
+    Binary {
+        output: String,
+        libs: Vec<String>,
+    },
+    Run {
+        output: String,
+        libs: Vec<String>,
+    },
+    Test {
+        output: String,
+        libs: Vec<String>,
+    },
 }
 
 /// `-C strip=MODE`: how much to strip from the linked binary (the C++ `JamStrip`).
@@ -1127,10 +1142,11 @@ pub enum Strip {
 }
 
 impl EmitMode {
-    /// `true` for the test-harness build (`jam test <file>`): skip the user's
-    /// `fn main`, lower `tfn` test functions, and synthesize a harness `main`.
+    /// `true` for the test-harness build (`jam test <file>`, with or without
+    /// `--emit-ir`): skip the user's `fn main`, lower `tfn` test functions, and
+    /// synthesize a harness `main`.
     fn is_test(&self) -> bool {
-        matches!(self, EmitMode::Test { .. })
+        matches!(self, EmitMode::Test { .. } | EmitMode::Ir { test: true })
     }
 }
 
@@ -2197,7 +2213,7 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             synthesize_test_main(&cg, &test_entries);
         }
         return match mode {
-            EmitMode::Ir => {
+            EmitMode::Ir { .. } => {
                 // Clear the indicator before the IR hits stdout (the C++
                 // emit-IR early exit, main.cpp:1547-1553).
                 progress.stop();
@@ -2285,7 +2301,13 @@ fn emit_object(cg: &CodegenContext, output: &str, opt: OptLevel, lto: Lto) -> Re
 /// LTO, dead-strip, and `-C strip` plumbing. Shared between the normal link
 /// and the test-cache link (and FNV-mixed into the cache key, like the C++
 /// hashes linkArgs[4..]).
-fn link_flags(host: &Target, libs: &[String], opt: OptLevel, lto: Lto, strip: Strip) -> Vec<String> {
+fn link_flags(
+    host: &Target,
+    libs: &[String],
+    opt: OptLevel,
+    lto: Lto,
+    strip: Strip,
+) -> Vec<String> {
     let mut flags: Vec<String> = Vec::new();
     // libm: `frem` on floats lowers to a `fmod` libcall. glibc keeps math in
     // libm.so (pass `-lm`); macOS/Windows/musl bundle it into libc.
