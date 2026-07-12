@@ -1,0 +1,11 @@
+// Ports "Codegen - namespace access to non-pub fn rejected"
+// (test_codegen_errors.cpp): calling a private function through a module
+// handle is a privacy error.
+// expect-error: symbol `priv` is not exported from module
+
+const lib = import("reject_vis_helper");
+
+fn main() i32 {
+    var r: i32 = lib.priv(7);
+    return 0;
+}
