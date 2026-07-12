@@ -1571,19 +1571,26 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             for imp in &m.imports {
                 // Resolve the import spelling to its real identity (a RELATIVE
                 // re-export like std/std.jam's `import("fmt")` resolves to
-                // `std/fmt`), then append any `.chain` segments.
-                let base = resolver
+                // `std/fmt`), then fold any `.chain` segments through the SAME
+                // identities table: `import("std").fmt` walks std/std.jam's
+                // `fmt` re-export to `std/fmt`, not the naive `std/std/fmt`
+                // concatenation. (The old global handle map hid this — the
+                // entry's chained handle worked only because std's own
+                // re-export leaked a same-named global handle.)
+                let mut candidate = resolver
                     .import_identities
                     .get(&(id.clone(), imp.path.clone()))
                     .cloned()
                     .unwrap_or_else(|| imp.path.clone());
-                let candidate = if imp.chain.is_empty() {
-                    base
-                } else {
-                    format!("{}/{}", base, imp.chain.join("/"))
-                };
+                for seg in &imp.chain {
+                    candidate = resolver
+                        .import_identities
+                        .get(&(candidate.clone(), seg.clone()))
+                        .cloned()
+                        .unwrap_or_else(|| format!("{candidate}/{seg}"));
+                }
                 if loaded_keys.contains(candidate.as_str()) {
-                    cg.register_import_handle(imp.name.clone(), candidate);
+                    cg.register_import_handle(id.clone(), imp.name.clone(), candidate);
                 }
             }
         }

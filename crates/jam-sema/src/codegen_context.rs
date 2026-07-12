@@ -201,9 +201,13 @@ pub struct CodegenContext<'ctx> {
     // imports (`const { Token } = import("m")` aliases Token -> m.Token).
     // Resolved regardless of body module (the C++ scoped-alias table).
     type_aliases: RefCell<HashMap<String, TypeIdx>>,
-    // Import-handle name -> resolved module identity: `const lib = import("m")`
-    // makes `lib.fn()` resolve to `m.fn`.
-    import_handles: RefCell<HashMap<String, String>>,
+    // (owner module, import-handle name) -> resolved module identity:
+    // `const lib = import("m")` makes `lib.fn()` resolve to `m.fn` — but only
+    // from bodies of the module that DECLARED the import. There is no
+    // cross-module fallback: a handle absent from the declaring module's
+    // imports is an error, never resolved against the entry module's (the C++
+    // per-module moduleImports_, codegen.cpp:725-738).
+    import_handles: RefCell<HashMap<(String, String), String>>,
     // (body_module, GenericCall TypeIdx) -> the instantiated `Named` TypeIdx.
     // Keyed by the body module too: the SAME bare `Pair(u64)` TypeIdx resolves
     // to mod_gen_a.Pair__u64 in one module and mod_gen_b.Pair__u64 in another.
@@ -460,12 +464,30 @@ impl<'ctx> CodegenContext<'ctx> {
         let elem = TypeIdx::new(k.a);
         let len_node = NodeIdx::new(k.b);
         let len = self.fold_comptime_expr(len_node);
-        if !len.is_int() {
+        if matches!(len, ComptimeValue::None) {
             return Err("astgen: array length must be comptime-known".into());
+        }
+        // A folded float or negative size is a sign/kind error, not an
+        // unknown length (the C++ resolveArrayExpr, codegen.cpp:1567-1580).
+        let negative = matches!(
+            len,
+            ComptimeValue::Int {
+                is_signed: true,
+                bits,
+                ..
+            } if (bits as i64) < 0
+        );
+        if !len.is_int() || negative {
+            return Err("astgen: array size must be a non-negative integer".into());
         }
         let n = len.as_u64();
         if n > u32::MAX as u64 {
-            return Err("astgen: array size out of range".into());
+            // A negative fold wraps to a huge unsigned value; report it as the
+            // sign error it is rather than a baffling range overflow.
+            if (n as i64) < 0 {
+                return Err("astgen: array size must be a non-negative integer".into());
+            }
+            return Err(format!("astgen: array size {n} exceeds u32 range"));
         }
         let resolved = self.type_pool.intern_array(elem, n as u32);
         self.array_expr_resolutions
@@ -1712,15 +1734,26 @@ impl<'ctx> CodegenContext<'ctx> {
     pub fn register_type_alias(&self, name: impl Into<String>, target: TypeIdx) {
         self.type_aliases.borrow_mut().insert(name.into(), target);
     }
-    /// Register an import handle (`const lib = import("m")`) -> module identity.
-    pub fn register_import_handle(&self, name: impl Into<String>, module: impl Into<String>) {
+    /// Register an import handle (`const lib = import("m")`) -> module
+    /// identity, scoped to the module that declared the import (entry = "").
+    pub fn register_import_handle(
+        &self,
+        owner: impl Into<String>,
+        name: impl Into<String>,
+        module: impl Into<String>,
+    ) {
         self.import_handles
             .borrow_mut()
-            .insert(name.into(), module.into());
+            .insert((owner.into(), name.into()), module.into());
     }
-    /// The module identity an import-handle name resolves to, if any.
+    /// The module identity an import-handle name resolves to FROM THE CURRENT
+    /// BODY MODULE, if any. No cross-module fallback: an imported body must
+    /// not see the entry module's handles (the C++ getImportHandle).
     pub fn import_handle_module(&self, name: &str) -> Option<String> {
-        self.import_handles.borrow().get(name).cloned()
+        self.import_handles
+            .borrow()
+            .get(&(self.current_body_module(), name.to_string()))
+            .cloned()
     }
     /// Format a qualified-name lookup miss the way the C++
     /// `JamCodegenContext::formatNamespaceLookupError` does (codegen.cpp:819).
