@@ -2367,7 +2367,9 @@ fn link_flags(
     flags
 }
 
-/// `clang <obj> -o <out> <flags..>`. Does NOT remove the object.
+/// `clang <obj> -o <out> <flags..>`. Does NOT remove the object. On any
+/// failure — nonzero clang exit or a failed spawn — prints the C++'s
+/// `Linking failed` line (main.cpp:1736-1738) and returns 1.
 fn run_clang_link(obj: &str, out: &str, flags: &[String]) -> i32 {
     let mut cmd = std::process::Command::new("clang");
     cmd.arg(obj).arg("-o").arg(out);
@@ -2376,12 +2378,8 @@ fn run_clang_link(obj: &str, out: &str, flags: &[String]) -> i32 {
     }
     match cmd.status() {
         Ok(s) if s.success() => 0,
-        Ok(s) => {
-            eprintln!("link failed: clang exited with {s}");
-            1
-        }
-        Err(e) => {
-            eprintln!("failed to invoke clang: {e}");
+        _ => {
+            eprintln!("Linking failed");
             1
         }
     }
@@ -2402,8 +2400,13 @@ fn link_binary(
     let host = Target::from_triple_str(&default_target_triple());
     let flags = link_flags(&host, libs, opt, lto, strip);
     let rc = run_clang_link(&obj, output, &flags);
+    if rc != 0 {
+        // On link failure the C++ leaves the intermediate object in cwd (the
+        // early return at main.cpp:1736-1739 skips the cleanup) — match it.
+        return rc;
+    }
     let _ = std::fs::remove_file(&obj);
-    rc
+    0
 }
 
 /// FNV-1a over a file's bytes (the C++ hashFileFNV, main.cpp:139). Keys the
@@ -2461,7 +2464,8 @@ fn link_and_run_test(
         if !std::path::Path::new(&cache_path).exists()
             && run_clang_link(&obj, &cache_path, &flags) != 0
         {
-            eprintln!("Linking failed");
+            // The cache path DOES clean up on failure (main.cpp:1715-1718),
+            // unlike the ordinary link's leave-the-object-behind early return.
             let _ = std::fs::remove_file(&obj);
             return 1;
         }
@@ -2471,10 +2475,11 @@ fn link_and_run_test(
     }
 
     let rc = run_clang_link(&obj, output, &flags);
-    let _ = std::fs::remove_file(&obj);
     if rc != 0 {
+        // Match the C++ ordinary-link failure: intermediate left in cwd.
         return rc;
     }
+    let _ = std::fs::remove_file(&obj);
     progress.stop();
     run_binary(output)
 }

@@ -1045,6 +1045,87 @@ static void astgenReturn(AstGenCtx &gctx, const AstNode &n) {
 			return;
 		}
 		valRef = astgenExpr(gctx, valIdx, retTy);
+		// Reconcile the returned value's type with the declared return
+		// type (resolve-then-compare, like the var-decl declared-vs-init
+		// check above). Without this, `return x` with a narrower int —
+		// e.g. a u8 enum payload returned from a u32 function — ships
+		// LLVM-invalid IR (`ret i8` from an i32 function). A LOSSLESS
+		// narrower int widens (ZExt/SExt by the value's own signedness);
+		// anything lossy (narrowing, signed→unsigned) is a hard error.
+		TypeIdx valTy = gctx.jfn.getInst(valRef).ty;
+		if (retTy != kNoType && valTy != kNoType) {
+			std::function<TypeIdx(TypeIdx)> resolveForCmp =
+			    [&](TypeIdx t) -> TypeIdx {
+				if (t == kNoType) return t;
+				t = gctx.ctx.requalifyType(t, gctx.ctx.currentBodyModule());
+				const TypeKey &k = gctx.ctx.getTypePool().get(t);
+				if (k.kind == TypeKind::Named) {
+					const std::string &name = gctx.ctx.getStringPool().get(
+					    static_cast<StringIdx>(k.a));
+					TypeIdx sub = gctx.ctx.lookupCurrentSubst(name);
+					if (sub != kNoType) return resolveForCmp(sub);
+				}
+				if (k.kind == TypeKind::GenericCall) {
+					TypeIdx r = gctx.ctx.resolveGenericCall(t);
+					if (r != kNoType) return resolveForCmp(r);
+				}
+				if (k.kind == TypeKind::Named) {
+					const std::string &nm = gctx.ctx.getStringPool().get(
+					    static_cast<StringIdx>(k.a));
+					TypeIdx a = gctx.ctx.lookupTypeAlias(nm);
+					if (a != kNoType) return resolveForCmp(a);
+					if (nm.find('.') != std::string::npos) {
+						TypeIdx c = gctx.ctx.resolveChainedType(nm);
+						if (c != kNoType) return resolveForCmp(c);
+					}
+				}
+				return t;
+			};
+			TypeIdx want = resolveForCmp(retTy);
+			TypeIdx got = resolveForCmp(valTy);
+			auto pointerCompatible = [&](TypeIdx a, TypeIdx b) -> bool {
+				const TypeKey &ka = gctx.ctx.getTypePool().get(a);
+				const TypeKey &kb = gctx.ctx.getTypePool().get(b);
+				bool aPtr = ka.kind == TypeKind::PtrSingle ||
+				            ka.kind == TypeKind::PtrMany;
+				bool bPtr = kb.kind == TypeKind::PtrSingle ||
+				            kb.kind == TypeKind::PtrMany;
+				return aPtr && bPtr && ka.a == kb.a;
+			};
+			// A unit-only enum lowers to its bare u8 tag, and the enum→int
+			// cast returns that tag WITHOUT retagging, so `return p as u8;`
+			// carries the enum TypeIdx at u8's representation. Treat the
+			// pair as identical.
+			auto unitEnumAsU8 = [&](TypeIdx t, TypeIdx other) -> bool {
+				if (other != BuiltinType::U8) return false;
+				const JamCodegenContext::EnumInfo *ei = gctx.ctx.lookupEnum(t);
+				return ei != nullptr && !ei->hasPayloadVariant;
+			};
+			if (want != got && !pointerCompatible(want, got) &&
+			    !unitEnumAsU8(got, want) && !unitEnumAsU8(want, got)) {
+				const TypeKey &wk = gctx.ctx.getTypePool().get(want);
+				const TypeKey &gk = gctx.ctx.getTypePool().get(got);
+				// Unsigned zero-extends into any wider int; signed
+				// sign-extends only into a wider SIGNED int.
+				bool losslessWiden = wk.kind == TypeKind::Int &&
+				                     gk.kind == TypeKind::Int && gk.a < wk.a &&
+				                     (gk.b == 0 || wk.b != 0);
+				if (losslessWiden) {
+					JirInst ext{};
+					ext.tag = gk.b != 0 ? JirTag::SExt : JirTag::ZExt;
+					ext.a = valRef;
+					ext.ty = want;
+					valRef = emit(gctx, ext);
+				} else {
+					failHere(gctx,
+					         "return value type does not match the declared "
+					         "return type of `" +
+					             gctx.jfn.name +
+					             "`; add an explicit `as` cast or adjust the "
+					             "declaration");
+				}
+			}
+		}
 	}
 	// Drop every active scope before exiting the function — minus the
 	// moved-out var, if any.
