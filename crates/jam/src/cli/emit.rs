@@ -1411,6 +1411,40 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
                 cg.register_function_ast(format!("{qself}.{}", meth.name), meth.clone());
             }
         }
+        // Methods of generic struct-returning factories register under the
+        // factory's qualified name ("std/collections.Vec.push") — parameter
+        // MODES don't depend on T, so the move analysis can resolve
+        // `v.push(c)` through the receiver's requalified GenericCall callee
+        // (the C++ registerAnonMethods, main.cpp:983-1007). Keys never collide
+        // with real struct methods (factories are functions, not structs), and
+        // register_function_ast touches no string pool, so the --emit-jir
+        // intern order is unaffected.
+        for func in &m.functions {
+            if !func.is_generic() {
+                continue;
+            }
+            for &stmt in &func.body {
+                let rn = *cg.node_store.get(stmt);
+                if rn.tag != AstTag::Return {
+                    continue;
+                }
+                if rn.lhs == 0 {
+                    break;
+                }
+                let value = *cg.node_store.get(NodeIdx::new(rn.lhs));
+                if value.tag != AstTag::StructExpr {
+                    break;
+                }
+                let anon_idx = value.lhs as usize;
+                if anon_idx >= m.anon_structs.len() {
+                    break;
+                }
+                let qfn = qualify_type_name(&func.module_path, &func.name);
+                for meth in &m.anon_structs[anon_idx].methods {
+                    cg.register_function_ast(format!("{qfn}.{}", meth.name), meth.clone());
+                }
+            }
+        }
         // Value consts inline at their use sites — register by bare name (and
         // module-qualified name for imports). Type-alias consts are skipped.
         for c in &m.consts {
