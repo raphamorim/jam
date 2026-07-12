@@ -1,0 +1,32 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Clone - payloaded enum
+// clone fenced": enum payload clone recurses into the payload's clone
+// tier; a non-cloneable payload (own cfn drop, no cfn clone) reports
+// owns-resources at the clone site. (Cloneable payloads deep-clone —
+// pinned in tests/unit/test_match_move.jam.)
+// expect-error: owns resources
+// expect-error: define `cfn clone(self: Self) Self`
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+
+fn bad(sink: *mut u32) {
+    var m: Maybe = Maybe.Some(Counter { value: 1, sink: sink });
+    var n: Maybe = m.clone();
+}
+fn main() {}

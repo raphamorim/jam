@@ -1,0 +1,34 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Move - conditional
+// method-call move rejected": a method-call move inside an if-arm is a
+// maybe-move of the outer binding.
+// ADAPTED: the C++ test used Vec(Counter).push; methods of GENERIC
+// instantiations currently escape the move analysis (recorded as a
+// gap), so this pins the non-generic receiver shape.
+// expect-error: move it on all control-flow paths or none
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+const Bin = struct {
+    dummy: u32,
+
+    fn put(self: mut Self, value: move Counter) {
+        var owned: Counter = value;
+    }
+};
+
+fn bad(sink: *mut u32, doIt: bool) {
+    var b: Bin = Bin { dummy: 0 };
+    var c: Counter = Counter { value: 1, sink: sink };
+    if (doIt) {
+        b.put(c);
+    }
+}
+fn main() {}

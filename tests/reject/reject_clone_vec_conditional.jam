@@ -1,0 +1,30 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Clone - container clone
+// conditional on element cloneability": Vec(T)'s clone instantiates
+// conditionally (Rust's `impl<T: Clone> Clone for Vec<T>`) — the
+// container itself works, but .clone() reports owns-resources at the
+// call site, naming the instantiation.
+// expect-error: `std/collections.Vec__Counter` owns resources
+// expect-error: define `cfn clone(self: Self) Self`
+
+const { Vec } = import("std/collections");
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+fn bad(sink: *mut u32) {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 1, sink: sink });
+    var w: Vec(Counter) = v.clone();
+}
+fn main() {}

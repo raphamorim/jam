@@ -1,0 +1,29 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Conditional - withdrawn
+// method replays reason at call site" (filled flavor): Vec(T).filled is
+// withdrawn for drop-bearing T by the mode-aware ANALYSIS (the fill
+// duplicates a borrowed drop-bearing value); calling it replays the
+// recorded reason.
+// expect-error: method `std/collections.Vec__Counter.filled` is not available for this instantiation
+// expect-error: borrowed, not owned
+
+const { Vec } = import("std/collections");
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    var v: Vec(Counter) = Vec(Counter).filled(c, 3);
+}
+fn main() {}

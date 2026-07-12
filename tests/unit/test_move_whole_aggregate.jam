@@ -1,0 +1,40 @@
+// Whole-binding moves of an aggregate holding a drop-bearing FIELD stay
+// legal — the field-extraction fence (tests/reject/reject_move_field_extract.jam)
+// only bites paths, not whole bindings. Ported from the positive arm of
+// tests/cpp/test_codegen_errors.cpp "Move - drop-bearing field extraction
+// rejected" (field_extract_whole_ok). The moved-into param owns the
+// aggregate; its field's drop fires exactly once at callee exit.
+
+const { assert } = import("test");
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+const Holder = struct {
+    c: Counter,
+};
+
+// Empty body: the move param is the final owner; the Counter field's
+// drop fires here, once.
+fn consumeHolder(h: move Holder) {
+}
+
+fn buildAndMove(sink: *mut u32) {
+    var h: Holder = Holder { c: Counter { value: 1, sink: sink } };
+    consumeHolder(h);
+}
+
+tfn wholeAggregateMoveDropsFieldOnce() {
+    var hits: u32 = 0;
+    buildAndMove(&hits);
+    // One drop: the field inside the moved-in param at consumeHolder's
+    // exit. A double-drop (no caller suppression) gives 2; a leak gives 0.
+    assert(hits, 1);
+}

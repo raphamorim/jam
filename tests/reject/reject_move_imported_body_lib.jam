@@ -1,0 +1,21 @@
+// Helper module for reject_move_imported_body.jam (not a test itself):
+// the move violation lives HERE, in an imported body calling a private
+// same-module helper — the diagnostic must blame this file.
+pub const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+}
+
+pub fn badHelper(sink: *mut u32) u32 {
+    var c: Counter = Counter { value: 1, sink: sink };
+    consume(c);
+    return c.value;
+}

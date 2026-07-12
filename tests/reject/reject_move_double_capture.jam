@@ -1,0 +1,24 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Move - double capture
+// in array literal rejected": [c, c] — the first element moves c, the
+// second is use-after-move.
+// expect-error: use of moved binding `c`
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    var arr: [2]Counter = [c, c];
+}
+fn main() {}

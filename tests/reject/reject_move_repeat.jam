@@ -1,0 +1,24 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Move - drop-bearing
+// repeat literal rejected": [c; N] duplicates one value into N slots —
+// N owners of one payload. rustc requires T: Copy; jam rejects.
+// expect-error: owners of one drop-bearing value
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    var arr: [2]Counter = [c; 2];
+}
+fn main() {}

@@ -1,0 +1,28 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Move - move inside loop
+// rejected": a loop body runs zero or more times, so a move of an outer
+// binding inside it is always a maybe-move.
+// expect-error: move it on all control-flow paths or none
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    var i: u32 = 0;
+    while (i < 3) {
+        consume(c);
+        i = i + 1;
+    }
+}
+fn main() {}

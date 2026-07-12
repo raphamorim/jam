@@ -1,0 +1,29 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Conditional - withdrawn
+// method replays reason at call site" (v[i] sugar / `at` flavor): the
+// indexing hook is withdrawn for uncloneable elements (astgen
+// withdrawal); calling it replays the reason.
+// expect-error: method `std/collections.Vec__Counter.at` is not available for this instantiation
+// expect-error: owns resources
+
+const { Vec } = import("std/collections");
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+fn bad(sink: *mut u32) u32 {
+    var v: Vec(Counter) = Vec(Counter).empty();
+    v.push(Counter { value: 1, sink: sink });
+    return v[0].value;
+}
+fn main() {}

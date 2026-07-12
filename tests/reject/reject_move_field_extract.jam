@@ -1,0 +1,43 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Move - drop-bearing
+// field extraction rejected": ownership is tracked per whole binding,
+// so extracting a drop-bearing field duplicates ownership (the field
+// copy and the aggregate's drop glue both drop the payload) in every
+// ownership-transferring position: move arg, return, var init.
+// (Whole-binding moves stay legal — tests/unit/test_move_whole_aggregate.jam.)
+// expect-error: cannot move a drop-bearing field out of its aggregate
+// expect-error: cannot return a drop-bearing field out of its aggregate
+// expect-error: cannot copy a drop-bearing field out of its aggregate
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+const Holder = struct {
+    c: Counter,
+};
+
+fn badMoveArg(sink: *mut u32) {
+    var h: Holder = Holder { c: Counter { value: 1, sink: sink } };
+    consume(h.c);
+}
+
+fn badReturn(h: move Holder) Counter {
+    return h.c;
+}
+
+fn badVarInit(sink: *mut u32) {
+    var h: Holder = Holder { c: Counter { value: 1, sink: sink } };
+    var x: Counter = h.c;
+}
+
+fn main() {}

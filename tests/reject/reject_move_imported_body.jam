@@ -1,0 +1,15 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Move - imported-module
+// body analyzed, blames defining file": the mode-aware callsite analysis
+// covers imported module bodies (including their calls to private
+// same-module helpers), attributing diagnostics to the defining file.
+// Regression: std generic bodies escaping analysis is how Box.init's
+// double-drop shipped.
+// expect-error: use of moved binding `c`
+// expect-error: reject_move_imported_body_lib.jam:
+
+const { badHelper } = import("reject_move_imported_body_lib");
+
+fn main() {
+    var hits: u32 = 0;
+    badHelper(&hits);
+}

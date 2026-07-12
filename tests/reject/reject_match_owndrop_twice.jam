@@ -1,0 +1,24 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "MatchMove - own-cfn-drop
+// enum edge": enums with their OWN cfn drop are match-consumed even when
+// payload-less (the analyzer/codegen gates must agree — found by the
+// rustc-comparison fleet).
+// expect-error: use of moved binding `t`
+
+extern fn puts(s: *const[] u8) i32;
+
+const Token = enum {
+    Red,
+    Blue,
+};
+
+cfn drop(self: mut Token) {
+    puts("D");
+}
+
+fn bad() u32 {
+    var t: Token = Token.Red();
+    match (t) { _ { } }
+    match (t) { _ { return 1; } }
+    return 0;
+}
+fn main() {}

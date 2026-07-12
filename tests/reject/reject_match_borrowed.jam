@@ -1,0 +1,30 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "MatchMove - rejections"
+// (borrowed flavor): a borrowed (let param) scrutinee cannot be
+// consumed by a match.
+// expect-error: cannot move drop-bearing `m` out of a `let` parameter
+// expect-error: borrowed, not owned
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+
+fn bad(m: Maybe) u32 {
+    match (m) { _ { return 1; } }
+    return 0;
+}
+fn main() {}

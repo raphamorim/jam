@@ -1,0 +1,25 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "MatchMove - own-cfn-drop
+// enum edge" (E0509 analog): binding the payload out from under an enum
+// that has its own cfn drop is rejected — the binding and the enum's
+// drop would both own the payload.
+// expect-error: cannot bind the payload out of an enum that has its own `cfn drop`
+
+extern fn puts(s: *const[] u8) i32;
+
+const Wrapped = enum {
+    None,
+    Some(u32),
+};
+
+cfn drop(self: mut Wrapped) {
+    puts("D");
+}
+
+fn bad() u32 {
+    var w: Wrapped = Wrapped.Some(5);
+    match (w) {
+        Wrapped.Some(x) { return x; }
+        _ { return 0; }
+    }
+}
+fn main() {}

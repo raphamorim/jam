@@ -1,0 +1,25 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Move - move out of
+// borrowed param rejected": a let/mut parameter is borrowed, not owned;
+// moving a drop-bearing value out of it (here a var-init move) would
+// leave the caller and the new owner both dropping the payload.
+// expect-error: cannot move drop-bearing `c` out of a `let` parameter
+// expect-error: declare the parameter `move` to take ownership
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+fn steal(c: Counter) {
+    var mine: Counter = c;
+}
+fn main() {}

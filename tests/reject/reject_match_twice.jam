@@ -1,0 +1,31 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "MatchMove - rejections"
+// (use-after flavor): matching a drop-bearing enum consumes the
+// scrutinee, so re-matching is use-after-move.
+// expect-error: use of moved binding `m`
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+
+fn bad(sink: *mut u32) u32 {
+    var m: Maybe = Maybe.Some(Counter { value: 1, sink: sink });
+    match (m) { _ { } }
+    match (m) { _ { return 1; } }
+    return 0;
+}
+fn main() {}

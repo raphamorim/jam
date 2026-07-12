@@ -1,0 +1,25 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Move - reassign after
+// move rejected": the move suppressed the scope-exit drop, so the
+// binding cannot be re-initialized.
+// expect-error: cannot assign to `c` after it was moved
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+fn bad(sink: *mut u32) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    consume(c);
+    c = Counter { value: 2, sink: sink };
+}
+fn main() {}

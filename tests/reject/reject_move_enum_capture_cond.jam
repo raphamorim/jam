@@ -1,0 +1,31 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "Move - conditional enum
+// payload capture rejected": capturing a drop-bearing local into an enum
+// payload only on some paths makes its drop conditional.
+// expect-error: move it on all control-flow paths or none
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+
+fn bad(sink: *mut u32, doIt: bool) {
+    var c: Counter = Counter { value: 1, sink: sink };
+    if (doIt) {
+        var m: Maybe = Maybe.Some(c);
+    }
+}
+fn main() {}

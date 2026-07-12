@@ -1,0 +1,31 @@
+// Ported from tests/cpp/test_codegen_errors.cpp "MatchMove - rejections"
+// (cond flavor): a conditional match of an outer drop-bearing binding
+// violates the depth rule — its drop would become conditional.
+// expect-error: move it on all control-flow paths or none
+
+const Counter = struct {
+    value: u32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut Counter) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+fn consume(c: move Counter) {
+    var owned: Counter = c;
+}
+
+const Maybe = enum {
+    None,
+    Some(Counter),
+};
+
+fn bad(sink: *mut u32, doIt: bool) {
+    var m: Maybe = Maybe.Some(Counter { value: 1, sink: sink });
+    if (doIt) {
+        match (m) { _ { } }
+    }
+}
+fn main() {}
