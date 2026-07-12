@@ -1,0 +1,17 @@
+// Ports tests/cpp/test_init_analysis.cpp: "InitAnalysis - escape &mut
+// field". Scope escape: returning `&p.a` — a sub-path rooted at a
+// `mut`-mode parameter — is just as much of an escape as `&p`.
+// expect-error: cannot return `&` of `mut`-mode parameter `p`
+
+const Pair = struct {
+    a: u32,
+    b: u32,
+};
+
+fn dangleField(p: mut Pair) *mut u32 {
+    return &p.a;
+}
+
+fn main() i32 {
+    return 0;
+}

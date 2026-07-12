@@ -1,0 +1,12 @@
+// Ports tests/cpp/test_init_analysis.cpp: "InitAnalysis - escape &mut
+// param". Scope escape: returning `&p` of a `mut`-mode parameter would
+// let the second-class borrow outlive the call frame.
+// expect-error: cannot return `&` of `mut`-mode parameter `p`
+
+fn dangle(p: mut u32) *mut u32 {
+    return &p;
+}
+
+fn main() i32 {
+    return 0;
+}

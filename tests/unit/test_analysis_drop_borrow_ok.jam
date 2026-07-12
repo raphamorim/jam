@@ -1,0 +1,44 @@
+// Ports tests/cpp/test_init_analysis.cpp: "InitAnalysis - let on
+// drop-bearing OK" and "InitAnalysis - mut on drop-bearing OK".
+// Passing a drop-bearing binding by `let` (default read-only borrow)
+// or `mut` leaves ownership with the caller — only `move` interacts
+// with the drop-suppression analysis. Both must compile and the
+// caller's scope-exit drop must still fire exactly once.
+
+const { assert } = import("test");
+
+const File = struct {
+    fd: i32,
+    sink: *mut u32,
+};
+
+cfn drop(self: mut File) {
+    var p: *mut u32 = self.sink;
+    p.* = p.* + 1;
+}
+
+// let borrow (default mode): read-only access, caller keeps ownership.
+fn read(f: File) i32 {
+    return f.fd;
+}
+
+// mut borrow: in-place mutation through the caller's storage.
+fn close(f: mut File) {
+    f.fd = -1;
+}
+
+fn borrowBoth(sink: *mut u32) i32 {
+    var f: File = File { fd: 7, sink: sink };
+    var seen: i32 = read(f);
+    close(f);
+    return seen + f.fd;
+}
+
+tfn letAndMutOnDropBearingOK() {
+    var hits: u32 = 0;
+    // read sees 7, close sets fd to -1: 7 + (-1) = 6.
+    assert(borrowBoth(&hits), 6);
+    // Exactly one drop: f at borrowBoth's scope exit. Borrows must not
+    // add drops (2+) or suppress the caller's (0).
+    assert(hits, 1);
+}

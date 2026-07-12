@@ -1,0 +1,14 @@
+// Ports tests/cpp/test_init_analysis.cpp: "InitAnalysis - two moves same
+// binding". Exclusivity: two `move` args draining the same binding in
+// one call conflict.
+// expect-error: conflicting borrows of `x`
+
+fn consumeTwo(a: move u32, b: move u32) u32 {
+    return a + b;
+}
+
+fn main() i32 {
+    var x: u32 = 5;
+    var r: u32 = consumeTwo(x, x);
+    return 0;
+}

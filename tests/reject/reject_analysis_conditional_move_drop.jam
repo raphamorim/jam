@@ -1,0 +1,30 @@
+// Ports tests/cpp/test_init_analysis.cpp: "InitAnalysis - conditional
+// move on drop-bearing rejected". Moving a drop-bearing binding inside
+// an if-arm of a binding declared outside is a maybe-move; jam keeps
+// drops static (no runtime drop flags) and rejects it.
+// expect-error: move it on all control-flow paths or none
+// expect-error: is moved on some control-flow paths but not others
+
+const File = struct {
+    fd: i32,
+};
+
+cfn drop(self: mut File) {
+    self.fd = 0;
+}
+
+fn consume(f: move File) i32 {
+    return f.fd;
+}
+
+fn caller(doIt: bool) {
+    var f: File = File { fd: 7 };
+    if (doIt) {
+        consume(f);
+    }
+}
+
+fn main() i32 {
+    caller(true);
+    return 0;
+}

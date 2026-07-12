@@ -1,0 +1,19 @@
+// Ports tests/cpp/test_init_analysis.cpp: "InitAnalysis - overlapping
+// path". Exclusivity: `mut` borrow of the whole struct overlaps a `let`
+// read of one of its fields in the same call.
+// expect-error: conflicting borrows of `p`
+
+const Pair = struct {
+    a: u32,
+    b: u32,
+};
+
+fn modifyAndRead(whole: mut Pair, part: u32) u32 {
+    return part;
+}
+
+fn main() i32 {
+    var p: Pair = Pair { a: 1, b: 2 };
+    var r: u32 = modifyAndRead(p, p.a);
+    return 0;
+}

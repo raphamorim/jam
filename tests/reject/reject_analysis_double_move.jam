@@ -1,0 +1,15 @@
+// Ports tests/cpp/test_init_analysis.cpp: "InitAnalysis - double move".
+// Passing the same binding to a `move` param twice: the second call
+// reads an already-drained binding.
+// expect-error: use of moved binding `x`
+
+fn consume(buf: move u32) u32 {
+    return buf;
+}
+
+fn main() i32 {
+    var x: u32 = 100;
+    consume(x);
+    consume(x);
+    return 0;
+}

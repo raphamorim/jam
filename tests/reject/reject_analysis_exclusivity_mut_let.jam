@@ -1,0 +1,15 @@
+// Ports tests/cpp/test_init_analysis.cpp: "InitAnalysis - mut + let same
+// binding". Exclusivity: a `mut` borrow and a `let` read of the same
+// binding cannot coexist in one call.
+// expect-error: conflicting borrows of `n`
+
+fn modify(x: mut u32, y: u32) u32 {
+    x = x + y;
+    return x;
+}
+
+fn main() i32 {
+    var n: u32 = 5;
+    var r: u32 = modify(n, n);
+    return 0;
+}
