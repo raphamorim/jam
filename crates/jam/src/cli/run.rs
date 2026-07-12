@@ -304,6 +304,14 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
         }
         None => {}
     }
+    // A file carrying `// expect-error:` directives is a MUST-FAIL test: the
+    // compile itself is the assertion, so there is no harness to build or run.
+    if test_mode && !emit_ir {
+        let expected = expect_error_directives(&filename);
+        if !expected.is_empty() {
+            return run_must_fail(&filename, &expected);
+        }
+    }
     let mode = if emit_ir {
         // Print-IR-and-exit wins over run/test execution (the early return
         // inside compileAndRun, main.cpp:1547-1553); under `test` the dump
@@ -326,6 +334,62 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
         }
     };
     emit::emit_jir(&filename, mode, opt, lto, strip)
+}
+
+/// `// expect-error: <substring>` directives make a file a MUST-FAIL test:
+/// `jam test` compiles it expecting a non-zero exit, and the compiler's stderr
+/// must contain every listed substring. Returns the (possibly empty) list.
+fn expect_error_directives(path: &str) -> Vec<String> {
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    src.lines()
+        .filter_map(|l| l.trim_start().strip_prefix("// expect-error:"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Run one must-fail test: re-invoke this binary as `jam build <file>` with
+/// captured output, require a failing exit, and require every expected
+/// substring in stderr. Returns the test's exit code (0 = passed).
+fn run_must_fail(path: &str, expected: &[String]) -> i32 {
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("jam"));
+    let stem = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out");
+    let out_name = format!("jam_reject_{stem}");
+    let output = match std::process::Command::new(exe)
+        .arg("build")
+        .arg(path)
+        .arg("-o")
+        .arg(&out_name)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            println!("error: failed to spawn compile for must-fail test: {e}");
+            return 1;
+        }
+    };
+    if output.status.success() {
+        let _ = std::fs::remove_file(&out_name);
+        println!("expected compile to FAIL, but it succeeded");
+        return 1;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let missing: Vec<&String> = expected.iter().filter(|e| !stderr.contains(*e)).collect();
+    if missing.is_empty() {
+        println!("{} expected error(s) matched", expected.len());
+        return 0;
+    }
+    for m in &missing {
+        println!("expected error not found: {m}");
+    }
+    println!("--- compiler stderr ---");
+    print!("{stderr}");
+    1
 }
 
 /// Recursively discover `*.jam` files under `dir`, sorted (main.cpp's
@@ -561,7 +625,9 @@ fn test_directory(
     let mut skipped = 0;
     let mut runnable: Vec<String> = Vec::new();
     for f in &files {
-        if file_has_tests(f) {
+        // Both harness (`tfn`) files and `// expect-error:` must-fail files
+        // count as runnable tests.
+        if file_has_tests(f) || !expect_error_directives(f).is_empty() {
             runnable.push(f.clone());
         } else {
             skipped += 1;
@@ -570,6 +636,8 @@ fn test_directory(
 
     let jobs = test_jobs();
     if jobs > 1 && runnable.len() > 1 {
+        // Must-fail files need no special casing here: each worker re-invokes
+        // `jam test <file>`, whose single-file path dispatches on directives.
         run_tests_parallel(&runnable, libs, opt, jobs, &mut passed, &mut failed);
     } else {
         for f in &runnable {
@@ -579,6 +647,15 @@ fn test_directory(
             // Flush so the header precedes the test binary's own stdout.
             use std::io::Write;
             let _ = std::io::stdout().flush();
+            let expected = expect_error_directives(f);
+            if !expected.is_empty() && !emit_ir {
+                if run_must_fail(f, &expected) != 0 {
+                    failed += 1;
+                } else {
+                    passed += 1;
+                }
+                continue;
+            }
             let stem = Path::new(f)
                 .file_stem()
                 .and_then(|s| s.to_str())
