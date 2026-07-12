@@ -1570,14 +1570,37 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
                 ns.types
                     .insert(name.to_string(), cg.type_pool.intern_named(sid));
             };
+            // Only PUB decls enter an imported module's namespace; non-pub
+            // names are recorded so handle-qualified access reports "not
+            // exported" (the C++ regFn/regPriv split, main.cpp:701-721). The
+            // entry module (i == 0) has no import handle pointing at it, so
+            // its namespace stays unrestricted.
+            let entry = i == 0;
             for s in &m.structs {
-                add_type(&s.name, &s.module_path, &mut cg);
+                if entry || s.is_pub {
+                    add_type(&s.name, &s.module_path, &mut cg);
+                } else {
+                    ns.private_names.insert(s.name.clone());
+                }
             }
             for e in &m.enums {
-                add_type(&e.name, &e.module_path, &mut cg);
+                if entry || e.is_pub {
+                    add_type(&e.name, &e.module_path, &mut cg);
+                } else {
+                    ns.private_names.insert(e.name.clone());
+                }
             }
             for u in &m.unions {
-                add_type(&u.name, &u.module_path, &mut cg);
+                if entry || u.is_pub {
+                    add_type(&u.name, &u.module_path, &mut cg);
+                } else {
+                    ns.private_names.insert(u.name.clone());
+                }
+            }
+            for f in &m.functions {
+                if !entry && !f.is_pub && !f.is_extern && !f.is_export {
+                    ns.private_names.insert(f.name.clone());
+                }
             }
             for imp in &m.imports {
                 if !imp.is_pub {

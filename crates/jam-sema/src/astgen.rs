@@ -3395,6 +3395,15 @@ fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<Ji
             None
         }
     };
+    // A handle-qualified spelling of a PRIVATE function must not resolve, even
+    // when the handle name coincides with the module identity and the raw
+    // spelling matches the internal qualified registry key (the C++ registers
+    // handle keys for pub fns only, main.cpp:701).
+    if callee.contains('.')
+        && let Some(msg) = gctx.ctx.namespace_privacy_violation(&callee)
+    {
+        return Ok(recover_here(gctx, msg, TypeIdx::NONE));
+    }
     let fn_ast = match body_qualified.or_else(|| gctx.ctx.get_function_ast(&callee)) {
         Some(f) => f,
         None => {
@@ -7921,6 +7930,26 @@ pub fn astgen_body_into(
 ) -> Result<(), String> {
     if fn_ast.is_extern {
         return Ok(());
+    }
+    // Privacy: a signature naming another module's PRIVATE type through an
+    // import handle is rejected here — a byref param never resolves its
+    // pointee otherwise (opaque `ptr`), so the lazy type-lowering gate in
+    // `compute_llvm_type` would never see it. Named spellings only; other
+    // kinds resolve (and gate) through the type-lowering path.
+    let priv_check = |t: TypeIdx| -> Result<(), String> {
+        let k = ctx.type_pool.get(t);
+        if k.kind == TypeKind::Named
+            && let Some(msg) = ctx.namespace_privacy_violation(&String::from_utf8_lossy(
+                &ctx.string_pool.get(StringIdx::new(k.a)),
+            ))
+        {
+            return Err(msg);
+        }
+        Ok(())
+    };
+    priv_check(fn_ast.return_type)?;
+    for p in &fn_ast.args {
+        priv_check(p.ty)?;
     }
     let entry = jfn.push_block("entry");
     let mut gctx = AstGenCtx {

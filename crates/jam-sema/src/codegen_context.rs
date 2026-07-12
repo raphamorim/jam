@@ -247,6 +247,10 @@ pub struct ModuleNamespace {
     /// pub re-export name -> the resolved module identity it points at
     /// (`pub const leaf = import("mod_chain_leaf")` -> `leaf` -> `mod_chain_leaf`).
     pub module_aliases: HashMap<String, String>,
+    /// NON-pub decl names (types + fns), recorded so a handle-qualified access
+    /// distinguishes "private" from "does not exist" (the C++ `privateNames`,
+    /// main.cpp:702/713 regPriv).
+    pub private_names: std::collections::HashSet<String>,
 }
 
 /// A module-scope const: its initializer expression + declared type. A plain
@@ -1736,8 +1740,47 @@ impl<'ctx> CodegenContext<'ctx> {
         match self.import_handle_module(handle) {
             None => format!("unknown module handle `{handle}` in `{qualified}`"),
             Some(module_path) => {
-                format!("symbol `{bare}` does not exist in module `{module_path}`")
+                // Distinguish private from nonexistent (the C++ privateNames
+                // branch, codegen.cpp:831).
+                let is_private = self
+                    .module_namespaces
+                    .borrow()
+                    .get(&module_path)
+                    .is_some_and(|ns| ns.private_names.contains(bare));
+                if is_private {
+                    format!("symbol `{bare}` is not exported from module `{module_path}`")
+                } else {
+                    format!("symbol `{bare}` does not exist in module `{module_path}`")
+                }
             }
+        }
+    }
+
+    /// Privacy gate for a dotted spelling `handle.Name` evaluated from OUTSIDE
+    /// the handle's target module. The registries key types/functions by their
+    /// qualified identity for internal resolution, and a handle spelled like
+    /// the module identity (`const lib = import("lib")`) makes a user spelling
+    /// collide with that internal key — so the pub check must happen at lookup
+    /// (the C++ never registers handle-qualified keys for non-pub decls,
+    /// main.cpp:701-721). Returns the diagnostic when `Name` is private.
+    pub fn namespace_privacy_violation(&self, dotted: &str) -> Option<String> {
+        let (handle, bare) = dotted.split_once('.')?;
+        let target = self.import_handle_module(handle)?;
+        // The defining module's own bodies keep using qualified identities.
+        if self.current_body_module() == target {
+            return None;
+        }
+        let violates = self
+            .module_namespaces
+            .borrow()
+            .get(&target)
+            .is_some_and(|ns| ns.private_names.contains(bare));
+        if violates {
+            Some(format!(
+                "symbol `{bare}` is not exported from module `{target}`"
+            ))
+        } else {
+            None
         }
     }
     /// Register a loaded module's public namespace (keyed by its identity).
@@ -1871,6 +1914,11 @@ impl<'ctx> CodegenContext<'ctx> {
                 .union_llvm_type(ty)
                 .ok_or_else(|| format!("Unknown union type: {}", self.str_name(k.a))),
             TypeKind::Named => {
+                // A handle-qualified spelling of a PRIVATE type is rejected
+                // before the registry can serve the internal qualified key.
+                if let Some(msg) = self.namespace_privacy_violation(&self.str_name(k.a)) {
+                    return Err(msg);
+                }
                 // Registry-backed resolution. The substitution / alias /
                 // chained-reexport / privacy resolution order lands with the
                 // analyzer + substitution engine.
