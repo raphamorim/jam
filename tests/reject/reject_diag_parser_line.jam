@@ -1,0 +1,6 @@
+// Ports "Diagnostics - parser error carries :line:".
+// expect-error: reject_diag_parser_line.jam:5:
+
+fn main() i32 {
+    return *;
+}

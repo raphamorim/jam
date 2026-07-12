@@ -1,0 +1,8 @@
+// Ports "Diagnostics - break outside loop carries :line:".
+// expect-error: reject_diag_break_outside_loop.jam:6: error:
+// expect-error: `break` outside of loop
+
+fn main() i32 {
+    break;
+    return 0;
+}

@@ -1,0 +1,13 @@
+// Ports "Diagnostics - unknown method is recoverable" with the :line:
+// pin. A dotted call whose prefix is neither a type nor a known method
+// receiver reports the module-handle miss — verified against the C++
+// oracle, which prints the same message for this shape.
+// expect-error: reject_diag_unknown_method.jam:11: error: unknown module handle `p` in `p.nope`
+
+const P = struct { x: i32 };
+
+fn main() i32 {
+    var p = P { x: 1 };
+    var r: i32 = p.nope();
+    return 0;
+}

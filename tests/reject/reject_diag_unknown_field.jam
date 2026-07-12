@@ -1,0 +1,9 @@
+// Ports "Diagnostics - unknown field carries :line:".
+// expect-error: reject_diag_unknown_field.jam:8: error: unknown field `nope` on `P`
+
+const P = struct { x: i32 };
+
+fn main() i32 {
+    var p = P { x: 1 };
+    return p.nope;
+}

@@ -1,0 +1,7 @@
+// Ports "Diagnostics - self-referential enum rejected": a payload
+// carrying the enum itself is infinite-sized.
+// expect-error: enum `E` depends on itself
+
+const E = enum { Nothing, Just(E) };
+
+fn main() {}

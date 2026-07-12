@@ -1,0 +1,6 @@
+// Ports "Diagnostics - unknown variable carries :line:".
+// expect-error: reject_diag_unknown_var.jam:5: error: unknown variable `badName`
+
+fn main() i32 {
+    return badName;
+}

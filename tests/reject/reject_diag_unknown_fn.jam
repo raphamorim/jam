@@ -1,0 +1,8 @@
+// Ports "Diagnostics - unknown function carries :line:" and pins the
+// exact `file:line: error:` diagnostic shape.
+// expect-error: reject_diag_unknown_fn.jam:6: error: unknown function `foobar`
+
+fn main() i32 {
+    foobar();
+    return 0;
+}

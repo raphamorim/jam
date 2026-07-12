@@ -1,0 +1,6 @@
+// Ports "Diagnostics - self-referential union rejected".
+// expect-error: union `U` depends on itself
+
+const U = union { a: U, b: i32 };
+
+fn main() {}

@@ -1,0 +1,8 @@
+// Ports "Diagnostics - struct-via-union cycle rejected": a mixed
+// struct -> union -> struct chain.
+// expect-error: depends on itself
+
+const U = union { s: S, b: i32 };
+const S = struct { u: U };
+
+fn main() {}

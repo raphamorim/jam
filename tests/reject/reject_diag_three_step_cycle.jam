@@ -1,0 +1,11 @@
+// Ports "Diagnostics - three-step struct cycle full chain": the trace
+// names every ancestor in the cycle.
+// expect-error: struct `A` depends on itself
+// expect-error: referenced by `B`
+// expect-error: referenced by `C`
+
+const A = struct { b: B };
+const B = struct { c: C };
+const C = struct { a: A };
+
+fn main() {}
