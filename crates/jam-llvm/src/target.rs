@@ -6,26 +6,22 @@
  */
 
 //! Target initialization, host queries, the `TargetMachine`, and object/bitcode
-//! emission — the Rust reproduction of the C++ facade's target + emit surface.
+//! emission.
 //!
 //! The emit path is the one place the LLVM-C API under-exposes the C++ API, so
-//! two pieces live in the C++ shim (`shim/jam_shim.cpp`, compiled by `build.rs`)
-//! rather than being driven through the C API:
-//!   * the optimization pipeline (`jam_shim_optimize`) is the C++ facade's
-//!     `PassBuilder` configuration copied VERBATIM — the tuning options, the
-//!     analysis-manager wiring, the `OptimizationLevel` switch, the pre-pipeline
-//!     `InternalizePass([main]) + GlobalDCEPass`, the size-favoring function
-//!     attrs (Os/Oz), and the per-module/LTO/O0 pipeline selection. Running the
-//!     identical pipeline on the same LLVM gives byte-identical optimized IR to
-//!     the oracle, which the C-API textual-pipeline form could not guarantee.
-//!   * `TargetOptions::{FunctionSections, DataSections}` are not reachable
-//!     through the LLVM-C API at all (`TargetOptions` is C++-only), so
-//!     [`TargetMachine::new`] flips those two bits via
-//!     `jam_set_target_machine_sections` when `opt != None`, matching the C++.
+//! two pieces live in the C++ shim (`shim/jam_shim.cpp`, compiled by `build.rs`):
+//!   * the optimization pipeline (`jam_shim_optimize`) — kept identical to the
+//!     oracle's PassBuilder configuration, so the same LLVM produces
+//!     byte-identical optimized IR (the C-API textual-pipeline form couldn't
+//!     guarantee that);
+//!   * `TargetOptions::{FunctionSections, DataSections}` — not reachable
+//!     through the LLVM-C API at all, so [`TargetMachine::new`] flips those two
+//!     bits via `jam_set_target_machine_sections` when `opt != None`.
 //!
 //! These two functions are the only C++ in the crate and the sole reason the
-//! build needs a C++ compiler + LLVM's C++ headers. [`TargetMachine::run_optimization`]
-//! invokes the optimizer; callers run it before [`TargetMachine::emit_to_file`].
+//! build needs a C++ compiler + LLVM's C++ headers.
+//! [`TargetMachine::run_optimization`] invokes the optimizer; callers run it
+//! before [`TargetMachine::emit_to_file`].
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint};
@@ -140,8 +136,7 @@ impl OptLevel {
     }
 
     /// The integer discriminant the C++ shim's `jam_shim_optimize` switches on.
-    /// Matches the declaration order (None=0 … Small=5) and the C++ facade's
-    /// `JamOptLevel` enum, so the shim selects the identical `OptimizationLevel`.
+    /// Matches the declaration order (None=0 … Small=5).
     fn shim_discriminant(self) -> c_int {
         match self {
             OptLevel::None => 0,
@@ -200,8 +195,8 @@ impl TargetMachine {
         lto: Lto,
     ) -> Option<TargetMachine> {
         let ctriple = cstr(triple);
-        // Match the C++ facade: a missing CPU falls back to "generic"
-        // (`cpu ? cpu : "generic"`). An empty feature string is left as-is.
+        // A missing CPU falls back to "generic"; an empty feature string is
+        // left as-is.
         let ccpu = cstr(if cpu.is_empty() { "generic" } else { cpu });
         let cfeat = cstr(features);
         unsafe {
@@ -228,9 +223,9 @@ impl TargetMachine {
             if tm.is_null() {
                 return None;
             }
-            // Mirror the C++ facade: enable per-function/-data sections when
-            // optimizing. TargetOptions is not in the LLVM-C API, so this goes
-            // through the C++ shim (see `shim/jam_shim.cpp`).
+            // Enable per-function/-data sections when optimizing (pairs with
+            // the linker's dead-strip/--gc-sections). TargetOptions is not in
+            // the LLVM-C API, so this goes through the C++ shim.
             if opt != OptLevel::None {
                 raw::jam_set_target_machine_sections(tm, 1, 1);
             }
@@ -276,18 +271,13 @@ impl TargetMachine {
         }
     }
 
-    /// Run the new-PM optimization pipeline against `module` in place. This is
-    /// the C++ facade's pipeline copied verbatim into the shim
-    /// (`shim/jam_shim.cpp`, `jam_shim_optimize`): the size-favoring function
-    /// attrs (Os/Oz), the pre-pipeline internalize+globaldce (keeping `main` and
-    /// `llvm.used` members, skipped under LTO), and the OptimizationLevel switch
-    /// driving `buildO0DefaultPipeline` / `buildLTOPreLinkDefaultPipeline` /
-    /// `buildPerModuleDefaultPipeline`. Running the identical pipeline on the
-    /// same LLVM gives byte-identical optimized IR to the oracle.
-    ///
-    /// A no-op at `OptLevel::None` is still well-defined (the shim runs the O0
-    /// default pipeline); callers skip it at `None` to match the oracle, which
-    /// only invokes the optimizer when emitting an object/bitcode at any level.
+    /// Run the new-PM optimization pipeline (`jam_shim_optimize` in the C++
+    /// shim) against `module` in place: size-favoring function attrs (Os/Oz),
+    /// the pre-pipeline internalize+globaldce (keeping `main` and `llvm.used`
+    /// members, skipped under LTO), and the OptimizationLevel-selected
+    /// pipeline. Kept identical to the oracle's so optimized IR matches byte
+    /// for byte. Well-defined at `OptLevel::None` too, but callers skip it
+    /// then.
     pub fn run_optimization(&self, module: &Module<'_>) {
         unsafe {
             raw::jam_shim_optimize(
@@ -300,15 +290,13 @@ impl TargetMachine {
         }
     }
 
-    /// Emit an object file (LTO off) or LLVM bitcode (LTO on) to `filename`. The
-    /// optimization pipeline is NOT run here — callers invoke
-    /// [`run_optimization`] first (the C++ facade runs the pipeline as part of
-    /// its emit; we split it so `--emit-ir` can print the UNoptimized module,
-    /// matching the oracle's pre-optimization `--emit-ir`). Returns the LLVM
-    /// error text on failure.
+    /// Emit an object file (LTO off) or LLVM bitcode (LTO on) to `filename`.
+    /// The optimization pipeline is NOT run here — callers invoke
+    /// [`run_optimization`] first; the split lets `--emit-ir` print the
+    /// UNoptimized module, matching the oracle. Returns the LLVM error text on
+    /// failure.
     pub fn emit_to_file(&self, module: &Module<'_>, filename: &str) -> Result<(), String> {
         unsafe {
-            // Emit.
             let cfile = cstr(filename);
             if self.lto != Lto::Off {
                 if raw::LLVMWriteBitcodeToFile(module.as_ptr(), cfile.as_ptr()) != 0 {

@@ -23,15 +23,12 @@ impl Drop for ProgressGuard {
     }
 }
 
-// The OSC 9;4 progress escapes go to STDERR, only when stderr is a TTY —
-// matching the C++ ProgressGuard (`isatty(STDERR_FILENO)`, main.cpp:55). They
-// must NEVER touch stdout: stdout carries `--emit-ir` output, which is the
-// differential harness's primary gate, and stray escape bytes there poison
-// every IR diff. Write failures are ignored (a missing progress hint must not
-// crash the compiler).
+// The OSC 9;4 progress escapes go to STDERR, and only when stderr is a TTY.
+// They must NEVER touch stdout: stdout carries `--emit-ir` output, and stray
+// escape bytes there poison every IR diff. Write failures are ignored (a
+// missing progress hint must not crash the compiler).
 impl ProgressGuard {
-    /// `enabled=false` (test mode) constructs an inert guard — the C++
-    /// `ProgressGuard progress(!testMode)`.
+    /// `enabled=false` (test mode) constructs an inert guard.
     pub fn new(enabled: bool) -> Self {
         if !enabled || !io::stderr().is_terminal() {
             return ProgressGuard { active: false };

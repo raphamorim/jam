@@ -7,18 +7,17 @@
 
 //! `jam_llvm` — hand-rolled Rust bindings to LLVM (22.1) for the Jam compiler.
 //!
-//! This crate is the pure-Rust replacement for the C++ `jam_llvm.{h,cpp}` C
-//! facade. It is layered:
+//! Layered:
 //!
 //!   * [`raw`] — the only `unsafe extern "C"` surface: declarations of the
 //!     LLVM-C API functions we use, transcribed from the LLVM 22 headers. No
 //!     `inkwell`, no `llvm-sys`; the link is wired by `build.rs`.
 //!   * the safe wrappers ([`Context`], [`Module`], [`Builder`], [`Type`],
-//!     [`Value`], [`Function`], [`BasicBlock`], [`TargetMachine`]) — RAII owners
-//!     and `Copy` handles that mirror the operations the C facade exposed.
-//!   * binary128 float support (`APFloat` replacement) lives in the standalone
-//!     [`float128`] crate — re-exported here for API stability — since it is
-//!     pure Rust and needed by `jam_syntax` too.
+//!     [`Value`], [`Function`], [`BasicBlock`], [`TargetMachine`]) — RAII
+//!     owners and `Copy` handles.
+//!   * binary128 float support lives in the standalone [`float128`] crate —
+//!     re-exported here for API stability — since it is pure Rust and needed
+//!     by `jam_syntax` too.
 //!
 //! Handles ([`Type`]/[`Value`]/`…`) borrow `'ctx` from the [`Context`] that owns
 //! the underlying LLVM objects, so they cannot outlive it.

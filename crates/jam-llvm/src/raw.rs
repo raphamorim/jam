@@ -113,7 +113,6 @@ pub enum LLVMUnnamedAddr {
     Global = 2,
 }
 
-// ICMP predicate values (32..=41) match Jam's JamIntPredicate exactly.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub enum LLVMIntPredicate {
@@ -753,9 +752,8 @@ unsafe extern "C" {
 
 // jam C++ shim — compiled by build.rs from `shim/jam_shim.cpp`, NOT part of
 // libLLVM. Sets `TargetOptions` fields (FunctionSections/DataSections) that the
-// LLVM-C API does not expose, and runs the new-PM optimization pipeline copied
-// verbatim from the C++ facade (so the pass pipeline is provably identical to
-// the oracle's).
+// LLVM-C API does not expose, and runs the new-PM optimization pipeline — kept
+// identical to the oracle's so optimized IR matches byte for byte.
 unsafe extern "C" {
     pub fn jam_set_target_machine_sections(
         TM: LLVMTargetMachineRef,
@@ -764,10 +762,9 @@ unsafe extern "C" {
     );
 
     /// Run the module optimization pipeline (PassBuilder + the pre-pipeline
-    /// internalize/globaldce + size attrs), exactly as the C++ facade does.
-    /// `optLevel` matches the `OptLevel` enum discriminants
-    /// (None=0,Less=1,Default=2,Aggressive=3,Size=4,Small=5); `lto` matches the
-    /// `Lto` enum (Off=0,Thin=1,Fat=2).
+    /// internalize/globaldce + size attrs). `optLevel` matches the `OptLevel`
+    /// enum discriminants (None=0,Less=1,Default=2,Aggressive=3,Size=4,
+    /// Small=5); `lto` matches the `Lto` enum (Off=0,Thin=1,Fat=2).
     pub fn jam_shim_optimize(
         M: LLVMModuleRef,
         TM: LLVMTargetMachineRef,

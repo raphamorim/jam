@@ -5,10 +5,9 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! `--emit-*` dumps used by the differential harness. Today: `--emit-tokens`,
-//! whose output is byte-for-byte identical to the C++ oracle's
-//! `emitTokensForFile` (`KIND line escaped-lexeme` per token, incl. trailing
-//! EOF). Escaping and the string-vs-raw lexeme choice match the oracle exactly.
+//! `--emit-*` text dumps (tokens / ast / jir / ir). The formats are frozen —
+//! they match the original C++ compiler's output byte-for-byte (kept at the
+//! `cpp-final` tag), so don't reorder interning or printing casually.
 
 use std::io::{self, Write};
 
@@ -65,8 +64,8 @@ pub fn emit_tokens(path: &str) -> i32 {
     0
 }
 
-/// Escape a lexeme so each token stays on one line — identical to the oracle's
-/// `escapeForDump` (backslash, `\n`/`\t`/`\r`, and `\xNN` for other controls;
+/// Escape a lexeme so each token stays on one line — matches the oracle's
+/// escaping exactly (backslash, `\n`/`\t`/`\r`, `\xNN` for other controls;
 /// every other byte, including UTF-8 continuation bytes, passes through raw).
 fn write_escaped<W: Write>(out: &mut W, s: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -99,7 +98,7 @@ fn write_escaped<W: Write>(out: &mut W, s: &[u8]) {
     }
 }
 
-// ---- --emit-ast: byte-exact mirror of the C++ emitAstForFile dumper --------
+// ---- --emit-ast: byte-exact mirror of the oracle's AST dumper --------------
 
 fn pad(o: &mut Vec<u8>, n: usize) {
     for _ in 0..n {
@@ -238,7 +237,7 @@ fn dump_child(
     indent: usize,
 ) {
     if id == 0 {
-        return; // kNoNode prints nothing (matches the C++)
+        return; // "no node" prints nothing
     }
     dump_node(o, ns, tp, sp, id, indent);
 }
@@ -568,7 +567,7 @@ fn dump_function(
     }
 }
 
-/// Lex + parse `path` and print the AST (byte-identical to the C++ oracle).
+/// Lex + parse `path` and print the AST (byte-identical to the oracle).
 pub fn emit_ast(path: &str) -> i32 {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -721,9 +720,9 @@ pub fn emit_ast(path: &str) -> i32 {
     0
 }
 
-// ---- --emit-jir: byte-exact mirror of the C++ emitJirFunctions dumper -------
+// ---- --emit-jir: byte-exact mirror of the oracle's JIR dumper ---------------
 
-/// Print one `JirFunction` in the oracle's `emitJirFunctions` format.
+/// Print one `JirFunction` in the oracle's `--emit-jir` format.
 fn dump_jir_function(o: &mut Vec<u8>, tp: &TypePool, sp: &StringPool, f: &JirFunction) {
     o.extend_from_slice(b"function ");
     o.extend_from_slice(f.name.as_bytes());
@@ -787,8 +786,8 @@ fn dump_jir_function(o: &mut Vec<u8>, tp: &TypePool, sp: &StringPool, f: &JirFun
             spell_type(o, tp, sp, inst.ty);
             o.extend_from_slice(b" flags=");
             num(o, inst.flags as u64);
-            // Name-carrying instructions append the referenced string (OOB-safe,
-            // unescaped — matches the oracle's `dumpStr`).
+            // Name-carrying instructions append the referenced string
+            // (OOB-safe, unescaped — matches the oracle).
             match inst.tag {
                 JirTag::Call | JirTag::FnRef | JirTag::Str => {
                     o.extend_from_slice(b" str=\"");
@@ -807,8 +806,8 @@ fn dump_jir_function(o: &mut Vec<u8>, tp: &TypePool, sp: &StringPool, f: &JirFun
     }
 }
 
-/// Qualify a type/method name with its owning module (the C++
-/// `qualifyTypeName`): bare for the entry module, `module.name` otherwise.
+/// Qualify a type/method name with its owning module: bare for the entry
+/// module, `module.name` otherwise.
 fn qualify_type_name(module_path: &str, name: &str) -> String {
     if module_path.is_empty() {
         name.to_string()
@@ -818,16 +817,10 @@ fn qualify_type_name(module_path: &str, name: &str) -> String {
 }
 
 /// Register a value const under both its qualified key (for imports) and its
-/// bare name. The bare name is the per-module body's spelling, so when the ENTRY
-/// and an imported module both define `const N` the entry's value must win the
-/// bare slot (the entry body's `current_body_module()==""` reads the bare key).
-/// The C++ avoids this by keying every const under its qualified identity (the
-/// entry's modulePath is its non-empty filename) and resolving the bare spelling
-/// through a per-module owner map (main.cpp:1847). We mirror the OUTCOME: the
-/// entry const (empty module_path) is authoritative for the bare key — it always
-/// writes it — while an imported const claims the bare key only if no const is
-/// registered there yet, so it never clobbers an entry const regardless of the
-/// registration order across the two passes (entry-first vs entry-last).
+/// bare name. The entry const (empty module_path) is authoritative for the
+/// bare key — it always writes it — while an imported const claims the bare
+/// key only if nothing is registered there yet, so it never clobbers an entry
+/// const regardless of registration order across the two passes.
 fn register_const_keyed(
     cg: &CodegenContext,
     c: &jam_syntax::ast::ConstDeclAST,
@@ -844,18 +837,13 @@ fn register_const_keyed(
     }
 }
 
-/// Register the module's struct/union/enum types into the context (creating the
-/// named LLVM struct handles the analyzer fills) and drive the analyzer over
-/// every type decl, materialising the LLVM layouts that AstGen's `Named` field /
-/// param / return types resolve through. Mirrors the C++ register pass
-/// (`declareStructs`/`declareUnions`/`declareEnums`) + the analyzer loop.
+/// Register every module's struct/union/enum types (under module-qualified
+/// names) and drive the analyzer over each type decl, materialising the LLVM
+/// layouts that `Named` field/param/return types resolve through. Imported
+/// bare names get a pre-interned `requalify` entry.
 ///
 /// `modules: &'ctx` — the decl table borrows the module ASTs for the context's
-/// (invariant) lifetime; the caller guarantees they outlive the context. Each
-/// module's types register under their module-qualified name (bare for the
-/// entry module, `module.Name` for imports), and imported bare names get a
-/// pre-interned `requalify` entry so a module body's bare type references
-/// resolve to their qualified identity.
+/// (invariant) lifetime; the caller guarantees they outlive the context.
 fn register_and_analyze<'ctx>(cg: &mut CodegenContext<'ctx>, modules: &[&'ctx ModuleAST]) {
     // -1. Register value consts FIRST so a const-sized array field
     //     (`cells: [RAM_END]u8`) folds during the layout pass below.
@@ -864,7 +852,7 @@ fn register_and_analyze<'ctx>(cg: &mut CodegenContext<'ctx>, modules: &[&'ctx Mo
             // A type-alias const (`const CounterI32 = Counter(i32)`): register it
             // in the type-alias table (qualified to its own module), so
             // `name_for_kinds`' chase resolves `CounterI32` -> `Counter(i32)` ->
-            // the monomorphized struct. The C++ registerConsts (main.cpp:891-915).
+            // the monomorphized struct.
             if !c.aliased_type.is_none() {
                 let target = cg.requalify_type(c.aliased_type, &c.module_path);
                 cg.register_type_alias(c.name.clone(), target);
@@ -911,12 +899,11 @@ fn register_and_analyze<'ctx>(cg: &mut CodegenContext<'ctx>, modules: &[&'ctx Mo
 
     // 1. Register every module's types under their qualified name, with field /
     //    payload types REQUALIFIED (so a struct field of an imported sibling
-    //    type carries its qualified identity — the C++ `requalFields`).
-    // NOTE: struct/union/enum field types are requalified but NOT array-length-
-    // resolved here — a struct-field array `cells: [N]u8` is left as the deferred
-    // ArrayExpr (so const-sized struct fields stay cleanly unported) because
+    //    type carries its qualified identity).
+    // NOTE: field types are requalified but NOT array-length-resolved here — a
+    // struct-field array `cells: [N]u8` stays a deferred ArrayExpr because
     // indexing such a field (`self.cells[i]`) needs a Load-array-then-Index
-    // lowering in astgen_index that isn't ported yet.
+    // lowering in astgen_index that doesn't exist yet.
     for m in modules {
         for s in &m.structs {
             let q = qualify_type_name(&s.module_path, &s.name);
@@ -996,13 +983,11 @@ fn register_and_analyze<'ctx>(cg: &mut CodegenContext<'ctx>, modules: &[&'ctx Mo
     }
 }
 
-/// Materialise every type's LLVM body (the C++ demand-driven body-fill pass,
-/// main.cpp:1877-1884). Split out of `register_and_analyze` and run LATER —
-/// AFTER import handles + module namespaces are registered — so a struct/enum
-/// whose field/payload is a CHAINED type (`w.leaf.Point`) can resolve through
-/// the re-export chain when its body lays out. The C++ runs this pass after the
-/// namespace registration too; running it eagerly inside `register_and_analyze`
-/// (before namespaces existed) left chained-typed fields unresolved (stub body).
+/// Materialise every type's LLVM body. Split out of `register_and_analyze` and
+/// run LATER — AFTER import handles + module namespaces are registered — so a
+/// struct/enum whose field/payload is a CHAINED type (`w.leaf.Point`) can
+/// resolve through the re-export chain when its body lays out; filling eagerly
+/// (before namespaces exist) leaves such fields as stub bodies.
 fn fill_type_bodies<'ctx>(cg: &mut CodegenContext<'ctx>, modules: &[&'ctx ModuleAST]) {
     // One decl table over all modules' type decls (keyed by qualified name).
     let mut decls = DeclTable::new();
@@ -1032,14 +1017,10 @@ fn fill_type_bodies<'ctx>(cg: &mut CodegenContext<'ctx>, modules: &[&'ctx Module
     }
 }
 
-/// Lex + parse `path`, lower each non-test, non-generic function to JIR, and
-/// print it in the oracle's `--emit-jir` format. This is the intermediate
-/// AST→JIR differential gate, sitting between `--emit-ast` and `--emit-ir`.
-///
-/// Resolve a const init expression AS A TYPE (the C++ `resolveExprAsType`): a
-/// `Variable` naming a builtin scalar or a user type, or a direct `Call` to a
-/// `type`-returning generic fn -> a `GenericCall`. NONE otherwise. Drives
-/// type-alias-const registration (`const CounterI32 = Counter(i32)`).
+/// Resolve a const init expression AS A TYPE: a `Variable` naming a builtin
+/// scalar or a user type, or a direct `Call` to a `type`-returning generic fn
+/// -> a `GenericCall`. NONE otherwise. Drives type-alias-const registration
+/// (`const CounterI32 = Counter(i32)`).
 fn resolve_expr_as_type(cg: &mut CodegenContext, expr: NodeIdx) -> TypeIdx {
     use jam_syntax::ast_flat::builtin;
     if expr.is_none() {
@@ -1108,9 +1089,7 @@ fn resolve_expr_as_type(cg: &mut CodegenContext, expr: NodeIdx) -> TypeIdx {
 pub enum EmitMode {
     Jir,
     /// `--emit-ir`: print the LLVM IR and exit before the object/link step.
-    /// `test` is set when `test` accompanies the flag — the C++ threads both
-    /// through `compileAndRun`, so the dump then includes the synthesized
-    /// harness `main` (main.cpp:1449-1553).
+    /// With `test` set the dump includes the synthesized harness `main`.
     Ir {
         test: bool,
     },
@@ -1128,8 +1107,8 @@ pub enum EmitMode {
     },
 }
 
-/// `-C strip=MODE`: how much to strip from the linked binary (the C++ `JamStrip`).
-/// Applied as linker flags at link time (main.cpp:2620-2631); no effect on the IR.
+/// `-C strip=MODE`: how much to strip from the linked binary. Applied as
+/// linker flags at link time; no effect on the IR.
 #[derive(Copy, Clone, PartialEq, Eq, Default)]
 pub enum Strip {
     /// Keep everything (`none`/`off`/`false`/`no`).
@@ -1150,11 +1129,11 @@ impl EmitMode {
     }
 }
 
-/// The C++ `bindDeclTypes` (Phase 1b, src/main.cpp:364-387): requalify + instantiate
-/// every decl-level GenericCall type (function/method return+params, struct/union
-/// fields, enum payloads) so the monomorph TYPE interns EARLY — at the oracle's
-/// position — while the deferral flag keeps each generic's method bodies stashed
-/// for the later method pre-pass. Each decl resolves in its OWN module's scope.
+/// Requalify + instantiate every decl-level GenericCall type (function/method
+/// return+params, struct/union fields, enum payloads) so the monomorph TYPE
+/// interns EARLY — at the oracle's string-pool position — while the deferral
+/// flag keeps each generic's method bodies stashed for the later method
+/// pre-pass. Each decl resolves in its OWN module's scope.
 fn bind_decl_module(cg: &CodegenContext, m: &ModuleAST, with_fns: bool) {
     let inst = |ty: TypeIdx, mpath: &str| {
         cg.push_body_module(mpath.to_string());
@@ -1164,9 +1143,9 @@ fn bind_decl_module(cg: &CodegenContext, m: &ModuleAST, with_fns: bool) {
     };
     // Function/method SIGNATURE types only run for imported modules: the entry's
     // own functions resolve lazily during body lowering (see the caller). But the
-    // entry's aggregate TYPES (struct fields, enum payloads, union fields) ARE laid
-    // out here, like the oracle's analyzer, so e.g. an entry enum's `Many(Vec(u64))`
-    // payload requalifies to `std/collections.Vec(u64)` rather than staying bare.
+    // entry's aggregate TYPES (struct fields, enum payloads, union fields) ARE
+    // laid out here, so e.g. an entry enum's `Many(Vec(u64))` payload requalifies
+    // to `std/collections.Vec(u64)` rather than staying bare.
     if with_fns {
         for f in &m.functions {
             inst(f.return_type, &f.module_path);
@@ -1202,13 +1181,8 @@ fn bind_decl_module(cg: &CodegenContext, m: &ModuleAST, with_fns: bool) {
     }
 }
 
-/// Single-file, function-only slice: struct/enum registration, the analyzer
-/// pass, and cross-function calls arrive with their astgen handlers (a
-/// not-yet-ported node lowers to a per-function diagnostic and a non-zero exit,
-/// the same shape the oracle uses to batch-report decl failures).
-///
-/// `--target-info`: print the host target's properties (the C++ `showTarget`
-/// block, main.cpp:3072). Standalone — prints; the caller exits 0.
+/// `--target-info`: print the host target's properties. Standalone — prints;
+/// the caller exits 0.
 pub fn print_target_info() {
     let t = Target::from_triple_str(&default_target_triple());
     println!("Target Information:");
@@ -1229,10 +1203,9 @@ pub fn print_target_info() {
 }
 
 pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Strip) -> i32 {
-    // OSC 9;4 terminal progress for the whole compile (the C++ `ProgressGuard
-    // progress(!testMode)`, main.cpp:174): indeterminate while compiling,
-    // error state on a diagnostic bail, cleared before handing the terminal to
-    // the child (run/test) or printing the success line.
+    // OSC 9;4 terminal progress for the whole compile: indeterminate while
+    // compiling, error state on a diagnostic bail, cleared before handing the
+    // terminal to the child (run/test) or printing the success line.
     let mut progress = ProgressGuard::new(!mode.is_test());
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -1291,11 +1264,10 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     let mut resolver = ModuleResolver::new(base_dir);
     resolver.load_all(&module, &mut type_pool, &mut string_pool, &mut node_store);
 
-    // Validate the entry module's imports (the C++ driver, main.cpp:1190-1232):
-    // every import must resolve to a loadable module, and every destructuring
-    // name must be EXPORTED. The `--emit-tokens`/`--emit-ast` paths return
-    // earlier (separate functions), so this only fires for jir/ir/build/test —
-    // matching the oracle, which prints the error to stderr and exits 1.
+    // Validate the entry module's imports: every import must resolve to a
+    // loadable module, and every destructuring name must be EXPORTED. The
+    // `--emit-tokens`/`--emit-ast` paths return earlier (separate functions),
+    // so this only fires for jir/ir/build/test.
     if let Err(e) = resolver.validate_entry_imports(&module, path) {
         eprintln!("{e}");
         return 1;
@@ -1313,18 +1285,13 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     let mut loaded_sorted: Vec<&(String, ModuleAST)> = resolver.loaded.iter().collect();
     loaded_sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // For `--emit-ir` / `build`: the oracle iterates `resolver.getLoadedModules()`
-    // (a libc++ `std::unordered_map`) in HASH-BUCKET order — NOT sorted. Reproduce
-    // that exact iteration order with `libcxx_unordered_iteration_order`, fed the
-    // loaded keys in their insertion (load) order. LLVM prints types/globals/
-    // functions in value-CREATION order, so every imported-module pass below must
-    // walk modules in this order for the IR to be byte-identical. `--emit-jir`
-    // keeps `loaded_sorted` (the oracle sorts only for that mode), so the JIR gate
-    // is untouched.
-    // Test mode (`jam test <file>`): the entry file's `tfn`s register under a
-    // `__test_<name>` key (so a `tfn add(...)` doesn't shadow the regular
-    // `fn add(...)` in the call-site registry — main.cpp:2042-2049), get lowered
-    // (skipping the user's `fn main`), and a harness `main` is synthesized.
+    // For `--emit-ir` / `build`: the oracle iterates its loaded modules (a
+    // libc++ `std::unordered_map`) in HASH-BUCKET order — NOT sorted. Reproduce
+    // that exact iteration order with `libcxx_unordered_iteration_order`, fed
+    // the loaded keys in their insertion (load) order. LLVM prints types/
+    // globals/functions in value-CREATION order, so every imported-module pass
+    // below must walk modules in this order for the IR to be byte-identical.
+    // `--emit-jir` keeps `loaded_sorted` (the oracle sorts only for that mode).
     let test_mode = mode.is_test();
     let loaded_libcxx: Vec<&(String, ModuleAST)> = if matches!(mode, EmitMode::Jir) {
         loaded_sorted.clone()
@@ -1343,13 +1310,12 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     }
     // Register every function's call-site name BEFORE register_and_analyze so its
     // enum-payload / struct-field requalification can resolve a generic callee
-    // (`Vec` -> `std/collections.Vec`) via get_function_ast — mirrors the C++
-    // registerTypeOwners preceding bindDeclTypes. register_function_ast touches no
-    // string pool, so the `--emit-jir` intern order is unaffected. The loop further
-    // below re-registers (idempotent) + adds struct methods + the drop registry.
-    // Registry key for a call-site lookup. In test mode an entry-file `tfn`
-    // registers under `__test_<name>` so it doesn't shadow a regular function of
-    // the same source name (the C++ `regName`, main.cpp:2048).
+    // (`Vec` -> `std/collections.Vec`) via get_function_ast. register_function_ast
+    // touches no string pool, so the `--emit-jir` intern order is unaffected. The
+    // loop further below re-registers (idempotent) + adds struct methods + the
+    // drop registry.
+    // In test mode an entry-file `tfn` registers under `__test_<name>` so it
+    // doesn't shadow a regular function of the same source name.
     let reg_key = |func: &FunctionAST| -> String {
         if test_mode && func.is_test {
             format!("__test_{}", func.name)
@@ -1368,11 +1334,11 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             }
         }
     }
-    // Struct-type registration / analysis ORDER (the C++ declareStructs,
-    // main.cpp:1419-1478): LLVM materializes named struct types in creation order.
-    // The oracle declares IMPORTED modules' types FIRST (libc++ iteration order)
-    // then the ENTRY module's. For `--emit-jir` the original entry-first order over
-    // `loaded_sorted` is preserved (the JIR gate doesn't observe LLVM type order).
+    // Struct-type registration / analysis ORDER: LLVM materializes named struct
+    // types in creation order. The oracle declares IMPORTED modules' types FIRST
+    // (libc++ iteration order) then the ENTRY module's. For `--emit-jir` the
+    // original entry-first order over `loaded_sorted` is preserved (the JIR gate
+    // doesn't observe LLVM type order).
     let reg_modules: Vec<&ModuleAST> = if matches!(mode, EmitMode::Jir) {
         all_modules.clone()
     } else {
@@ -1414,11 +1380,10 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         // Methods of generic struct-returning factories register under the
         // factory's qualified name ("std/collections.Vec.push") — parameter
         // MODES don't depend on T, so the move analysis can resolve
-        // `v.push(c)` through the receiver's requalified GenericCall callee
-        // (the C++ registerAnonMethods, main.cpp:983-1007). Keys never collide
-        // with real struct methods (factories are functions, not structs), and
-        // register_function_ast touches no string pool, so the --emit-jir
-        // intern order is unaffected.
+        // `v.push(c)` through the receiver's requalified GenericCall callee.
+        // Keys never collide with real struct methods (factories are
+        // functions, not structs), and register_function_ast touches no string
+        // pool, so the --emit-jir intern order is unaffected.
         for func in &m.functions {
             if !func.is_generic() {
                 continue;
@@ -1462,14 +1427,12 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         }
     }
 
-    // Eager `comp const` validation (the C++ `validateCompConsts`,
-    // codegen.cpp:640 / main.cpp:1861): every comp-marked module const must fold
+    // Eager `comp const` validation: every comp-marked module const must fold
     // against the const fixpoint in its OWN module's scope. A non-foldable init
     // (`comp const X = 10 / 0;` — div-by-zero, runtime-dependent, or otherwise
     // unsupported) is rejected HERE at the declaration; without this the use site
     // re-lowers the unfoldable init and emits poison IR. Plain consts stay lazy.
-    // The `--emit-tokens`/`--emit-ast` paths return before codegen, so (like the
-    // oracle) this only fires for jir/ir/build/test.
+    // Only fires for jir/ir/build/test (the token/ast paths return earlier).
     {
         let mut diags = Diagnostics::new();
         for m in &all_modules {
@@ -1537,8 +1500,8 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
 
         // Type-alias consts (`const CounterI32 = Counter(i32)`): a const whose
         // init expression resolves-as-type to a GenericCall is a type alias;
-        // register it (bare + qualified) to the requalified target. Mirrors the
-        // C++ registerConsts/resolveExprAsType. name_for_kinds chases these.
+        // register it (bare + qualified) to the requalified target.
+        // name_for_kinds chases these.
         for m in &all_modules {
             for c in &m.consts {
                 if c.init_expr.is_none() {
@@ -1613,9 +1576,8 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             };
             // Only PUB decls enter an imported module's namespace; non-pub
             // names are recorded so handle-qualified access reports "not
-            // exported" (the C++ regFn/regPriv split, main.cpp:701-721). The
-            // entry module (i == 0) has no import handle pointing at it, so
-            // its namespace stays unrestricted.
+            // exported". The entry module (i == 0) has no import handle
+            // pointing at it, so its namespace stays unrestricted.
             let entry = i == 0;
             for s in &m.structs {
                 if entry || s.is_pub {
@@ -1662,8 +1624,8 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
                     format!("{}/{}", base, imp.chain.join("/"))
                 };
                 if loaded_keys.contains(candidate.as_str()) {
-                    // Intern the target path (the oracle stores a `Module`
-                    // TypeIdx whose `internModule` interns this string here).
+                    // Intern the target path — the oracle interns this string
+                    // at this exact point, so the string-pool order depends on it.
                     cg.string_pool.intern(candidate.as_bytes());
                     ns.module_aliases.insert(imp.name.clone(), candidate);
                 }
@@ -1672,21 +1634,19 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         }
     }
 
-    // ROOT A1 — in-place FunctionAST signature requalification (the C++
-    // `bindDeclTypes`, src/main.cpp:1294-1317). The Rust requalifies decl-type
-    // references lazily at use, but a cross-module call site lowers the callee's
+    // In-place FunctionAST signature requalification. Decl-type references
+    // requalify lazily at use, but a cross-module call site lowers the callee's
     // param/return types against ITS OWN body module (""), where a bare imported
     // Named (`Inner`, `Pair`, `Status`) has no requalify entry — so the param
-    // classify fails with "unresolved Named type". Here we rewrite each loaded
-    // module's function (and struct-method) return + param types to their
-    // module-qualified identity and RE-REGISTER the FunctionAST under the same
-    // keys the registration loop used, so `get_function_ast` hands lower_arg /
-    // emit_call a signature whose Named types are already qualified.
+    // classify fails with "unresolved Named type". Rewrite each loaded module's
+    // function (and struct-method) return + param types to their module-qualified
+    // identity and RE-REGISTER the FunctionAST under the same keys the
+    // registration loop used.
     {
         // Requalify a function's return + each param against `mpath`. Bare Named
         // leaves resolve through the requalify map; a GenericCall callee chases
-        // qualify_generic_callee (the C++ requalifyType GenericCall arm). Returns
-        // the rewritten clone and whether anything changed.
+        // qualify_generic_callee. Returns the rewritten clone and whether
+        // anything changed.
         let requalify_fn =
             |cg: &CodegenContext, f: &FunctionAST, mpath: &str| -> (FunctionAST, bool) {
                 let mut nf = f.clone();
@@ -1733,8 +1693,7 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         }
     }
 
-    // ROOT A2 — scoped handle.Type aliases (the C++ `registerHandleFlats`/
-    // `aliasNamed`, src/main.cpp:1629-1659). A type annotation `var s: a.Status` /
+    // Scoped handle.Type aliases. A type annotation `var s: a.Status` /
     // `fn f(pb: B.Pair)` carries the literal dotted Named `a.Status`; requalify
     // early-returns on dotted names and there is no `handle.Type` alias, so the
     // registry lookup misses. For every import handle in every module, alias each
@@ -1804,26 +1763,18 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     }
 
     // Lay out every type body now that import handles + module namespaces are
-    // registered. For --emit-jir this runs HERE: its type/string interning sets the
-    // dump's intern order. For --emit-ir/binary the fill is DEFERRED to after the
-    // extern/prototype passes (below), so the ENTRY-module field/payload generic
-    // instantiation (`items: Vec(u64)`) emits its methods AFTER Pass A's externs —
-    // matching the oracle's demand-driven body fill (ensureDeclAnalyzed runs after
-    // Pass A/B, main.cpp:1877 > 1530/1578). For --emit-ir/binary the fill is DEFERRED to after the
-    // extern/prototype passes (below), so the ENTRY-module field/payload generic
-    // instantiation (`items: Vec(u64)`) emits its methods AFTER Pass A's externs —
-    // matching the oracle's demand-driven body fill (ensureDeclAnalyzed runs after
-    // Pass A/B, main.cpp:1877 > 1530/1578).
-    // Drop + clone registry population. Deferred to run AFTER the type-body
-    // fill (the C++ builds dropRegistry/cloneRegistry at main.cpp:2154/2168 —
-    // AFTER bindDeclTypes lays out fields at 1316, which triggers each generic
-    // monomorph's method instantiation). A conditional method like
-    // `Box(T).clone` instantiates DURING that layout, when the C++
-    // `getDropRegistry()` is still null (setDropRegistry runs at 2164): so its
-    // `self.ptr[0].clone()` over a drop-bearing T (`cue.Cue`) sees NO registered
-    // drop and field-wise clones (Tier 2) instead of erroring. Populating the
-    // registry before the fill (as we did) turned that into a spurious
-    // owns-resources error, withdrawing the clone body to a bare `declare`.
+    // registered. For --emit-jir this runs HERE: its type/string interning sets
+    // the dump's intern order. For --emit-ir/binary the fill is DEFERRED to after
+    // the extern/prototype passes (below), so the ENTRY-module field/payload
+    // generic instantiation (`items: Vec(u64)`) emits its methods AFTER Pass A's
+    // externs, matching the oracle's demand-driven body fill.
+    // Drop + clone registry population is ALSO deferred to after the type-body
+    // fill: a conditional method like `Box(T).clone` instantiates DURING that
+    // layout, when the drop registry must still be empty — so its
+    // `self.ptr[0].clone()` over a drop-bearing T sees NO registered drop and
+    // field-wise clones (Tier 2) instead of erroring. Populating the registry
+    // before the fill turned that into a spurious owns-resources error,
+    // withdrawing the clone body to a bare `declare`.
     let register_drop_clone = |cg: &mut CodegenContext, all_modules: &[&ModuleAST]| {
         for m in all_modules {
             let drops = build_drop_registry(m, &cg.type_pool, &cg.string_pool);
@@ -1839,9 +1790,9 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             }
             // A TOP-LEVEL `cfn clone(self: T) T` goes in the clone registry (NOT as
             // a `{T}.clone` method) so a direct `t.clone()` routes through
-            // emit_clone_into's glue (passing `srcPtr`, like the oracle) rather than
-            // ordinary method dispatch. In-struct clones already register as
-            // `{T}.clone` methods.
+            // emit_clone_into's glue (passing `srcPtr`) rather than ordinary
+            // method dispatch. In-struct clones already register as `{T}.clone`
+            // methods.
             let mut clones = CloneRegistry::new();
             add_clone_candidates(&mut clones, m, &cg.type_pool, &cg.string_pool);
             for (type_name, clone_fn) in &clones {
@@ -1856,8 +1807,7 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     }
     // The analyzer pushes type-cycle diagnostics ("struct `A` depends on
     // itself", with the reference-trace chain) onto the context's GLOBAL
-    // collector — flush them before lowering walks the infinite-sized types
-    // (the C++ hasErrors gate after the analysis passes, main.cpp:1341).
+    // collector — flush them before lowering walks the infinite-sized types.
     if cg.has_errors() {
         progress.error();
         eprint!("{}", cg.diagnostics().render_to_string());
@@ -1884,10 +1834,9 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     };
     // Like `lower`, but WITHOUT re-declaring the LLVM prototype — the function was
     // already declared by an earlier pass (Pass B for imported free fns, the method
-    // pre-pass for struct methods). Re-declaring would make LLVM rename the duplicate
-    // (`@helper.1`), which the oracle does NOT do for these (its imported-body and
-    // method-body loops, main.cpp:2212-2284, skip jirDeclarePrototype). Only the
-    // ENTRY module's free fns are declared at lowering time (main.cpp:2206).
+    // pre-pass for struct methods). Re-declaring would make LLVM rename the
+    // duplicate (`@helper.1`), which the oracle's IR does NOT carry for these.
+    // Only the ENTRY module's free fns are declared at lowering time.
     let lower_nodecl = |cg: &mut CodegenContext,
                         f: &FunctionAST,
                         jir: &mut Vec<JirFunction>,
@@ -1900,20 +1849,18 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             Err(e) => errs.push(e),
         }
     };
-    // bindDeclTypes (the C++ Phase 1b): instantiate every IMPORTED-module decl-type
-    // generic monomorph EARLY (type-only — method bodies deferred to the method
-    // pre-pass), in module LOAD order (mirrors getLoadedModules), so the type
-    // monomorphs intern at the oracle's string-pool position instead of lazily
-    // during body lowering. The ENTRY module is deliberately skipped: the oracle
-    // requalifies but does NOT lay out (instantiate) the entry's own decl types
-    // here — those resolve lazily when the entry's bodies lower (e.g. the entry's
-    // `fn unwrapI32(o: Option(i32))` interns `Option__i32` late, not in this pass).
-    // Only for the `--emit-jir` differential dump: the early type-only
-    // instantiation reproduces the oracle's string-pool order, but its deferred
-    // method lowering sets generic LLVM struct bodies before all dependencies are
-    // ready, which the object-emission backend can't consume. The IR/binary paths
-    // keep the original coupled instantiation (correct codegen; intern order is
-    // irrelevant to a binary). The C++ reconstruction scopes its sort the same way.
+    // Instantiate every IMPORTED-module decl-type generic monomorph EARLY
+    // (type-only — method bodies deferred to the method pre-pass), in module LOAD
+    // order, so the type monomorphs intern at the oracle's string-pool position
+    // instead of lazily during body lowering. The ENTRY module is deliberately
+    // skipped: its own decl types resolve lazily when its bodies lower (e.g. the
+    // entry's `fn unwrapI32(o: Option(i32))` interns `Option__i32` late).
+    // `--emit-jir` only: the early type-only instantiation reproduces the
+    // oracle's string-pool order, but its deferred method lowering sets generic
+    // LLVM struct bodies before all dependencies are ready, which the
+    // object-emission backend can't consume. The IR/binary paths keep the
+    // original coupled instantiation (correct codegen; intern order is
+    // irrelevant to a binary).
     if matches!(mode, EmitMode::Jir) {
         cg.set_defer_method_lowering(true);
         for pair in &resolver.loaded {
@@ -1953,12 +1900,12 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         }
         qualify_sig(&mut cg, func, "");
     }
-    // Declare `pub extern` fn prototypes (malloc/free/realloc from std/box +
-    // std/collections) BEFORE any body lowers, so generic instantiation — which
-    // calls them during method codegen — finds them already in the LLVM module
-    // (the C++ Pass 1A, main.cpp:591-606). jir_declare_prototype is LLVM-only
-    // (no string/type interning), and extern sigs are primitives, so --emit-jir
-    // is unaffected. These declarations only surface in --emit-ir.
+    // Pass A: declare `pub extern` fn prototypes (malloc/free/realloc from
+    // std/box + std/collections) BEFORE any body lowers, so generic
+    // instantiation — which calls them during method codegen — finds them
+    // already in the LLVM module. jir_declare_prototype is LLVM-only (no
+    // string/type interning), and extern sigs are primitives, so --emit-jir is
+    // unaffected. These declarations only surface in --emit-ir.
     for pair in &loaded_libcxx {
         for func in &pair.1.functions {
             if func.is_pub
@@ -1971,17 +1918,15 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             }
         }
     }
-    // Pass B (the C++ second prototype pass, main.cpp:1578-1596): for each imported
-    // module (libc++ iteration order), declare prototypes for ALL its non-generic
-    // functions — pub AND private — INCLUDING the externs already declared in Pass A.
-    // The second extern declaration is intentional: LLVM auto-renames the duplicate
-    // (`@malloc.1`, `@free.2`), which the oracle's IR carries. Private helpers also
-    // need prototypes so the pub bodies that reference them resolve at LLVM codegen.
-    // Wrapped in push/pop_body_module so each signature resolves in its own module's
-    // scope (a private-type param must not trip another module's privacy gate).
-    // jir_declare_prototype is LLVM-only (no string/type interning beyond what Pass A
-    // already did), and this whole pass is gated to non-Jir so the JIR gate is
-    // untouched. astgen_metadata never fails, mirroring the C++ unconditional call.
+    // Pass B: for each imported module (libc++ iteration order), declare
+    // prototypes for ALL its non-generic functions — pub AND private — INCLUDING
+    // the externs already declared in Pass A. The second extern declaration is
+    // intentional: LLVM auto-renames the duplicate (`@malloc.1`, `@free.2`),
+    // which the oracle's IR carries. Private helpers also need prototypes so the
+    // pub bodies that reference them resolve at LLVM codegen. Wrapped in
+    // push/pop_body_module so each signature resolves in its own module's scope
+    // (a private-type param must not trip another module's privacy gate).
+    // Gated to non-Jir so the JIR gate is untouched.
     if !matches!(mode, EmitMode::Jir) {
         for pair in &loaded_libcxx {
             cg.push_body_module(pair.0.clone());
@@ -1996,10 +1941,10 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             cg.pop_body_module();
         }
     }
-    // (--emit-ir/binary) Fill the type bodies now — AFTER Pass A/B have declared the
-    // libc externs + imported prototypes — so a field/payload generic's methods emit
-    // after the externs (the oracle's ensureDeclAnalyzed order). The JIR path already
-    // filled above.
+    // (--emit-ir/binary) Fill the type bodies now — AFTER Pass A/B have declared
+    // the libc externs + imported prototypes — so a field/payload generic's
+    // methods emit after the externs, matching the oracle's emission order. The
+    // JIR path already filled above.
     if !matches!(mode, EmitMode::Jir) {
         fill_type_bodies(&mut cg, &reg_modules);
         register_drop_clone(&mut cg, &all_modules);
@@ -2011,15 +1956,15 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             return 1;
         }
     }
-    // Method-signature metadata pre-pass (the C++ Phase 1k `registerStructMethods`,
-    // main.cpp:1144-1219). Run astgen_metadata() on every struct method BEFORE any
-    // function body lowers, so a method whose RETURN/PARAM type is a GenericCall
-    // (`fn readAll(self) Vec(u8)`) instantiates that generic — interning its method
-    // names (`Vec__u8.withCapacity`) — at signature-resolution time, ahead of the
-    // body call sites that name cross-module callees (`std/fs.cpath`). Without this
-    // the generic interns during readAll's body walk, AFTER cpath/openMode bodies,
-    // reversing the oracle's string-pool order. Imported (sorted) then entry, exactly
-    // like the C++ pass; jir_declare_prototype is LLVM-only so --emit-jir is unmoved.
+    // Method-signature metadata pre-pass: run astgen_metadata() on every struct
+    // method BEFORE any function body lowers, so a method whose RETURN/PARAM type
+    // is a GenericCall (`fn readAll(self) Vec(u8)`) instantiates that generic —
+    // interning its method names (`Vec__u8.withCapacity`) — at signature-
+    // resolution time, ahead of the body call sites that name cross-module
+    // callees. Without this the generic interns during readAll's body walk,
+    // AFTER cpath/openMode bodies, reversing the oracle's string-pool order.
+    // Imported (sorted) then entry; jir_declare_prototype is LLVM-only so
+    // --emit-jir is unmoved.
     for pair in &loaded_libcxx {
         cg.push_body_module(pair.0.clone());
         for s in &pair.1.structs {
@@ -2046,23 +1991,23 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     // loop walks `jir_functions` in push order, and LLVM prints each function — and
     // first-referenced struct type — in definition order).
     //
-    // For `--emit-jir` the oracle dumps ENTRY FIRST then imported (sorted): keep that.
-    // For `--emit-ir`/build the oracle emits all IMPORTED modules (libc++ order) FIRST
-    // and the ENTRY module LAST (main.cpp:2018,2196). Lower in that inverted order so
-    // the function-definition sequence — and the struct-type-decl order that follows
+    // For `--emit-jir` the oracle dumps ENTRY FIRST then imported (sorted): keep
+    // that. For `--emit-ir`/build the oracle emits all IMPORTED modules (libc++
+    // order) FIRST and the ENTRY module LAST. Lower in that inverted order so the
+    // function-definition sequence — and the struct-type-decl order that follows
     // from first reference — matches the oracle.
-    // `declare_at_lowering`: only the ENTRY module's free fns get a fresh prototype
-    // at lowering time (JIR keeps its original all-declare behavior — harmless, since
-    // the JIR text dump ignores LLVM prototypes; IR mirrors main.cpp's split exactly).
+    // Only the ENTRY module's free fns get a fresh prototype at lowering time
+    // (JIR keeps its original all-declare behavior — harmless, since the JIR
+    // text dump ignores LLVM prototypes).
     let is_jir = matches!(mode, EmitMode::Jir);
     let lower_imported =
         |cg: &mut CodegenContext, jir: &mut Vec<JirFunction>, errs: &mut Vec<String>| {
             for pair in &loaded_libcxx {
                 let (key, m) = (&pair.0, &pair.1);
                 cg.push_body_module(key.clone());
-                // Swap the display file to this imported module's defining file so an
-                // astgen diagnostic in an imported body is attributed to it, then
-                // restore (the C++ setCurrentFile swap, main.cpp:2253-2286).
+                // Swap the display file to this imported module's defining file so
+                // an astgen diagnostic in an imported body is attributed to it,
+                // then restore.
                 let prev_file = cg.current_file();
                 cg.set_current_file(format!("{key}.jam"));
                 for func in &m.functions {
@@ -2115,8 +2060,7 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
                 }
                 // Non-test mode: skip `tfn` test functions. Test mode: lower the
                 // `tfn` bodies but skip the user's `fn main` (the harness supplies
-                // its own). Mirrors the C++ test-mode function selection
-                // (main.cpp:2197-2200).
+                // its own).
                 if !test_mode && func.is_test {
                     continue;
                 }
@@ -2135,12 +2079,12 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
                 }
             }
         };
-    // Both JIR and IR push ENTRY bodies first, then imported (libc++ for IR, sorted
-    // for JIR): the oracle's jirFunctions list is entry-first (main.cpp:2196-2223
-    // before 2242+), so the body-DEFINITION order — and the @str global / first-
-    // referenced-type order that follows it — is entry-first too.
-    // Stamp the entry display file for astgen diagnostics (the C++
-    // setCurrentFile(filename), main.cpp:1112). lower_imported swaps per module.
+    // Both JIR and IR push ENTRY bodies first, then imported (libc++ for IR,
+    // sorted for JIR): the oracle's function list is entry-first, so the
+    // body-DEFINITION order — and the @str global / first-referenced-type order
+    // that follows it — is entry-first too.
+    // Stamp the entry display file for astgen diagnostics; lower_imported swaps
+    // per module.
     cg.set_current_file(path);
     lower_entry(&mut cg, &mut jir_functions, &mut errors);
     lower_imported(&mut cg, &mut jir_functions, &mut errors);
@@ -2152,13 +2096,12 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         return 1;
     }
 
-    // Verify each JirFunction's structural invariants before codegen (the C++
-    // production verify pass, src/main.cpp:2319-2345). Catches malformed dispatch,
-    // missing terminators, OOB refs, and cross-block use-before-def. The resolver
-    // resolves a body's bare GenericCall / ArrayExpr type refs against its own
-    // module. The `--emit-jir` dump returns before this pass in the oracle, so it
-    // is gated to the codegen path to keep the JIR gate byte-identical. All
-    // diagnostics are stamped with the entry filename (main.cpp:2342).
+    // Verify each JirFunction's structural invariants before codegen: malformed
+    // dispatch, missing terminators, OOB refs, cross-block use-before-def. The
+    // resolver resolves a body's bare GenericCall / ArrayExpr type refs against
+    // its own module. Gated to the codegen path (the oracle's `--emit-jir` dump
+    // returns before this pass) to keep the JIR gate byte-identical. All
+    // diagnostics are stamped with the entry filename.
     if !matches!(mode, EmitMode::Jir) {
         let mut diags = Diagnostics::new();
         let resolver = |t: TypeIdx| -> TypeIdx {
@@ -2196,21 +2139,20 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         }
     }
 
-    // Whole-module definite-init / move-ownership sweep (the C++ dedicated pass,
-    // src/main.cpp:2356-2421). Runs over EVERY non-generic entry function, struct
-    // method, and imported-module function/method — AFTER every prototype is in
-    // scope, BEFORE codegen. The `--emit-jir` dump returns before this pass in the
-    // oracle, so it is gated to the codegen path here to keep the JIR gate
-    // byte-identical. Diagnostics funnel into a `Diagnostics` channel so they
-    // render `file:line: error: message`, exactly like the oracle's `emit`.
+    // Whole-module definite-init / move-ownership sweep. Runs over EVERY
+    // non-generic entry function, struct method, and imported-module
+    // function/method — AFTER every prototype is in scope, BEFORE codegen.
+    // Gated to the codegen path (same reason as the verify pass above).
+    // Diagnostics funnel into a `Diagnostics` channel so they render
+    // `file:line: error: message`.
     if !matches!(mode, EmitMode::Jir) {
         let mut diags = Diagnostics::new();
         let mut run_analysis_in = |cg: &CodegenContext, f: &FunctionAST, file: &str| {
             if f.is_extern {
                 return;
             }
-            // Resolve body-level type references against the function's own module
-            // while analysis runs (the C++ pushBodyModule(function->modulePath)).
+            // Resolve body-level type references against the function's own
+            // module while analysis runs.
             cg.push_body_module(f.module_path.clone());
             let found = jam_sema::init_analysis::analyze(f, cg);
             cg.pop_body_module();
@@ -2262,15 +2204,15 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         }
     }
 
-    // `--emit-ir` / `build`: lower each JIR function to LLVM (Pass-2 jirDefineBody,
-    // after all prototypes were declared above), so cross-function references
-    // resolve. Then either print the module IR (the C++ `--emit-ir`) or emit an
-    // object file and link it into a native executable (the C++ default mode).
+    // `--emit-ir` / `build`: lower each JIR function's body to LLVM (after all
+    // prototypes were declared above), so cross-function references resolve.
+    // Then either print the module IR or emit an object file and link it into a
+    // native executable.
     if !matches!(mode, EmitMode::Jir) {
         for f in &jir_functions {
             // Push the function's owning module so `get_llvm_type` requalifies its
             // bare type references (`File` -> `std/fs.File`) against the right
-            // module (the C++ pushBodyModule(jfn.modulePath), main.cpp:1386).
+            // module.
             cg.push_body_module(f.module_path.clone());
             if let Err(e) = jir_define_body(f, &cg) {
                 errors.push(e);
@@ -2284,8 +2226,7 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             return 1;
         }
         // Test mode: synthesize the harness `main` that drives every `tfn`.
-        // A file with zero tests links/runs nothing and exits 0 (the C++
-        // `testFunctionNames.empty()` early return, main.cpp:2438).
+        // A file with zero tests links/runs nothing and exits 0.
         if test_mode {
             if test_entries.is_empty() {
                 return 0;
@@ -2294,8 +2235,7 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         }
         return match mode {
             EmitMode::Ir { .. } => {
-                // Clear the indicator before the IR hits stdout (the C++
-                // emit-IR early exit, main.cpp:1547-1553).
+                // Clear the indicator before the IR hits stdout.
                 progress.stop();
                 print!("{}", cg.module().print_to_string());
                 0
@@ -2305,8 +2245,7 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
                 if rc != 0 {
                     return rc;
                 }
-                // Clear the indicator before the success line (the C++
-                // progress.stop() at main.cpp:1747).
+                // Clear the indicator before the success line.
                 progress.stop();
                 println!("Compilation successful: {output}");
                 0
@@ -2338,14 +2277,6 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     0
 }
 
-/// Emit the lowered module to an object file and link it into a native
-/// executable via the system `clang` (the C++ default-mode object-emit + link,
-/// main.cpp:1585-1660). Opt/LTO default to off; libm is linked on glibc.
-/// Run the LLVM IR optimization pipeline on the module in place. A no-op at
-/// `OptLevel::None` (the default), matching the oracle, which only invokes the
-/// optimizer at a non-zero level. The pass pipeline lives in the C++ shim
-/// (`jam_shim_optimize`) and is the C++ optimizer verbatim, so the optimized IR
-/// is byte-identical to the oracle's on the same LLVM.
 /// Optimize the module and emit the intermediate object (or bitcode, under
 /// LTO) next to `output`. Returns the intermediate's path.
 fn emit_object(cg: &CodegenContext, output: &str, opt: OptLevel, lto: Lto) -> Result<String, i32> {
@@ -2362,13 +2293,13 @@ fn emit_object(cg: &CodegenContext, output: &str, opt: OptLevel, lto: Lto) -> Re
         return Err(1);
     };
     tm.configure_module(cg.module());
-    // Run the IR optimization pipeline before object emit (the C++ runs it here,
-    // main.cpp:2598, only at a non-zero level; `--emit-ir` never optimizes).
+    // Run the IR optimization pipeline before object emit — only at a non-zero
+    // level; `--emit-ir` never optimizes.
     if !matches!(opt, OptLevel::None) {
         tm.run_optimization(cg.module());
     }
     // LTO emits LLVM bitcode (.bc) instead of a native object; clang's LTO
-    // plugin re-runs the optimization at link time (the C++ main.cpp:2548).
+    // plugin re-runs the optimization at link time.
     let obj = format!("{output}.{}", if lto == Lto::Off { "o" } else { "bc" });
     if let Err(e) = tm.emit_to_file(cg.module(), &obj) {
         eprintln!("Failed to emit object file: {e}");
@@ -2379,8 +2310,7 @@ fn emit_object(cg: &CodegenContext, output: &str, opt: OptLevel, lto: Lto) -> Re
 
 /// The link flags that follow `clang <obj> -o <out>` — libm, user `-l` libs,
 /// LTO, dead-strip, and `-C strip` plumbing. Shared between the normal link
-/// and the test-cache link (and FNV-mixed into the cache key, like the C++
-/// hashes linkArgs[4..]).
+/// and the test-cache link (and FNV-mixed into the cache key).
 fn link_flags(
     host: &Target,
     libs: &[String],
@@ -2394,19 +2324,19 @@ fn link_flags(
     if matches!(host.os, Os::Linux | Os::FreeBsd) && host.abi != Abi::Musl {
         flags.push("-lm".to_string());
     }
-    // User-requested `-l<name>` libraries pass through to the link step (the
-    // C++ linkLibs forwarding, e.g. `jam run -lncurses tetris.jam`).
+    // User-requested `-l<name>` libraries pass through to the link step
+    // (e.g. `jam run -lncurses tetris.jam`).
     for lib in libs {
         flags.push(format!("-l{lib}"));
     }
     // Hand the bitcode to clang's LTO driver so it selects the right linker
-    // plugin (the C++ main.cpp:2569-2570).
+    // plugin.
     match lto {
         Lto::Thin => flags.push("-flto=thin".to_string()),
         Lto::Fat => flags.push("-flto=full".to_string()),
         Lto::Off => {}
     }
-    // Strip unreferenced functions/data at link time (the C++ main.cpp:1632).
+    // Strip unreferenced functions/data at link time.
     // Pairs with FunctionSections/DataSections on the TargetMachine, which
     // split each symbol into its own section so the linker can GC them
     // individually. Mach-O uses -dead_strip; ELF (Linux/FreeBSD) uses
@@ -2420,9 +2350,9 @@ fn link_flags(
             _ => {}
         }
     }
-    // `-C strip`: drop debug info / local symbols via linker flags (the C++
-    // main.cpp:2620-2631). Mach-O: `-Wl,-S` strips DWARF, `-Wl,-x` removes local
-    // symbols; ELF: `--strip-debug` for debug only, `-s` for everything.
+    // `-C strip`: drop debug info / local symbols via linker flags. Mach-O:
+    // `-Wl,-S` strips DWARF, `-Wl,-x` removes local symbols; ELF:
+    // `--strip-debug` for debug only, `-s` for everything.
     if strip != Strip::None {
         match host.os {
             Os::MacOs => {
@@ -2448,8 +2378,8 @@ fn link_flags(
 }
 
 /// `clang <obj> -o <out> <flags..>`. Does NOT remove the object. On any
-/// failure — nonzero clang exit or a failed spawn — prints the C++'s
-/// `Linking failed` line (main.cpp:1736-1738) and returns 1.
+/// failure — nonzero clang exit or a failed spawn — prints `Linking failed`
+/// and returns 1.
 fn run_clang_link(obj: &str, out: &str, flags: &[String]) -> i32 {
     let mut cmd = std::process::Command::new("clang");
     cmd.arg(obj).arg("-o").arg(out);
@@ -2481,19 +2411,17 @@ fn link_binary(
     let flags = link_flags(&host, libs, opt, lto, strip);
     let rc = run_clang_link(&obj, output, &flags);
     if rc != 0 {
-        // On link failure the C++ leaves the intermediate object in cwd (the
-        // early return at main.cpp:1736-1739 skips the cleanup) — match it.
+        // On link failure the intermediate object is deliberately left in cwd.
         return rc;
     }
     let _ = std::fs::remove_file(&obj);
     0
 }
 
-/// FNV-1a over a file's bytes (the C++ hashFileFNV, main.cpp:139). Keys the
-/// linked-test-binary cache: macOS assesses every fresh executable inode on
-/// first exec (60-290ms), so re-running a byte-identical test binary from a
-/// cached inode instead of relinking a new one is the difference between ~1ms
-/// and ~100ms per test file.
+/// FNV-1a over a file's bytes. Keys the linked-test-binary cache: macOS
+/// assesses every fresh executable inode on first exec (60-290ms), so
+/// re-running a byte-identical test binary from a cached inode instead of
+/// relinking a new one is ~1ms vs ~100ms per test file.
 fn hash_file_fnv(path: &str) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
     let mut h: u64 = 1469598103934665603;
@@ -2511,10 +2439,10 @@ fn hash_mix_string(h: &mut u64, s: &str) {
     }
 }
 
-/// Test-mode link + run with the cached-inode fast path (the C++
-/// main.cpp:1691-1725): key the linked binary by the object bytes + link
-/// flags, link once into `output/testcache/t<hex>`, and re-exec the CACHED
-/// INODE when nothing changed. The cached binary is deliberately NOT removed
+/// Test-mode link + run with the cached-inode fast path: key the linked
+/// binary by the object bytes + link flags, link once into
+/// `output/testcache/t<hex>`, and re-exec the CACHED INODE when nothing
+/// changed. The cached binary is deliberately NOT removed
 /// after the run, and the link is skipped entirely on a cache hit. Falls back
 /// to the ordinary link+run when the object can't be hashed.
 fn link_and_run_test(
@@ -2544,8 +2472,8 @@ fn link_and_run_test(
         if !std::path::Path::new(&cache_path).exists()
             && run_clang_link(&obj, &cache_path, &flags) != 0
         {
-            // The cache path DOES clean up on failure (main.cpp:1715-1718),
-            // unlike the ordinary link's leave-the-object-behind early return.
+            // The cache path DOES clean up on failure, unlike the ordinary
+            // link's leave-the-object-behind early return.
             let _ = std::fs::remove_file(&obj);
             return 1;
         }
@@ -2556,7 +2484,7 @@ fn link_and_run_test(
 
     let rc = run_clang_link(&obj, output, &flags);
     if rc != 0 {
-        // Match the C++ ordinary-link failure: intermediate left in cwd.
+        // Same as the ordinary link failure: intermediate left in cwd.
         return rc;
     }
     let _ = std::fs::remove_file(&obj);
@@ -2564,8 +2492,7 @@ fn link_and_run_test(
     run_binary(output)
 }
 
-/// Synthesize the `jam test` harness `main` (the C++ test-mode codegen,
-/// main.cpp:2436-2524). For each `tfn` (in source order) it prints
+/// Synthesize the `jam test` harness `main`. For each `tfn` (in source order) it prints
 /// `"testing <name>... "`, calls the test fn, then prints `"ok\n"`; after the
 /// loop it prints `"<N> test(s) passed\n"` and returns 0. A failing `assert`
 /// inside a test calls `exit(1)` before its `ok\n` ever prints — that IS the
@@ -2600,8 +2527,8 @@ fn synthesize_test_main(cg: &CodegenContext, entries: &[(String, String)]) {
 
     for (display, mangled) in entries {
         let Some(test_func) = module.get_function(mangled) else {
-            // A test whose body failed to lower never got a prototype; the
-            // C++ guards the same way (`if (testFunc)`), silently skipping it.
+            // A test whose body failed to lower never got a prototype;
+            // silently skip it.
             continue;
         };
         // "testing <name>... "
@@ -2625,9 +2552,8 @@ fn synthesize_test_main(cg: &CodegenContext, entries: &[(String, String)]) {
 }
 
 /// Run the freshly-linked `output` binary, delete it, and propagate its exit
-/// status as jam's own (the C++ test/run execution path, main.cpp:2715-2728).
-/// A signal-killed child decodes to `128 + signal` (shell convention) so a
-/// crashed test binary never silently reports success.
+/// status as jam's own. A signal-killed child decodes to `128 + signal` (shell
+/// convention) so a crashed test binary never silently reports success.
 fn run_binary(output: &str) -> i32 {
     run_binary_at(output, true)
 }

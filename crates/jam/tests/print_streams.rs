@@ -5,11 +5,10 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! stdout/stderr separation for the cfn print pipeline (the C++
-//! tests/cpp/test_print.cpp): `fmt.print` must land on fd 1 and `fmt.eprint`
-//! on fd 2. The @-emit dispatch passes the fd as a comp-known literal, so a
-//! wiring mistake would silently swap streams — only capturing the two
-//! streams separately can catch it.
+//! stdout/stderr separation for the cfn print pipeline: `fmt.print` must land
+//! on fd 1 and `fmt.eprint` on fd 2. The @-emit dispatch passes the fd as a
+//! comp-known literal, so a wiring mistake would silently swap streams — only
+//! capturing the two streams separately can catch it.
 
 use std::process::Command;
 

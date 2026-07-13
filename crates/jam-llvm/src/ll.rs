@@ -5,10 +5,10 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Safe wrappers over the LLVM-C API, mirroring the operations the C++
-//! `jam_llvm` facade exposed. RAII owners ([`Context`], [`Module`], [`Builder`])
-//! dispose on drop; handle types ([`Type`], [`Value`], [`Function`],
-//! [`BasicBlock`]) are `Copy` and borrow `'ctx` from their owning [`Context`].
+//! Safe wrappers over the LLVM-C API. RAII owners ([`Context`], [`Module`],
+//! [`Builder`]) dispose on drop; handle types ([`Type`], [`Value`],
+//! [`Function`], [`BasicBlock`]) are `Copy` and borrow `'ctx` from their
+//! owning [`Context`].
 
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
@@ -49,8 +49,8 @@ pub struct Context {
 }
 
 impl Context {
-    /// Create a context. Value names are discarded at construction (matching the
-    /// C++ facade) so `--emit-ir` prints auto-numbered temporaries.
+    /// Create a context. Value names are discarded at construction so
+    /// `--emit-ir` prints auto-numbered temporaries.
     pub fn new() -> Context {
         unsafe {
             let ptr = raw::LLVMContextCreate();
@@ -211,8 +211,7 @@ impl<'ctx> Module<'ctx> {
         }
     }
 
-    /// A private, constant, NUL-terminated string global (like the C++
-    /// `JamLLVMAddGlobalString`).
+    /// A private, constant, NUL-terminated string global.
     pub fn add_global_string(&self, s: &[u8], name: &str) -> Value<'ctx> {
         unsafe {
             let ctx = raw::LLVMGetModuleContext(self.ptr);
@@ -445,9 +444,9 @@ impl<'ctx> Builder<'ctx> {
     ///
     /// Emitting an alloca at the current insertion point inside a loop would
     /// allocate fresh stack every iteration (allocas only release at function
-    /// return) until the stack overflows. So — like the C++ facade — we hoist
-    /// every alloca to the entry block. `align_bytes == 0` defers to LLVM's
-    /// datalayout-derived alignment.
+    /// return) until the stack overflows. So we hoist every alloca to the
+    /// entry block. `align_bytes == 0` defers to LLVM's datalayout-derived
+    /// alignment.
     pub fn alloca(&self, ty: Type<'ctx>, align_bytes: u64, name: &str) -> Value<'ctx> {
         let c = cstr(name);
         unsafe {
@@ -492,7 +491,7 @@ impl<'ctx> Builder<'ctx> {
     }
 
     /// `@llvm.memcpy` of `size` bytes. The C API takes the size as a value, so
-    /// we materialize an i64 constant (the C++ facade took a `uint64_t`).
+    /// we materialize an i64 constant.
     pub fn memcpy(
         &self,
         dst: Value<'ctx>,
@@ -959,8 +958,8 @@ impl<'ctx> Function<'ctx> {
         }
     }
 
-    /// Run LLVM's function verifier; returns `true` when the function is valid
-    /// (the C++ facade's polarity). Failures are printed to stderr.
+    /// Run LLVM's function verifier; returns `true` when the function is
+    /// valid. Failures are printed to stderr.
     pub fn verify(self) -> bool {
         unsafe {
             raw::LLVMVerifyFunction(self.0.0, raw::LLVMVerifierFailureAction::PrintMessage) == 0

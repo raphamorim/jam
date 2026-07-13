@@ -9,12 +9,11 @@
  *
  *   1. a handful of codegen knobs live on llvm::TargetOptions, which the
  *      LLVM-C API does not expose (there is no LLVMTargetOptionsRef); and
- *   2. the optimization pipeline is reproduced VERBATIM from the C++ facade
- *      (src/jam_llvm.cpp) so that the new-PM PassBuilder configuration — the
+ *   2. the optimization pipeline — the new-PM PassBuilder configuration, the
  *      tuning options, the analysis-manager wiring, the OptimizationLevel
  *      switch, the pre-pipeline internalize+globaldce, and the pipeline
- *      selection — is provably byte-identical to the C++ oracle's. Running the
- *      same pipeline on the same LLVM gives byte-identical optimized IR.
+ *      selection — is kept identical to the oracle's. Running the same
+ *      pipeline on the same LLVM gives byte-identical optimized IR.
  *
  * This mirrors rustc's `rustllvm` shim: bind the C API directly for everything,
  * and reach into C++ only for the gaps. Keep it tiny.
@@ -42,8 +41,7 @@
 
 // Mirror the optimization-level discriminants of the Rust `OptLevel` enum
 // (crates/jam-llvm/src/target.rs): None,Less,Default,Aggressive,Size,Small ->
-// 0,1,2,3,4,5. The C++ facade's JamOptLevel enum has the same ordering, so the
-// switch below matches src/jam_llvm.cpp exactly.
+// 0,1,2,3,4,5.
 enum {
 	JAM_OPT_NONE = 0,
 	JAM_OPT_LESS = 1,
@@ -73,13 +71,9 @@ extern "C" void jam_set_target_machine_sections(LLVMTargetMachineRef TM,
 	tm->Options.DataSections = DataSections != 0;
 }
 
-// Run the new-PM module optimization pipeline against `M`, configured exactly
-// like the C++ facade `JamLLVMEmitObjectFile` (src/jam_llvm.cpp lines
-// ~1190-1300). Copied VERBATIM from there so the pass pipeline is provably
-// identical; the only edits are the reinterpret_cast unwraps (the C++ used the
-// facade's UNWRAP macros) and the JamOptLevel/JamLTO constants reproduced
-// above. Reaching the C++ API requires the C++ classes, which live in the
-// libLLVM the crate already links.
+// Run the new-PM module optimization pipeline against `M`. This needs LLVM's
+// C++ API (PassBuilder has no C binding), which lives in the libLLVM the
+// crate already links — hence the shim.
 extern "C" void jam_shim_optimize(LLVMModuleRef M, LLVMTargetMachineRef TM,
                                   int optLevel, int isDebug, int lto) {
 	auto *m = reinterpret_cast<llvm::Module *>(M);

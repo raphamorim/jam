@@ -6,10 +6,9 @@
  */
 
 //! Bake the git short-SHA (plus a `-dirty` marker when the worktree differs
-//! from HEAD) into the binary as `JAM_VERSION_SHA`, exactly like the C++
-//! Makefile: `git rev-parse --short HEAD`, with `-dirty` appended when
-//! `git diff --quiet HEAD` reports changes. Falls back to `unknown` outside a
-//! git checkout. `jam version` prints `<CARGO_PKG_VERSION>-<JAM_VERSION_SHA>`.
+//! from HEAD) into the binary as `JAM_VERSION_SHA`. Falls back to `unknown`
+//! outside a git checkout. `jam version` prints
+//! `<CARGO_PKG_VERSION>-<JAM_VERSION_SHA>`.
 
 use std::process::Command;
 
@@ -25,7 +24,7 @@ fn main() {
     let version = match sha {
         Some(sha) => {
             // `git diff --quiet HEAD` exits non-zero when the worktree has any
-            // tracked changes vs HEAD — the same dirty test the Makefile uses.
+            // tracked changes vs HEAD.
             let dirty = Command::new("git")
                 .args(["diff", "--quiet", "HEAD"])
                 .status()

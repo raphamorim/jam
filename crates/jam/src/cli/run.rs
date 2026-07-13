@@ -5,15 +5,13 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! The compile driver: one single-pass argument loop transliterated from the
-//! C++ oracle (src/main.cpp:1904-2286), so flag interplay — position relative
-//! to `run`, values that look like flags, trailing options — resolves
-//! identically. `run` compiles a file, runs it, propagates its exit code, and
-//! deletes the temp binary; `test` compiles in test mode (synthesizing a
-//! harness `main` over the file's `tfn`s), runs it, and propagates its output +
-//! exit. `test <dir>` (or no arg → cwd) walks `*.jam` files, runs each one's
-//! tests, and prints a `Summary:` line. The `build` subcommand reuses the same
-//! loop with `run`/`test` demoted to ordinary positionals.
+//! The compile driver: one single-pass argument loop. `run` compiles a file,
+//! runs it, propagates its exit code, and deletes the temp binary; `test`
+//! compiles in test mode (synthesizing a harness `main` over the file's
+//! `tfn`s), runs it, and propagates its output + exit. `test <dir>` (or no
+//! arg → cwd) walks `*.jam` files, runs each one's tests, and prints a
+//! `Summary:` line. The `build` subcommand reuses the same loop with
+//! `run`/`test` demoted to ordinary positionals.
 
 use std::path::Path;
 
@@ -21,9 +19,8 @@ use jam_llvm::{Lto, OptLevel};
 
 use crate::cli::emit::{self, EmitMode, Strip};
 
-/// Parse a `-C opt-level=N` value to an [`OptLevel`] (the C++ mapping,
-/// src/main.cpp:2941-2947): `0`→None, `1`→Less, `2`→Default, `3`→Aggressive,
-/// `s`→Size, `z`→Small. Returns `None` for an unrecognized value.
+/// Parse a `-C opt-level=N` value to an [`OptLevel`]. Returns `None` for an
+/// unrecognized value.
 fn opt_level_from_value(value: &str) -> Option<OptLevel> {
     match value {
         "0" => Some(OptLevel::None),
@@ -36,9 +33,8 @@ fn opt_level_from_value(value: &str) -> Option<OptLevel> {
     }
 }
 
-/// Parse one `-C key=value` payload into the opt/lto/strip slots — the C++ key
-/// mappings + error texts (main.cpp:1965-2020). Returns the process exit code
-/// on a malformed or unknown option.
+/// Parse one `-C key=value` payload into the opt/lto/strip slots. Returns the
+/// process exit code on a malformed or unknown option.
 fn parse_codegen_opt(
     codegen: &str,
     opt: &mut OptLevel,
@@ -100,15 +96,14 @@ enum OracleEmit {
     Jir,
 }
 
-/// The compile driver: the C++ argument loop (main.cpp:1917-2074) plus its
-/// post-parse sequence (main.cpp:2076-2286), transliterated token for token so
-/// every interplay — flag position relative to `run`, option values that look
-/// like flags, trailing options falling through as positionals — resolves
-/// identically.
+/// The compile driver: a single-pass argument loop, so flag interplay — flag
+/// position relative to `run`, option values that look like flags, trailing
+/// options falling through as positionals — resolves in one deterministic
+/// order.
 ///
 /// `start` is the first argv index to consider: 1 for the bare
 /// `jam [FLAGS] <file>` form (where `run`/`test` toggle modes anywhere in
-/// argv, like the C++), 2 under the `build` subcommand. `mode_tokens` is
+/// argv), 2 under the `build` subcommand. `mode_tokens` is
 /// false under `build`, demoting `run`/`test` to ordinary positionals.
 pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
     let mut run_flag = false;
@@ -127,8 +122,7 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
     let mut i = start;
     while i < args.len() {
         let arg = &args[i];
-        // `run`/`test` mode tokens — recognized anywhere in argv
-        // (main.cpp:1919-1926).
+        // `run`/`test` mode tokens — recognized anywhere in argv.
         if mode_tokens && arg == "run" {
             run_flag = true;
             i += 1;
@@ -139,9 +133,9 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
             i += 1;
             continue;
         }
-        // Linker flags — accepted in every mode (main.cpp:1928-1935). The
-        // spaced forms consume the next token unconditionally, so a value that
-        // looks like a flag (`-l --release`) is still a library name.
+        // Linker flags — accepted in every mode. The spaced forms consume the
+        // next token unconditionally, so a value that looks like a flag
+        // (`-l --release`) is still a library name.
         if (arg == "-l" || arg == "--library") && i + 1 < args.len() {
             libs.push(args[i + 1].clone());
             i += 2;
@@ -152,8 +146,7 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
             i += 1;
             continue;
         }
-        // `--release` / `--release-small` were removed in favor of `-C
-        // opt-level` (main.cpp:1939-1950).
+        // `--release` / `--release-small` were removed in favor of `-C opt-level`.
         if arg == "--release" {
             eprintln!("Error: `--release` was removed; use `-C opt-level=3` instead");
             return 1;
@@ -162,9 +155,9 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
             eprintln!("Error: `--release-small` was removed; use `-C opt-level=z` instead");
             return 1;
         }
-        // `-C key=value` (spaced) or `-Ckey=value` (joined) codegen options
-        // (main.cpp:1958-2023). Handled BEFORE the `run` strictness check, so
-        // `jam run -C opt-level=3 file` is accepted — as in the C++.
+        // `-C key=value` (spaced) or `-Ckey=value` (joined) codegen options.
+        // Handled BEFORE the `run` strictness check, so
+        // `jam run -C opt-level=3 file` is accepted.
         let codegen: Option<String> = if arg == "-C" && i + 1 < args.len() {
             i += 1;
             Some(args[i].clone())
@@ -180,9 +173,8 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
             i += 1;
             continue;
         }
-        // Inside `run`, anything else flag-shaped is an error
-        // (main.cpp:2024-2038) — including the flags parsed below, which are
-        // honored only BEFORE the `run` token.
+        // Inside `run`, anything else flag-shaped is an error — including the
+        // flags parsed below, which are honored only BEFORE the `run` token.
         if run_flag {
             if arg.starts_with('-') {
                 eprintln!(
@@ -200,7 +192,7 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
             i += 1;
             continue;
         }
-        // Compile-only / test-mode flags (main.cpp:2040-2064).
+        // Compile-only / test-mode flags.
         if arg == "--help" || arg == "-h" {
             crate::cli::display_help();
             return 0;
@@ -245,8 +237,8 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
             continue;
         }
         // Positional: source file or directory. Flags may follow it; a second
-        // positional is an error (main.cpp:2065-2073). A trailing option with
-        // no value (`jam file -o`) falls through here, like the C++.
+        // positional is an error. A trailing option with no value
+        // (`jam file -o`) falls through here.
         if !filename.is_empty() {
             eprintln!("Error: unexpected extra argument `{arg}` (already have `{filename}`)");
             return 1;
@@ -255,7 +247,7 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
         i += 1;
     }
 
-    // `jam test` with no path means "run every test under cwd" (main.cpp:2077).
+    // `jam test` with no path means "run every test under cwd".
     if test_mode && filename.is_empty() {
         filename = ".".to_string();
     }
@@ -273,12 +265,12 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
         unsafe { std::env::set_var("JAM_STD_PATH", &std_path_override) };
     }
     // `--target-info` prints the host target block, then CONTINUES into the
-    // normal compile (main.cpp:2089-2103). It still requires an input file —
-    // the emptiness check above runs first, as in the C++.
+    // normal compile. It still requires an input file — the emptiness check
+    // above runs first.
     if show_target {
         emit::print_target_info();
     }
-    // Directory input: only meaningful with `test` (main.cpp:2110-2118).
+    // Directory input: only meaningful with `test`.
     if Path::new(&filename).is_dir() {
         if !test_mode {
             eprintln!("Error: directory input is only supported with `test` (got '{filename}')");
@@ -288,9 +280,9 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
     }
     // The default output name `output` collides with a same-named directory
     // (this repo has one): the link fails with a cryptic `ld: errno=21`. Fall
-    // back to a usable name instead (main.cpp:2265-2274). Applies to an
-    // explicit `-o` name too, and the note prints even under `--emit-ir`,
-    // which resolves the name it will never write — as in the C++.
+    // back to a usable name instead. Applies to an explicit `-o` name too, and
+    // the note prints even under `--emit-ir`, which resolves the name it will
+    // never write.
     if Path::new(&output_name).is_dir() {
         let fallback = format!("{output_name}.bin");
         eprintln!("note: output name '{output_name}' is a directory; writing '{fallback}'");
@@ -313,9 +305,8 @@ pub fn driver(args: &[String], start: usize, mode_tokens: bool) -> i32 {
         }
     }
     let mode = if emit_ir {
-        // Print-IR-and-exit wins over run/test execution (the early return
-        // inside compileAndRun, main.cpp:1547-1553); under `test` the dump
-        // includes the synthesized harness main.
+        // Print-IR-and-exit wins over run/test execution; under `test` the
+        // dump includes the synthesized harness main.
         EmitMode::Ir { test: test_mode }
     } else if test_mode {
         EmitMode::Test {
@@ -392,8 +383,7 @@ fn run_must_fail(path: &str, expected: &[String]) -> i32 {
     1
 }
 
-/// Recursively discover `*.jam` files under `dir`, sorted (main.cpp's
-/// `collectJamFiles`). Returns paths as strings.
+/// Recursively discover `*.jam` files under `dir`, sorted.
 fn collect_jam_files(dir: &str) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
     collect_jam_files_into(Path::new(dir), &mut files);
@@ -417,9 +407,9 @@ fn collect_jam_files_into(dir: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// Cheap `tfn` substring scan — avoids lowering files with no test functions
-/// (main.cpp's `fileHasTests`). Matches `tfn` at line start or after whitespace,
-/// followed by whitespace or `(`.
+/// Cheap `tfn` substring scan — avoids lowering files with no test functions.
+/// Matches `tfn` at line start or after whitespace, followed by whitespace
+/// or `(`.
 fn file_has_tests(path: &str) -> bool {
     let Ok(src) = std::fs::read(path) else {
         return false;
@@ -445,9 +435,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Worker-pool size for `jam test <dir>` (the C++ main.cpp:2143-2148):
-/// min(cpu count, 8), overridable via `JAM_TEST_JOBS` (>= 1). `JAM_TEST_JOBS=1`
-/// forces the serial in-process path (useful under a debugger).
+/// Worker-pool size for `jam test <dir>`: min(cpu count, 8), overridable via
+/// `JAM_TEST_JOBS` (>= 1). `JAM_TEST_JOBS=1` forces the serial in-process path
+/// (useful under a debugger).
 fn test_jobs() -> usize {
     let hw = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -462,7 +452,7 @@ fn test_jobs() -> usize {
     jobs
 }
 
-/// The `-C opt-level=` value spelling for a re-invoked worker (main.cpp:2150).
+/// The `-C opt-level=` value spelling for a re-invoked worker.
 fn opt_name(opt: OptLevel) -> &'static str {
     match opt {
         OptLevel::Less => "1",
@@ -475,8 +465,9 @@ fn opt_name(opt: OptLevel) -> &'static str {
 }
 
 /// A `jam test <file>` re-invocation of this binary with stdout+stderr merged
-/// into one buffered pipe (the C++ spawnAsync, main.cpp:113): the drain thread
-/// keeps the pipe from filling while the parent polls for completion.
+/// into one buffered pipe. The drain thread keeps the pipe from filling (and
+/// the child from blocking on a full pipe) while the parent polls for
+/// completion.
 struct TestWorker {
     child: std::process::Child,
     file: String,
@@ -495,7 +486,7 @@ fn spawn_test_worker(exe: &Path, file: &str, libs: &[String], opt: OptLevel) -> 
         .arg(file)
         .arg("-o")
         .arg(format!("jam_test_{stem}"));
-    // Only the opt level is forwarded (the C++ childArgv, main.cpp:2178-2183).
+    // Only the opt level is forwarded.
     if !matches!(opt, OptLevel::None) {
         cmd.arg("-C").arg(format!("opt-level={}", opt_name(opt)));
     }
@@ -536,11 +527,11 @@ fn worker_exit_code(status: std::process::ExitStatus) -> i32 {
     }
 }
 
-/// The parallel worker pool (the C++ main.cpp:2165-2242): per-file work is
-/// ~98% blocked subprocess waits (clang link + first-exec assessment of the
-/// freshly linked test binary), so a small pool of `jam test <file>`
-/// re-invocations gives near-linear speedup. Each worker's output prints as a
-/// coherent block on completion, in completion order.
+/// The parallel worker pool: per-file work is ~98% blocked subprocess waits
+/// (clang link + first-exec assessment of the freshly linked test binary), so
+/// a small pool of `jam test <file>` re-invocations gives near-linear speedup.
+/// Each worker's output prints as a coherent block on completion, in
+/// completion order.
 fn run_tests_parallel(
     runnable: &[String],
     libs: &[String],
@@ -602,7 +593,7 @@ fn run_tests_parallel(
 }
 
 /// `jam test <dir>`: run each file's tests, tracking passed/failed/skipped,
-/// then print the `Summary:` line (main.cpp:3094-3243). Files run through the
+/// then print the `Summary:` line. Files run through the
 /// parallel worker pool when more than one job is available; `JAM_TEST_JOBS=1`
 /// (or a single runnable file) takes the serial in-process path, whose sorted,
 /// deterministic output is what a differential comparison can rely on.
@@ -661,9 +652,8 @@ fn test_directory(
                 .and_then(|s| s.to_str())
                 .unwrap_or("out");
             let output = format!("jam_test_{stem}");
-            // The serial walker threads `--emit-ir` into each per-file compile
-            // (the C++ passes emitIR through, main.cpp:2249-2251); the parallel
-            // pool does not forward it, also as in the C++ (main.cpp:2178-2183).
+            // The serial walker threads `--emit-ir` into each per-file
+            // compile; the parallel pool does not forward it.
             let mode = if emit_ir {
                 EmitMode::Ir { test: true }
             } else {
