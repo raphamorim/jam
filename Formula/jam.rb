@@ -14,18 +14,16 @@ class Jam < Formula
   license "Apache-2.0" => { with: "LLVM-exception" }
   head "https://github.com/raphamorim/jam.git", branch: "main"
 
-  depends_on "cmake" => :build
+  depends_on "rust" => :build
   depends_on "llvm@22"
 
   def install
     llvm = Formula["llvm@22"]
-    ENV.prepend_path "PATH", llvm.opt_bin
+    # crates/jam-llvm/build.rs locates LLVM through this (before the
+    # PATH / Homebrew fallbacks) and links the monolithic libLLVM.
+    ENV["LLVM_CONFIG"] = (llvm.opt_bin/"llvm-config").to_s
 
-    system "cmake", "-S", ".", "-B", "build",
-                    "-DCMAKE_PREFIX_PATH=#{llvm.opt_prefix}",
-                    *std_cmake_args
-    system "cmake", "--build", "build"
-    system "cmake", "--install", "build"
+    system "cargo", "install", *std_cargo_args(path: "crates/jam")
 
     (lib/"jam").install "std" unless (lib/"jam/std").exist?
   end
