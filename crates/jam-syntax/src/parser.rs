@@ -5,18 +5,9 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Recursive-descent parser — ported from `src/parser.cpp`.
-//!
-//! The complete port, validated against the C++ `--emit-ast` oracle: cursor/
-//! error scaffolding, the binary-precedence ladder, `parse_unary`,
-//! `parse_type`, and `parse_primary` (literals incl. the f64/f128 number
-//! encoding, struct literals, generic type-method calls, `match` + patterns,
-//! struct/enum expressions, and the postfix member/index/slice/call chain with
-//! the exact direct-vs-indirect call decision), plus statements
-//! (`parse_expression`), declarations, and the public `parse()` module entry.
-//!
-//! `ParserAbort` becomes `Err(ParseError)`; the diagnostic is pushed before the
-//! error is returned (matching the C++ `parseError` sink).
+//! Recursive-descent parser: expressions via a binary-precedence ladder,
+//! statements, types, declarations, and the public `parse()` module entry.
+//! On error the diagnostic is pushed first, then `Err(ParseError)` unwinds.
 
 use std::collections::HashSet;
 
@@ -57,8 +48,8 @@ pub struct Parser<'a> {
     #[allow(dead_code)]
     anon_structs: Vec<StructDeclAST>,
     /// Global base for anon-struct NAMING (shared across module parses), so
-    /// `__anon_struct_N` is numbered across all modules like the C++ shared
-    /// registry. The per-module `anon_structs` index stays local.
+    /// `__anon_struct_N` is numbered across all modules. The per-module
+    /// `anon_structs` index stays local.
     anon_base: u32,
     #[allow(dead_code)]
     anon_enums: Vec<EnumDeclAST>,
@@ -183,11 +174,11 @@ impl<'a> Parser<'a> {
         self.string_pool.intern(bytes)
     }
 
-    // ---- number literal decode (ports parseNumLexeme) ----
+    // ---- number literal decode ----
 
-    /// Returns `(magnitude, is_neg, is_float)`. Errors (with the same messages)
-    /// on BigInt / malformed literals. The float bit pattern it would compute
-    /// is vestigial — `parse_primary` re-derives floats via `float128`.
+    /// Returns `(magnitude, is_neg, is_float)`; errors on BigInt / malformed
+    /// literals. The float bit pattern it would compute is vestigial —
+    /// `parse_primary` re-derives floats via `float128`.
     fn parse_num_lexeme(&mut self, s: &[u8]) -> PResult<(u64, bool, bool)> {
         let neg = !s.is_empty() && s[0] == b'-';
         let abs = if neg { &s[1..] } else { s };
@@ -386,7 +377,7 @@ impl<'a> Parser<'a> {
     }
 
     // ===================================================================
-    // Statements (parse_expression is the STATEMENT entry, per the C++ name).
+    // Statements. parse_expression is the STATEMENT entry, despite the name.
     // Entry-level subtleties are load-bearing: init/cond use parse_logical_or;
     // for-bounds and assign-target use parse_comparison.
     // ===================================================================
@@ -465,8 +456,7 @@ impl<'a> Parser<'a> {
     /// Parse a parenthesized `( cond )` head + `{ body }`, returning
     /// `(cond, body)`. Used by if/while (heads are unambiguous via parens, so
     /// `allow_struct_lit` is left as-is). `kw_quoted` is the keyword as quoted
-    /// in the open-paren message (the C++ quotes `'while'` but
-    /// `` `inline while` ``); `kw` is the form used in the remaining messages.
+    /// in the open-paren message; `kw` is the form used in the rest.
     fn parse_paren_cond_block(
         &mut self,
         kw_quoted: &str,
@@ -563,7 +553,7 @@ impl<'a> Parser<'a> {
             return self.parse_var_decl(0);
         }
 
-        // `match` — delegate (leaves the token for parse_match). Not yet ported.
+        // `match` — delegate (leaves the token for parse_match).
         if self.check(TokenType::Match) {
             return self.parse_match();
         }
@@ -595,8 +585,8 @@ impl<'a> Parser<'a> {
         }
 
         if self.match_(TokenType::Loop) {
-            // Desugars to while(true). Emit the BoolLit cond FIRST (node-id
-            // ordering must match the C++).
+            // Desugars to while(true). The BoolLit cond is emitted FIRST —
+            // node-id ordering is part of the AST dump.
             let cond = self.emit(AstNode {
                 tag: AstTag::BoolLit,
                 op: 0,
@@ -714,8 +704,8 @@ impl<'a> Parser<'a> {
     /// `(cond, then_body, else_body)`. `is_comp` controls the else-if guard
     /// (`else comp if` chains too) and the error messages.
     fn parse_if_tail(&mut self, is_comp: bool) -> PResult<(NodeIdx, Vec<NodeIdx>, Vec<NodeIdx>)> {
-        // The C++ writes the comp-if keyword as `` `comp if` `` but the plain
-        // keyword as `'if'`/bare `if`; match each message byte-for-byte.
+        // The comp-if messages quote the keyword as `` `comp if` ``; the plain
+        // form uses `'if'` / bare `if`.
         let (kw_quoted, kw) = if is_comp {
             ("`comp if`", "`comp if`")
         } else {
@@ -1210,9 +1200,9 @@ impl<'a> Parser<'a> {
 
     // ---- primary + postfix ----
 
-    /// Parse a NUMBER token already consumed. Reproduces the C++
-    /// f64-inline-vs-f128-quad encoding exactly. A preceding unary `-` is
-    /// folded into the literal's sign flag by `parse_unary`, not here.
+    /// Parse a NUMBER token already consumed. Floats are stored f64-inline
+    /// when lossless, else as an f128 quad in the extra pool. A preceding
+    /// unary `-` is folded into the sign flag by `parse_unary`, not here.
     fn parse_number(&mut self) -> PResult<NodeIdx> {
         let raw = self.prev_text().to_vec();
         let (mag, lex_neg, is_float) = self.parse_num_lexeme(&raw)?;
@@ -1248,7 +1238,7 @@ impl<'a> Parser<'a> {
                 }
             }
         } else {
-            let _ = mag; // (force_neg path still uses mag for the value)
+            let _ = mag;
             ((mag & 0xFFFF_FFFF) as u32, (mag >> 32) as u32)
         };
         Ok(self.emit(AstNode {
@@ -1275,10 +1265,10 @@ impl<'a> Parser<'a> {
             self.consume(TokenType::OpenParen, "Expected '(' after '@name'")?;
             // Names starting with "emit" are the @-emit family; they take
             // expression args, as does `@dropInPlace(ptr)`. Everything else
-            // (sizeOf, alignOf) stays on the legacy type-arg path. The test
-            // order matches the C++: the emit-family/expr-intrinsic decision
-            // comes FIRST, so a zero-arg emit intrinsic still encodes as the
-            // expr-arg multi-form (flags=1, extra=[argCount=0]).
+            // (sizeOf, alignOf) stays on the legacy type-arg path. The
+            // emit-family/expr-intrinsic decision comes FIRST, so a zero-arg
+            // emit intrinsic still encodes as the expr-arg multi-form
+            // (flags=1, extra=[argCount=0]).
             let is_emit_family = name.starts_with(b"emit");
             let is_expr_intrinsic = is_emit_family || name.as_slice() == b"dropInPlace";
             if is_expr_intrinsic {
@@ -1723,7 +1713,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Emit a `Call` node, choosing the direct (StringIdx callee) vs indirect
-    /// (NodeIdx receiver, flags bit 0) encoding exactly as the C++ does.
+    /// (NodeIdx receiver, flags bit 0) encoding.
     fn emit_call(&mut self, expr: NodeIdx, bare_name: &[u8], args_extra: ExtraIdx) -> NodeIdx {
         if self.is_qualified_name_chain(expr) {
             let dot_count = self.chain_dot_count(expr);
@@ -1835,7 +1825,7 @@ impl<'a> Parser<'a> {
     }
 
     // ===================================================================
-    // Types (core forms; full parse_type lands with installment 2)
+    // Types
     // ===================================================================
 
     fn parse_type(&mut self) -> PResult<TypeIdx> {
@@ -1895,9 +1885,8 @@ impl<'a> Parser<'a> {
                 self.advance(); // number
                 let raw = self.prev_text().to_vec();
                 let (mag, neg, is_float) = self.parse_num_lexeme(&raw)?;
-                // Literal sizes validate here, exactly like the C++
-                // (parser.cpp:706-713) — a float or negative size must not
-                // silently fold, and an over-u32 size must not truncate.
+                // Literal sizes validate here — a float or negative size must
+                // not silently fold, and an over-u32 size must not truncate.
                 if neg || is_float {
                     return Err(self.parse_error("array size must be a non-negative integer"));
                 }
@@ -2068,7 +2057,7 @@ impl<'a> Parser<'a> {
             f.is_extern = true;
             f.is_export = is_export;
             f.is_pub = is_pub;
-            f.is_test = false; // forced (matches C++)
+            f.is_test = false; // extern fns are never tests
             f.is_var_args = is_var_args;
             f.is_cfn = is_cfn;
             return Ok(f);
@@ -2083,7 +2072,7 @@ impl<'a> Parser<'a> {
         f.is_export = is_export;
         f.is_pub = is_pub;
         f.is_test = is_test;
-        f.is_var_args = false; // forced (matches C++)
+        f.is_var_args = false; // var-args only applies to extern decls
         f.is_cfn = is_cfn;
         Ok(f)
     }
@@ -2226,13 +2215,11 @@ impl<'a> Parser<'a> {
     /// Anonymous `struct { ... }` in expression position (caller consumed
     /// `struct`). Pushes a synthetic `__anon_struct_N` decl and emits a
     /// `StructExpr` node whose `lhs` is the side-table index. The index is
-    /// taken *before* parsing the body (mirrors the C++ ordering exactly).
+    /// taken *before* parsing the body.
     fn parse_struct_expression(&mut self) -> PResult<NodeIdx> {
         self.consume(TokenType::OpenBrace, "Expected '{' after 'struct'")?;
-        // `lhs` (the side-table index) stays LOCAL to this module; the synthetic
-        // NAME is GLOBAL across all module parses (shared-pool numbering) so the
-        // interned `__anon_struct_N` strings match the C++ oracle's shared
-        // anon-struct registry.
+        // `lhs` (the side-table index) stays LOCAL to this module; the
+        // synthetic NAME is GLOBAL across all module parses.
         let idx = self.anon_structs.len() as u32;
         let name = format!("__anon_struct_{}", self.anon_base + idx);
         self.struct_context_stack.push(name.clone());
@@ -2651,7 +2638,7 @@ mod tests {
         assert_eq!(rhs.lhs, 7);
         assert_eq!(rhs.flags & 1, 1);
 
-        // Double negation cancels (sign XOR, matching the C++ fold).
+        // Double negation cancels (sign XOR).
         let (ns3, r3) = parse_expr("- -7");
         let n3 = ns3.get(r3);
         assert_eq!(n3.tag, AstTag::NumberLit);

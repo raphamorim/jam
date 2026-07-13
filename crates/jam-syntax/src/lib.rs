@@ -5,8 +5,8 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! `jam_syntax` — the Jam frontend: tokens and the lexer today; `number_literal`,
-//! the flat AST arenas, and the parser follow (gated by `--emit-ast`).
+//! `jam_syntax` — the Jam frontend: tokens, lexer, number-literal parsing,
+//! the flat AST arenas, and the parser.
 
 pub mod ast;
 pub mod ast_flat;

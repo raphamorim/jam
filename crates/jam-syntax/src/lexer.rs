@@ -5,19 +5,14 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Lexer — ported 1:1 from `src/lexer.{h,cpp}`.
-//!
-//! Operates on raw bytes (`&[u8]`) so byte offsets match the C++ exactly (the
-//! C++ indexes `source[current]` as `char`). Keywords/operators are ASCII;
-//! string contents are scanned byte-by-byte and may carry arbitrary bytes via
-//! `\x` escapes. The C++ throws on lexical errors; here those become
-//! `Err(LexError)`. An "unexpected character" is reported and skipped (no
-//! token), matching the C++ `cerr` + continue.
+//! The lexer. Operates on raw bytes (`&[u8]`): keywords and operators are
+//! ASCII; string contents are scanned byte-by-byte and may carry arbitrary
+//! bytes via `\x` escapes. Lexical errors surface as `Err(LexError)`; an
+//! "unexpected character" is reported to stderr and skipped (no token).
 
 use crate::token::{Token, TokenType};
 
-/// A lexical error, anchored to a source line (mirrors the C++ `runtime_error`
-/// messages, which all carry `at line N`).
+/// A lexical error, anchored to a source line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LexError {
     pub line: u32,
@@ -354,7 +349,7 @@ impl Lexer {
                 self.line
             )));
         }
-        // Encode as UTF-8 (manual, matching the C++ byte sequence exactly).
+        // Encode the codepoint as UTF-8.
         let mut out = Vec::new();
         if codepoint <= 0x7F {
             out.push(codepoint as u8);
@@ -521,7 +516,7 @@ impl Lexer {
                     } else if Self::is_alpha(c) {
                         self.identifier();
                     } else {
-                        // Unexpected character: report and skip (matches C++).
+                        // Unexpected character: report and skip.
                         eprintln!("Unexpected character at line {}: {}", self.line, c as char);
                     }
                 }
@@ -567,8 +562,7 @@ mod tests {
         assert_eq!(kinds("0..=9"), vec![Number, DotDotEq, Number, Eof]);
         assert_eq!(kinds("1.5"), vec![Number, Eof]);
         // The number scanner is greedy (letters are potential suffixes;
-        // validation is deferred to the parser), so `1.x` is one NUMBER token —
-        // confirmed against the C++ oracle.
+        // validation is deferred to the parser), so `1.x` is one NUMBER token.
         assert_eq!(kinds("1.x"), vec![Number, Eof]);
     }
 

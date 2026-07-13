@@ -5,13 +5,10 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Diagnostics — ported 1:1 from `src/diagnostics.{h,cpp}`.
-//!
-//! The renderer ([`Diagnostics::emit`]) is a **byte-for-byte** reproduction of
-//! the C++ `emitOne`: the whole test suite asserts on stderr substrings, so the
-//! 4-space-per-note-level indent, the ` at file:line` elision when `line == 0`,
-//! the `error → note` severity demotion for attached notes, and the
-//! `stable_sort` ordering are all load-bearing and must not drift.
+//! Diagnostics: `SrcLoc`, `Diagnostic`, the `Diagnostics` accumulator and its
+//! renderer. The output format is load-bearing — the test suite asserts on
+//! stderr substrings — so the 4-space note indent, `:line` elision, note
+//! severity demotion, and stable sort order must not drift.
 
 use std::io;
 
@@ -123,10 +120,6 @@ impl Diagnostic {
 }
 
 /// RAII guard for a reference-trace stack: push on construct, pop on drop.
-/// Faithful to the C++ `RefTraceFrame`, but the stack is owned elsewhere
-/// (codegen) and borrowed `&mut` for the guard's lifetime — Rust makes the
-/// push/pop balance and the borrow exclusivity checkable, which the C++ raw
-/// reference could not.
 pub struct RefTraceGuard<'a> {
     stack: &'a mut Vec<Trace>,
 }
@@ -218,8 +211,7 @@ impl Diagnostics {
     }
 
     /// Roll back to a previously observed size — used by conditional
-    /// instantiation to withdraw a failed attempt's diagnostics. Mirrors the
-    /// C++ `truncateTo` (`resize` down only).
+    /// instantiation to withdraw a failed attempt's diagnostics. Shrinks only.
     pub fn truncate_to(&mut self, n: usize) {
         if n < self.diags.len() {
             self.diags.truncate(n);
@@ -230,8 +222,8 @@ impl Diagnostics {
     /// errors before warnings at the same location.
     pub fn emit<W: io::Write>(&self, out: &mut W) -> io::Result<()> {
         let mut sorted: Vec<&Diagnostic> = self.diags.iter().collect();
-        // Stable sort — same-(file,line,severity) diagnostics keep insertion
-        // order (the C++ uses std::stable_sort; Rust's sort_by is stable).
+        // sort_by is stable: same-(file,line,severity) diagnostics keep
+        // insertion order.
         sorted.sort_by(|a, b| {
             a.loc
                 .file

@@ -5,19 +5,17 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Flat, tag-dispatched AST — ported 1:1 from `src/ast_flat.h`.
-//!
-//! [`AstNode`] is a 16-byte struct; indices replace pointers; variadic payloads
-//! spill into [`NodeStore`]'s `extra` pool. The flat layout keeps nodes packed
-//! so codegen walks a cache-friendly array via `match` on [`AstTag`].
+//! Flat, tag-dispatched AST. [`AstNode`] is a 16-byte struct; indices replace
+//! pointers; variadic payloads spill into [`NodeStore`]'s `extra` pool, so
+//! codegen walks a cache-friendly packed array via `match` on [`AstTag`].
 //!
 //! Conventions (load-bearing):
 //!   * `NodeIdx(0)` is the null/absent node; slot 0 is reserved with
 //!     `AstTag::Invalid` so a zero `AstNode` is the sentinel.
 //!   * `lhs`/`rhs` are **raw `u32`** generic slots whose meaning depends on the
 //!     tag (a `NodeIdx`, `StringIdx`, `TypeIdx`, `ExtraIdx`, or half of a
-//!     value). The per-tag encodings are documented on [`AstTag`] and must match
-//!     the C++ exactly — the parser writes them and astgen/codegen decode them.
+//!     value). The per-tag encodings documented on [`AstTag`] are a contract:
+//!     the parser writes them and astgen/codegen decode them.
 //!   * `StringIdx(0)` = empty string, `TypeIdx(0)` = invalid (slot-0 sentinels).
 
 use std::cell::RefCell;
@@ -229,15 +227,11 @@ impl NodeStore {
     }
 }
 
-/// Interned identifiers + string literals. The C++ used a `deque<string>` to
-/// keep `string_view` keys stable; Rust owns the bytes in a `Vec` and keys the
-/// map by the owned bytes, so no deque is needed. Stores `Vec<u8>` because
-/// decoded string-literal values can be non-UTF-8 (`\xFF`).
-/// Interior mutability (RefCell) so `intern` is `&self` — this mirrors the C++
-/// `stringPool` being a `mutable` field, letting `&self` layout queries
-/// (get_llvm_type/type_size) instantiate generics on-demand. `get` returns owned
-/// bytes (every caller copies them anyway via `into_owned()`/`to_vec()`), so no
-/// borrow is ever held across an `intern` — there is no double-borrow panic risk.
+/// Interned identifiers + string literals. Stores `Vec<u8>` because decoded
+/// string-literal values can be non-UTF-8 (`\xFF`). RefCell so `intern` is
+/// `&self` — `&self` layout queries (get_llvm_type/type_size) instantiate
+/// generics on-demand. `get` returns owned bytes, so no borrow is ever held
+/// across an `intern` — no double-borrow panic risk.
 pub struct StringPool {
     strings: RefCell<Vec<Vec<u8>>>,
     idx: RefCell<HashMap<Vec<u8>, u32>>,
@@ -276,10 +270,9 @@ impl StringPool {
     }
 
     /// Resolve a `StringIdx` to its (owned) bytes. Out-of-range indices return
-    /// the empty slice — the AST dumper reads `lhs`/`rhs` of some nodes (e.g.
+    /// empty — the AST dumper reads `lhs`/`rhs` of some nodes (e.g.
     /// `PatEnumVariant` with bindings, whose slots actually hold an ExtraIdx)
-    /// as if they were string indices; the C++ oracle's `std::deque` yields a
-    /// zeroed (empty) string for those reads, and we reproduce that exactly.
+    /// as if they were string indices, and expects an empty string back.
     pub fn get(&self, id: StringIdx) -> Vec<u8> {
         self.strings
             .borrow()
@@ -295,7 +288,7 @@ impl StringPool {
     }
 }
 
-/// Type kinds. See `src/ast_flat.h` for the per-kind `a`/`b` slot meanings.
+/// Type kinds. Per-kind `a`/`b` slot meanings are noted inline.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum TypeKind {
@@ -321,8 +314,8 @@ pub enum TypeKind {
 }
 
 /// Interned type key. `a`/`b` are raw `u32` slots whose meaning depends on
-/// `kind`. Unused slots are always 0 (the constructors guarantee it), so the
-/// derived `PartialEq`/`Hash` is exactly the C++ kind-aware `operator==`.
+/// `kind`. Unused slots are always 0 (the constructors guarantee it), so
+/// the derived `PartialEq`/`Hash` compare correctly.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TypeKey {
     pub kind: TypeKind,
@@ -359,11 +352,9 @@ pub mod builtin {
 /// Type interning. Built-ins occupy fixed pre-interned slots (see [`builtin`]).
 /// Generic-call arg lists and fn-param lists are interned in ordered side
 /// tables (`BTreeMap`, deterministic) so identical lists share an index — and
-/// thus identical `GenericCall`/`Fn` keys share a `TypeIdx`.
-/// Interior mutability (RefCell) so `intern*` are `&self` — mirrors the C++
-/// `typePool` being a `mutable` field, so `&self` layout queries can instantiate
-/// generics on-demand. `get` returns `TypeKey` by Copy and `generic_args_at`/
-/// `fn_params_at` return owned `Vec`s, so no borrow is held across an `intern`.
+/// thus identical `GenericCall`/`Fn` keys share a `TypeIdx`. RefCell so
+/// `intern*` are `&self`; `get` returns `TypeKey` by Copy and the `*_at`
+/// accessors return owned `Vec`s, so no borrow is held across an `intern`.
 pub struct TypePool {
     keys: RefCell<Vec<TypeKey>>,
     idx: RefCell<HashMap<TypeKey, u32>>,
@@ -428,7 +419,7 @@ impl TypePool {
     }
 
     /// Returned by value (Copy) — interning can grow `keys`, so a reference
-    /// could dangle (the C++ documents this exact footgun).
+    /// could dangle.
     pub fn get(&self, i: TypeIdx) -> TypeKey {
         self.keys.borrow()[i.index()]
     }

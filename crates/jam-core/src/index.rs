@@ -5,18 +5,12 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Frozen arena-index newtypes — the shared "interface decision" the whole
-//! migration depends on. Each is a zero-cost `#[repr(transparent)]` wrapper
-//! around a `u32`, so the C++ "everything is a u32 alias" model ports with a
-//! strict type-safety upgrade: a `NodeIdx` can never be silently used where a
-//! `TypeIdx` is expected.
+//! Arena-index newtypes: zero-cost `#[repr(transparent)]` wrappers around
+//! `u32`, so a `NodeIdx` can never be silently used where a `TypeIdx` is
+//! expected.
 //!
-//! **Slot 0 is the reserved sentinel** in every pool (`kNoString`, `kNoType`,
-//! invalid node/decl). [`Self::NONE`] is that sentinel; pools are constructed
-//! pre-seeded so index 0 is never a live entry. The C++ holds raw
-//! `FunctionAST*` in `Decl`, exported-symbol tables, generic-instance keys, and
-//! the drop registry; all of those migrate to [`FunctionId`] indices into an
-//! owned arena.
+//! **Slot 0 is the reserved sentinel** in every pool. `NONE` is that sentinel;
+//! pools are constructed pre-seeded so index 0 is never a live entry.
 
 macro_rules! idx_newtype {
     ($(#[$doc:meta])* $name:ident) => {
@@ -75,11 +69,11 @@ idx_newtype!(
     NodeIdx
 );
 idx_newtype!(
-    /// Index into the interned type pool (`TypePool`; `kNoType` == `NONE`).
+    /// Index into the interned type pool (`TypePool`).
     TypeIdx
 );
 idx_newtype!(
-    /// Index into the interned string pool (`StringPool`; `kNoString` == `NONE`).
+    /// Index into the interned string pool (`StringPool`).
     StringIdx
 );
 idx_newtype!(
@@ -91,11 +85,11 @@ idx_newtype!(
     DeclIndex
 );
 idx_newtype!(
-    /// Owned-arena id for a function AST (replaces raw `FunctionAST*`).
+    /// Owned-arena id for a function AST.
     FunctionId
 );
 idx_newtype!(
-    /// Owned-arena id for a module AST (replaces raw `ModuleAST*`).
+    /// Owned-arena id for a module AST.
     ModuleId
 );
 idx_newtype!(

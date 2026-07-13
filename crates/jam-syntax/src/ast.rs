@@ -5,17 +5,9 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! The declaration tree — ported 1:1 from `src/ast.h`.
-//!
-//! This is the parser's output: a [`ModuleAST`] of declarations. Function
-//! bodies are sequences of [`NodeIdx`] into the shared flat `NodeStore`. The
-//! C++ used `unique_ptr<FunctionAST>` for pointer stability; the Rust port owns
-//! the values directly (`Vec<FunctionAST>`), and the raw-pointer-to-`FunctionId`
-//! arena refactor lands when decl/modules need stable cross-references.
-//!
-//! The C++ `mutable mangledNameCache` is intentionally omitted here — it is a
-//! codegen-time memo, not parser data, and will be a `OnceCell` when mangling
-//! is ported.
+//! The declaration tree — the parser's output: a [`ModuleAST`] of top-level
+//! declarations. Function bodies are sequences of [`NodeIdx`] into the shared
+//! flat `NodeStore`.
 
 use jam_core::ParamMode;
 use jam_core::index::{NodeIdx, TypeIdx};

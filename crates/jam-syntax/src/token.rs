@@ -5,18 +5,12 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Tokens — ported 1:1 from `src/token.h`.
-//!
-//! Storage model matches the C++: `byte_offset` + `length` mark the token's raw
-//! span in the source buffer; [`Token::text`] slices it (the right call for
-//! every kind except `StringLiteral`). `lexeme` carries the *decoded* value and
-//! is populated only for `StringLiteral` (escape sequences resolved to the
-//! bytes the runtime expects — which the raw source slice doesn't contain). It
-//! is `Vec<u8>`, not `String`, because `\xFF`-style escapes can produce
-//! non-UTF-8 bytes.
+//! Tokens. `byte_offset` + `length` mark the token's raw span in the source
+//! buffer; [`Token::text`] slices it. `lexeme` carries the *decoded* value and
+//! is populated only for `StringLiteral` — it's `Vec<u8>`, not `String`,
+//! because `\xFF`-style escapes can produce non-UTF-8 bytes.
 
-/// Token kind. Variant order matches the C++ `enum TokenType` exactly, so the
-/// discriminants line up (`Eof == 0`).
+/// Token kind. Variant order is pinned (`Eof == 0`) — don't reorder.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TokenType {
     Eof,
@@ -91,8 +85,7 @@ pub enum TokenType {
 }
 
 impl TokenType {
-    /// Stable dump name — the `--emit-tokens` contract (the C++ `TOK_` prefix
-    /// dropped). Must stay byte-identical to the oracle's `tokenName`.
+    /// Stable dump name — part of the `--emit-tokens` output contract.
     pub fn name(self) -> &'static str {
         use TokenType::*;
         match self {

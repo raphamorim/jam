@@ -5,16 +5,11 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Numeric-literal validation and value extraction — ported 1:1 from
-//! `src/number_literal.{h,cpp}`.
-//!
-//! The lexer produces a permissive `NUMBER` token; this is where its bytes are
-//! validated (base prefix, underscore placement, digit ranges, exponent rules)
-//! and converted to a value. Integers accumulate with C++-faithful unsigned
-//! wraparound (overflow → `BigInt`). The float value, which the C++ obtained
-//! via `strtod` (decimal *and* hex), is obtained here via
-//! [`float128::parse_decimal_float`] — correctly rounded for both bases, and
-//! without an LLVM dependency.
+//! Numeric-literal validation and value extraction. The lexer produces a
+//! permissive `NUMBER` token; here its bytes are validated (base prefix,
+//! underscore placement, digit ranges, exponent rules) and converted to a
+//! value. Overflowing integers become `BigInt`; floats parse via
+//! [`float128::parse_decimal_float`] (correctly rounded, decimal and hex).
 
 use float128::{ParsedFloat, parse_decimal_float, quad_to_target_as_double};
 
@@ -303,7 +298,7 @@ pub fn parse_number_literal(bytes: &[u8]) -> NumberResult {
         special = 0;
 
         if !is_float {
-            // Accumulate, tracking overflow with C++-faithful unsigned wrap.
+            // Accumulate with wrapping arithmetic, tracking overflow.
             if x != 0 {
                 let mul = x.wrapping_mul(base_value as u64);
                 if mul / base_value as u64 != x {
@@ -354,7 +349,7 @@ pub fn parse_number_literal(bytes: &[u8]) -> NumberResult {
     NumberResult::ok_int(x, base)
 }
 
-/// Human-readable message for a numeric-literal error (ported 1:1).
+/// Human-readable message for a numeric-literal error.
 pub fn number_error_message(kind: NumberErrorKind) -> &'static str {
     use NumberErrorKind::*;
     match kind {
