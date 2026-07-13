@@ -1635,4 +1635,3 @@ mod tests {
         assert_eq!(ev.eval(access, &scope, &mut ctx).as_u64(), 5);
     }
 }
-

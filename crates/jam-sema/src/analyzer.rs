@@ -861,4 +861,3 @@ mod tests {
         assert!(az.analysis_stack().is_empty());
     }
 }
-

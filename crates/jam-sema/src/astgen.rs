@@ -2939,11 +2939,7 @@ fn astgen_as_cast(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
 /// Reject `&x` passed to a MODE parameter (the C++ rejectAddrOfOnModeArg,
 /// astgen.cpp:5999): `&` makes a pointer, but a non-pointer param takes its
 /// argument by mode — the signature's `mut`/`move` already grants access.
-fn reject_addr_of_on_mode_arg(
-    gctx: &AstGenCtx,
-    arg_idx: NodeIdx,
-    p: &Param,
-) -> Result<(), String> {
+fn reject_addr_of_on_mode_arg(gctx: &AstGenCtx, arg_idx: NodeIdx, p: &Param) -> Result<(), String> {
     let n = gctx.ctx.node_store.get(arg_idx);
     if n.tag != AstTag::AddressOf {
         return Ok(());
