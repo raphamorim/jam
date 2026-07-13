@@ -802,4 +802,63 @@ mod tests {
         }
         assert!(cg.has_errors());
     }
+    /// The C++ testCycleChainListsAnalysisStackInOrder: the cycle diagnostic
+    /// names the repeated decl.
+    #[test]
+    fn cycle_error_names_the_repeated_decl() {
+        let ctx = Context::new();
+        let mut cg = CodegenContext::new(&ctx, "m");
+        let mut decls = DeclTable::new();
+        let a = decls.create(DeclKind::Function, "A");
+        let b = decls.create(DeclKind::Function, "B");
+        decls.get_mut(a).analysis = DeclAnalysis::InProgress;
+        decls.get_mut(b).analysis = DeclAnalysis::InProgress;
+        {
+            let mut az = Analyzer::new(&mut cg, &mut decls);
+            az.analysis_stack.push(a);
+            let _ = az.ensure_decl_analyzed(a);
+        }
+        assert!(cg.has_errors());
+        let diags = cg.diagnostics();
+        let last = diags.all().last().unwrap();
+        assert!(
+            last.message.contains("`A`"),
+            "cycle message names the decl: {}",
+            last.message
+        );
+    }
+
+    /// The C++ testResolveDeclLooksUpByNameAndAnalyzes: the by-name chokepoint
+    /// analyzes on demand, and an unknown name is None WITHOUT a diagnostic —
+    /// the caller decides whether that is an error.
+    #[test]
+    fn resolve_decl_by_name_and_silent_miss() {
+        let ctx = Context::new();
+        let mut cg = CodegenContext::new(&ctx, "m");
+        let mut decls = DeclTable::new();
+        decls.create(DeclKind::Struct, "Foo");
+        let mut az = Analyzer::new(&mut cg, &mut decls);
+        let v = az.resolve_decl("Foo");
+        assert!(matches!(v, DeclValue::Type(t) if !t.is_none()));
+        let miss = az.resolve_decl("DoesNotExist");
+        assert!(matches!(miss, DeclValue::None));
+        drop(az);
+        assert!(!cg.has_errors());
+    }
+
+    /// The C++ testAnalysisStackEmptyAfterTopLevelCall: every push pairs with
+    /// a pop, so the stack drains between top-level calls.
+    #[test]
+    fn analysis_stack_empty_after_top_level_calls() {
+        let ctx = Context::new();
+        let mut cg = CodegenContext::new(&ctx, "m");
+        let mut decls = DeclTable::new();
+        let a = decls.create(DeclKind::Function, "a");
+        let b = decls.create(DeclKind::Struct, "b");
+        let mut az = Analyzer::new(&mut cg, &mut decls);
+        let _ = az.ensure_decl_analyzed(a);
+        let _ = az.ensure_decl_analyzed(b);
+        assert!(az.analysis_stack().is_empty());
+    }
 }
+

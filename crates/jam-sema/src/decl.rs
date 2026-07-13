@@ -303,4 +303,48 @@ mod tests {
         assert_eq!(t.get(s).analysis, DeclAnalysis::Complete);
         assert!(matches!(t.get(s).value, DeclValue::Type(_)));
     }
+    /// The C++ testFindByNameAndKindLandsOnRequestedKind: a function and a
+    /// struct may share a name; the kind-aware lookup walks past the first
+    /// registration to the requested kind.
+    #[test]
+    fn find_by_name_and_kind_disambiguates() {
+        let mut t = DeclTable::new();
+        let f = t.create(DeclKind::Function, "Counter");
+        let st = t.create(DeclKind::Struct, "Counter");
+        assert_eq!(t.find_by_name("Counter"), f);
+        assert_eq!(t.find_by_name_and_kind("Counter", DeclKind::Function), f);
+        assert_eq!(t.find_by_name_and_kind("Counter", DeclKind::Struct), st);
+        assert_eq!(
+            t.find_by_name_and_kind("Counter", DeclKind::Enum),
+            DeclIndex::NONE
+        );
+        assert_eq!(
+            t.find_by_name_and_kind("Missing", DeclKind::Struct),
+            DeclIndex::NONE
+        );
+    }
+
+    /// The C++ testSelfDependencyIgnored: self-loops never enter the graph, so
+    /// trace walks can't spin.
+    #[test]
+    fn self_dependency_is_ignored() {
+        let mut t = DeclTable::new();
+        let a = t.create(DeclKind::Function, "a");
+        t.declare_dependency(a, a);
+        assert!(t.get(a).dependencies.is_empty());
+        assert!(t.get(a).dependants.is_empty());
+    }
+
+    /// The C++ testKNoDecCallsAreNoOps: a sentinel on either side is silently
+    /// ignored.
+    #[test]
+    fn sentinel_dependency_edges_are_noops() {
+        let mut t = DeclTable::new();
+        let a = t.create(DeclKind::Function, "a");
+        t.declare_dependency(DeclIndex::NONE, a);
+        t.declare_dependency(a, DeclIndex::NONE);
+        assert!(t.get(a).dependencies.is_empty());
+        assert!(t.get(a).dependants.is_empty());
+    }
 }
+
