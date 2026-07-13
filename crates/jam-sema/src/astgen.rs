@@ -6,22 +6,9 @@
  */
 
 //! AstGen — eager lowering of a parsed `FunctionAST` into a typed
-//! [`JirFunction`]. Ported (incrementally) from `src/astgen.cpp`.
-//!
-//! The output is typed from the start: literals lower at their natural width or
-//! at an `expected`-type hint threaded from the parent. Each visited node
-//! pushes zero or more `JirInst`s into the function's instruction array.
-//!
-//! ## Scope of this increment (the end-to-end seed)
-//!
-//! The slice that closes source→JIR→LLVM-IR for arithmetic functions:
-//! `astgen_metadata` (signature), `astgen_body_into` (params + body walk +
-//! fall-through terminator), and `astgen_expr` covering NumberLit, BoolLit,
-//! Variable (local/param load), BinaryOp (arith + comparison with int
-//! widening), and the Return statement. The remaining node shapes
-//! (VarDecl/Assign/If/While/For/Match, struct/array/index/member, calls,
-//! comp/drop machinery, the integer smallest-fit fallback, generic
-//! instantiation) return a clean "not yet ported" error and land next.
+//! [`JirFunction`]. Output is typed from the start: literals lower at their
+//! natural width or at an `expected`-type hint threaded from the parent; each
+//! visited node pushes zero or more `JirInst`s into the instruction array.
 
 use std::collections::HashMap;
 
@@ -37,9 +24,9 @@ use crate::jir::{JirBlockRef, JirFunction, JirInst, JirRef, JirTag, NO_JIR_BLOCK
 use crate::jir_codegen::{jir_declare_prototype, jir_define_body};
 use crate::mangling::mangled_function_name;
 
-/// A drop-bearing binding tracked for scope-exit destruction (the C++
-/// `DropTrack`). The mangled drop symbol is re-resolved at emission time by
-/// `emit_drop_in_place` (matching the C++ emit path), so it isn't cached here.
+/// A drop-bearing binding tracked for scope-exit destruction. The mangled
+/// drop symbol is re-resolved at emission time by `emit_drop_in_place`, so it
+/// isn't cached here.
 #[derive(Clone)]
 struct DropTrack {
     var_name: String,
@@ -55,12 +42,7 @@ struct LoopFrame {
     body_scope_idx: usize,
 }
 
-/// Per-function lowering state. The comp-binding scope chain, `localScopes`
-/// (redeclaration namespaces), and `runtimeCondDepth` the C++ `AstGenCtx`
-/// carries are deferred with their features; this slice carries the locals map,
-/// the loop stack, and the drop-scope stack.
-/// Metadata for an explicit `comp const` / `comp var` binding (the C++
-/// `AstGenCtx::CompBindingInfo`).
+/// Metadata for an explicit `comp const` / `comp var` binding.
 #[derive(Clone, Copy)]
 struct CompBindingInfo {
     /// Runtime-conditional depth at declaration — assignments from deeper
@@ -93,33 +75,32 @@ struct AstGenCtx<'a, 'ctx> {
     /// Per-frame metadata for the explicit comp bindings declared in that
     /// frame (pushed/popped with the drop scopes). Seeded names (module
     /// consts, comp params) are absent, so they never match the
-    /// comp-assignment path — same contract as the C++ `compBindInfo`.
+    /// comp-assignment path.
     comp_bind_info: Vec<HashMap<String, CompBindingInfo>>,
     /// Depth of runtime conditional control flow (if / while / for / match arm
     /// bodies). `comp if` arms do NOT count: their statements lower inline and
     /// execute unconditionally.
     runtime_cond_depth: u32,
-    /// Recoverable diagnostics collected while still walking the body (the C++
-    /// `recoverHere` path: append the error + emit a `Poison` placeholder and
-    /// keep going, so independent statements each report their own miss). These
-    /// are flushed — in source order — when the body finishes lowering; a
-    /// non-empty list makes the body's overall result an `Err`.
+    /// Recoverable diagnostics collected while still walking the body (append
+    /// the error + emit a `Poison` and keep going, so independent statements
+    /// each report their own miss). Flushed in source order when the body
+    /// finishes lowering; a non-empty list makes the overall result an `Err`.
     recovered: Vec<String>,
 }
 
-/// Append a recoverable diagnostic WITHOUT emitting a Poison (the C++
-/// `appendErrorHere`) — for skip-and-continue loops like struct-literal fields,
-/// where the offending item is simply dropped.
+/// Append a recoverable diagnostic WITHOUT emitting a Poison — for
+/// skip-and-continue loops like struct-literal fields, where the offending
+/// item is simply dropped.
 fn append_error_here(gctx: &mut AstGenCtx, message: String) {
     let prefixed = fail_node(gctx, gctx.current_node, &message);
     gctx.recovered.push(prefixed);
 }
 
-/// Append a recoverable diagnostic (already prefixed `file:line: error:` via
+/// Append a recoverable diagnostic (prefixed `file:line: error:` via
 /// [`fail_node`]) anchored at `gctx.current_node` and hand back a `Poison`
-/// placeholder so the walk continues. Mirrors the C++ `recoverHere`
-/// (astgen.cpp:243): the driver short-circuits before codegen whenever any
-/// error was recorded, so the Poison never reaches a real backend.
+/// placeholder so the walk continues. The driver short-circuits before
+/// codegen whenever any error was recorded, so the Poison never reaches a
+/// real backend.
 fn recover_here(gctx: &mut AstGenCtx, message: String, ty: TypeIdx) -> JirRef {
     append_error_here(gctx, message);
     emit(
@@ -132,10 +113,9 @@ fn recover_here(gctx: &mut AstGenCtx, message: String, ty: TypeIdx) -> JirRef {
     )
 }
 
-/// Method-miss reporting that understands CONDITIONAL methods (the C++
-/// `reportMethodMiss`, astgen.cpp:194): an instantiated generic method
-/// withdrawn for these type arguments replays the recorded reason instead of a
-/// bare "unknown method".
+/// Method-miss reporting that understands CONDITIONAL methods: an
+/// instantiated generic method withdrawn for these type arguments replays the
+/// recorded reason instead of a bare "unknown method".
 fn report_method_miss(gctx: &mut AstGenCtx, qualified: &str) -> Result<JirRef, String> {
     if let Some(why) = gctx.ctx.get_withdrawn_method(qualified) {
         return Err(fail_node(
@@ -151,13 +131,11 @@ fn report_method_miss(gctx: &mut AstGenCtx, qualified: &str) -> Result<JirRef, S
     ))
 }
 
-/// Stamp a propagated astgen error with the `file:line: error:` prefix anchored
-/// at `gctx.current_node` — UNLESS it already carries one. Most raw `Err(String)`
-/// sites deep in the lowering tree return a bare body (the C++ `failHere` adds
-/// the prefix there); this is the single boundary that reproduces that prefix.
-/// Move-safety errors (init_analysis) and the field-extract rejections already
-/// format their own `file:line: error:`, so an error that already contains
-/// `": error: "` is passed through untouched to avoid double-prefixing.
+/// Stamp a propagated astgen error with the `file:line: error:` prefix
+/// anchored at `gctx.current_node` — UNLESS it already carries one.
+/// Move-safety errors (init_analysis) and the field-extract rejections format
+/// their own prefix, so those pass through untouched to avoid
+/// double-prefixing.
 fn prefix_hard_error(gctx: &AstGenCtx, e: String) -> String {
     if e.contains(": error: ") || e.starts_with("error: ") {
         e
@@ -269,8 +247,8 @@ fn pop_drop_scope_emitting(gctx: &mut AstGenCtx) {
 }
 
 /// Find the binding-info record for an explicit comp binding, innermost frame
-/// first (the C++ `lookupCompBindingInfo`). `None` when `name` is not an
-/// explicit comp binding — seeded module consts / comp params don't match.
+/// first. `None` when `name` is not an explicit comp binding — seeded module
+/// consts / comp params don't match.
 fn lookup_comp_binding_info(gctx: &AstGenCtx, name: &str) -> Option<CompBindingInfo> {
     gctx.comp_bind_info
         .iter()
@@ -295,9 +273,9 @@ fn consume_moved_variable(gctx: &mut AstGenCtx, expr_idx: NodeIdx) {
     }
 }
 
-/// Format an astgen failure anchored at `node` as `file:line: error: message`,
-/// matching the C++ `failNode` -> `Diagnostics::emit` byte output. The file is
-/// the context's current display file; the line is `node`'s parse-time line.
+/// Format an astgen failure anchored at `node` as `file:line: error: message`.
+/// The file is the context's current display file; the line is `node`'s
+/// parse-time line.
 fn fail_node(gctx: &AstGenCtx, node: NodeIdx, message: &str) -> String {
     let file = gctx.ctx.current_file();
     let line = gctx.ctx.node_store.get_line(node);
@@ -319,8 +297,7 @@ fn fail_node(gctx: &AstGenCtx, node: NodeIdx, message: &str) -> String {
 /// value and the aggregate's drop glue would both drop the same payload. True
 /// when `expr_idx` is a `MemberAccess` chain rooted at a LOCAL binding whose
 /// `result_ty` needs drop. Paths that index through raw pointers (`self.ptr[i]`)
-/// are the pointer world and stay unchecked. Ported from the C++
-/// `isDropBearingFieldExtract`, astgen.cpp:5874-5898.
+/// are the pointer world and stay unchecked.
 fn is_drop_bearing_field_extract(gctx: &AstGenCtx, expr_idx: NodeIdx, result_ty: TypeIdx) -> bool {
     if result_ty.is_none() {
         return false;
@@ -351,8 +328,8 @@ fn is_drop_bearing_field_extract(gctx: &AstGenCtx, expr_idx: NodeIdx, result_ty:
     false
 }
 
-/// Reject moving/extracting a drop-bearing field out of its owned aggregate (else
-/// double-free). The C++ `rejectDropBearingFieldExtract`, astgen.cpp:5900-5909.
+/// Reject moving/extracting a drop-bearing field out of its owned aggregate
+/// (else double-free).
 fn reject_drop_bearing_field_extract(
     gctx: &AstGenCtx,
     expr_idx: NodeIdx,
@@ -394,7 +371,7 @@ fn detect_return_move(gctx: &AstGenCtx, val_idx: NodeIdx) -> Option<String> {
 }
 
 /// Drop every element of a fixed-size array `*ptr` via a runtime `0..count`
-/// loop (IndexAddr + recursive drop). Mirrors the C++ `emitArrayElementDrops`.
+/// loop (IndexAddr + recursive drop).
 fn emit_array_element_drops(gctx: &mut AstGenCtx, ptr: JirRef, arr_ty: TypeIdx) {
     let (elem_ty, count) = {
         let ak = gctx.ctx.type_pool.get(arr_ty);
@@ -532,7 +509,7 @@ fn emit_array_element_drops(gctx: &mut AstGenCtx, ptr: JirRef, arr_ty: TypeIdx) 
 
 /// Recursively destroy `*ptr` of type `ty`: a fixed array drops its elements; a
 /// struct/named type emits its `cfn drop` call (if any) then drops droppable
-/// fields. Container (Vec etc.) and payloaded-enum element drops are deferred.
+/// fields.
 fn emit_drop_in_place(gctx: &mut AstGenCtx, ptr: JirRef, ty: TypeIdx) {
     // Fixed-size array: own its elements (no cfn drop / fields of its own).
     if gctx.ctx.type_pool.get(ty).kind == TypeKind::Array {
@@ -559,8 +536,8 @@ fn emit_drop_in_place(gctx: &mut AstGenCtx, ptr: JirRef, ty: TypeIdx) {
         );
     }
     emit_field_drops(gctx, ptr, ty);
-    // Payloaded enums own the live variant's payload: tag-dispatched payload drops
-    // run after any user drop (the C++ emitEnumPayloadDrops, astgen.cpp:5476).
+    // Payloaded enums own the live variant's payload: tag-dispatched payload
+    // drops run after any user drop.
     emit_enum_payload_drops(gctx, ptr, ty);
 }
 
@@ -673,8 +650,8 @@ fn emit_enum_payload_drops(gctx: &mut AstGenCtx, ptr: JirRef, ty: TypeIdx) {
 
 /// If `container_ty` is a contiguous owning container — a struct with a `cfn len`
 /// and exactly one `*mut[] Elem` data field whose `Elem` needs drop — emit the
-/// `0..self.len()` loop that drops each live element (the C++
-/// `emitContainerElementDrops`). Returns whether it applied.
+/// `0..self.len()` loop that drops each live element. Returns whether it
+/// applied.
 fn emit_container_element_drops(gctx: &mut AstGenCtx, ptr: JirRef, container_ty: TypeIdx) -> bool {
     let Some(sname) = gctx.ctx.struct_name_of(container_ty) else {
         return false;
@@ -869,8 +846,8 @@ fn emit_container_element_drops(gctx: &mut AstGenCtx, ptr: JirRef, container_ty:
     true
 }
 
-/// Deep-clone `*src` of type `ty` into `*dest` (the C++ `emitCloneInto`): plain
-/// data bitwise-copies; arrays / enum payloads / struct fields recurse; a type
+/// Deep-clone `*src` of type `ty` into `*dest`: plain data bitwise-copies;
+/// arrays / enum payloads / struct fields recurse; a type
 /// with its own `cfn clone` calls it; a drop-bearing struct with NO clone recipe
 /// is an error (it owns resources). Returns Err on the error tier (the caller
 /// withdraws the conditional method).
@@ -1147,10 +1124,10 @@ fn emit_clone_into(
     Ok(())
 }
 
-/// Built-in `recv.clone()` for receivers WITHOUT a user `cfn clone` (the C++
-/// `tryLowerBuiltinClone`). Returns `Some(NO_JIR_REF-or-value)`; `Ok(None)` when
-/// a user clone exists (caller does ordinary dispatch). Tier 1 returns the value
-/// directly; tier 2 glues into a fresh slot and returns the dest pointer.
+/// Built-in `recv.clone()` for receivers WITHOUT a user `cfn clone`.
+/// Returns `Some(NO_JIR_REF-or-value)`; `Ok(None)` when a user clone exists
+/// (caller does ordinary dispatch). Tier 1 returns the value directly; tier 2
+/// glues into a fresh slot and returns the dest pointer.
 fn try_lower_builtin_clone(
     gctx: &mut AstGenCtx,
     recv_ptr: JirRef,
@@ -1278,11 +1255,9 @@ fn astgen_expr(gctx: &mut AstGenCtx, node: NodeIdx, expected: TypeIdx) -> Result
         AstTag::MemberAccess => astgen_member_access(gctx, &n),
         AstTag::Deref => astgen_deref(gctx, &n),
         AstTag::AddressOf => astgen_address_of(gctx, &n),
-        // `astgen_slice` is implemented but NOT wired: it unblocks the large std
-        // files (test_os_intrinsics/print/fs/...) past the slice node into deeper
-        // string-pool intern-order divergences. They must stay fully unported
-        // until those deeper features land, so leave Slice deferred to keep the
-        // gate green; flip this on together with the std-file intern-order work.
+        // Caution: slice lowering on the large std files
+        // (test_os_intrinsics/print/fs/...) can still diverge from the
+        // reference string-pool intern order deeper in.
         AstTag::Slice => astgen_slice(gctx, &n),
         AstTag::Return => {
             astgen_return(gctx, &n)?;
@@ -1365,8 +1340,7 @@ fn astgen_number_lit(
     };
     // With an integer `expected` we honour it directly (peer-type propagation).
     // GenericCall destinations and type-alias chains resolve first so the
-    // contract holds transitively; these route through context stubs that are
-    // no-ops today, so a builtin int resolves immediately.
+    // contract holds transitively.
     if !expected.is_none() {
         let mut resolved = expected;
         if gctx.ctx.type_pool.get(resolved).kind == TypeKind::GenericCall {
@@ -1487,10 +1461,8 @@ fn astgen_variable(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Resu
             if !v.is_none() {
                 // A `comp const` (width u64 for an untyped int literal)
                 // materializes narrowed to the USE SITE's expected type first,
-                // falling back to the const's own declared type — the C++
-                // `want = (expected != kNoType) ? expected : declaredType`
-                // (astgen.cpp:1424). Without this, `var n: u32 = N` stores an
-                // i64 into the i32 slot.
+                // falling back to the const's own declared type. Without this,
+                // `var n: u32 = N` stores an i64 into the i32 slot.
                 let want = if expected.is_none() {
                     mc.declared_type
                 } else {
@@ -1506,7 +1478,6 @@ fn astgen_variable(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Resu
     // at here.)
     if let Some(f) = gctx.ctx.get_function_ast(&name) {
         if f.is_generic() {
-            // Recoverable (the C++ astgen.cpp:1444).
             return Ok(recover_here(
                 gctx,
                 format!("cannot take address of generic fn `{name}`"),
@@ -1527,8 +1498,8 @@ fn astgen_variable(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Resu
             },
         ));
     }
-    // Recoverable (the C++ astgen.cpp:1466): emit a Poison so the rest of the
-    // function still gets analyzed and additional errors report in one pass.
+    // Emit a Poison so the rest of the function still gets analyzed and
+    // additional errors report in one pass.
     Ok(recover_here(
         gctx,
         format!("unknown variable `{name}`"),
@@ -1536,10 +1507,8 @@ fn astgen_variable(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Resu
     ))
 }
 
-/// Emit a JIR constant for a folded compile-time value, narrowed to `expected`
-/// when it is a matching scalar (the C++ `materializeComptimeValue`).
-/// Does comp int `bits` (interpreted per `is_signed`) fit a `width`-bit integer
-/// of signedness `target_signed`? Mirrors the C++ `compIntFits` (astgen.cpp).
+/// Does comp int `bits` (interpreted per `is_signed`) fit a `width`-bit
+/// integer of signedness `target_signed`?
 fn comp_int_fits(bits: u64, is_signed: bool, width: u16, target_signed: bool) -> bool {
     if width >= 64 {
         if target_signed {
@@ -1565,7 +1534,7 @@ fn comp_int_fits(bits: u64, is_signed: bool, width: u16, target_signed: bool) ->
     bits <= ((1u64 << width) - 1)
 }
 
-/// Decimal spelling of a comp int for diagnostics (C++ `compIntToString`).
+/// Decimal spelling of a comp int for diagnostics.
 fn comp_int_to_string(bits: u64, is_signed: bool) -> String {
     if is_signed {
         (bits as i64).to_string()
@@ -1575,7 +1544,7 @@ fn comp_int_to_string(bits: u64, is_signed: bool) -> String {
 }
 
 /// Chase a declared annotation through generic-call / substitution / type-alias
-/// links to its underlying scalar (the C++ `resolveScalarExpected`).
+/// links to its underlying scalar.
 fn resolve_scalar_expected(ctx: &CodegenContext, mut t: TypeIdx) -> TypeIdx {
     let mut guard = 0;
     while guard < 8 && !t.is_none() {
@@ -1611,9 +1580,7 @@ fn resolve_scalar_expected(ctx: &CodegenContext, mut t: TypeIdx) -> TypeIdx {
 
 /// Coerce a freshly evaluated comp value to a declared annotation
 /// (`comp const N: u8 = 200;`) — scalar kinds only, with hard-error misfits.
-/// Ports the C++ `coerceCompToDeclared` (astgen.cpp:909-963). The returned value
-/// carries the declared width/signedness for ints; the error strings match the
-/// oracle byte-for-byte.
+/// The returned value carries the declared width/signedness for ints.
 fn coerce_comp_to_declared(
     gctx: &mut AstGenCtx,
     v: ComptimeValue,
@@ -1700,11 +1667,9 @@ fn materialize_comptime_value(
                 if ek.kind == TypeKind::Int {
                     let ew = ek.a as u16;
                     let es = ek.b != 0;
-                    // A comp value that can't represent the expected width is a
-                    // hard error, not a silent truncation (the C++
-                    // materializeComptimeValue fit-check, astgen.cpp:785+).
+                    // A comp value that can't represent the expected width is
+                    // an error, not a silent truncation.
                     if !comp_int_fits(*bits, *is_signed, ew, es) {
-                        // Recoverable (the C++ astgen.cpp:800).
                         return Ok(recover_here(
                             gctx,
                             format!(
@@ -1791,7 +1756,7 @@ fn materialize_comptime_value(
             ))
         }
         // Type values have no runtime representation — a value position
-        // consuming one is an error, not a lowering (the C++ astgen.cpp:860).
+        // consuming one is an error, not a lowering.
         ComptimeValue::Type(_) => Ok(recover_here(
             gctx,
             format!("{what} is of type `type` and has no runtime representation"),
@@ -2011,9 +1976,9 @@ fn astgen_binary_op(
 
 /// Resolve a declared/initializer type through generic-call, type-alias,
 /// generic-substitution, and module re-export chains for the var-decl
-/// declared-vs-initializer comparison (the C++ `resolveForCmp` lambda,
-/// astgen.cpp:1252-1289). Both sides are run through this so `var a:
-/// Identity(i32) = 42;` compares `i32 == i32` rather than `GenericCall != Int`.
+/// declared-vs-initializer comparison. Both sides are run through this so
+/// `var a: Identity(i32) = 42;` compares `i32 == i32` rather than
+/// `GenericCall != Int`.
 fn resolve_for_cmp(ctx: &CodegenContext, t: TypeIdx) -> TypeIdx {
     if t.is_none() {
         return t;
@@ -2065,11 +2030,11 @@ fn resolve_for_cmp(ctx: &CodegenContext, t: TypeIdx) -> TypeIdx {
 fn astgen_var_decl(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     let extra = n.lhs;
     let name_id = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra));
-    // The declared type stays LITERAL inside an instantiated body (the C++
-    // astgenVarDecl never substitutes it): `var out: Vec(T)` keeps `Vec(T)`,
-    // so the slot's AddrOf receiver interns the literal `*Vec(T)` GenericCall in
-    // the oracle's TypePool order. Downstream registry lookups requalify/resolve
-    // at use, so the bare literal slot type is still correct.
+    // The declared type stays LITERAL inside an instantiated body: `var out:
+    // Vec(T)` keeps `Vec(T)`, so the slot's AddrOf receiver interns the
+    // literal `*Vec(T)` GenericCall in the reference TypePool order.
+    // Downstream registry lookups requalify/resolve at use, so the bare
+    // literal slot type is still correct.
     let declared = TypeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 1)));
     let init_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 2)));
     let name = str_at(gctx, name_id);
@@ -2078,8 +2043,7 @@ fn astgen_var_decl(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     // innermost `local_scopes` frame, so `const a = X; var a = Y;` at the same
     // level errors, but
     //     fn f() { var x = 1; if (c) { var x = 2; } }
-    // still compiles — intentional inner-block shadowing is allowed (the C++
-    // astgen.cpp:1149).
+    // still compiles — intentional inner-block shadowing is allowed.
     if let Some(frame) = gctx.local_scopes.last()
         && frame.contains(&name)
     {
@@ -2092,9 +2056,8 @@ fn astgen_var_decl(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
 
     // `comp const X = E;` / `comp var X = E;` (rhs bit 1) — fold the initializer
     // and bind it in the comp scope (no runtime slot); uses inline the value.
-    // Mirrors the C++ astgen.cpp:1157-1172: non-foldable inits are rejected
-    // (anchored at the initializer), and a declared annotation coerces +
-    // range-checks the value.
+    // Non-foldable inits are rejected (anchored at the initializer), and a
+    // declared annotation coerces + range-checks the value.
     if n.rhs & 2 != 0 {
         let is_const_binding = n.rhs & 1 != 0;
         let mut v = gctx.ctx.fold_comptime_expr_in(init_idx, &gctx.comp_scope);
@@ -2158,10 +2121,10 @@ fn astgen_var_decl(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     } else {
         // Declared: register the slot before lowering the init (self-ref). Try
         // the place-into-destination path first (StructLit / sret Call write
-        // directly into the slot); fall back to value-compile + Store. The
-        // declared type stays bare (the oracle keeps local-slot types bare;
-        // registry lookups requalify at use). An `[expr]T` array type resolves
-        // its comptime length so the slot is a concrete `[n]T`.
+        // directly into the slot); fall back to value-compile + Store.
+        // Local-slot types stay bare; registry lookups requalify at use. An
+        // `[expr]T` array type resolves its comptime length so the slot is a
+        // concrete `[n]T`.
         let ty = if gctx.ctx.type_pool.get(declared).kind == TypeKind::ArrayExpr {
             gctx.ctx.resolve_array_expr_instantiate(declared)?
         } else {
@@ -2182,8 +2145,8 @@ fn astgen_var_decl(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
         }
         if !astgen_expr_into_ptr(gctx, init_idx, ty, alloca_ref)? {
             let init_ref = astgen_expr(gctx, init_idx, ty)?;
-            // Type-check the init against the declared type (the C++
-            // astgen.cpp:1290-1327). The astgen_number_lit path already narrows
+            // Type-check the init against the declared type. The
+            // astgen_number_lit path already narrows
             // integer literals to the declared int width when `expected` is an
             // Int, so `var x: i32 = 5;` lands as I32. Anything else that doesn't
             // match is a real mismatch — `var x: f32 = 3;` (int into float),
@@ -2232,8 +2195,7 @@ fn astgen_var_decl(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
 
     // `var owned = c;` with a bare drop-bearing `c` MOVES it: the new binding
     // owns the value, so the source's scope-exit drop is suppressed. `var x = h.c`
-    // (field extraction) has no per-field suppression — reject it instead (the C++
-    // rejectDropBearingFieldExtract, astgen.cpp:1344).
+    // (field extraction) has no per-field suppression — reject it instead.
     reject_drop_bearing_field_extract(gctx, init_idx, ty, "copy")?;
     consume_moved_variable(gctx, init_idx);
     // If this binding's type owns heap, track it for scope-exit cleanup (a
@@ -2257,8 +2219,7 @@ fn astgen_var_decl(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
 ///   * `Deref` — the operand pointer value itself.
 ///   * `MemberAccess` — `FieldAddr` into a struct base, or a `BitCast` of a
 ///     union base (every union field shares the union's address).
-///
-/// `Index` lvalues (array/slice element addresses) land with array support.
+///   * `Index` — element address into an array/slice/many-pointer base.
 fn astgen_lvalue(gctx: &mut AstGenCtx, node: NodeIdx) -> Result<(JirRef, TypeIdx), String> {
     let n = *gctx.ctx.node_store.get(node);
     match n.tag {
@@ -2305,7 +2266,6 @@ fn astgen_lvalue(gctx: &mut AstGenCtx, node: NodeIdx) -> Result<(JirRef, TypeIdx
                 .struct_fields(base_ty)
                 .ok_or_else(|| "astgen: lvalue field access on non-struct".to_string())?;
             let Some(idx) = fields.iter().position(|(nm, _)| *nm == member) else {
-                // Recoverable (the C++ astgen.cpp:2172).
                 let sname = gctx.ctx.struct_name_of(base_ty).unwrap_or_default();
                 let p = recover_here(
                     gctx,
@@ -2345,8 +2305,7 @@ fn astgen_lvalue(gctx: &mut AstGenCtx, node: NodeIdx) -> Result<(JirRef, TypeIdx
                 TypeKind::Array | TypeKind::Slice | TypeKind::PtrMany => TypeIdx::new(a),
                 _ => {
                     // A struct base usually means the `v[i]` sugar's `at` was
-                    // withdrawn for this instantiation — replay why (the C++
-                    // astgen.cpp:7473).
+                    // withdrawn for this instantiation — replay why.
                     if let Some(sb) = gctx.ctx.struct_name_of(base_ty) {
                         let qualified = format!("{sb}.at");
                         if gctx.ctx.get_withdrawn_method(&qualified).is_some() {
@@ -2472,8 +2431,7 @@ fn astgen_assign(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     // Assignment to a `comp var` (an explicit comp binding, not a runtime
     // local) mutates the comp scope — no JIR. Runtime locals shadow comp
     // bindings; seeded names (module consts, comp params) don't match and fall
-    // through to the runtime lvalue path. Ports the C++ astgenAssign comp path
-    // (astgen.cpp:1510-1565) rule-for-rule.
+    // through to the runtime lvalue path.
     let tnode = *gctx.ctx.node_store.get(target_idx);
     if tnode.tag == AstTag::Variable {
         let tname = str_at(gctx, tnode.lhs);
@@ -2554,12 +2512,11 @@ fn astgen_assign(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
         let base_idx = NodeIdx::new(tnode.lhs);
         let idx_idx = NodeIdx::new(tnode.rhs);
         if let Some((recv, method)) = container_index_recv(gctx, base_idx, "setAt")? {
-            // The oracle's emitStructCfnDispatch order: index at u64, THEN the value
-            // by value (astgen_expr, not lower_arg — a by-value StructLit arg, no
-            // spill), THEN narrow the index, then the call.
+            // Emission order matters for the reference output: index at u64,
+            // THEN the value by value (astgen_expr, not lower_arg — a by-value
+            // StructLit arg, no spill), THEN narrow the index, then the call.
             // A bare drop-bearing local stored into a container element MOVES;
-            // field extraction on the RHS has no per-field suppression — reject
-            // (the C++ rejectDropBearingFieldExtract, astgen.cpp:1624).
+            // field extraction on the RHS has no per-field suppression — reject.
             let val_param_ty = method.args[2].ty;
             reject_drop_bearing_field_extract(gctx, value_idx, val_param_ty, "copy")?;
             let idx_u64 = astgen_expr(gctx, idx_idx, builtin::U64)?;
@@ -2572,7 +2529,7 @@ fn astgen_assign(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     }
     let (ptr_ref, leaf_ty) = astgen_lvalue(gctx, target_idx)?;
     // Field extraction on the RHS (`x = h.c`) has no per-field suppression —
-    // reject (the C++ rejectDropBearingFieldExtract, astgen.cpp:1660).
+    // reject.
     reject_drop_bearing_field_extract(gctx, value_idx, leaf_ty, "copy")?;
     let val_ref = astgen_expr(gctx, value_idx, leaf_ty)?;
     if !leaf_ty.is_none()
@@ -2663,9 +2620,7 @@ fn astgen_unary_op(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Resu
 /// destination is passed as the operand's expected hint for numeric targets so
 /// a literal settles at the target width in one step (essential for floats — a
 /// double-then-FPTrunc would double-round). Scalar conversions are covered:
-/// bool→int, ptr↔ptr, ptr↔int, int↔int, int↔float, float↔float. The
-/// enum↔int conversions are deferred with enum codegen; GenericCall
-/// destinations resolve through the (currently no-op) context stub.
+/// bool→int, ptr↔ptr, ptr↔int, int↔int, int↔float, float↔float.
 fn astgen_as_cast(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     let operand_idx = NodeIdx::new(n.lhs);
     let mut dst_ty = TypeIdx::new(n.rhs);
@@ -2931,14 +2886,9 @@ fn astgen_as_cast(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     Err("astgen: unsupported `as` cast between these types".into())
 }
 
-/// Lower a single call argument against parameter `p` (the C++ `lowerArgInner`).
-/// ByValue params take the value (with the slice→pointer rejection); ByPointer
-/// params (`mut`, or any aggregate) take an address — the caller's storage for
-/// an lvalue arg, or a fresh spill slot for an rvalue.
-///
-/// Reject `&x` passed to a MODE parameter (the C++ rejectAddrOfOnModeArg,
-/// astgen.cpp:5999): `&` makes a pointer, but a non-pointer param takes its
-/// argument by mode — the signature's `mut`/`move` already grants access.
+/// Reject `&x` passed to a MODE parameter: `&` makes a pointer, but a
+/// non-pointer param takes its argument by mode — the signature's
+/// `mut`/`move` already grants access.
 fn reject_addr_of_on_mode_arg(gctx: &AstGenCtx, arg_idx: NodeIdx, p: &Param) -> Result<(), String> {
     let n = gctx.ctx.node_store.get(arg_idx);
     if n.tag != AstTag::AddressOf {
@@ -2959,8 +2909,6 @@ fn reject_addr_of_on_mode_arg(gctx: &AstGenCtx, arg_idx: NodeIdx, p: &Param) -> 
     ))
 }
 
-/// A `move`-mode arg transfers ownership to the callee — the source's drop is
-/// consumed.
 /// True when `n` is a `MemberAccess` whose base is a non-local Variable — i.e. a
 /// `Type.Variant` / `handle.X` constructor expression rather than an addressable
 /// lvalue (a local's `s.field` has its base in `locals`). lower_arg spills these.
@@ -2975,8 +2923,8 @@ fn member_access_is_ctor(gctx: &AstGenCtx, n: &AstNode) -> bool {
 fn lower_arg(gctx: &mut AstGenCtx, arg_idx: NodeIdx, p: &Param) -> Result<JirRef, String> {
     reject_addr_of_on_mode_arg(gctx, arg_idx, p)?;
     // A `move`-mode arg that extracts a drop-bearing field out of an owned
-    // aggregate is rejected — the callee and the parent's glue would both drop it
-    // (the C++ lowerArg's rejectDropBearingFieldExtract, astgen.cpp:5933).
+    // aggregate is rejected — the callee and the parent's glue would both
+    // drop it.
     if p.mode == jam_core::param_mode::ParamMode::Move {
         reject_drop_bearing_field_extract(gctx, arg_idx, p.ty, "move")?;
     }
@@ -3000,21 +2948,19 @@ fn lower_arg(gctx: &mut AstGenCtx, arg_idx: NodeIdx, p: &Param) -> Result<JirRef
         // ByPointer: feed an address.
         let arg_node = *gctx.ctx.node_store.get(arg_idx);
         match arg_node.tag {
-            // Lvalueable args hand over their existing storage pointer. (Index is
-            // accepted by astgen_lvalue only once array support lands.)
+            // Lvalueable args hand over their existing storage pointer.
             AstTag::Variable | AstTag::Index | AstTag::Deref => astgen_lvalue(gctx, arg_idx)?.0,
             // A `Type.Variant` / `handle.X` member access whose base is a non-local
             // Variable is a CONSTRUCTOR (e.g. a payloaded enum's unit variant
-            // `Msg.Quit`), not an lvalue — astgen_lvalue can't resolve the base. Spill
-            // it like any rvalue (the `_` arm) — the C++ `memberAccessOnNonLvalue`
-            // guard, astgen.cpp:5808. A member access on a LOCAL (`s.field`) stays an
-            // lvalue.
+            // `Msg.Quit`), not an lvalue — astgen_lvalue can't resolve the base.
+            // Spill it like any rvalue (the `_` arm). A member access on a LOCAL
+            // (`s.field`) stays an lvalue.
             AstTag::MemberAccess if !member_access_is_ctor(gctx, &arg_node) => {
                 astgen_lvalue(gctx, arg_idx)?.0
             }
             AstTag::AddressOf => astgen_expr(gctx, arg_idx, TypeIdx::NONE)?,
-            // Spill an rvalue into a fresh slot so the callee gets a pointer. The
-            // place-into-destination fast path is deferred — value-compile + Store.
+            // Spill an rvalue into a fresh slot so the callee gets a pointer
+            // (value-compile + Store; no place-into-destination fast path here).
             _ => {
                 let ptr = emit_alloca_hoisted(
                     gctx,
@@ -3044,15 +2990,12 @@ fn lower_arg(gctx: &mut AstGenCtx, arg_idx: NodeIdx, p: &Param) -> Result<JirRef
     Ok(r)
 }
 
-/// Emit a `Call` to `fn_ast` with already-lowered `arg_refs`. sret-returning
-/// callees get their result slot as a leading arg (the caller's `dest_ptr` when
-/// supplied, else a fresh alloca that becomes the Call's result). The arg list
-/// The per-value mangle token for a `comp` argument (`scale__u2`), mirroring the
-/// C++ switch (astgen.cpp:6539-6566): an int folds to `i`/`u` + its u64 value, a
-/// bool to `true`/`false`, a string to `s` + its libc++ `std::hash` (stable +
-/// printable over arbitrary contents), a type to its width spelling / `bool` /
-/// `t` + TypeIdx. A bare `_ => "x"` previously collapsed DISTINCT string and type
-/// instantiations onto one cache key + LLVM symbol (the linker then merged them).
+/// The per-value mangle token for a `comp` argument (`scale__u2`): an int
+/// folds to `i`/`u` + its u64 value, a bool to `true`/`false`, a string to
+/// `s` + its libc++ `std::hash` (stable + printable over arbitrary contents),
+/// a type to its width spelling / `bool` / `t` + TypeIdx. A bare `_ => "x"`
+/// previously collapsed DISTINCT string and type instantiations onto one
+/// cache key + LLVM symbol (the linker then merged them).
 fn comp_value_spelling(v: &ComptimeValue, gctx: &AstGenCtx) -> String {
     match v {
         ComptimeValue::Int { is_signed, .. } => {
@@ -3093,8 +3036,8 @@ fn astgen_comp_instantiated_call(
     let mut suffix = String::new();
     let mut runtime_idx: Vec<NodeIdx> = Vec::new();
     let mut runtime_params: Vec<jam_syntax::ast::Param> = Vec::new();
-    // The comp-param substitution baked into the clone's body (the C++
-    // `compSubst`): a body reference to `k` folds to this call-site value.
+    // The comp-param substitution baked into the clone's body: a body
+    // reference to `k` folds to this call-site value.
     let mut comp_subst: HashMap<String, ComptimeValue> = HashMap::new();
     for i in 0..arg_count {
         let arg_idx = NodeIdx::new(
@@ -3106,7 +3049,6 @@ fn astgen_comp_instantiated_call(
             Some(p) if p.is_comp => {
                 let v = gctx.ctx.fold_comptime_expr_in(arg_idx, &gctx.comp_scope);
                 if matches!(v, ComptimeValue::None) {
-                    // Recoverable (the C++ astgen.cpp:6530).
                     return Ok(recover_here(
                         gctx,
                         format!(
@@ -3141,7 +3083,7 @@ fn astgen_comp_instantiated_call(
     clone.args = runtime_params;
 
     // EAGERLY declare + define the clone the first time this instantiation is
-    // seen (the C++ `astgenCompInstantiatedCall`): the clone body is never
+    // seen: the clone body is never
     // emitted by the regular pipeline, so without this the call dangles
     // ("unknown callee"). The clone's name doubles as the cache key AND its
     // LLVM symbol. Cache on `get_function_ast` so a repeat call reuses it.
@@ -3170,8 +3112,11 @@ fn astgen_comp_instantiated_call(
     emit_call(gctx, &clone, &arg_refs, dest_ptr)
 }
 
-/// is packed `[count, args..]` into the function's extra array. A `noreturn`
-/// callee terminates the current block with `Unreachable`.
+/// Emit a `Call` to `fn_ast` with already-lowered `arg_refs`. sret-returning
+/// callees get their result slot as a leading arg (the caller's `dest_ptr`
+/// when supplied, else a fresh alloca). The arg list is packed
+/// `[count, args..]` into the function's extra array. A `noreturn` callee
+/// terminates the current block with `Unreachable`.
 fn emit_call(
     gctx: &mut AstGenCtx,
     fn_ast: &FunctionAST,
@@ -3181,8 +3126,8 @@ fn emit_call(
     let mangled = mangled_function_name(fn_ast, &gctx.ctx.type_pool, &gctx.ctx.string_pool);
     let callee_id = gctx.ctx.string_pool.intern_str(&mangled).raw();
 
-    // The callee's return type spelled in ITS module (a callee returning its own
-    // module's `Token` shows `mod.Token` at the call site, like the oracle).
+    // The callee's return type spelled in ITS module (a callee returning its
+    // own module's `Token` shows `mod.Token` at the call site).
     let rq = gctx
         .ctx
         .requalify_type(fn_ast.return_type, &fn_ast.module_path);
@@ -3242,10 +3187,6 @@ fn emit_call(
     Ok(call_ref)
 }
 
-/// Lower a direct free-function `Call` (`lhs`=callee StringIdx, `rhs`=ExtraIdx
-/// → `[argCount, args..]`). The indirect/method form (flags bit 0), comptime-fn
-/// and comp-instantiated calls, and the fn-pointer-in-local fallback are
-/// deferred — they error cleanly until ported.
 /// Construct an enum variant value `Enum.Variant(args)`: the discriminant byte
 /// (unit-only enums return it directly), else a `{tag, payload}` aggregate built
 /// via an alloca — `FieldAddr(0)` = tag, `FieldAddr(1)` = payload area, each
@@ -3342,9 +3283,8 @@ fn astgen_enum_variant_ctor(
                     .node_store
                     .get_extra(ExtraIdx::new(args_extra + 1 + i as u32)),
             );
-            // Enum payload capture is a MOVE — extracting a drop-bearing field out
-            // of an aggregate to capture it is rejected (the C++
-            // rejectDropBearingFieldExtract, astgen.cpp:4561).
+            // Enum payload capture is a MOVE — extracting a drop-bearing field
+            // out of an aggregate to capture it is rejected.
             reject_drop_bearing_field_extract(gctx, arg_idx, field_ty, "capture")?;
             let pay_val = astgen_expr(gctx, arg_idx, field_ty)?;
             consume_moved_variable(gctx, arg_idx);
@@ -3396,7 +3336,7 @@ fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<Ji
     }
     let callee = str_at(gctx, n.lhs);
     // Inside an instantiated body, rewrite `Self.method`/`T.method` to the
-    // concrete `Inst.method` (the C++ resolvePrefix). No-op otherwise.
+    // concrete `Inst.method`. No-op otherwise.
     let callee = gctx.ctx.resolve_subst_prefix(&callee);
     let args_extra = n.rhs;
     let arg_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra));
@@ -3407,9 +3347,9 @@ fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<Ji
         return astgen_assert_call(gctx, n);
     }
 
-    // Resolve a bare callee against the BODY module first (the C++ namespace
-    // lookup): two modules may each define `scale`, and a body must reach its
-    // own, not whichever registered last under the bare key.
+    // Resolve a bare callee against the BODY module first: two modules may
+    // each define `scale`, and a body must reach its own, not whichever
+    // registered last under the bare key.
     let body_qualified = {
         let bm = gctx.ctx.current_body_module();
         if !bm.is_empty() && !callee.contains('.') {
@@ -3420,8 +3360,8 @@ fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<Ji
     };
     // A handle-qualified spelling of a PRIVATE function must not resolve, even
     // when the handle name coincides with the module identity and the raw
-    // spelling matches the internal qualified registry key (the C++ registers
-    // handle keys for pub fns only, main.cpp:701).
+    // spelling matches the internal qualified registry key (handle keys are
+    // registered for pub fns only).
     if callee.contains('.')
         && let Some(msg) = gctx.ctx.namespace_privacy_violation(&callee)
     {
@@ -3443,9 +3383,9 @@ fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<Ji
             // Qualified callees (`std.fmt.println`, `lib.priv`) get the precise
             // namespace diagnostic — "symbol `X` does not exist in module `M`"
             // — anchored at the import handle; bare callees get "unknown
-            // function" (the C++ astgen.cpp:7336-7341). The C++ `recoverHere`s
-            // here (not `failHere`): each independent call site reports its own
-            // miss, so a body with several bad calls emits one error per call.
+            // function". Recover rather than hard-fail: each independent call
+            // site reports its own miss, so a body with several bad calls
+            // emits one error per call.
             let msg = if callee.contains('.') {
                 gctx.ctx.format_namespace_lookup_error("function", &callee)
             } else {
@@ -3478,13 +3418,12 @@ fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<Ji
     emit_call(gctx, &fn_ast, &arg_refs, dest_ptr)
 }
 
-// ---- cfn-call expansion (the C++ astgenCompTimeFnCall + CfnEmitter) ----
+// ---- cfn-call expansion ----
 
-/// A `@emit*` intrinsic recorded from a cfn body. The C++ aliases the AstGenCtx
-/// mutably during execBlock; Rust's borrow checker forbids that (the evaluator
-/// holds immutable pool borrows for all of exec_block), so we RECORD the
-/// intrinsics as pure data during execution and REPLAY them into the caller's
-/// JIR after the evaluator's borrows release.
+/// A `@emit*` intrinsic recorded from a cfn body. The evaluator holds
+/// immutable pool borrows for all of exec_block, so the caller's JIR can't be
+/// mutated mid-execution: intrinsics are RECORDED as pure data during
+/// execution and REPLAYED into the caller's JIR after the borrows release.
 enum CfnEmitCmd {
     WriteBytes {
         fd: u32,
@@ -3577,8 +3516,8 @@ impl crate::comptime::CompEmitter for RecordingCfnEmitter {
     }
 }
 
-/// Register + declare a fake `printf` / `exit` extern prototype, once (the C++
-/// astgenAssertCall registers these lazily). Mirrors ensure_dprintf.
+/// Register + declare a fake `printf` / `exit` extern prototype, once
+/// (lazily, like ensure_dprintf).
 fn ensure_printf(gctx: &mut AstGenCtx) {
     if gctx.ctx.get_function_ast("printf").is_some() {
         return;
@@ -3615,7 +3554,7 @@ fn ensure_exit(gctx: &mut AstGenCtx) {
 
 /// Lower `assert(actual, expected)`: ICmpEq (or FCmpOeq for floats) + CondBr to
 /// an `assert.fail` block (printf "Assertion failed\n" + exit(1) + Unreachable)
-/// and an `assert.pass` continuation (the C++ astgenAssertCall).
+/// and an `assert.pass` continuation.
 fn astgen_assert_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     let args_extra = n.rhs;
     let arg_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra));
@@ -3676,8 +3615,8 @@ fn astgen_assert_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Strin
     emit_cond_br(gctx, cmp_ref, pass_b, fail_b);
 
     gctx.current_block = fail_b;
-    // Intern "printf" FIRST (the C++ printfNameId at astgen.cpp:5646, before the
-    // message string) to keep the string-pool order byte-exact.
+    // Intern "printf" FIRST (before the message string) to keep the
+    // string-pool order byte-exact.
     let pid = gctx.ctx.string_pool.intern(b"printf");
     ensure_printf(gctx);
     let slice_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
@@ -3748,9 +3687,9 @@ fn astgen_assert_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Strin
 }
 
 /// Register + declare the libc `dprintf` extern prototype, once. cfn output
-/// (print/eprint) lowers to `dprintf(fd, "%.*s", len, ptr)` calls — the C++
-/// `ensureDprintfForCfn`. The LLVM proto is `(i32, i8*, ...)` varargs; the
-/// `fmt` param is typed `*const u8` so jir_declare_prototype lowers it to `i8*`.
+/// (print/eprint) lowers to `dprintf(fd, "%.*s", len, ptr)` calls. The LLVM
+/// proto is `(i32, i8*, ...)` varargs; the `fmt` param is typed `*const u8`
+/// so jir_declare_prototype lowers it to `i8*`.
 fn ensure_dprintf(gctx: &mut AstGenCtx) {
     if gctx.ctx.get_function_ast("dprintf").is_some() {
         return;
@@ -3770,9 +3709,8 @@ fn ensure_dprintf(gctx: &mut AstGenCtx) {
 }
 
 /// Replay `@emitWriteBytes(fd, fmt, start, end)` — emit `dprintf(fd, "%.*s",
-/// len, ptr)` for the literal byte span `fmt[start..end]` (the C++ handleWrite
-/// Bytes). The substring is interned to `.rodata`; runtime hands its ptr+len to
-/// dprintf.
+/// len, ptr)` for the literal byte span `fmt[start..end]`. The substring is
+/// interned to `.rodata`; runtime hands its ptr+len to dprintf.
 fn replay_write_bytes(
     gctx: &mut AstGenCtx,
     fd: u32,
@@ -3877,8 +3815,7 @@ fn replay_write_bytes(
 }
 
 /// Emit `dprintf(fd, "%.*s", len, ptr)` for a compile-time literal byte string
-/// in the current block (the C++ Bool-case `emitStrLit`). `fd_ref` is reused, not
-/// re-emitted.
+/// in the current block. `fd_ref` is reused, not re-emitted.
 fn emit_write_literal(gctx: &mut AstGenCtx, fd_ref: JirRef, literal: &[u8]) {
     let slice_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
     let u8ptr = gctx.ctx.type_pool.intern_ptr_many(builtin::U8);
@@ -3956,8 +3893,7 @@ fn emit_write_literal(gctx: &mut AstGenCtx, fd_ref: JirRef, literal: &[u8]) {
 }
 
 /// Replay `@emitPutByte(fd, byte)` — emit `dprintf(fd, "%c", byte)` with the
-/// byte widened to i32 (`%c` expects an int) — the C++ handlePutByte
-/// (astgen.cpp:6276).
+/// byte widened to i32 (`%c` expects an int).
 fn replay_put_byte(gctx: &mut AstGenCtx, fd: u32, byte: u8) {
     ensure_dprintf(gctx);
     let fd_ref = emit(
@@ -3981,8 +3917,7 @@ fn replay_put_byte(gctx: &mut AstGenCtx, fd: u32, byte: u8) {
     emit_dprintf_single_arg(gctx, fd_ref, b"%c", byte_ref);
 }
 
-/// Emit `dprintf(fd, fmtSpec, arg)` — one extra runtime arg after the spec (the
-/// C++ emitDprintfSingleArg).
+/// Emit `dprintf(fd, fmtSpec, arg)` — one extra runtime arg after the spec.
 fn emit_dprintf_single_arg(gctx: &mut AstGenCtx, fd_ref: JirRef, spec: &[u8], arg: JirRef) {
     let slice_ty = gctx.ctx.type_pool.intern_slice(builtin::U8);
     let u8ptr = gctx.ctx.type_pool.intern_ptr_many(builtin::U8);
@@ -4020,9 +3955,9 @@ fn emit_dprintf_single_arg(gctx: &mut AstGenCtx, fd_ref: JirRef, spec: &[u8], ar
     );
 }
 
-/// Per-type runtime print dispatch for `@emitPrintLocalByRange` (the C++
-/// emitDprintfForValue): widen ints to i64 (`%lld`/`%llu`), floats to f64
-/// (`%g`), and write `str` slices as `%.*s`. Bool stays a follow-up.
+/// Per-type runtime print dispatch for `@emitPrintLocalByRange`: widen ints
+/// to i64 (`%lld`/`%llu`), floats to f64 (`%g`), and write `str` slices as
+/// `%.*s`.
 fn emit_dprintf_for_value(
     gctx: &mut AstGenCtx,
     fd_ref: JirRef,
@@ -4135,8 +4070,8 @@ fn emit_dprintf_for_value(
             Ok(())
         }
         TypeKind::Bool => {
-            // Branch on the value, writing the "true"/"false" literal in each arm
-            // (the C++ Bool case). Block labels match the oracle for byte-exact IR.
+            // Branch on the value, writing the "true"/"false" literal in each
+            // arm. Block labels match the reference output for byte-exact IR.
             let true_b = gctx.jfn.push_block("emit.true");
             let false_b = gctx.jfn.push_block("emit.false");
             let join_b = gctx.jfn.push_block("emit.bool.end");
@@ -4201,8 +4136,8 @@ fn replay_print_local(
 }
 
 /// Run a `cfn` body at the call site, replaying its `@emit*` output into the
-/// caller's JIR (the C++ astgenCompTimeFnCall). The args fold in the caller's
-/// comp scope; the body then runs in a fresh scope holding only the params.
+/// caller's JIR. The args fold in the caller's comp scope; the body then runs
+/// in a fresh scope holding only the params.
 fn astgen_comptime_fn_call(
     gctx: &mut AstGenCtx,
     fn_ast: &FunctionAST,
@@ -4210,7 +4145,7 @@ fn astgen_comptime_fn_call(
     arg_count: u32,
 ) -> Result<JirRef, String> {
     if arg_count as usize != fn_ast.args.len() {
-        // Recoverable (the C++ astgen.cpp:6432) — cfn doesn't support varargs.
+        // cfn doesn't support varargs.
         return Ok(recover_here(
             gctx,
             format!(
@@ -4226,9 +4161,9 @@ fn astgen_comptime_fn_call(
 
     // A VALUE-returning cfn (declared return type) folds its body at compile time
     // — with a CfnResolver active so cfn->cfn calls and recursion resolve — and
-    // materializes the `return` value as a JIR constant, narrowed to the declared
-    // return type (the C++ astgen.cpp:6499-6509). Value cfns carry no @-emit
-    // output, so the recording path below is only for VOID @-emit cfns.
+    // materializes the `return` value as a JIR constant, narrowed to the
+    // declared return type. Value cfns carry no @-emit output, so the
+    // recording path below is only for VOID @-emit cfns.
     if !fn_ast.return_type.is_none() && fn_ast.return_type != builtin::VOID {
         let arg_exprs: Vec<NodeIdx> = (0..arg_count)
             .map(|i| {
@@ -4243,7 +4178,6 @@ fn astgen_comptime_fn_call(
             .ctx
             .eval_cfn_call(fn_ast, &arg_exprs, &gctx.comp_scope, line)?;
         if returned.is_none() {
-            // Recoverable (the C++ astgen.cpp:6501).
             return Ok(recover_here(
                 gctx,
                 format!(
@@ -4293,7 +4227,6 @@ fn astgen_comptime_fn_call(
             );
             let v = ev.eval(arg_idx, &gctx.comp_scope, &mut ctx);
             if v.is_none() {
-                // Recoverable (the C++ astgen.cpp:6462).
                 let msg = format!(
                     "argument to cfn `{}` (param `{}`) must be a compile-time constant",
                     fn_ast.name, fn_ast.args[i as usize].name
@@ -4329,8 +4262,7 @@ fn astgen_comptime_fn_call(
             &mut ctx,
         );
         if matches!(r, ExecResult::Error | ExecResult::IterationCap) {
-            // Recoverable (the C++ astgen.cpp:6488) — return a poison so the
-            // rest of the caller still gets analyzed.
+            // Return a poison so the rest of the caller still gets analyzed.
             let msg = format!(
                 "cfn `{}` failed during compile-time evaluation",
                 fn_ast.name
@@ -4389,9 +4321,9 @@ fn lower_call_args(
 }
 
 /// Lower a method call's non-receiver args. Method args are lowered by VALUE
-/// (`astgen_expr`, not `lower_arg`) — the oracle's method-dispatch loads a
-/// `move`/byref arg's value rather than passing its address — with the move's
-/// caller-side drop consumed. Param `1+i` skips the implicit `self`.
+/// (`astgen_expr`, not `lower_arg`) — method dispatch loads a `move`/byref
+/// arg's value rather than passing its address — with the move's caller-side
+/// drop consumed. Param `1+i` skips the implicit `self`.
 fn lower_method_args(
     gctx: &mut AstGenCtx,
     method: &FunctionAST,
@@ -4408,8 +4340,7 @@ fn lower_method_args(
         let param = method.args.get(i as usize + 1);
         let expect = param.map(|p| p.ty).unwrap_or(TypeIdx::NONE);
         // A `move`-mode method arg extracting a drop-bearing field out of an
-        // aggregate is rejected (the C++ rejectDropBearingFieldExtract,
-        // astgen.cpp:6949).
+        // aggregate is rejected.
         if param.map(|p| p.mode) == Some(jam_core::param_mode::ParamMode::Move) {
             reject_drop_bearing_field_extract(gctx, arg_idx, expect, "move")?;
         }
@@ -4421,11 +4352,11 @@ fn lower_method_args(
     Ok(out)
 }
 
-/// Lower a `Type.method(args)` (TypeMethodCall) call's args BY VALUE — the oracle's
-/// `astgenTypeMethodCall` lowers each arg with `astgenExpr` regardless of the param
-/// ABI (no spill, no address-of even for a `move`/byref struct), consuming a move
-/// arg's caller-side drop. Like `lower_method_args` but params index from 0 (the
-/// `Type.method` form has no implicit `self`).
+/// Lower a `Type.method(args)` (TypeMethodCall) call's args BY VALUE
+/// regardless of the param ABI (no spill, no address-of even for a
+/// `move`/byref struct), consuming a move arg's caller-side drop. Like
+/// `lower_method_args` but params index from 0 (the `Type.method` form has no
+/// implicit `self`).
 fn lower_type_method_args(
     gctx: &mut AstGenCtx,
     method: &FunctionAST,
@@ -4441,8 +4372,8 @@ fn lower_type_method_args(
         );
         let param = method.args.get(i as usize);
         let expect = param.map(|p| p.ty).unwrap_or(TypeIdx::NONE);
-        // A `move`-mode arg extracting a drop-bearing field out of an aggregate is
-        // rejected (the C++ rejectDropBearingFieldExtract, astgen.cpp:7192).
+        // A `move`-mode arg extracting a drop-bearing field out of an
+        // aggregate is rejected.
         if param.map(|p| p.mode) == Some(jam_core::param_mode::ParamMode::Move) {
             reject_drop_bearing_field_extract(gctx, arg_idx, expect, "move")?;
         }
@@ -4557,9 +4488,8 @@ fn astgen_indirect_call(
     }
     // Array builtin `recv.asPtr()` / `recv.asMutPtr()` on a field / index / deref
     // array lvalue (`self.buf.asMutPtr()`): the array's base address — an
-    // `IndexAddr` at 0 -> `PtrMany(elem)`. Mirrors the C++ handling of any
-    // lvalueable receiver (astgen.cpp:6788-6827); the local-Variable form is
-    // handled in the prefix dispatch.
+    // `IndexAddr` at 0 -> `PtrMany(elem)`. The local-Variable form is handled
+    // in the prefix dispatch.
     if (method_name == "asPtr" || method_name == "asMutPtr")
         && recv_ptr != NO_JIR_REF
         && gctx.ctx.type_pool.get(recv_ty).kind == TypeKind::Array
@@ -4626,8 +4556,8 @@ fn astgen_dotted_call(
     // Multi-dot handle chains (`w.leaf.makePoint`): resolve through the module
     // namespace re-export chain to the leaf module's free function.
     if prefix.contains('.') {
-        // The oracle's multi-dot pre-check probes the recv prefix as a Named
-        // (a handle-qualified enum-variant ctor); interning it here keeps the
+        // The multi-dot pre-check probes the recv prefix as a Named (a
+        // handle-qualified enum-variant ctor); interning it here keeps the
         // string pool byte-aligned even when the prefix isn't an enum.
         let sid = gctx.ctx.string_pool.intern(prefix.as_bytes());
         let _ = gctx.ctx.type_pool.intern_named(sid);
@@ -4642,8 +4572,8 @@ fn astgen_dotted_call(
             return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
         }
         // `a.Counter.init(args)` / `a.Status.Ok(args)`: a handle-qualified struct
-        // method/ctor or enum-variant ctor. Resolve the `handle.Type` prefix to its
-        // module, then dispatch (the C++ multi-dot branch, astgen.cpp:6981).
+        // method/ctor or enum-variant ctor. Resolve the `handle.Type` prefix to
+        // its module, then dispatch.
         if let Some((handle, type_name)) = prefix.split_once('.')
             && let Some(module) = gctx.ctx.import_handle_module(handle)
         {
@@ -4694,8 +4624,7 @@ fn astgen_dotted_call(
         && let Some(method) = gctx.ctx.get_function_ast(&format!("{module}.{suffix}"))
     {
         // Privacy: a non-`pub` function reached through a module handle is not
-        // exported (the C++ `formatNamespaceLookupError` privateNames branch,
-        // codegen.cpp:831). `extern`/`export` libc bare names stay accessible.
+        // exported. `extern`/`export` libc bare names stay accessible.
         if !method.is_pub && !method.is_extern && !method.is_export {
             return Err(format!(
                 "symbol `{suffix}` is not exported from module `{module}`"
@@ -4763,7 +4692,7 @@ fn astgen_dotted_call(
     // Not a method — fall through (e.g. a Fn-typed field call via the
     // fn-pointer fallback). A withdrawn conditional method replays its reason
     // here rather than falling through to the module-handle fallback's
-    // confusing error (the C++ astgen.cpp:7152).
+    // confusing error.
     let Some(method) = gctx.ctx.get_function_ast(&qualified) else {
         if gctx.ctx.get_withdrawn_method(&qualified).is_some() {
             report_method_miss(gctx, &qualified)?;
@@ -4772,7 +4701,7 @@ fn astgen_dotted_call(
     };
 
     // Receiver from the local slot: ByPointer wraps the slot in an explicit
-    // AddrOf (the oracle's `AddrOf ty=*Recv`); ByValue loads it.
+    // AddrOf (`AddrOf ty=*Recv`); ByValue loads it.
     let self_mode = method
         .args
         .first()
@@ -4807,10 +4736,10 @@ fn astgen_dotted_call(
 }
 
 /// The `Type.method()` enum-variant constructor (`Option(i32).Some(42)`): the
-/// SINGLE-payload form the oracle's `astgenTypeMethodCall` uses — `FieldAddr(1)`
-/// typed `*PayloadType` + a direct store (distinct from the shared byte-stride
-/// `astgen_enum_variant_ctor` the dotted-Call path uses). `None` when the suffix
-/// isn't a variant. `extra` is the TypeMethodCall extra (`[methodId, argc, args]`).
+/// SINGLE-payload form — `FieldAddr(1)` typed `*PayloadType` + a direct store
+/// (distinct from the shared byte-stride `astgen_enum_variant_ctor` the
+/// dotted-Call path uses). `None` when the suffix isn't a variant. `extra` is
+/// the TypeMethodCall extra (`[methodId, argc, args]`).
 fn astgen_type_method_enum_ctor(
     gctx: &mut AstGenCtx,
     enum_name: &str,
@@ -4878,9 +4807,8 @@ fn astgen_type_method_enum_ctor(
     if !payload_types.is_empty() && arg_count >= 1 {
         let field_ty = payload_types[0];
         let arg_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 2)));
-        // Enum payload capture is a MOVE — a drop-bearing field extracted out of an
-        // aggregate is rejected (the C++ rejectDropBearingFieldExtract, the
-        // TypeMethodCall enum-construct path).
+        // Enum payload capture is a MOVE — a drop-bearing field extracted out
+        // of an aggregate is rejected.
         reject_drop_bearing_field_extract(gctx, arg_idx, field_ty, "capture")?;
         let payload_val = astgen_expr(gctx, arg_idx, field_ty)?;
         let pf_ptr = gctx.ctx.type_pool.intern_ptr_single(field_ty);
@@ -4925,13 +4853,12 @@ fn astgen_type_method_call(
     n: &AstNode,
     dest_ptr: JirRef,
 ) -> Result<JirRef, String> {
-    // The receiver type stays LITERAL (the C++ astgenTypeMethodCall reads
-    // `n.lhs` directly and never substitutes it): a generic receiver inside an
-    // instantiated body (`Vec(T).empty()`) keeps `Vec(T)`, so the AddrOf
-    // receiver interns the literal `*Vec(T)` GenericCall in the oracle's
-    // TypePool order. Resolution applies the active subst internally
-    // (resolve_generic_call reads current_subst), so `Vec(T)` still resolves to
-    // the right monomorph.
+    // The receiver type stays LITERAL (never substituted here): a generic
+    // receiver inside an instantiated body (`Vec(T).empty()`) keeps `Vec(T)`,
+    // so the AddrOf receiver interns the literal `*Vec(T)` GenericCall in the
+    // reference TypePool order. Resolution applies the active subst
+    // internally (resolve_generic_call reads current_subst), so `Vec(T)`
+    // still resolves to the right monomorph.
     let recv_ty = TypeIdx::new(n.lhs);
     let extra = n.rhs;
     let method_name_id = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra));
@@ -4959,11 +4886,11 @@ fn astgen_type_method_call(
         .struct_name_of(recv_ty)
         .ok_or_else(|| format!("astgen: `{method_name}` receiver is not a struct/enum"))?;
     let qualified = format!("{recv_name}.{method_name}");
-    // Intern the qualified callee name BEFORE lowering args (the C++
-    // astgenTypeMethodCall interns it at the head, ahead of the arg loop). When
-    // an arg fails to lower — e.g. `Box(Counter).init(self.ptr[0].clone())` in
-    // Box(T).clone, where `Counter` has no `clone` — the callee name has already
-    // landed in the string pool, matching the oracle's eager nested-arg order.
+    // Intern the qualified callee name BEFORE lowering args. When an arg
+    // fails to lower — e.g. `Box(Counter).init(self.ptr[0].clone())` in
+    // Box(T).clone, where `Counter` has no `clone` — the callee name has
+    // already landed in the string pool, keeping the pool's eager
+    // nested-arg order.
     gctx.ctx.string_pool.intern_str(&qualified);
     let Some(method) = gctx.ctx.get_function_ast(&qualified) else {
         return report_method_miss(gctx, &qualified);
@@ -5194,7 +5121,6 @@ fn astgen_at_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
                 },
             ))
         }
-        // Recoverable (the C++ astgen.cpp:5574).
         other => Ok(recover_here(
             gctx,
             format!("unknown intrinsic `@{other}`"),
@@ -5220,7 +5146,7 @@ struct SwitchCase {
 }
 
 /// Peer-resolve two arm-tail types: widen the narrower int / float, or `NONE`
-/// when they can't unify (the C++ `peerResolveType`).
+/// when they can't unify.
 fn peer_resolve_type(a: TypeIdx, b: TypeIdx, tp: &TypePool) -> TypeIdx {
     if a.is_none() {
         return b;
@@ -5341,7 +5267,7 @@ fn collect_switch_cases(
             let has_bindings = p.flags & 1 != 0;
             let infer_receiver = p.flags & 4 != 0;
             // A bare-identifier const pattern (`A` naming `const A = 10`) folds
-            // the const to a Switch case value (the C++ collectSwitchCases).
+            // the const to a Switch case value.
             if !scrut_is_enum && infer_receiver && !has_bindings {
                 let cname = str_at(gctx, p.rhs);
                 let bm = gctx.ctx.current_body_module();
@@ -5413,9 +5339,8 @@ fn collect_switch_cases(
 }
 
 /// Compare `scrut` against one pattern, branching to `arm_block` on match and
-/// `next_block` otherwise (the C++ `astgenPatternCompare`). Handles PatLit,
-/// PatRange, PatOr, PatEnumVariant (with payload-binding extraction into
-/// `out_bindings`), and PatWildcard. Module-const patterns are deferred.
+/// `next_block` otherwise. Handles PatLit, PatRange, PatOr, PatEnumVariant
+/// (with payload-binding extraction into `out_bindings`), and PatWildcard.
 fn astgen_pattern_compare(
     gctx: &mut AstGenCtx,
     pat_idx: NodeIdx,
@@ -5594,7 +5519,7 @@ fn astgen_pattern_compare_enum(
         Some(ref n) if gctx.ctx.is_enum_name_registered(n) => n.clone(),
         _ => {
             // Const pattern (bare ident naming a module const): compare the
-            // scrutinee against the const's value (the C++ astgenPatternCompare).
+            // scrutinee against the const's value.
             if infer_receiver && !has_bindings {
                 let cname = str_at(gctx, variant_name_id);
                 let bm = gctx.ctx.current_body_module();
@@ -5822,9 +5747,8 @@ fn astgen_match(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Result<
         gctx.ctx.enum_name_of(scrut_ty).is_some() && gctx.ctx.type_needs_drop(scrut_ty);
     let mut scrut_owned = NO_JIR_REF;
     if match_owns {
-        // Matching a drop-bearing field extracted out of an aggregate would leave
-        // the aggregate's glue to re-drop it — reject (the C++
-        // rejectDropBearingFieldExtract, astgen.cpp:4175).
+        // Matching a drop-bearing field extracted out of an aggregate would
+        // leave the aggregate's glue to re-drop it — reject.
         reject_drop_bearing_field_extract(gctx, scrut_idx, scrut_ty, "consume")?;
         consume_moved_variable(gctx, scrut_idx);
         scrut_owned = emit_alloca_hoisted(
@@ -6157,8 +6081,7 @@ fn astgen_array_lit(
                 .get_extra(ExtraIdx::new(elems_extra + 1 + i)),
         );
         // Capturing a drop-bearing field extracted out of an aggregate into an
-        // array element is rejected (the C++ rejectDropBearingFieldExtract,
-        // astgen.cpp:1989).
+        // array element is rejected.
         reject_drop_bearing_field_extract(gctx, e, elem_ty, "capture")?;
         let r = astgen_expr(gctx, e, elem_ty)?;
         consume_moved_variable(gctx, e);
@@ -6188,8 +6111,7 @@ fn astgen_array_lit(
 
 /// Lower an `ArrayRepeat` (`[expr; N]`). A constant zero / byte fill lowers to a
 /// single `MemSet`; everything else expands to an N-copy `ArrayLit`. Drop-
-/// bearing element types are rejected (N owners of one value). Non-literal
-/// counts (which need the comptime folder) are deferred.
+/// bearing element types are rejected (N owners of one value).
 fn astgen_array_repeat(
     gctx: &mut AstGenCtx,
     n: &AstNode,
@@ -6321,8 +6243,7 @@ fn container_index_recv(
     let Some(method) = gctx.ctx.get_function_ast(&qualified) else {
         // `at`/`setAt` may be a WITHDRAWN conditional method for this
         // instantiation (e.g. Vec(T) where T isn't cloneable): replay the
-        // reason instead of the generic index error (the C++ astgen.cpp:1598,
-        // 2699).
+        // reason instead of the generic index error.
         if gctx.ctx.get_withdrawn_method(&qualified).is_some() {
             report_method_miss(gctx, &qualified)?;
         }
@@ -6336,9 +6257,9 @@ fn container_index_recv(
         .first()
         .map(|p| p.mode)
         .unwrap_or(jam_core::param_mode::ParamMode::Let);
-    // The receiver via the lvalue path (the C++ `astgenLvalue`): a Variable base's
-    // storage pointer is just its alloca ref — no extra `AddrOf`. ByPointer self
-    // takes that pointer; ByValue self loads through it.
+    // The receiver via the lvalue path: a Variable base's storage pointer is
+    // just its alloca ref — no extra `AddrOf`. ByPointer self takes that
+    // pointer; ByValue self loads through it.
     let (slot_ptr, _) = astgen_lvalue(gctx, base_idx)?;
     let recv = if classify_param(self_mode, inst_ty, gctx.ctx)?.kind == ParamAbiKind::ByPointer {
         slot_ptr
@@ -6356,9 +6277,9 @@ fn container_index_recv(
     Ok(Some((recv, method)))
 }
 
-/// Lower a container index expression the way the oracle's index-method dispatch
-/// does: at its natural `u64` width, then `Trunc` to the method's index-param type
-/// (typically `u32`). Matches the `Int(u64)`+`Trunc` the oracle emits.
+/// Lower a container index expression at its natural `u64` width, then
+/// `Trunc` to the method's index-param type (typically `u32`) — the
+/// `Int(u64)`+`Trunc` shape the reference output expects.
 fn lower_index_arg(
     gctx: &mut AstGenCtx,
     idx_idx: NodeIdx,
@@ -6370,8 +6291,9 @@ fn lower_index_arg(
 
 /// Narrow an already-lowered `u64` index to the index-method's param type (a
 /// `Trunc` to the typical `u32`; a no-op at `u64`). Kept separate from
-/// `lower_index_arg` so the `setAt` dispatch can lower the value BETWEEN the index
-/// and this narrowing, matching the oracle's emitStructCfnDispatch order.
+/// `lower_index_arg` so the `setAt` dispatch can lower the value BETWEEN the
+/// index and this narrowing — that emission order must hold for the
+/// reference output.
 fn narrow_index(gctx: &mut AstGenCtx, idx_u64: JirRef, param_ty: TypeIdx) -> JirRef {
     if param_ty == builtin::U64 {
         return idx_u64;
@@ -6455,17 +6377,9 @@ fn astgen_index(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     ))
 }
 
-/// Lower a `MemberAccess` (`lhs`=base, `rhs`=member StringIdx) in value
-/// position. An addressable base reads through a `FieldAddr`/`BitCast` + `Load`
-/// (no whole-aggregate value load); a value base uses `ExtractValue` (slice
-/// `.ptr`/`.len`), a spill+`Load` (union), or `FieldAccess` (struct).
-///
-/// Deferred: enum-variant constructor references (`Color.Red`) — they fall
-/// through to the lvalue/value path and surface as an unknown-variable error.
-/// Lower a slice expression `base[a..b]` (the C++ `astgenSlice`): the base is a
-/// many-item pointer; emit `IndexAddr(base, a)` for the data pointer and `b - a`
-/// (u64) for the length, then a `MakeSlice` `{ptr, len}` aggregate. Implemented
-/// wired into astgen_expr dispatch.
+/// Lower a slice expression `base[a..b]`: the base is a many-item pointer;
+/// emit `IndexAddr(base, a)` for the data pointer and `b - a` (u64) for the
+/// length, then a `MakeSlice` `{ptr, len}` aggregate.
 fn astgen_slice(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     let base_idx = NodeIdx::new(n.lhs);
     let ex = n.rhs;
@@ -6475,7 +6389,6 @@ fn astgen_slice(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     let base = astgen_expr(gctx, base_idx, TypeIdx::NONE)?;
     let bk = gctx.ctx.type_pool.get(gctx.jfn.get_inst(base).ty);
     if bk.kind != TypeKind::PtrMany && bk.kind != TypeKind::PtrSingle {
-        // Recoverable (the C++ astgen.cpp:2742).
         return Ok(recover_here(
             gctx,
             "slice expression `base[a..b]` needs a many-item pointer base".to_string(),
@@ -6618,14 +6531,12 @@ fn astgen_member_access(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Str
     // Enum-variant constructor reference (`Color.Red`): a `Variable` base whose
     // name is a registered enum (and isn't a runtime local). Unit-only enums
     // lower to the tag i8 retagged to the enum type; a payloaded enum's unit
-    // variant builds a `{tag, undef}` StructLit. (Handle-qualified chains —
-    // `a.Status.Ok` — land with module resolution.)
+    // variant builds a `{tag, undef}` StructLit.
     if base_tag == AstTag::Variable {
         let base_name = str_at(gctx, base_node.lhs);
-        // Mirror the C++ `astgenMemberAccess` (codegen.cpp:2053-2055, 2094): a
-        // pure-Variable base ALWAYS interns its name as a `Named` enum probe,
-        // even when the name is a runtime local — `self.field` interns
-        // `Named("self")` before the field projection. The earlier `!locals`
+        // A pure-Variable base ALWAYS interns its name as a `Named` enum
+        // probe, even when the name is a runtime local — `self.field` interns
+        // `Named("self")` before the field projection. An earlier `!locals`
         // guard skipped this, leaving the type pool one `Named` short and
         // shifting every later GenericCall's TypeIdx (the `Vec__T<idx>`
         // monomorph spelling read 4 too low).
@@ -6774,7 +6685,6 @@ fn astgen_member_access(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Str
         if let Some(fields) = gctx.ctx.struct_fields(base_leaf) {
             let sname = gctx.ctx.struct_name_of(base_leaf).unwrap_or_default();
             let Some(idx) = fields.iter().position(|(nm, _)| *nm == member) else {
-                // Recoverable (the C++ astgen.cpp:2172).
                 return Ok(recover_here(
                     gctx,
                     format!("unknown field `{member}` on `{sname}`"),
@@ -6883,7 +6793,6 @@ fn astgen_member_access(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Str
         .ok_or_else(|| "astgen: cannot access field of non-struct type".to_string())?;
     let sname = gctx.ctx.struct_name_of(base_ty).unwrap_or_default();
     let Some(idx) = fields.iter().position(|(nm, _)| *nm == member) else {
-        // Recoverable (the C++ astgen.cpp:2258).
         return Ok(recover_here(
             gctx,
             format!("unknown field `{member}` on `{sname}`"),
@@ -6908,9 +6817,6 @@ fn astgen_member_access(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Str
 /// by permuting the named field values into positional order (jir_codegen emits
 /// the InsertValue chain). A union literal lists exactly one field: alloca the
 /// union, store the field value into the slot, load the whole union back.
-///
-/// Deferred: the place-into-destination form (`astgenStructLitInto`) and
-/// drop/move tracking of captured fields.
 fn astgen_struct_lit(
     gctx: &mut AstGenCtx,
     n: &AstNode,
@@ -7001,25 +6907,23 @@ fn astgen_struct_lit(
         let idx = match fields.iter().position(|(nm, _)| *nm == field_name) {
             Some(p) => p,
             None => {
-                // Recoverable (the C++ astgen.cpp:1749): record the bad field
-                // name and skip it so other malformed fields in the same
-                // literal still get reported in this pass.
+                // Record the bad field name and skip it so other malformed
+                // fields in the same literal still get reported in this pass.
                 append_error_here(gctx, format!("unknown struct field `{field_name}`"));
                 continue;
             }
         };
         let expected_field = fields[idx].1;
-        // Capturing a drop-bearing field extracted out of an aggregate would leave
-        // the aggregate's glue to re-drop it — reject (the C++
-        // rejectDropBearingFieldExtract, astgen.cpp:1754).
+        // Capturing a drop-bearing field extracted out of an aggregate would
+        // leave the aggregate's glue to re-drop it — reject.
         reject_drop_bearing_field_extract(gctx, expr_idx, expected_field, "capture")?;
         let mut field_val = astgen_expr(gctx, expr_idx, expected_field)?;
         // Struct-literal field capture MOVES a bare drop-bearing local: the
         // field now owns it, so its scope-exit drop is suppressed.
         consume_moved_variable(gctx, expr_idx);
-        // Silent int→float widening (matches the legacy struct codegen): an
-        // integer literal in a float field settles via SIToFP / UIToFP rather
-        // than feeding an int into the float slot of the InsertValue chain.
+        // Silent int→float widening: an integer literal in a float field
+        // settles via SIToFP / UIToFP rather than feeding an int into the
+        // float slot of the InsertValue chain.
         let vt = gctx.jfn.get_inst(field_val).ty;
         if vt != expected_field && !vt.is_none() {
             let fk_kind = gctx.ctx.type_pool.get(expected_field).kind;
@@ -7086,10 +6990,10 @@ fn emit_sret_arg(gctx: &mut AstGenCtx, ret_ty: TypeIdx) -> JirRef {
 
 /// Try to lower `expr_idx` directly into `dest_ptr`, returning `true` when the
 /// destination was written (no SSA value remains for the caller to bind).
-/// Byref producers — `StructLit` (per-field stores) and sret `Call` (forwarded
-/// sret slot) — place in-line; everything else returns `false` so the caller
-/// takes the value-compile + Store path. (ArrayLit/TypeMethodCall place paths
-/// land with those handlers.)
+/// Byref producers — `StructLit` (per-field stores), sret `Call`/
+/// `TypeMethodCall` (forwarded sret slot), and `ArrayLit` (per-element
+/// writes) — place in-line; everything else returns `false` so the caller
+/// takes the value-compile + Store path.
 fn astgen_expr_into_ptr(
     gctx: &mut AstGenCtx,
     expr_idx: NodeIdx,
@@ -7259,7 +7163,6 @@ fn astgen_struct_lit_into(
                 has_field[p] = true;
             }
             None => {
-                // Recoverable (the C++ astgen.cpp:1854).
                 append_error_here(gctx, format!("unknown struct field `{field_name}`"));
             }
         }
@@ -7275,8 +7178,7 @@ fn astgen_struct_lit_into(
         let expected_field = fields[i].1;
         let expr_idx = NodeIdx::new(expr_by_idx[i]);
         // Field capture (place path) extracting a drop-bearing field out of an
-        // aggregate is rejected (the C++ rejectDropBearingFieldExtract,
-        // astgen.cpp:1868).
+        // aggregate is rejected.
         reject_drop_bearing_field_extract(gctx, expr_idx, expected_field, "capture")?;
         let ptr_ty = gctx.ctx.type_pool.intern_ptr_single(expected_field);
         let field_ptr = emit(
@@ -7344,14 +7246,14 @@ fn astgen_return(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     if n.lhs != 0 {
         let val_idx = NodeIdx::new(n.lhs);
         let ret_ty = gctx.jfn.return_type;
-        // `return h.c` extracting a drop-bearing field out of an owned aggregate
-        // is rejected — the caller's copy and the aggregate's glue would both drop
-        // the payload (the C++ rejectDropBearingFieldExtract, astgen.cpp:1030).
+        // `return h.c` extracting a drop-bearing field out of an owned
+        // aggregate is rejected — the caller's copy and the aggregate's glue
+        // would both drop the payload.
         reject_drop_bearing_field_extract(gctx, val_idx, ret_ty, "return")?;
         // sret (indirect) returns place the value directly into the return slot:
         // byref producers (StructLit / sret Call) write through `SretArg`, and
-        // the function returns void. The `SretArg` is emitted eagerly (matching
-        // the C++ argument evaluation) even when the place path declines.
+        // the function returns void. The `SretArg` is emitted eagerly, even
+        // when the place path declines.
         let sret_fn =
             !ret_ty.is_none() && classify_return(ret_ty, gctx.ctx)?.kind == ReturnAbiKind::Indirect;
         if sret_fn {
@@ -7371,14 +7273,9 @@ fn astgen_return(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
         val_ref = astgen_expr(gctx, val_idx, ret_ty)?;
         // Reconcile the returned value's type with the declared return type
         // (resolve-then-compare, like the var-decl declared-vs-init check).
-        // The C++ oracle has NO check here and ships LLVM-invalid IR for
-        // `fn f() i32 { var x = 1; return x; }` (the literal infers at
-        // smallest fit, the load returns at the slot's width, and codegen
-        // emits `ret i8` from an i32 function). We deliberately diverge:
-        // a LOSSLESS narrower int widens (ZExt/SExt by the value's own
-        // signedness — the semantics the invalid narrow `ret` accidentally
-        // approximated), and anything lossy (narrowing, signed→unsigned) is
-        // a hard error.
+        // A LOSSLESS narrower int widens (ZExt/SExt by the value's own
+        // signedness); anything lossy (narrowing, signed→unsigned) is a hard
+        // error.
         let val_ty = gctx.jfn.get_inst(val_ref).ty;
         if !ret_ty.is_none() && !val_ty.is_none() {
             let want = resolve_for_cmp(gctx.ctx, ret_ty);
@@ -7391,9 +7288,9 @@ fn astgen_return(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
                 a_ptr && b_ptr && ka.a == kb.a
             };
             // A unit-only enum lowers to its bare u8 tag, and the enum→int
-            // cast returns that tag WITHOUT retagging (both here and in the
-            // C++), so `return p as u8;` carries the enum TypeIdx at u8's
-            // representation. Treat the pair as identical.
+            // cast returns that tag WITHOUT retagging, so `return p as u8;`
+            // carries the enum TypeIdx at u8's representation. Treat the pair
+            // as identical.
             let unit_enum_as_u8 = |t: TypeIdx, other: TypeIdx| -> bool {
                 other == builtin::U8
                     && gctx.ctx.enum_name_of(t).is_some()
@@ -7495,10 +7392,6 @@ fn emit_cond_br(gctx: &mut AstGenCtx, cond: JirRef, then_b: JirBlockRef, else_b:
 /// Lower an `if`/`else` statement. Builds then/else/merge blocks; `else` is
 /// optional. After both arms, the merge block becomes the insertion point —
 /// dead (zero predecessors) if both arms diverged, which the verifier tolerates.
-///
-/// Deferred: the `comp if` (flags bit 0) conditional-compilation path, per-arm
-/// drop scopes, and the `runtimeCondDepth` bookkeeping (only observable through
-/// comp-binding mutation rules, which error today).
 fn astgen_if(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     let cond_idx = NodeIdx::new(n.lhs);
     let extra = n.rhs;
@@ -7507,8 +7400,8 @@ fn astgen_if(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
 
     // `comp if`: fold the condition at compile time and lower ONLY the taken
     // branch inline (the dead branch is never analyzed — it may reference
-    // symbols that don't exist on this target). Code after the `comp if` goes in
-    // a fresh `compifend` block, matching the oracle.
+    // symbols that don't exist on this target). Code after the `comp if` goes
+    // in a fresh `compifend` block.
     if n.flags & 1 != 0 {
         let taken = match gctx.ctx.fold_comptime_expr_in(cond_idx, &gctx.comp_scope) {
             ComptimeValue::Bool(b) => b,
@@ -7528,9 +7421,9 @@ fn astgen_if(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
         }
         pop_drop_scope_emitting(gctx);
         // Only open a continuation block if the arm DIVERGED (return/break/
-        // continue): statements after the comp-if would otherwise append after the
-        // terminator. A non-terminating arm just continues in the current block —
-        // no `compifend`, no branch (matches the C++ astgen.cpp:3382-3385).
+        // continue): statements after the comp-if would otherwise append after
+        // the terminator. A non-terminating arm just continues in the current
+        // block — no `compifend`, no branch.
         if block_has_terminator(gctx) {
             gctx.current_block = gctx.jfn.push_block("compifend");
         }
@@ -7991,8 +7884,8 @@ pub fn astgen_body_into(
         recovered: Vec::new(),
     };
     // Seed the root comp frame with any active comp-param substitutions, so a
-    // body reference to a comp param (`k`) folds to the call-site constant (the
-    // C++ `seedComptimeScope` tail). No-op for ordinary (non-comp) bodies.
+    // body reference to a comp param (`k`) folds to the call-site constant.
+    // No-op for ordinary (non-comp) bodies.
     ctx.seed_comp_subst_into(&mut gctx.comp_scope);
     // The function-body drop scope (frame 0). Params register into it so the
     // reverse drop walk fires body locals first, params last.
@@ -8004,8 +7897,8 @@ pub fn astgen_body_into(
         // Requalify a bare imported-module type (`Counter`→`mod_x.Counter`) so
         // the ABI classifier + the Param inst's type match the registry.
         let bm = gctx.ctx.current_body_module();
-        // requalify_type now qualifies a GenericCall callee+args itself, so the
-        // Param/Alloca/Load instruction types match the oracle's qualified spelling.
+        // requalify_type qualifies a GenericCall callee+args itself, so the
+        // Param/Alloca/Load instruction types carry the qualified spelling.
         let mut pty = gctx.ctx.requalify_type(p.ty, &bm);
         // An `[expr]T` param resolves its comptime length for the Param inst +
         // ABI (the signature header keeps the unresolved ArrayExpr spelling).
@@ -8068,10 +7961,9 @@ pub fn astgen_body_into(
     }
 
     // Walk the body statements (statements dispatch through astgen_expr too).
-    // A hard error (`failHere`/`failNode` analogue) propagates out, but any
-    // recoverable diagnostics already collected must surface first — the C++
-    // pushes both to the shared Diagnostics, so the hard one trails the
-    // recovered ones in source order. `finish` folds the two streams together.
+    // A hard error propagates out, but any recoverable diagnostics already
+    // collected must surface first — the hard one trails the recovered ones
+    // in source order. `finish` folds the two streams together.
     fn finish(gctx: &AstGenCtx, hard: Option<String>) -> Result<(), String> {
         let mut all: Vec<String> = gctx.recovered.clone();
         if let Some(h) = hard {
@@ -8112,8 +8004,8 @@ pub fn astgen_body_into(
                 },
             );
         } else if fn_ast.return_type == builtin::NORETURN {
-            // The C++ `failHere`s (anchored at the last-entered node), so the
-            // diagnostic carries the `file:line: error:` prefix.
+            // Anchored at the last-entered node so the diagnostic carries the
+            // `file:line: error:` prefix.
             let msg = format!(
                 "fn `{}` is declared `noreturn` but its body falls through without diverging",
                 fn_ast.name
@@ -8121,7 +8013,6 @@ pub fn astgen_body_into(
             let hard = fail_node(&gctx, gctx.current_node, &msg);
             return finish(&gctx, Some(hard));
         } else if !fn_ast.return_type.is_none() {
-            // C++ body: "has non-void return type" (no "a"), `failHere`-anchored.
             let msg = format!(
                 "fn `{}` has non-void return type but a path reaches the \
                  function end without returning a value",
@@ -8159,20 +8050,20 @@ pub fn astgen_function(
 /// Pass-2 of generic instantiation (wired into `CodegenContext` via
 /// `set_method_instantiator`): lower each instantiated method's body under the
 /// active substitution so call-site method names + recursive sub-instantiations
-/// intern in the oracle's order. Bodies are NOT dumped — they run purely for the
-/// string-pool side effects. A conditional method (everything but `drop`) whose
-/// body fails to compile for these type args is WITHDRAWN (the C++ `withdraw`);
-/// strings its partial lowering already interned survive, matching the oracle.
+/// intern in the reference string-pool order. Bodies are NOT dumped — they run
+/// purely for the string-pool side effects. A conditional method (everything
+/// but `drop`) whose body fails to compile for these type args is WITHDRAWN;
+/// strings its partial lowering already interned survive in the pool.
 pub fn instantiate_methods(
     ctx: &CodegenContext,
     clones: &[FunctionAST],
     body_subst: &std::collections::HashMap<String, TypeIdx>,
 ) -> Result<(), String> {
     ctx.push_subst(body_subst.clone());
-    // Pass-1: JIR metadata + LLVM prototype for every method (the C++ two-pass —
-    // all prototypes declared before any body so cross-method LLVM calls in
-    // Pass-2 resolve). jir_declare_prototype does not touch the string pool, so
-    // the --emit-jir dump is unaffected.
+    // Pass-1: JIR metadata + LLVM prototype for every method (all prototypes
+    // declared before any body so cross-method LLVM calls in Pass-2 resolve).
+    // jir_declare_prototype does not touch the string pool, so the --emit-jir
+    // dump is unaffected.
     let mut built: Vec<(JirFunction, usize)> = Vec::with_capacity(clones.len());
     for (i, clone) in clones.iter().enumerate() {
         if clone.is_extern {
@@ -8182,21 +8073,16 @@ pub fn instantiate_methods(
         let _ = jir_declare_prototype(&jfn, ctx);
         built.push((jfn, i));
     }
-    // Pass-2: JIR body + LLVM body. A non-`drop` method whose body fails to lower
-    // is the C++ conditional WITHDRAWAL; until clone-synthesis + nested-generic
-    // intern order are byte-exact, DEFER the whole instantiation on the first
-    // such method rather than ship a divergence. The instantiated LLVM body
-    // (jir_define_body) is what makes `--emit-ir` carry the method definitions;
-    // it's a no-op on the --emit-jir text dump.
-    // Withdraw-and-continue (the faithful C++ behavior): a non-`drop` method whose
-    // body fails to lower is a CONDITIONAL WITHDRAWAL — drop it from the registry
-    // and keep going; the rest of the instantiation still succeeds.
+    // Pass-2: JIR body + LLVM body. A non-`drop` method whose body fails to
+    // lower is a CONDITIONAL WITHDRAWAL — drop it from the registry and keep
+    // going; the rest of the instantiation still succeeds. The instantiated
+    // LLVM body (jir_define_body) is what makes `--emit-ir` carry the method
+    // definitions; it's a no-op on the --emit-jir text dump.
     for (jfn, i) in &mut built {
         let clone = &clones[*i];
         let is_drop = clone.name.ends_with(".drop");
-        // The recorded reason is the bare diagnostic message (the C++ takes
-        // `diagnostics()[diagMark].message`), so strip the `file:line: error: `
-        // anchor a propagated astgen error carries.
+        // The recorded reason is the bare diagnostic message, so strip the
+        // `file:line: error: ` anchor a propagated astgen error carries.
         let bare_reason = |e: &str| -> String {
             match e.split_once(": error: ") {
                 Some((_, msg)) => msg.to_string(),
@@ -8204,8 +8090,8 @@ pub fn instantiate_methods(
             }
         };
         // (1) Body that fails to lower for these type args is a CONDITIONAL
-        // WITHDRAWAL (the C++ `withdraw`): drop it from the registry, record
-        // the reason for call-site replay, skip its body, keep going.
+        // WITHDRAWAL: drop it from the registry, record the reason for
+        // call-site replay, skip its body, keep going.
         if let Err(e) = astgen_body_into(jfn, clone, ctx)
             && !is_drop
         {
@@ -8213,13 +8099,12 @@ pub fn instantiate_methods(
             ctx.record_withdrawn_method(&clone.name, bare_reason(&e));
             continue;
         }
-        // (2) Move/ownership WITHDRAWAL: even when the body lowers, a non-`drop`
-        // method whose move-analysis reports a diagnostic under these
-        // (substituted) type args is withdrawn to a bare `declare` — exactly the
-        // oracle's `init_analysis` -> `withdraw` for e.g. `Vec(T).filled`, which
-        // moves a by-value drop-bearing parameter in a loop. The subst pushed
-        // above is active, so a body-local `Self`/`Vec(T)` type resolves to its
-        // drop-bearing monomorph here.
+        // (2) Move/ownership WITHDRAWAL: even when the body lowers, a
+        // non-`drop` method whose move-analysis reports a diagnostic under
+        // these (substituted) type args is withdrawn to a bare `declare` —
+        // e.g. `Vec(T).filled`, which moves a by-value drop-bearing parameter
+        // in a loop. The subst pushed above is active, so a body-local
+        // `Self`/`Vec(T)` type resolves to its drop-bearing monomorph here.
         if !is_drop {
             let adiags = crate::init_analysis::analyze(clone, ctx);
             if let Some(first) = adiags.first() {
@@ -8228,12 +8113,11 @@ pub fn instantiate_methods(
                 continue;
             }
         }
-        // (3) Structural JIR verification (the C++ verifyJirFunction at
-        // instantiation, codegen.cpp:1846-1864): a malformed instantiated body
-        // (bad dispatch, missing terminator, OOB ref, cross-block use-before-def)
+        // (3) Structural JIR verification: a malformed instantiated body (bad
+        // dispatch, missing terminator, OOB ref, cross-block use-before-def)
         // is withdrawn for non-`drop` methods, the same as a move-analysis
-        // failure. The resolver resolves the clone's GenericCall / ArrayExpr type
-        // refs against the active substitution.
+        // failure. The resolver resolves the clone's GenericCall / ArrayExpr
+        // type refs against the active substitution.
         let resolver = |t: TypeIdx| -> TypeIdx {
             let k = ctx.type_pool.get(t);
             if k.kind == TypeKind::GenericCall {
@@ -8451,8 +8335,7 @@ mod tests {
     }
 
     /// Recoverable diagnostics accumulate: one pass over a body reports every
-    /// independent error (the C++ recoverHere/appendErrorHere contract), not
-    /// just the first.
+    /// independent error, not just the first.
     #[test]
     fn multiple_errors_report_in_one_pass() {
         let err = astgen_first_fn("fn f() { foo1(); foo2(); @nosuch(i32); }").unwrap_err();
@@ -8503,10 +8386,8 @@ mod tests {
         );
     }
 
-    /// Returned-value vs declared-return-type reconciliation (deliberate
-    /// divergence from the C++ oracle, which has no check and emits
-    /// LLVM-invalid `ret i8` from an i32 function for the inferred-literal
-    /// case): lossless narrower ints widen, lossy mismatches error.
+    /// Returned-value vs declared-return-type reconciliation: lossless
+    /// narrower ints widen, lossy mismatches error.
     #[test]
     fn return_type_mismatch_widens_or_rejects() {
         // `var x = 1` infers u8 (smallest fit); returning it at i32 now
@@ -8534,8 +8415,7 @@ mod tests {
     }
 
     /// Same-scope redeclaration is rejected; inner-block shadowing, sibling
-    /// blocks reusing a name, and param shadowing stay legal (the C++
-    /// `localScopes` check, astgen.cpp:1149).
+    /// blocks reusing a name, and param shadowing stay legal.
     #[test]
     fn same_scope_redeclaration_rejected() {
         let err = astgen_first_fn("fn f() { const a = 1; var a = 2; }").unwrap_err();
@@ -8565,9 +8445,8 @@ mod tests {
         lower_first_fn("fn h(a: i32) i32 { var a: i32 = 2; return a; }");
     }
 
-    /// The comp-binding assignment rules (the C++ astgenAssign comp path,
-    /// astgen.cpp:1510-1565): const-ness, runtime-conditional depth, kind
-    /// stability, and int width/signedness fit.
+    /// The comp-binding assignment rules: const-ness, runtime-conditional
+    /// depth, kind stability, and int width/signedness fit.
     #[test]
     fn comp_binding_assignment_rules() {
         // Legal reassignment at the declaration depth lowers end to end.
@@ -8603,9 +8482,9 @@ mod tests {
     }
 
     /// `materialize_comptime_value` chases the expected type through alias /
-    /// generic links (the C++ resolveScalarExpected at astgen.cpp:794): a comp
-    /// value flowing into an alias-typed slot gets the alias target's width and
-    /// fit-check, not a pass-through at its natural width.
+    /// generic links: a comp value flowing into an alias-typed slot gets the
+    /// alias target's width and fit-check, not a pass-through at its natural
+    /// width.
     #[test]
     fn comp_value_into_alias_typed_slot_resolves_and_fit_checks() {
         let astgen_with_byte_alias = |src: &str| {
@@ -8816,8 +8695,8 @@ mod tests {
         assert_eq!(sym, "T.drop");
     }
 
-    /// `@emitPutByte` in a cfn replays as `dprintf(fd, "%c", byte)` at the call
-    /// site (the C++ handlePutByte, astgen.cpp:6276).
+    /// `@emitPutByte` in a cfn replays as `dprintf(fd, "%c", byte)` at the
+    /// call site.
     #[test]
     fn cfn_emit_put_byte_replays_dprintf() {
         let owner = Context::new();
@@ -8880,9 +8759,9 @@ mod tests {
         assert!(lf.verify(), "LLVM verify failed");
     }
 
-    /// A conditional method withdrawn for an instantiation replays the recorded
-    /// reason at the call site (the C++ `reportMethodMiss`), both for a dotted
-    /// method call and for the `v[i]` -> `at` index sugar.
+    /// A conditional method withdrawn for an instantiation replays the
+    /// recorded reason at the call site, both for a dotted method call and
+    /// for the `v[i]` -> `at` index sugar.
     #[test]
     fn withdrawn_method_replays_reason_at_call_site() {
         let run = |src: &str, withdrawn: &str| -> Result<(), String> {

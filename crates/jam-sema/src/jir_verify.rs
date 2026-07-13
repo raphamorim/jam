@@ -5,30 +5,10 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Structural verification of a finished [`JirFunction`]. Catches drift the
-//! codegen would otherwise hit as a silent miscompile or a late LLVM-verifier
-//! failure. Run after AstGen finishes a function; returns an empty vector when
-//! the function is well-formed, otherwise human-readable diagnostics (with
-//! source-line hints where available). Ported from `src/jir_verify.{h,cpp}`.
-//!
-//! Checks:
-//!   - Every non-entry block holds no `Alloca` (allocas live in the entry block
-//!     only — `emitAllocaHoisted` enforces this at astgen time).
-//!   - Every block ends with exactly one terminator (Br/CondBr/Switch/Ret/
-//!     Unreachable) as its last instruction; empty blocks are rejected.
-//!   - Every `JirRef` operand points into `insts` (1..len) and was defined in an
-//!     earlier block (or earlier in the same block) — the def-before-use
-//!     invariant the codegen's instruction cache relies on. `NO_JIR_REF` is
-//!     allowed only where the slot is optional (e.g. `Ret`'s `a`).
-//!   - Every `JirBlockRef` (Br/CondBr/Switch targets) points within `blocks`.
-//!   - Every extra-pool slice (Call/CondBr/Switch/StructLit/ArrayLit) fits.
-//!   - Binary-op / comparison operands have structurally-agreeing types (when a
-//!     [`TypePool`] is supplied; opaque aggregate/pointer types bypass to avoid
-//!     false positives).
-//!
-//! The optional `resolver` maps a `TypeIdx` through generic-call resolution to
-//! its canonical concrete form (the C++ passes a function pointer + ctx; here a
-//! borrowed closure carries its own context).
+//! Structural verification of a finished [`JirFunction`]: entry-only allocas,
+//! exactly-one-terminator blocks, def-before-use operand refs, in-bounds
+//! block/extra refs, and binary-op operand type agreement. Run after AstGen;
+//! returns human-readable diagnostics (empty when the function is well-formed).
 
 use jam_core::diag::{Diagnostic, Severity, SrcLoc};
 use jam_core::index::{StringIdx, TypeIdx};
@@ -374,14 +354,10 @@ impl<'a> Verifier<'a> {
                 }
                 let arg_count = self.jfn.extra[inst.b as usize];
                 self.check_extra_slice(inst.b, 1 + arg_count as usize, r, "call-args");
-                // The C++ reads `extra[b + 1 + i]` unconditionally, relying on
-                // the `check_extra_slice` above to have fired for a malformed
-                // (overflowing) slice — but it still performs the OOB read,
-                // which is UB. Rust can't, so the per-element bounds guard here
-                // (and in CallIndirect / Switch / aggregate-lits below) avoids
-                // the panic. For well-formed input the slice always fits, so
-                // behaviour is identical; for malformed input the overflow
-                // diagnostic has already been emitted.
+                // If the slice overflows, `check_extra_slice` above has already
+                // diagnosed it; the per-element bounds guard here (and in
+                // CallIndirect / Switch / aggregate-lits below) just avoids an
+                // OOB panic on malformed input.
                 for i in 0..arg_count {
                     let idx = inst.b as usize + 1 + i as usize;
                     if idx < self.jfn.extra.len() {

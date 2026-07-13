@@ -7,12 +7,8 @@
 
 //! Target triple model — CPU/OS/ABI classification plus target-specific
 //! queries (pointer size, PIC/PIE requirements, libc, calling convention).
-//! Ported from `src/target.{h,cpp}`.
-//!
-//! The C++ builds a [`Target`] from an `llvm::Triple`; here the triple is
-//! parsed from its string form in pure Rust (the classification logic is
-//! normative platform behavior, identical on any host). Host detection is the
-//! driver's composition: `Target::from_triple_str(&jam_llvm::default_target_triple())`.
+//! Triples are parsed from their string form in pure Rust. Host detection is
+//! the driver's job: `Target::from_triple_str(&jam_llvm::default_target_triple())`.
 
 /// CPU architecture family.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -67,7 +63,7 @@ pub enum CallingConvention {
 }
 
 /// A parsed target triple: `arch-vendor-os-environment`. The default is all
-/// `Unknown` (mirrors the C++ default constructor).
+/// `Unknown`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Target {
     pub arch: Arch,
@@ -110,8 +106,7 @@ fn parse_abi(env: &str, os: Os) -> Abi {
         // musl, musleabi, musleabihf
         Abi::Musl
     } else if os == Os::Windows {
-        // Windows with no recognized environment -> MinGW (the C++
-        // `UnknownEnvironment` arm).
+        // Windows with no recognized environment -> MinGW.
         Abi::MinGw
     } else if os == Os::MacOs {
         Abi::None

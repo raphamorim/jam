@@ -7,10 +7,9 @@
 
 //! `jam_sema` — semantic analysis and lowering for the Jam compiler.
 //!
-//! Built bottom-up during the C++→Rust migration: the typed flat [`jir`]
-//! intermediate representation lands first (the spine that AstGen produces and
-//! codegen consumes), followed by ABI classification, AstGen, and the JIR
-//! verifier. Everything here sits above `jam_core` and `jam_syntax`.
+//! AstGen produces the typed flat [`jir`], codegen consumes it; ABI
+//! classification and the JIR verifier live here too. Sits above `jam_core`
+//! and `jam_syntax`.
 
 pub mod abi;
 pub mod analyzer;

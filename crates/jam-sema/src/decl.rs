@@ -7,23 +7,19 @@
 
 //! The declaration table — the per-compilation registry of every named
 //! top-level binding (functions, types, consts) from the main module and every
-//! imported module's `pub` items. Ported from `src/decl.{h,cpp}`.
+//! imported module's `pub` items.
 //!
 //! `Decl`s are held by index (`DeclIndex`) so references stay stable across the
 //! vector's reallocation. Index 0 is the sentinel (`DeclIndex::NONE`).
 //!
-//! ## Lifetime
-//!
 //! A `Decl` borrows AST nodes (`&'a FunctionAST`, …) and embeds a
-//! [`FnSignature`] whose `ParamAbi`/`ReturnAbi` borrow the LLVM context. The
-//! C++ keeps these as two independent borrows; here a single lifetime `'a`
-//! covers both, since the driver's `Context` and `ModuleAST` both outlive the
-//! table (the two borrows unify to the shorter at the call site).
+//! [`FnSignature`] whose `ParamAbi`/`ReturnAbi` borrow the LLVM context; one
+//! lifetime `'a` covers both, since the driver's `Context` and `ModuleAST` both
+//! outlive the table (the two borrows unify to the shorter at the call site).
 //!
-//! The mutation pattern matters for the analyzer port: the C++ `analyzeStruct`
-//! holds a `Decl&` across a recursive re-fetch that can reallocate `decls_`.
-//! The Rust analyzer must read by index, recurse, then write back by index —
-//! never hold a `&mut Decl` across a call that can `create` another decl.
+//! Analyzer mutation pattern: read by index, recurse, then write back by index —
+//! never hold a `&mut Decl` across a call that can `create` another decl (the
+//! vec can reallocate).
 
 use jam_core::index::{DeclIndex, TypeIdx};
 use jam_syntax::ast::{ConstDeclAST, EnumDeclAST, FunctionAST, StructDeclAST, UnionDeclAST};
@@ -303,9 +299,8 @@ mod tests {
         assert_eq!(t.get(s).analysis, DeclAnalysis::Complete);
         assert!(matches!(t.get(s).value, DeclValue::Type(_)));
     }
-    /// The C++ testFindByNameAndKindLandsOnRequestedKind: a function and a
-    /// struct may share a name; the kind-aware lookup walks past the first
-    /// registration to the requested kind.
+    /// A function and a struct may share a name; the kind-aware lookup walks
+    /// past the first registration to the requested kind.
     #[test]
     fn find_by_name_and_kind_disambiguates() {
         let mut t = DeclTable::new();
@@ -324,8 +319,7 @@ mod tests {
         );
     }
 
-    /// The C++ testSelfDependencyIgnored: self-loops never enter the graph, so
-    /// trace walks can't spin.
+    /// Self-loops never enter the graph, so trace walks can't spin.
     #[test]
     fn self_dependency_is_ignored() {
         let mut t = DeclTable::new();
@@ -335,8 +329,7 @@ mod tests {
         assert!(t.get(a).dependants.is_empty());
     }
 
-    /// The C++ testKNoDecCallsAreNoOps: a sentinel on either side is silently
-    /// ignored.
+    /// A sentinel on either side is silently ignored.
     #[test]
     fn sentinel_dependency_edges_are_noops() {
         let mut t = DeclTable::new();

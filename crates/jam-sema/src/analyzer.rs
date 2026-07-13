@@ -5,32 +5,19 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Demand-driven decl analysis. Ported from `src/analyzer.{h,cpp}`.
+//! Demand-driven decl analysis.
 //!
 //! Two state machines stack on the [`DeclTable`](crate::decl::DeclTable):
 //!   * `Decl.analysis` (`Unreferenced`/`InProgress`/`Complete`/…) — the
 //!     chokepoint at [`Analyzer::ensure_decl_analyzed`]. Re-entering an
 //!     `InProgress` decl is a dependency loop.
 //!   * `Struct/Enum/Union.status` — a separate body lifecycle, materialised on
-//!     demand by `resolve_type_fields_*` (the next increment).
+//!     demand by `resolve_type_fields_*`.
 //!
-//! ## Design
-//!
-//! Unlike the C++ (`Analyzer` holds `ctx&` + `DeclTable&` and the ctx has a
-//! back-reference for `get_llvm_type` → `ensure_struct_body`), this is a
-//! transient struct over `&mut CodegenContext` + `&mut DeclTable`. The analyzer
-//! drives its own dependency order, so `get_llvm_type` stays a pure `&self`
-//! reader (it returns the *named* struct handle; bodies are filled separately
-//! via `set_body`) — no bidirectional borrow, no merge.
-//!
-//! ## Scope of this increment
-//!
-//! The chokepoint + cycle detection + `analyze_function` (the `FnSignature`
-//! ABI cache) + the type-decl dispatch (each type resolves to its `Named`
-//! TypeIdx). The intricate `resolve_type_fields_{struct,enum,union}` body-fill
-//! — which materialises LLVM struct bodies and the enum/union layout math, and
-//! needs the driver's register pass to have created the named types — lands
-//! next.
+//! The analyzer is a transient struct over `&mut CodegenContext` +
+//! `&mut DeclTable` and drives its own dependency order, so `get_llvm_type`
+//! stays a pure `&self` reader (it returns the *named* struct handle; bodies
+//! are filled separately via `set_body`) — no bidirectional borrow.
 
 use jam_core::diag::{SrcLoc, Trace, TraceKind};
 use jam_core::index::{DeclIndex, StringIdx, TypeIdx};
@@ -40,7 +27,7 @@ use crate::abi::{classify_param, classify_return};
 use crate::codegen_context::CodegenContext;
 use crate::decl::{DeclAnalysis, DeclKind, DeclTable, DeclValue};
 
-/// Round `off` up to the next multiple of `align` (matches the C++ `alignUp`).
+/// Round `off` up to the next multiple of `align`.
 fn round_up(off: u64, align: u64) -> u64 {
     off.div_ceil(align) * align
 }
@@ -113,8 +100,8 @@ impl<'c, 'ctx> Analyzer<'c, 'ctx> {
         self.analysis_stack.pop();
 
         // Re-fetch by index — `analyze_decl` may have created new decls and
-        // reallocated the table (analyzer.cpp:108). Never hold a `Decl` borrow
-        // across the recursion.
+        // reallocated the table. Never hold a `Decl` borrow across the
+        // recursion.
         let again = self.decls.get_mut(idx);
         if again.analysis == DeclAnalysis::InProgress {
             // No terminal state set by the branch: default to Complete with the
@@ -188,8 +175,7 @@ impl<'c, 'ctx> Analyzer<'c, 'ctx> {
         DeclValue::Function(f)
     }
 
-    /// Resolve a type decl to its `Named` TypeIdx. (Body fill via
-    /// `resolve_type_fields_*` lands next; the decl is still usable as a type.)
+    /// Resolve a type decl to its `Named` TypeIdx.
     fn type_named_value(&mut self, idx: DeclIndex) -> DeclValue<'ctx> {
         let name = self.decls.get(idx).name.clone();
         let sid = self.ctx.string_pool.intern(name.as_bytes());
@@ -315,9 +301,8 @@ impl<'c, 'ctx> Analyzer<'c, 'ctx> {
                 // field. A payloaded-enum (or struct/union) field needs its body
                 // filled before `get_llvm_type` can resolve its aggregate type;
                 // querying first errored and stubbed the whole struct to `{ i8 }`
-                // (which then GEP'd out of bounds -> LLVM abort). The C++ ensures
-                // the nested body the same way (analyzer.cpp:208-234) and only a
-                // genuine cycle marks the fill failed.
+                // (which then GEP'd out of bounds -> LLVM abort). Only a genuine
+                // cycle marks the fill failed.
                 if let Some(fname) = self.direct_named_type(*fty)
                     && !self.ensure_nested_body(&fname)
                 {
@@ -419,9 +404,9 @@ impl<'c, 'ctx> Analyzer<'c, 'ctx> {
                 }
             }
 
-            // The enum's LLVM named struct uses the bare enum name (the C++
-            // names it `%Op`, not `%enum.Op`); instantiated generic enums
-            // already use the bare inst_name.
+            // The enum's LLVM named struct uses the bare enum name (`%Op`, not
+            // `%enum.Op`); instantiated generic enums already use the bare
+            // inst_name.
             let named = self.ctx.context().named_struct(&name);
             if failed {
                 let i8 = self.ctx.context().i8_type();
@@ -802,8 +787,7 @@ mod tests {
         }
         assert!(cg.has_errors());
     }
-    /// The C++ testCycleChainListsAnalysisStackInOrder: the cycle diagnostic
-    /// names the repeated decl.
+    /// The cycle diagnostic names the repeated decl.
     #[test]
     fn cycle_error_names_the_repeated_decl() {
         let ctx = Context::new();
@@ -828,9 +812,8 @@ mod tests {
         );
     }
 
-    /// The C++ testResolveDeclLooksUpByNameAndAnalyzes: the by-name chokepoint
-    /// analyzes on demand, and an unknown name is None WITHOUT a diagnostic —
-    /// the caller decides whether that is an error.
+    /// The by-name chokepoint analyzes on demand, and an unknown name is None
+    /// WITHOUT a diagnostic — the caller decides whether that is an error.
     #[test]
     fn resolve_decl_by_name_and_silent_miss() {
         let ctx = Context::new();
@@ -846,8 +829,7 @@ mod tests {
         assert!(!cg.has_errors());
     }
 
-    /// The C++ testAnalysisStackEmptyAfterTopLevelCall: every push pairs with
-    /// a pop, so the stack drains between top-level calls.
+    /// Every push pairs with a pop, so the stack drains between top-level calls.
     #[test]
     fn analysis_stack_empty_after_top_level_calls() {
         let ctx = Context::new();

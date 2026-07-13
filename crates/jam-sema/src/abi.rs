@@ -6,7 +6,7 @@
  */
 
 //! ABI classification — how a parameter is passed and how a return value is
-//! communicated at the LLVM-IR level. Ported from `src/abi.{h,cpp}`.
+//! communicated at the LLVM-IR level.
 //!
 //! [`is_by_ref`] is the load-bearing verdict: it decides whether a type's
 //! runtime form lives in memory (referred to by pointer in SSA) or rides in

@@ -7,19 +7,17 @@
 
 //! Module resolution — resolve `import("…")` spellings to `.jam` files, load +
 //! parse the transitive closure into the SHARED pools, and stamp each loaded
-//! module's `module_path` (the mangling prefix). Ported from
-//! `src/module_resolver.{h,cpp}`.
+//! module's `module_path` (the mangling prefix).
 //!
-//! The C++ recurses through nested resolvers; here [`ModuleResolver::load_all`]
-//! drives a flat work-list (avoiding the self-borrow that recursion-into-the-
-//! cache would create in Rust) and keys the cache by a file's canonical
-//! *identity* so distinct spellings of one file converge to a single module.
+//! [`ModuleResolver::load_all`] drives a flat work-list (recursing into the
+//! cache would self-borrow) and keys the cache by a file's canonical *identity*
+//! so distinct spellings of one file converge to a single module.
 //!
-//! Path-resolution tiers mirror the C++ `resolveUncached`: a sibling `.jam` /
-//! `dir/mod.jam` under the importing module's directory, then (unless the
-//! spelling was explicitly `./` / `../`) the standard library — `JAM_STD_PATH`,
-//! the installed exe-relative `lib/jam/std` root, or the in-tree `<CWD>/std/`
-//! dev fallback, with a leading `std/` stripped.
+//! Path-resolution tiers: a sibling `.jam` / `dir/mod.jam` under the importing
+//! module's directory, then (unless the spelling was explicitly `./` / `../`)
+//! the standard library — `JAM_STD_PATH`, the installed exe-relative
+//! `lib/jam/std` root, or the in-tree `<CWD>/std/` dev fallback, with a leading
+//! `std/` stripped.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -35,7 +33,7 @@ pub struct ModuleResolver {
     /// Canonical entry base directory (identities are computed relative to it).
     base_abs: Option<PathBuf>,
     loaded_keys: HashSet<String>,
-    /// `(identity, module)` in load order — the C++ `getLoadedModules()`.
+    /// `(identity, module)` in load order.
     pub loaded: Vec<(String, ModuleAST)>,
     /// `(importer identity, import spelling) -> resolved identity`. Lets the
     /// driver map a RELATIVE re-export (`pub const fmt = import("fmt")` in
@@ -55,8 +53,7 @@ impl ModuleResolver {
         }
     }
 
-    /// Standard-library root, computed once per process (the C++ `stdRoot`,
-    /// module_resolver.cpp:59-89). Order:
+    /// Standard-library root, computed once per process. Order:
     ///   1. `JAM_STD_PATH` env var (the `--std-path` CLI flag sets it before
     ///      resolution starts) — used as-is when non-empty.
     ///   2. Walk up from the running binary's (symlink-resolved) path, picking
@@ -168,14 +165,14 @@ impl ModuleResolver {
         ns: &mut NodeStore,
     ) {
         let entry_dir = self.base_abs.clone().unwrap_or_else(|| PathBuf::from("."));
-        // Anon-struct NAMES are numbered globally across all parses (shared-pool
-        // numbering, matching the C++ shared anon registry): the entry's anon
-        // structs are 0..E, then each loaded module continues from there.
+        // Anon-struct NAMES are numbered globally across all parses: the
+        // entry's anon structs are 0..E, then each loaded module continues
+        // from there.
         let mut anon_base = entry.anon_structs.len() as u32;
-        // The C++ resolver is DFS PRE-ORDER (`for import : Imports { loadNested }`,
-        // recursing immediately, imports before destructuring). This LIFO work-
-        // list reproduces that order by pushing in REVERSE (so pops come out
-        // forward) — load/parse order fixes the string-pool intern order.
+        // Load order is DFS pre-order (nested imports right after their
+        // importer, imports before destructuring). The LIFO work-list
+        // reproduces that by pushing in REVERSE (so pops come out forward) —
+        // load/parse order fixes the string-pool intern order.
         // Work tuple: (spelling, importer's dir, importer's identity). The
         // importer identity lets us record (importer, spelling) -> resolved id.
         let mut work: Vec<(String, PathBuf, String)> = Vec::new();
@@ -244,12 +241,10 @@ impl ModuleResolver {
         }
     }
 
-    /// Validate the ENTRY module's imports the way the C++ driver does
-    /// (`main.cpp:1190-1232` + `getOrLoadModule`/`canonicalKey`): every
-    /// non-`test` import must resolve to a loadable module, and every
-    /// destructuring-import name must be EXPORTED (`pub`) from its module.
-    /// Returns the exact multi-line stderr text the C++ prints (without a
-    /// trailing newline) on the first failure, mirroring its exit-1 abort.
+    /// Validate the ENTRY module's imports: every non-`test` import must
+    /// resolve to a loadable module, and every destructuring-import name must
+    /// be EXPORTED (`pub`) from its module. Returns the multi-line stderr text
+    /// (no trailing newline) for the first failure.
     ///
     /// `entry_dir` is the entry file's directory; `entry_file` is the entry
     /// file's display path (for the destructuring `<file>: error:` prefix).
@@ -261,7 +256,7 @@ impl ModuleResolver {
         let entry_dir = self.base_abs.clone().unwrap_or_else(|| PathBuf::from("."));
         let entry_dir = entry_dir.as_path();
         // Resolve an import base spelling to its identity key, or `None` if it
-        // cannot be resolved (the C++ `canonicalKey` + `getOrLoadModule` miss).
+        // cannot be resolved.
         let resolve_base = |spelling: &str| -> Option<String> {
             if spelling == "test" {
                 return Some("test".to_string());
@@ -275,11 +270,10 @@ impl ModuleResolver {
             })
         };
         // Walk a base + `.seg` re-export chain to the final module key.
-        // `Err(failing_path)` reproduces the C++ `resolved.first` on a miss.
+        // `Err(failing_path)` carries the path to blame in the error message.
         let resolve_chain = |base: &str, chain: &[String]| -> Result<String, String> {
             // For an empty chain (the common case), a failed base resolution is
-            // the only failure mode. `getOrLoadModule` already printed the
-            // "Cannot resolve import path" line in C++; we synthesize both.
+            // the only failure mode.
             let mut cur_path = self
                 .canonical_spelling(base, entry_dir)
                 .unwrap_or_else(|| base.to_string());
@@ -347,8 +341,8 @@ impl ModuleResolver {
         Ok(())
     }
 
-    /// Canonical-key spelling of an import (the C++ `canonicalKey`): the
-    /// module identity, or the original spelling when unresolvable.
+    /// Canonical-key spelling of an import: the module identity, or the
+    /// original spelling when unresolvable.
     fn canonical_spelling(&self, spelling: &str, from_dir: &Path) -> Option<String> {
         let resolved = self.resolve_uncached(spelling, from_dir)?;
         let key = self.module_identity(&resolved);
@@ -368,10 +362,9 @@ impl ModuleResolver {
     }
 }
 
-/// Whether `name` is an EXPORTED symbol of `module`. Mirrors the C++
-/// `SymbolTable::registerModule` (symbol_table.cpp:11-52): ONLY `pub`
-/// functions, `pub` types (struct/enum/union), `pub` consts, and `pub`
-/// import re-exports are surfaced; everything else is module-private.
+/// Whether `name` is an EXPORTED symbol of `module`: only `pub` functions,
+/// `pub` types (struct/enum/union), `pub` consts, and `pub` import re-exports
+/// are surfaced; everything else is module-private.
 fn module_exports(module: &ModuleAST, name: &str) -> bool {
     module.functions.iter().any(|f| f.name == name && f.is_pub)
         || module.structs.iter().any(|s| s.name == name && s.is_pub)
@@ -401,8 +394,8 @@ fn identity_under(resolved: &Path, root: &Path) -> Option<String> {
     Some(id)
 }
 
-/// Stamp `module_path = key` on a loaded module's decls (the C++ post-parse
-/// pass). Functions / methods skip `extern` (libc bare names) and `export`
+/// Stamp `module_path = key` on a loaded module's decls.
+/// Functions / methods skip `extern` (libc bare names) and `export`
 /// (user-requested exact symbols); types and consts are stamped unconditionally.
 fn stamp_module_path(module: &mut ModuleAST, key: &str) {
     for f in &mut module.functions {

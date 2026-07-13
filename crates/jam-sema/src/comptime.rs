@@ -5,28 +5,15 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Compile-time evaluation (`comp` / `cfn`). Folds AST expression nodes to
-//! [`ComptimeValue`]s and interprets `comp` statement bodies. Ported from
-//! `src/comptime.{h,cpp}`.
+//! Compile-time evaluation (`comp` / `cfn`): folds AST expressions to
+//! [`ComptimeValue`]s and interprets `comp` statement bodies. Any failure
+//! (runtime-dependent value, unsupported op, type mismatch) folds to
+//! [`ComptimeValue::None`] — the evaluator never panics; callers that require
+//! a fold use [`ComptimeEvaluator::eval_required`], which diagnoses instead.
 //!
-//! Failure modes (depends on a runtime value, unsupported operator, type
-//! mismatch) all surface as [`ComptimeValue::None`] — the evaluator never
-//! panics. Callers that *require* a fold call [`ComptimeEvaluator::eval_required`],
-//! which pushes a diagnostic on failure.
-//!
-//! Two divergences from the C++, both behaviour-preserving:
-//!   * The C++ stores the call context (emitter / resolver / diags / loc) as
-//!     `mutable` fields on a `const` evaluator. Rust threads an explicit
-//!     [`CompCtx`] through the eval/exec methods instead — same data, no interior
-//!     mutability. The C++'s separate `Diagnostics&` statement param is unified
-//!     into `CompCtx::diags`.
-//!   * `@isDarwin()` & friends query the host OS. The C++ calls
-//!     `Target::getHostTarget()` (an LLVM call) inline; here the host OS is
-//!     injected via [`CompCtx::host_os`] so the evaluator stays LLVM-free and
-//!     unit-testable. The driver supplies it from `jam_llvm::default_target_triple`.
-//!
-//! All integer arithmetic uses wrapping ops to match C++ unsigned wraparound /
-//! 2's-complement semantics (and to avoid Rust's debug overflow panics).
+//! All integer arithmetic uses wrapping ops — comptime ints follow the
+//! target's unsigned-wraparound / 2's-complement semantics (and debug builds
+//! must not panic on overflow).
 
 use std::collections::HashMap;
 
@@ -112,10 +99,8 @@ impl ComptimeValue {
     }
 }
 
-/// A lexically-scoped map of name -> [`ComptimeValue`]. The C++ chains scope
-/// objects by parent pointer; here a stack of frames models the same nesting
-/// (push a frame on block entry, pop on exit), which avoids self-referential
-/// borrows while preserving the bind/set/lookup semantics exactly.
+/// A lexically-scoped map of name -> [`ComptimeValue`], as a stack of frames:
+/// push on block entry, pop on exit; inner bindings shadow outer ones.
 #[derive(Clone, Debug, Default)]
 pub struct ComptimeScope {
     frames: Vec<HashMap<String, ComptimeValue>>,
@@ -128,7 +113,7 @@ impl ComptimeScope {
         }
     }
 
-    /// Enter a nested scope (mirrors `ComptimeScope inner(&scope)`).
+    /// Enter a nested scope.
     pub fn push(&mut self) {
         self.frames.push(HashMap::new());
     }
@@ -219,7 +204,9 @@ pub trait CompCallResolver {
 
 /// The call context threaded through evaluation: optional emit/resolve hooks,
 /// the diagnostics sink, the call-site location, and the host OS for target
-/// predicates. Replaces the C++ evaluator's `mutable` context fields.
+/// predicates. The host OS is injected (rather than queried from LLVM) so the
+/// evaluator stays LLVM-free and unit-testable; the driver supplies it from
+/// `jam_llvm::default_target_triple`.
 pub struct CompCtx<'c> {
     pub resolver: Option<&'c mut dyn CompCallResolver>,
     pub emitter: Option<&'c mut dyn CompEmitter>,
@@ -257,7 +244,7 @@ pub const DEFAULT_ITER_CAP: u32 = 10_000;
 pub struct ComptimeEvaluator<'a> {
     nodes: &'a NodeStore,
     strings: &'a StringPool,
-    #[allow(dead_code)] // reserved for type-aware folding (parity with C++)
+    #[allow(dead_code)] // reserved for type-aware folding
     types: &'a TypePool,
 }
 
@@ -998,8 +985,8 @@ mod tests {
 
     #[test]
     fn unsigned_subtraction_wraps() {
-        // 7 - 10 on u64 wraps to 2^64 - 3 (matches C++ unsigned wraparound;
-        // would panic with a plain `-` in Rust debug).
+        // 7 - 10 on u64 wraps to 2^64 - 3; would panic with a plain `-` in
+        // Rust debug.
         let mut s = NodeStore::new();
         let (a, b) = (num(&mut s, 7, false), num(&mut s, 10, false));
         let sub = binop(&mut s, BinOp::Sub, a, b);
@@ -1329,7 +1316,6 @@ mod tests {
         })
     }
 
-    /// The C++ testBitwise: and/or/xor over 0b1100 and 0b1010.
     #[test]
     fn bitwise_and_or_xor() {
         let mut s = NodeStore::new();
@@ -1345,8 +1331,8 @@ mod tests {
         }
     }
 
-    /// The C++ testLogAndShortCircuits: LHS=false never evaluates the RHS
-    /// (a missing variable that would fold to None).
+    /// LHS=false never evaluates the RHS (a missing variable that would fold
+    /// to None).
     #[test]
     fn logand_short_circuits_without_evaluating_rhs() {
         let sp = StringPool::new();
@@ -1362,7 +1348,6 @@ mod tests {
         assert_eq!(ev.eval(n, &scope, &mut ctx), ComptimeValue::Bool(false));
     }
 
-    /// The C++ testUnaryNegateInt / testUnaryLogNotBool.
     #[test]
     fn unary_negate_and_lognot() {
         let mut s = NodeStore::new();
@@ -1374,7 +1359,6 @@ mod tests {
         assert_eq!(eval1(&s, ln), ComptimeValue::Bool(false));
     }
 
-    /// The C++ testStringIndexReturnsByte / ...OutOfBoundsIsNone.
     #[test]
     fn string_index_byte_and_out_of_bounds() {
         let sp = StringPool::new();
@@ -1394,7 +1378,7 @@ mod tests {
         assert!(ev.eval(oob, &scope, &mut ctx).is_none());
     }
 
-    /// The C++ testTypeEquality: `type` values compare by TypeIdx.
+    /// `type` values compare by TypeIdx.
     #[test]
     fn type_equality() {
         use jam_syntax::ast_flat::builtin;
@@ -1423,7 +1407,6 @@ mod tests {
         assert_eq!(ev.eval(ne_tv, &scope, &mut ctx), ComptimeValue::Bool(true));
     }
 
-    /// The C++ testAggregateIndexing: index into an Aggregate binding.
     #[test]
     fn aggregate_indexing() {
         let sp = StringPool::new();
@@ -1445,7 +1428,6 @@ mod tests {
         assert_eq!(ev.eval(n, &scope, &mut ctx).as_u64(), 20);
     }
 
-    /// The C++ testEvalRequiredPushesDiagnosticOnFail / ...SilentOnSuccess.
     #[test]
     fn eval_required_diagnostics() {
         let sp = StringPool::new();
@@ -1483,7 +1465,6 @@ mod tests {
         assert!(!diags2.has_errors());
     }
 
-    /// The C++ testExecAssignToUndeclaredErrors.
     #[test]
     fn exec_assign_to_undeclared_errors() {
         let sp = StringPool::new();
@@ -1511,8 +1492,8 @@ mod tests {
         assert!(diags.has_errors());
     }
 
-    /// The C++ testExecWhileIterationCapTrips: the cap trips BEFORE the
-    /// 101st body run, leaving i == 100, and pushes a diagnostic.
+    /// The cap trips BEFORE the 101st body run, leaving i == 100, and pushes
+    /// a diagnostic.
     #[test]
     fn exec_while_iteration_cap_trips() {
         let sp = StringPool::new();
@@ -1563,8 +1544,7 @@ mod tests {
         assert_eq!(scope.lookup("i").unwrap().as_u64(), 100);
     }
 
-    /// The C++ testExecBlockShortCircuitsOnError: a failing statement stops
-    /// the block before later statements run.
+    /// A failing statement stops the block before later statements run.
     #[test]
     fn exec_block_short_circuits_on_error() {
         let sp = StringPool::new();
@@ -1611,7 +1591,6 @@ mod tests {
         assert_eq!(scope.lookup("x").unwrap().as_u64(), 0);
     }
 
-    /// The C++ testMemberAccessStrLength.
     #[test]
     fn member_access_str_length() {
         let sp = StringPool::new();

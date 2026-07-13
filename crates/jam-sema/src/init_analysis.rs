@@ -5,38 +5,21 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! Definite-initialization / move-ownership analysis — ported from
-//! `src/init_analysis.{h,cpp}`.
+//! Definite-initialization / move-ownership analysis.
 //!
-//! A tree-walking dataflow over a function body produces, at each program
-//! point, a map from binding name to a 2-bit lattice state {Unknown, Init,
-//! Uninit, MaybeInit}. The lattice merges by bitwise OR, exactly as Clang's
-//! `UninitializedValues` pass does. Jam programs are structured (no goto), so a
-//! recursive analyzer over the AST suffices — there is no separate CFG pass.
-//!
-//! ## Scope of this port
-//!
-//! Unlike the C++ standalone analyzer (which threaded raw callback function
-//! pointers through an `AnalysisHooks` struct), this port lives *inside*
-//! `jam_sema` and borrows the [`CodegenContext`] directly for the questions it
-//! cannot answer from its own tables: `type_needs_drop`, `requalify_type`, and
-//! the enum-variant-constructor registry. The pools (`NodeStore`, `StringPool`,
-//! `TypePool`) are read off the context too.
-//!
-//! ## Why it exists
+//! A tree-walking dataflow over a function body: at each program point, a map
+//! from binding name to a 2-bit lattice {Unknown, Init, Uninit, MaybeInit},
+//! merged by bitwise OR (as in Clang's `UninitializedValues`). Jam programs
+//! are structured (no goto), so a recursive AST walk suffices — no CFG pass.
 //!
 //! The single consumer is generic method-instantiation withdrawal
 //! ([`crate::astgen::instantiate_methods`]): when a generic method's body is
-//! lowered under drop-bearing type args, the oracle runs this analysis and, if
-//! it reports any move/ownership diagnostic, WITHDRAWS the method to a bare
-//! `declare` (no body). The canonical case is `Vec(T).filled`, which moves a
-//! by-value (`let`-mode) drop-bearing parameter into a slot inside a `while`
-//! loop — a use-of-moved-binding on loop re-entry, and a move out of a borrowed
-//! parameter besides.
-//!
-//! This port only needs to reproduce the oracle's *accept/reject* verdict, so
-//! diagnostic message strings are intentionally terse — what matters is whether
-//! [`analyze`] returns a non-empty diagnostics list.
+//! lowered under drop-bearing type args and this analysis reports any
+//! move/ownership diagnostic, the method is withdrawn to a bare `declare`
+//! (no body). Canonical trigger: `Vec(T).filled`, which moves a by-value
+//! (`let`-mode) drop-bearing parameter into a slot inside a `while` loop.
+//! Only the accept/reject verdict matters — whether [`analyze`] returns a
+//! non-empty diagnostics list — so the message strings are terse.
 
 use std::collections::{HashMap, HashSet};
 
@@ -72,8 +55,7 @@ pub struct Diagnostic {
     pub message: String,
     pub var_name: String,
     /// 1-based source line of the anchor node (`0` when none). Parse-time
-    /// stamped, so it is correct for imported modules too. Mirrors the C++
-    /// `Diagnostic::line` (`lineOf(anchor)`).
+    /// stamped, so it is correct for imported modules too.
     pub line: u32,
 }
 
@@ -81,7 +63,7 @@ type NameMap = HashMap<String, InitState>;
 
 /// One step of a borrow path under a call arg: a field access, an index, or a
 /// dereference. Used by the exclusivity check (MVS P5) to compare two arg
-/// expressions for overlapping access. Mirrors the C++ `Analyzer::PathStep`.
+/// expressions for overlapping access.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PathStep {
     /// `.field` — carries the field-name `StringIdx`.
@@ -93,8 +75,8 @@ enum PathStep {
 }
 
 /// A borrow path rooted at a base binding. `base == None` when the arg isn't a
-/// simple lvalue chain (the exclusivity check skips it). Mirrors the C++
-/// `Analyzer::BorrowPath`; `steps` is in root->leaf order after extraction.
+/// simple lvalue chain (the exclusivity check skips it). `steps` is in
+/// root->leaf order after extraction.
 struct BorrowPath {
     base: Option<u32>,
     steps: Vec<PathStep>,
@@ -196,8 +178,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         // If control reaches the end of the body without an explicit return,
         // every in-scope drop-bearing local must be definitely initialized —
         // codegen synthesizes a drop at fall-off-end. (Functions that always
-        // return skip this; the per-return checks cover them.) The C++
-        // run()'s `if (!r.terminated)` guard, init_analysis.cpp:298.
+        // return skip this; the per-return checks cover them.)
         if !r.terminated {
             self.check_drop_bearing_locals_init(&r.state, NodeIdx::NONE);
         }
@@ -219,7 +200,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     }
 
     /// MATCH-MOVE oracle: does this type carry ownership (so matching it by
-    /// value consumes the scrutinee)? The C++ `typeNeedsDrop` hook.
+    /// value consumes the scrutinee)?
     fn type_owns_drops(&self, ty: TypeIdx) -> bool {
         self.ctx.type_needs_drop(ty)
     }
@@ -733,9 +714,9 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
     fn analyze_return(&mut self, idx: NodeIdx, state: NameMap) -> StmtResult {
         let n = *self.ctx.node_store.get(idx);
-        // Scope-escape check BEFORE any reads of the operand (the C++
-        // analyzeReturn, init_analysis.cpp:841): returning `&` of a `mut`-mode
-        // parameter would extend a second-class borrow past the call frame.
+        // Scope-escape check runs BEFORE any reads of the operand: returning
+        // `&` of a `mut`-mode parameter would extend a second-class borrow
+        // past the call frame.
         if !NodeIdx::new(n.lhs).is_none() {
             self.check_scope_escape(NodeIdx::new(n.lhs));
         }
@@ -799,8 +780,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
         // Pre-pass: collect (argIdx, mode, path) for every arg so the exclusivity
         // check runs BEFORE any state transition (a flagged conflict surfaces even
-        // if a later arg would terminate the analysis). Mirrors the C++ ArgInfo
-        // pre-pass, init_analysis.cpp:914-932.
+        // if a later arg would terminate the analysis).
         struct ArgInfo {
             arg_idx: NodeIdx,
             mode: ParamMode,
@@ -825,8 +805,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
         // MVS P5 exclusivity: for each pair of args with overlapping paths, the
         // borrow set is OK only if BOTH modes are Let (multiple readers). Any
-        // other combination on overlapping paths is rejected. The C++
-        // exclusivity loop, init_analysis.cpp:937-950.
+        // other combination on overlapping paths is rejected.
         for i in 0..arg_infos.len() {
             for j in (i + 1)..arg_infos.len() {
                 let a = &arg_infos[i];
@@ -877,7 +856,6 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             // read), but borrowing a MOVED binding must still be rejected: a
             // callee could write through the pointer and "re-initialize" storage
             // whose scope-exit drop was already suppressed, leaking the new value.
-            // The C++ borrow-of-moved check, init_analysis.cpp:976-988.
             if self.node_tag(info.arg_idx) == AstTag::AddressOf
                 && let Some(base) = info.path.base
             {
@@ -1004,9 +982,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                     // Not an owned binding (a `let`/`mut` param, or a global).
                     // Moving a drop-bearing value out of a borrowed parameter is
                     // rejected — it is borrowed, not owned. This is the
-                    // `Vec(T).filled` trigger (`value: T` is a `let` param). The
-                    // diagnostic spells the param mode (the C++ message, ll.
-                    // 1024-1029).
+                    // `Vec(T).filled` trigger (`value: T` is a `let` param).
                     if let Some(&mode) = self.param_modes.get(name)
                         && mode != ParamMode::Move
                     {
@@ -1045,9 +1021,8 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
     /// Extract a borrow path from a call-arg expression: a chain of `&`,
     /// `.field`, `[idx]`, `.*` rooted at a Variable. Any other shape leaves
-    /// `base == None` so the exclusivity check skips that arg. `&` is transparent
-    /// — it does not contribute a step. Mirrors the C++ `Analyzer::extractPath`,
-    /// init_analysis.cpp:1078-1140.
+    /// `base == None` so the exclusivity check skips that arg. `&` is
+    /// transparent — it does not contribute a step.
     fn extract_path(&self, arg_idx: NodeIdx) -> BorrowPath {
         let mut path = BorrowPath {
             base: None,
@@ -1099,8 +1074,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     }
 
     /// Two paths overlap when one is a prefix of the other (or they are equal).
-    /// Per MVS §4.1; mirrors the C++ `Analyzer::pathsOverlap`,
-    /// init_analysis.cpp:1152-1177.
+    /// Per MVS §4.1.
     fn paths_overlap(a: &BorrowPath, b: &BorrowPath) -> bool {
         let (Some(ab), Some(bb)) = (a.base, b.base) else {
             return false;
@@ -1198,15 +1172,10 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     /// `comp if` verdict: fold the condition. Returns `Some(true/false)` for a
     /// foldable comptime bool, `None` to fall back to conservative both-arm
     /// analysis. Generic method bodies under analysis carry no comp scope of
-    /// their own, so this folds only against module/comp-subst consts.
-    ///
-    /// Divergence note vs the C++ (which replays astgen's RECORDED verdict via
-    /// `AnalysisHooks::compIfVerdict`): both fold module/comp-subst consts
-    /// identically, so a foldable condition always agrees with astgen. A
-    /// condition astgen folded through a FUNCTION-LOCAL comp binding is
-    /// unfoldable here (`None`) and analyzes BOTH arms — strictly conservative:
-    /// it can surface an extra diagnostic from the arm astgen elided, but can
-    /// never pick the opposite arm or miss an error in live code.
+    /// their own, so this folds only against module/comp-subst consts; a
+    /// condition astgen folded through a function-local comp binding is
+    /// unfoldable here and analyzes BOTH arms — conservative: it may
+    /// over-report from a dead arm, but never under-reports.
     fn comp_if_verdict(&self, cond: NodeIdx) -> Option<bool> {
         match self.ctx.fold_comptime_expr(cond) {
             crate::comptime::ComptimeValue::Bool(b) => Some(b),
@@ -1216,8 +1185,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
     /// At every `return` and at fall-off-end, a drop-bearing local that is not
     /// definitely-initialized must be rejected — codegen synthesizes a drop on
-    /// it at this exit and dropping uninit memory is UB. Ported 1:1 from the C++
-    /// `Analyzer::checkDropBearingLocalsInit`, init_analysis.cpp:1256-1325.
+    /// it at this exit and dropping uninit memory is UB.
     fn check_drop_bearing_locals_init(&mut self, state: &NameMap, anchor: NodeIdx) {
         // Walk only the bindings CURRENTLY IN SCOPE (present in the merged state
         // map). Inner-block bindings have been dropped at their own scope end and
@@ -1287,9 +1255,9 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         }
     }
 
-    /// Returning the address of a `mut`-mode parameter must be rejected — borrows
-    /// are second-class and cannot escape the function (dangling pointer). Ported
-    /// 1:1 from the C++ `Analyzer::checkScopeEscape`, init_analysis.cpp:1327-1368.
+    /// Returning the address of a `mut`-mode parameter must be rejected —
+    /// borrows are second-class and cannot escape the function (dangling
+    /// pointer).
     fn check_scope_escape(&mut self, expr_idx: NodeIdx) {
         if expr_idx.is_none() {
             return;
@@ -1332,9 +1300,9 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         }
     }
 
-    /// 1-based source line of `idx`, or `0` for `kNoNode`. NodeStore's parallel
+    /// 1-based source line of `idx`, or `0` for none. NodeStore's parallel
     /// line table is parse-time stamped, so it is correct for imported modules
-    /// too (the C++ `Analyzer::lineOf`).
+    /// too.
     fn line_of(&self, idx: NodeIdx) -> u32 {
         if idx.is_none() {
             return 0;

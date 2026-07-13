@@ -6,7 +6,7 @@
  */
 
 //! Function name mangling — the single source of truth for the LLVM-level
-//! symbol the linker sees. Ported from `src/mangling.h`.
+//! symbol the linker sees.
 //!
 //! Builds a dot-separated fully-qualified name, walking up the namespace chain.
 //! LLVM accepts `.` in symbol names, so no further escaping is needed.
@@ -28,9 +28,8 @@
 //!
 //! Centralised so every site that picks a function's LLVM symbol reads the
 //! same rules — duplicating the mangling table per call site is exactly how
-//! "unknown callee" miscompiles creep in. (The C++ memoizes the result on
-//! `fn.mangledNameCache`; this is a pure function of its inputs, so callers
-//! that want the cache can wrap it.)
+//! "unknown callee" miscompiles creep in. Pure function of its inputs; callers
+//! that want caching can wrap it.
 
 use jam_core::param_mode::ParamMode;
 use jam_syntax::ast::FunctionAST;

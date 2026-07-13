@@ -18,11 +18,10 @@
 //! width payloads (call arg lists, struct field values, switch cases, etc.)
 //! live in a per-function `extra` pool, just like the AST's `NodeStore`.
 //!
-//! Ported faithfully from `src/jir.h`. `JirRef` / `JirBlockRef` index newtypes
-//! live in [`jam_core::index`]; the per-instruction `a` / `b` slots stay raw
-//! `u32` because they are polymorphic — depending on the tag they hold a
-//! `JirRef`, a field index, a `StringIdx`, a `JirExtraIdx`, a block ref, or a
-//! raw constant (the per-tag contracts below spell out which).
+//! The per-instruction `a` / `b` slots stay raw `u32` because they are
+//! polymorphic — depending on the tag they hold a `JirRef`, a field index, a
+//! `StringIdx`, a `JirExtraIdx`, a block ref, or a raw constant (the per-tag
+//! contracts below spell out which).
 
 use jam_core::index::TypeIdx;
 use jam_core::param_mode::ParamMode;
@@ -39,7 +38,8 @@ pub const NO_JIR_BLOCK: JirBlockRef = 0;
 /// Ref into a function's extra-data pool.
 pub type JirExtraIdx = u32;
 
-/// JIR opcode. The discriminant order mirrors `src/jir.h` exactly.
+/// JIR opcode. The discriminant order is load-bearing: the numbering is pinned
+/// (and asserted in tests), so append new tags at the end — never reorder.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum JirTag {
@@ -202,8 +202,7 @@ pub enum JirTag {
 }
 
 impl JirTag {
-    /// Stable opcode name (matches the `--emit-jir` dump contract and the C++
-    /// `jir_verify` / `main.cpp` tag-name tables).
+    /// Stable opcode name (the `--emit-jir` dump contract).
     pub fn name(self) -> &'static str {
         match self {
             JirTag::Invalid => "Invalid",
@@ -453,10 +452,8 @@ pub struct JirModule {
 mod tests {
     use super::*;
 
-    // The data-structure invariants mirror the C++ `test_jir_skeleton`
-    // coverage: slot-0 sentinels, 1-based push refs, and extra-pool growth.
-    // (End-to-end JIR validation waits for the full AstGen path — there is no
-    // intermediate JIR-dump oracle.)
+    // Data-structure invariants: slot-0 sentinels, 1-based push refs, and
+    // extra-pool growth.
 
     #[test]
     fn sentinels_occupy_slot_zero() {
@@ -517,7 +514,7 @@ mod tests {
 
     #[test]
     fn jir_tag_discriminants_match_cpp_order() {
-        // A handful of anchor points pinned against `src/jir.h` ordering.
+        // Anchor points pinning the tag numbering.
         assert_eq!(JirTag::Invalid as u8, 0);
         assert_eq!(JirTag::Int as u8, 1);
         assert_eq!(JirTag::MakeSlice as u8, 5);

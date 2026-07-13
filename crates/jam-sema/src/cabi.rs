@@ -5,16 +5,13 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! C ABI helper for `extern "C"` function calling. Ported from
-//! `src/cabi.{h,cpp}`. Picks the LLVM calling convention for the target,
-//! applies linkage/attributes to functions, and checks C-ABI type
-//! compatibility.
+//! C ABI helper for `extern "C"` function calling. Picks the LLVM calling
+//! convention for the target, applies linkage/attributes to functions, and
+//! checks C-ABI type compatibility.
 //!
-//! Two behaviour-preserving omissions vs the C++: the explicit
-//! `setVisibility(DefaultVisibility)` / `setDLLStorageClass(DefaultStorageClass)`
-//! calls are dropped — they set the values a freshly-created function already
-//! has, so they are no-ops. (If a future target needs non-default visibility,
-//! add the wrapper then.)
+//! No explicit visibility / DLL-storage-class setup here: a freshly-created
+//! function already has the defaults. Add it if a target ever needs
+//! non-default visibility.
 
 use jam_llvm::{CallConv as LlvmCallConv, Function, Linkage, Module, Type};
 

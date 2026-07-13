@@ -7,7 +7,6 @@
 
 //! Drop / clone registries — scan a module's functions for the
 //! compiler-synthesized destructor / clone shapes and map each to its struct.
-//! Ported from `src/drop_registry.{h,cpp}`.
 //!
 //! A type `T` is *drop-bearing* when the program declares
 //! `cfn drop(self: mut T)` (top-level or in-struct). `cfn` (not plain `fn`) is
@@ -16,8 +15,8 @@
 //! too would double-drop. The clone counterpart is `cfn clone(self: T) T`
 //! (let-mode self — cloning borrows the original).
 //!
-//! The C++ uses `std::unordered_map`; here the registries are `BTreeMap` so the
-//! codegen's scope-exit walk emits drop calls in a deterministic order.
+//! The registries are `BTreeMap` so the codegen's scope-exit walk emits drop
+//! calls in a deterministic order.
 //! Registries borrow the module (`&'a FunctionAST`), which outlives them.
 
 use std::collections::BTreeMap;

@@ -7,27 +7,12 @@
 
 //! The codegen context — the backend's hub. Owns the LLVM module/builder and
 //! the shared frontend pools, caches the TypeIdx→LLVM-type lowering, and holds
-//! the struct/enum/union registries. Ported (incrementally) from the
-//! `JamCodegenContext` in `src/codegen.{h,cpp}`.
+//! the struct/enum/union registries.
 //!
-//! ## Lifetime design
-//!
-//! The C++ context owns its `llvm::LLVMContext` AND caches `llvm::Type*`
-//! handles into it. In Rust that shape is self-referential and illegal, so we
-//! follow the inkwell pattern: the *driver* creates the [`Context`] first, and
-//! `CodegenContext<'ctx>` borrows `&'ctx Context`, caching `Type<'ctx>` handles
-//! that all share the context's lifetime. The owned `Module`/`Builder` are also
-//! `'ctx`.
-//!
-//! ## Scope of this increment
-//!
-//! [`CodegenContext::get_llvm_type`] lowers the cases that do NOT need the
-//! analyzer-filled layout passes or the generic-substitution engine:
-//! primitives, pointers, slices (`{ptr,len}`), arrays, and registry-backed
-//! struct/union/enum types (once a body fills the registries). The
-//! substitution/alias/chained `Named` resolution order, generic-call and
-//! array-expr resolution, and `requalify_type` land with `decl` + the analyzer
-//! and return an explicit error here until then.
+//! Lifetimes follow the inkwell pattern: owning the LLVM context AND caching
+//! `Type` handles into it would be self-referential, so the *driver* creates
+//! the [`Context`] and `CodegenContext<'ctx>` borrows it — every cached
+//! `Type<'ctx>` (and the owned `Module`/`Builder`) shares that lifetime.
 
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
@@ -45,8 +30,8 @@ use crate::comptime::{
 use crate::generics::{generic_arg_spelling, substitute_type};
 use crate::target::Os;
 
-/// Round `off` up to the next multiple of `align` (matches the C++ `alignUp`,
-/// `(off + align - 1) / align * align`, without its intermediate overflow).
+/// Round `off` up to the next multiple of `align` (`div_ceil` avoids the
+/// intermediate overflow of the usual `(off + align - 1) / align * align`).
 fn align_up(off: u64, align: u64) -> u64 {
     off.div_ceil(align) * align
 }
@@ -121,17 +106,15 @@ pub struct CodegenContext<'ctx> {
     // lowering can fill it; recursion never holds the borrow across a call.
     llvm_type_cache: RefCell<Vec<Option<Type<'ctx>>>>,
 
-    // TypeIdx -> size / alignment in bytes, memoized. (The substitution-context
-    // bypass the C++ applies lands with the substitution engine; with no active
-    // subst yet, unconditional memoization is correct.)
+    // TypeIdx -> size / alignment in bytes, memoized.
     size_memo: RefCell<HashMap<TypeIdx, u64>>,
     align_memo: RefCell<HashMap<TypeIdx, u64>>,
 
     // Type registries, keyed by module-qualified name. `RefCell` so the
     // demand-driven analyzer can register bodies through `&self` *during*
-    // recursive lowering (`get_llvm_type` -> ensure-body -> `get_llvm_type`),
-    // mirroring the C++ `mutable` registries. Lookups therefore return Copy /
-    // cloned data, never a borrow that would outlive the `Ref` guard.
+    // recursive lowering (`get_llvm_type` -> ensure-body -> `get_llvm_type`).
+    // Lookups therefore return Copy / cloned data, never a borrow that would
+    // outlive the `Ref` guard.
     structs: RefCell<HashMap<String, StructInfo<'ctx>>>,
     unions: RefCell<HashMap<String, UnionInfo<'ctx>>>,
     enums: RefCell<HashMap<String, EnumInfo<'ctx>>>,
@@ -139,13 +122,12 @@ pub struct CodegenContext<'ctx> {
     // Accumulated diagnostics. RefCell so the demand-driven analyzer can push
     // errors through `&self` during lowering.
     diagnostics: RefCell<Diagnostics>,
-    // Display filename stamped onto astgen diagnostics (the C++ `currentFile_`,
-    // read by `locOf`). Entry-global, temporarily swapped to `<key>.jam` while an
-    // imported module's bodies lower (main.cpp:2253-2286).
+    // Display filename stamped onto astgen diagnostics. Entry-global,
+    // temporarily swapped to `<key>.jam` while an imported module's bodies lower.
     current_file: RefCell<String>,
     // Module-path stack — the analyzer pushes a type's OWNING module while
-    // filling its body so requalify / privacy use the right scope (the C++
-    // `BodyModuleGuard`). `current_body_module` reads the top (empty = entry).
+    // filling its body so requalify / privacy use the right scope.
+    // `current_body_module` reads the top (empty = entry).
     body_module_stack: RefCell<Vec<String>>,
     // (ctxModule -> (bareTypeName -> ownerModule)). Built up front by the
     // driver; consulted by `requalify_type`.
@@ -154,15 +136,14 @@ pub struct CodegenContext<'ctx> {
     // Registered function/method signatures, keyed by the lookup name the call
     // site uses (bare for entry-module free fns, qualified otherwise). Owns a
     // clone of each `FunctionAST` — cheap, since the body is just `NodeIdx`
-    // indices into the shared `NodeStore`. Mirrors the C++ `fnRegistry` of
-    // `const FunctionAST*`; AstGen reads it to lower `Call` (mangled name + ABI).
+    // indices into the shared `NodeStore`. AstGen reads it to lower `Call`
+    // (mangled name + ABI).
     function_asts: RefCell<HashMap<String, FunctionAST>>,
 
     // Withdrawn instantiated methods: qualified name
     // ("Vec__Counter.withCapacity") -> human-readable reason. A call to a
     // withdrawn method reports "not available for this instantiation" with the
-    // recorded reason instead of a bare "unknown method" (the C++
-    // `withdrawnMethods_`).
+    // recorded reason instead of a bare "unknown method".
     withdrawn_methods: RefCell<HashMap<String, String>>,
 
     // Type name -> its `cfn drop`'s mangled LLVM symbol. Pre-mangled (owned
@@ -170,7 +151,7 @@ pub struct CodegenContext<'ctx> {
     // `lookup_drop_fn_name` / `type_needs_drop` for scope-exit drop emission.
     drop_fns: RefCell<HashMap<String, String>>,
 
-    // Struct name -> its TOP-LEVEL `cfn clone(self: T) T` (the C++ `CloneRegistry`).
+    // Struct name -> its TOP-LEVEL `cfn clone(self: T) T`.
     // In-struct clones register as `Name.clone` methods (ordinary dispatch); only
     // the top-level form lives here, routed through emit_clone_into's glue.
     clone_fns: RefCell<HashMap<String, FunctionAST>>,
@@ -182,10 +163,10 @@ pub struct CodegenContext<'ctx> {
 
     // Active generic-substitution frames (innermost last). Each frame maps a
     // generic parameter name (`T`) to its concrete argument while a generic
-    // instantiation's body is lowered (the C++ `currentSubst_`).
+    // instantiation's body is lowered.
     current_subst: RefCell<Vec<HashMap<String, TypeIdx>>>,
 
-    // Active comp-value substitution context (the C++ `currentCompSubst_`).
+    // Active comp-value substitution context.
     // Parallel to `current_subst` but carries baked `ComptimeValue`s: set right
     // before a comp-instantiated fn clone's body is lowered, so a body
     // reference to a comp param (`k`) folds to the call-site constant.
@@ -199,14 +180,13 @@ pub struct CodegenContext<'ctx> {
     anon_enums: RefCell<HashMap<String, Vec<EnumDeclAST>>>,
     // Type-alias name -> target TypeIdx: `const Foo = Bar` and destructuring
     // imports (`const { Token } = import("m")` aliases Token -> m.Token).
-    // Resolved regardless of body module (the C++ scoped-alias table).
+    // Resolved regardless of body module.
     type_aliases: RefCell<HashMap<String, TypeIdx>>,
     // (owner module, import-handle name) -> resolved module identity:
     // `const lib = import("m")` makes `lib.fn()` resolve to `m.fn` — but only
     // from bodies of the module that DECLARED the import. There is no
     // cross-module fallback: a handle absent from the declaring module's
-    // imports is an error, never resolved against the entry module's (the C++
-    // per-module moduleImports_, codegen.cpp:725-738).
+    // imports is an error, never resolved against the entry module's.
     import_handles: RefCell<HashMap<(String, String), String>>,
     // (body_module, GenericCall TypeIdx) -> the instantiated `Named` TypeIdx.
     // Keyed by the body module too: the SAME bare `Pair(u64)` TypeIdx resolves
@@ -226,7 +206,7 @@ pub struct CodegenContext<'ctx> {
     // Set by the driver to `astgen::instantiate_methods` so instantiate_struct_expr
     // (here) can drive body lowering that lives in the astgen crate-module.
     method_instantiator: Cell<Option<MethodInstantiator>>,
-    // The `bindDeclTypes` early-instantiation pass (the C++ Phase 1b) instantiates
+    // The `bindDeclTypes` early-instantiation pass instantiates
     // a generic's TYPE only and DEFERS its method-body lowering, matching the
     // oracle's intern order (the type monomorph interns early; method names intern
     // in the later method pre-pass). When `defer_method_lowering` is set,
@@ -243,7 +223,7 @@ pub type MethodInstantiator =
     fn(&CodegenContext, &[FunctionAST], &HashMap<String, TypeIdx>) -> Result<(), String>;
 
 /// A loaded module's public surface, for resolving multi-dot chained access
-/// (`w.leaf.Point` / `w.leaf.makePoint`). Mirrors the C++ `ModuleNamespace`.
+/// (`w.leaf.Point` / `w.leaf.makePoint`).
 #[derive(Default)]
 pub struct ModuleNamespace {
     /// pub type name -> its qualified `Named` TypeIdx (`Point` -> `leaf.Point`).
@@ -252,8 +232,7 @@ pub struct ModuleNamespace {
     /// (`pub const leaf = import("mod_chain_leaf")` -> `leaf` -> `mod_chain_leaf`).
     pub module_aliases: HashMap<String, String>,
     /// NON-pub decl names (types + fns), recorded so a handle-qualified access
-    /// distinguishes "private" from "does not exist" (the C++ `privateNames`,
-    /// main.cpp:702/713 regPriv).
+    /// distinguishes "private" from "does not exist".
     pub private_names: std::collections::HashSet<String>,
 }
 
@@ -327,9 +306,9 @@ impl<'ctx> CodegenContext<'ctx> {
         let ev = ComptimeEvaluator::new(&self.node_store, &self.string_pool, &self.type_pool);
         let mut scope = ComptimeScope::new();
         // Install a cfn resolver so `bufLen(8)` in a `[N]u8` length (or any
-        // comptime position) folds by running the cfn body — the C++
-        // `CompCallResolverImpl`. Depth / total-call budgets shared (via Cell)
-        // across the recursion bound runaway cfn->cfn chains.
+        // comptime position) folds by running the cfn body. Depth / total-call
+        // budgets shared (via Cell) across the recursion bound runaway
+        // cfn->cfn chains.
         let depth = Cell::new(0u32);
         let total = Cell::new(0u32);
         let mut resolver = CfnResolver {
@@ -377,15 +356,11 @@ impl<'ctx> CodegenContext<'ctx> {
         ev.eval(expr, &scope, &mut ctx)
     }
 
-    /// Evaluate a VALUE-returning `cfn` call at compile time (the C++
-    /// `astgenCompTimeFnCall`'s fold path): fold each `arg_exprs[i]` in
-    /// `caller_scope`, bind to the callee's param names, then run the body —
-    /// with a `CfnResolver` active throughout so a cfn calling another cfn
-    /// (`doubled()` -> `base()`) and recursion (`fact`/`fib` via `comp if`)
-    /// resolve. Returns `Ok(value)` (the body's `return` value) or `Err` on an
-    /// arg that isn't comptime-constant / a body that fails to fold. Value cfns
-    /// carry no `@emit*` intrinsics, so no emitter is threaded here (the void
-    /// `@emit`-bearing cfns keep their recording path in astgen).
+    /// Evaluate a VALUE-returning `cfn` call at compile time: fold each arg in
+    /// `caller_scope`, bind to the callee's param names, run the body with a
+    /// `CfnResolver` active so cfn->cfn calls and recursion resolve. Returns the
+    /// body's `return` value, or `Err` on a non-constant arg / a body that fails
+    /// to fold. Value cfns carry no `@emit*` intrinsics, so no emitter here.
     pub fn eval_cfn_call(
         &self,
         fn_ast: &FunctionAST,
@@ -468,7 +443,7 @@ impl<'ctx> CodegenContext<'ctx> {
             return Err("astgen: array length must be comptime-known".into());
         }
         // A folded float or negative size is a sign/kind error, not an
-        // unknown length (the C++ resolveArrayExpr, codegen.cpp:1567-1580).
+        // unknown length.
         let negative = matches!(
             len,
             ComptimeValue::Int {
@@ -539,12 +514,6 @@ impl<'ctx> CodegenContext<'ctx> {
             .insert(module_path.into(), enums);
     }
 
-    /// Resolve a `GenericCall` type (e.g. `Pair(u64)`) to its monomorphized
-    /// `Named` struct, instantiating it on first use: register the struct with
-    /// substituted fields + clone each method's signature under `Inst.method`
-    /// (resolution-only — method bodies are NOT lowered here, matching the
-    /// `--emit-jir` cut before `jirDefineBody`). Caches `GenericCall -> Named`.
-    /// Returns `ty` unchanged for non-`GenericCall` inputs.
     /// Instantiate the generic underlying `ty` when it is a GenericCall or a
     /// type-alias chain that bottoms out in one (`CounterI32 -> Counter(i32)`),
     /// so its fields/layout resolve. `ty`'s own spelling is left unchanged.
@@ -569,6 +538,11 @@ impl<'ctx> CodegenContext<'ctx> {
         Ok(())
     }
 
+    /// Resolve a `GenericCall` type (e.g. `Pair(u64)`) to its monomorphized
+    /// `Named` struct, instantiating on first use: register the struct with
+    /// substituted fields + clone each method's signature under `Inst.method`
+    /// (method bodies are NOT lowered here). Caches `GenericCall -> Named`;
+    /// returns `ty` unchanged for non-`GenericCall` inputs.
     pub fn resolve_generic_call_instantiate(&self, ty: TypeIdx) -> Result<TypeIdx, String> {
         // Inside an instantiated body, apply the active substitution to the call's
         // type args (`Option(T)` -> `Option(u8)`) so we instantiate the concrete
@@ -601,8 +575,7 @@ impl<'ctx> CodegenContext<'ctx> {
         };
         // Canonicalize a handle-qualified callee (`c.Vec` -> `std/collections.Vec`)
         // so it resolves via get_function_ast AND its monomorph name (`Vec__i32`)
-        // dedups with the bare/canonical spelling — the C++ resolves these through
-        // its scoped handle-fn table (main.cpp:1609-1660). A canonical dotted callee
+        // dedups with the bare/canonical spelling. A canonical dotted callee
         // (`std/collections.Vec`), whose prefix is a module path not a handle, is
         // left unchanged.
         let callee = match callee.split_once('.') {
@@ -618,8 +591,7 @@ impl<'ctx> CodegenContext<'ctx> {
         // Requalify each type arg against the body module so a bare arg written
         // in a module's own body (`Option(File).Some(..)` inside std/fs) gets the
         // qualified monomorph name (`Option__std/fs.File`, not a duplicate bare
-        // `Option__File`). Idempotent for builtins / already-qualified args. This
-        // is the body-level half of the C++ bindDeclTypes requalification.
+        // `Option__File`). Idempotent for builtins / already-qualified args.
         let args: Vec<TypeIdx> = args.iter().map(|&a| self.requalify_type(a, &bm)).collect();
         let generic = if !callee.contains('.') && !bm.is_empty() {
             self.get_function_ast(&format!("{bm}.{callee}"))
@@ -631,8 +603,8 @@ impl<'ctx> CodegenContext<'ctx> {
         if !generic.is_generic() {
             return Err(format!("astgen: `{callee}` is not a generic"));
         }
-        // Mirror the C++ `requalifyType(GenericCall)` side effect: intern the
-        // qualified callee name at lookup time (keeps later StringIdxs aligned).
+        // Intern the qualified callee name at lookup time — keeps later
+        // StringIdxs aligned.
         // (Generics with RECURSIVE generic method signatures — Vec.pop ->
         // Option(T) — are deferred inside instantiate_struct_expr until the full
         // Pass-1 intern order lands; non-recursive ones instantiate cleanly.)
@@ -774,7 +746,7 @@ impl<'ctx> CodegenContext<'ctx> {
         // qualified-and-instantiated `std/option.Option__u8` so the recursive
         // type is interned here, before any body). Method NAMES are NOT interned
         // here — they intern lazily at the Pass-2 emit_call site, matching the
-        // oracle (jirDeclarePrototype does not touch the string pool).
+        // oracle's intern order.
         let mut clones: Vec<FunctionAST> = Vec::with_capacity(anon.methods.len());
         for m in &anon.methods {
             let mut clone = m.clone();
@@ -816,8 +788,7 @@ impl<'ctx> CodegenContext<'ctx> {
 
     /// Substitute + requalify a method signature type, and if the result is a
     /// GenericCall (`Option(T)` -> `Option(u8)`), qualify its callee and
-    /// instantiate it so the nested type is interned at Pass-1 (the C++ ABI
-    /// consultation order).
+    /// instantiate it so the nested type is interned at Pass-1.
     fn instantiate_sig_type(
         &self,
         ty: TypeIdx,
@@ -877,8 +848,7 @@ impl<'ctx> CodegenContext<'ctx> {
                 discriminant: v.discriminant,
             });
         }
-        // Payload layout (max over variants; each payload field aligned), the
-        // analyzer's `fillEnumBodies` equivalent for an instantiated enum.
+        // Payload layout: max over variants, each payload field aligned.
         let has_payload = variants.iter().any(|v| !v.payload_types.is_empty());
         let (mut max_size, mut max_align) = (0u64, 1u64);
         if has_payload {
@@ -900,9 +870,9 @@ impl<'ctx> CodegenContext<'ctx> {
         self.register_enum(inst_name.clone(), variants);
         if has_payload {
             let named = self.context().named_struct(&inst_name);
-            // Fill the LLVM struct body `{i8 tag, alignDriver, [extra x i8]}` so the
-            // instantiated enum is not left `opaque` in --emit-ir — the analyzer's
-            // enum-body layout (analyzer.rs:423-446) for an instantiated enum.
+            // Fill the LLVM struct body `{i8 tag, alignDriver, [extra x i8]}` so
+            // the instantiated enum is not left `opaque` in --emit-ir (same
+            // layout the analyzer computes for declared enums).
             let (align_driver, driver_size) = match max_align {
                 1 => (self.context().i8_type(), 1u64),
                 2 => (self.context().i16_type(), 2),
@@ -950,8 +920,7 @@ impl<'ctx> CodegenContext<'ctx> {
         let new_callee = if let Some((prefix, rest)) = callee.split_once('.') {
             // A handle-qualified generic callee (`c.Vec`): resolve the import handle
             // to its canonical module path so `c.Vec(i32)` interns the SAME
-            // GenericCall as bare `Vec(i32)` and dedups to one monomorph (the C++
-            // resolves these through its scoped handle-fn table, main.cpp:1609-1660).
+            // GenericCall as bare `Vec(i32)` and dedups to one monomorph.
             // An already-canonical dotted callee (`std/collections.Vec`) — whose
             // prefix is a module path, not a handle — passes through unchanged.
             match self.import_handle_module(prefix) {
@@ -973,10 +942,9 @@ impl<'ctx> CodegenContext<'ctx> {
         } else {
             callee.clone()
         };
-        // Requalify args with the active-subst-keeps-literal rule (matches the
-        // C++ requalifyTypeUncached GenericCall arm): a generic param `T` arg
-        // stays literal so an instantiated body interns the literal
-        // `Vec(T)`/`Option(T)` GenericCalls in the oracle's order.
+        // Requalify args with the active-subst-keeps-literal rule: a generic
+        // param `T` arg stays literal so an instantiated body interns the
+        // literal `Vec(T)`/`Option(T)` GenericCalls in the oracle's order.
         let new_args: Vec<TypeIdx> = args
             .iter()
             .map(|&a| self.requalify_generic_arg(a, ctx_module))
@@ -1032,9 +1000,9 @@ impl<'ctx> CodegenContext<'ctx> {
         substitute_type(ty, &frame, &self.type_pool, &self.string_pool)
     }
 
-    /// Rewrite a `Self.method` / `T.method` callee inside an instantiated body to
-    /// the concrete `Inst.method` (the C++ `resolvePrefix` reads currentSubst).
-    /// No-op outside an instantiation or for a non-subst prefix.
+    /// Rewrite a `Self.method` / `T.method` callee inside an instantiated body
+    /// to the concrete `Inst.method`. No-op outside an instantiation or for a
+    /// non-subst prefix.
     pub fn resolve_subst_prefix(&self, callee: &str) -> String {
         if !self.has_active_subst() {
             return callee.to_string();
@@ -1060,24 +1028,23 @@ impl<'ctx> CodegenContext<'ctx> {
             .and_then(|f| f.get(name).copied())
             .unwrap_or(TypeIdx::NONE)
     }
-    /// Whether any substitution frame is active (memoization in the type-layout
-    /// methods is bypassed while a substitution is in flight).
+    /// Whether any substitution frame is active.
     pub fn has_active_subst(&self) -> bool {
         !self.current_subst.borrow().is_empty()
     }
 
     /// Install the comp-value substitution map active while a comp-instantiated
-    /// fn clone's body is lowered (the C++ `setCurrentCompSubst`).
+    /// fn clone's body is lowered.
     pub fn set_current_comp_subst(&self, s: HashMap<String, ComptimeValue>) {
         *self.current_comp_subst.borrow_mut() = s;
     }
-    /// Clear the comp-value substitution map (the C++ `clearCurrentCompSubst`).
+    /// Clear the comp-value substitution map.
     pub fn clear_current_comp_subst(&self) {
         self.current_comp_subst.borrow_mut().clear();
     }
     /// Bind the active comp-value substitutions into `scope`, so a body
-    /// reference to a comp param folds to its call-site constant (the C++
-    /// `seedComptimeScope` tail loop). Bound last to shadow same-named consts.
+    /// reference to a comp param folds to its call-site constant. Bound last to
+    /// shadow same-named consts.
     pub fn seed_comp_subst_into(&self, scope: &mut ComptimeScope) {
         for (name, value) in self.current_comp_subst.borrow().iter() {
             scope.bind(name.clone(), value.clone());
@@ -1086,26 +1053,24 @@ impl<'ctx> CodegenContext<'ctx> {
 
     // ---- function registry ----
     /// Register a function/method signature under `name` (the call-site lookup
-    /// key). Last registration wins, matching the C++ `registerFunctionAST`.
+    /// key). Last registration wins.
     pub fn register_function_ast(&self, name: impl Into<String>, f: FunctionAST) {
         self.function_asts.borrow_mut().insert(name.into(), f);
     }
     /// Withdraw a conditionally-instantiated method whose body failed to compile
-    /// for these type args (the C++ `withdraw`).
+    /// for these type args.
     pub fn unregister_function_ast(&self, name: &str) {
         self.function_asts.borrow_mut().remove(name);
     }
-    /// Record why a conditionally-instantiated method was withdrawn (the C++
-    /// `recordWithdrawnMethod`): a call to a withdrawn method reports "not
-    /// available for this instantiation — <reason>" instead of a bare
-    /// "unknown method".
+    /// Record why a conditionally-instantiated method was withdrawn: a call to
+    /// a withdrawn method reports "not available for this instantiation —
+    /// <reason>" instead of a bare "unknown method".
     pub fn record_withdrawn_method(&self, name: impl Into<String>, reason: impl Into<String>) {
         self.withdrawn_methods
             .borrow_mut()
             .insert(name.into(), reason.into());
     }
-    /// The recorded withdrawal reason for `name`, if it was withdrawn (the C++
-    /// `getWithdrawnMethod`).
+    /// The recorded withdrawal reason for `name`, if it was withdrawn.
     pub fn get_withdrawn_method(&self, name: &str) -> Option<String> {
         self.withdrawn_methods.borrow().get(name).cloned()
     }
@@ -1116,15 +1081,14 @@ impl<'ctx> CodegenContext<'ctx> {
     fn method_instantiator(&self) -> Option<MethodInstantiator> {
         self.method_instantiator.get()
     }
-    /// While set, `instantiate_struct_expr` instantiates a generic's TYPE only and
-    /// stashes its method-body lowering (the C++ Phase-1b `bindDeclTypes`).
+    /// While set, `instantiate_struct_expr` instantiates a generic's TYPE only
+    /// and stashes its method-body lowering.
     pub fn set_defer_method_lowering(&self, on: bool) {
         self.defer_method_lowering.set(on);
     }
     /// Lower every method body stashed by the deferred (type-only) instantiation,
-    /// in stash order (the method pre-pass, the C++ Phase-1k). Drains the queue
-    /// with deferral OFF so nested generics encountered in a body instantiate
-    /// immediately (the C++ resolveGenericCall during method codegen).
+    /// in stash order (the method pre-pass). Drains the queue with deferral OFF
+    /// so nested generics encountered in a body instantiate immediately.
     pub fn drain_pending_method_lowering(&self) -> Result<(), String> {
         let Some(lower) = self.method_instantiator() else {
             return Ok(());
@@ -1152,9 +1116,9 @@ impl<'ctx> CodegenContext<'ctx> {
 
     // ---- drop registry ----
     /// Register the (already-mangled) LLVM symbol of `T`'s `cfn drop`, keyed by
-    /// the type name the drop site resolves through. The C++ stores a
-    /// `FunctionAST*` and mangles on lookup; we pre-mangle so the registry holds
-    /// owned `String`s (no module-AST borrow entangling the context lifetime).
+    /// the type name the drop site resolves through. Pre-mangled so the registry
+    /// holds owned `String`s (no module-AST borrow entangling the context
+    /// lifetime).
     pub fn register_drop_fn(
         &self,
         type_name: impl Into<String>,
@@ -1168,7 +1132,7 @@ impl<'ctx> CodegenContext<'ctx> {
     /// The mangled drop-fn symbol for the type `ty` names (Struct/Named/Enum),
     /// or `None` when it has no registered drop. Resolves through `name_for_kinds`
     /// so an instantiated generic / type-alias (`CounterI32` -> `Counter__i32`)
-    /// finds its drop — the C++ `lookupDropFnLLVMName` chase.
+    /// finds its drop.
     pub fn lookup_drop_fn_name(&self, ty: TypeIdx) -> Option<String> {
         let name = self.name_for_kinds(ty, &[TypeKind::Struct, TypeKind::Named, TypeKind::Enum])?;
         self.drop_fns.borrow().get(&name).cloned()
@@ -1249,23 +1213,23 @@ impl<'ctx> CodegenContext<'ctx> {
     }
 
     // ---- current display file (for astgen diagnostics) ----
-    /// Set the display filename stamped onto astgen diagnostics (the C++
-    /// `setCurrentFile`). Entry-global; swapped for imported-body lowering.
+    /// Set the display filename stamped onto astgen diagnostics.
+    /// Entry-global; swapped for imported-body lowering.
     pub fn set_current_file(&self, file: impl Into<String>) {
         *self.current_file.borrow_mut() = file.into();
     }
-    /// The display filename for the body currently lowering (the C++
-    /// `currentFile`). Empty until the driver sets it.
+    /// The display filename for the body currently lowering. Empty until the
+    /// driver sets it.
     pub fn current_file(&self) -> String {
         self.current_file.borrow().clone()
     }
 
     // ---- body-module stack ----
-    /// Enter a type body's owning module (the C++ `BodyModuleGuard` ctor).
+    /// Enter a type body's owning module.
     pub fn push_body_module(&self, module_path: impl Into<String>) {
         self.body_module_stack.borrow_mut().push(module_path.into());
     }
-    /// Leave the current body module (the guard's dtor).
+    /// Leave the current body module.
     pub fn pop_body_module(&self) {
         self.body_module_stack.borrow_mut().pop();
     }
@@ -1316,7 +1280,6 @@ impl<'ctx> CodegenContext<'ctx> {
     /// Rewrite a bare user-type `Named` leaf to its module-qualified TypeIdx as
     /// seen from `ctx_module` (a pure lookup into the pre-interned map; no-op for
     /// the entry module, already-qualified names, and non-`Named` types).
-    /// Recursive requalification through ptr/array element types is deferred.
     pub fn requalify_type(&self, ty: TypeIdx, ctx_module: &str) -> TypeIdx {
         let k = self.type_pool.get(ty);
         // A GenericCall requalifies its callee + args (`Option(File)` ->
@@ -1327,10 +1290,9 @@ impl<'ctx> CodegenContext<'ctx> {
         }
         // Wrapper kinds carry the element TypeIdx in `a`; recurse into it so a
         // qualified element (`[3]timer.TimerChannel`, `*mut bus.Bus`) surfaces
-        // through the wrapper. `b` (length / length-expr) is preserved. Mirrors
-        // the C++ `requalifyTypeUncached` wrapper arm (src/codegen.cpp:430-442);
-        // without this an array/pointer/slice field of an imported struct keeps
-        // a bare element name that can't requalify under a foreign body module.
+        // through the wrapper. `b` (length / length-expr) is preserved. Without
+        // this an array/pointer/slice field of an imported struct keeps a bare
+        // element name that can't requalify under a foreign body module.
         match k.kind {
             TypeKind::PtrSingle
             | TypeKind::PtrMany
@@ -1386,21 +1348,18 @@ impl<'ctx> CodegenContext<'ctx> {
         ty
     }
 
-    /// Requalify a GenericCall's *argument* the way the C++ `requalifyType`
-    /// does when called from `requalifyTypeUncached`'s GenericCall arm: an
-    /// active-subst `Named` (the generic param `T`/`Self`) stays LITERAL rather
-    /// than being substituted. `requalify_type` substitutes such a Named (it is
-    /// the only requalify caller that does so); for args we must keep `T`
-    /// un-substituted so a literal `Vec(T)` / `Option(T)` GenericCall interns
-    /// during an instantiated body — matching the oracle's TypePool order.
-    /// Recurses wrapper kinds (`*Vec(T)`) and nested GenericCalls.
+    /// Requalify a GenericCall's *argument*: an active-subst `Named` (the
+    /// generic param `T`/`Self`) stays LITERAL rather than being substituted
+    /// (unlike `requalify_type`), so a literal `Vec(T)` / `Option(T)`
+    /// GenericCall interns during an instantiated body — matching the oracle's
+    /// TypePool order. Recurses wrapper kinds (`*Vec(T)`) and nested GenericCalls.
     fn requalify_generic_arg(&self, ty: TypeIdx, ctx_module: &str) -> TypeIdx {
         let k = self.type_pool.get(ty);
         match k.kind {
             TypeKind::Named => {
                 let name = self.str_name(k.a);
-                // Active-subst param stays literal (the C++ rule); fall through
-                // to the ordinary requalify otherwise.
+                // Active-subst param stays literal; fall through to the
+                // ordinary requalify otherwise.
                 if self.has_active_subst() && !self.lookup_current_subst(&name).is_none() {
                     return ty;
                 }
@@ -1469,7 +1428,7 @@ impl<'ctx> CodegenContext<'ctx> {
         // instantiated `Named` struct; a type-alias Named (`CounterI32` ->
         // `Counter(i32)`) resolves to its target (which may itself be a
         // GenericCall, hence the loop) so struct/enum field lookups land on the
-        // monomorphized type. Mirrors the C++ lookupStruct recursive chaser.
+        // monomorphized type.
         for _ in 0..8 {
             let k = self.type_pool.get(ty);
             if k.kind == TypeKind::GenericCall {
@@ -1646,7 +1605,7 @@ impl<'ctx> CodegenContext<'ctx> {
             .map(|e| (e.max_payload_size, e.max_payload_align))
     }
     /// The registered enum name a `Enum`/`Named` TypeIdx resolves to, or `None`
-    /// when it isn't a registered enum. (The `lookupEnum(ty)->name` of the C++.)
+    /// when it isn't a registered enum.
     pub fn enum_name_of(&self, ty: TypeIdx) -> Option<String> {
         let name = self.name_for_kinds(ty, &[TypeKind::Enum, TypeKind::Named])?;
         if self.enums.borrow().contains_key(&name) {
@@ -1656,7 +1615,7 @@ impl<'ctx> CodegenContext<'ctx> {
         }
     }
     /// The registered struct name a `Struct`/`Named`/instantiated-`GenericCall`
-    /// TypeIdx resolves to, or `None` (the `lookupStruct(ty)->name` of the C++).
+    /// TypeIdx resolves to, or `None`.
     pub fn struct_name_of(&self, ty: TypeIdx) -> Option<String> {
         let name = self.name_for_kinds(ty, &[TypeKind::Struct, TypeKind::Named])?;
         if self.structs.borrow().contains_key(&name) {
@@ -1711,22 +1670,17 @@ impl<'ctx> CodegenContext<'ctx> {
         String::from_utf8_lossy(&self.string_pool.get(StringIdx::new(id))).into_owned()
     }
 
-    // ---- deferred resolution hooks ----
-    // These return `NONE` until the analyzer + substitution engine land. They
-    // exist now so `abi`'s classifiers can be ported against a stable surface;
-    // for non-generic, non-aliased types (the common case) they are never the
-    // deciding path.
+    // ---- aliases, import handles, chained access ----
 
-    /// Resolve a `GenericCall` TypeIdx to its instantiated concrete TypeIdx.
-    /// DEFERRED — returns `NONE`.
+    /// Resolve a `GenericCall` TypeIdx to its instantiated concrete TypeIdx,
+    /// instantiating on demand; `NONE` when it can't.
     pub fn resolve_generic_call(&self, ty: TypeIdx) -> TypeIdx {
         let cached = self.lookup_generic_resolution(ty);
         if !cached.is_none() {
             return cached;
         }
-        // ON-DEMAND INSTANTIATION (the C++ `const resolveGenericCall`): the pools +
-        // registries are interior-mutable, so a `&self` layout query instantiates
-        // an uninstantiated GenericCall on the spot.
+        // On-demand: the pools + registries are interior-mutable, so a `&self`
+        // layout query instantiates an uninstantiated GenericCall on the spot.
         self.resolve_generic_call_instantiate(ty)
             .unwrap_or(TypeIdx::NONE)
     }
@@ -1748,22 +1702,18 @@ impl<'ctx> CodegenContext<'ctx> {
     }
     /// The module identity an import-handle name resolves to FROM THE CURRENT
     /// BODY MODULE, if any. No cross-module fallback: an imported body must
-    /// not see the entry module's handles (the C++ getImportHandle).
+    /// not see the entry module's handles.
     pub fn import_handle_module(&self, name: &str) -> Option<String> {
         self.import_handles
             .borrow()
             .get(&(self.current_body_module(), name.to_string()))
             .cloned()
     }
-    /// Format a qualified-name lookup miss the way the C++
-    /// `JamCodegenContext::formatNamespaceLookupError` does (codegen.cpp:819).
-    /// `qualified` is the dotted spelling that failed to resolve (`fmt.println`),
-    /// `kind` is what we were looking for (`function`, `user-defined type`, ...).
-    /// Splits at the FIRST dot: the leading segment is an import handle; if it
-    /// resolves to a module, the trailing segment didn't exist there. The C++
-    /// also distinguishes a PRIVATE trailing symbol ("is not exported"), but the
-    /// Rust import-handle table carries only `handle -> modulePath` (no private-
-    /// name set), and no corpus path exercises that branch, so it is omitted.
+    /// Format a qualified-name lookup miss. `qualified` is the dotted spelling
+    /// that failed to resolve (`fmt.println`), `kind` is what we were looking
+    /// for (`function`, `user-defined type`, ...). Splits at the FIRST dot: the
+    /// leading segment is an import handle; if it resolves to a module, the
+    /// trailing segment is private there or doesn't exist.
     pub fn format_namespace_lookup_error(&self, kind: &str, qualified: &str) -> String {
         let Some(dot_pos) = qualified.find('.') else {
             return format!("Unknown {kind}: {qualified}");
@@ -1773,8 +1723,7 @@ impl<'ctx> CodegenContext<'ctx> {
         match self.import_handle_module(handle) {
             None => format!("unknown module handle `{handle}` in `{qualified}`"),
             Some(module_path) => {
-                // Distinguish private from nonexistent (the C++ privateNames
-                // branch, codegen.cpp:831).
+                // Distinguish private from nonexistent.
                 let is_private = self
                     .module_namespaces
                     .borrow()
@@ -1793,9 +1742,8 @@ impl<'ctx> CodegenContext<'ctx> {
     /// the handle's target module. The registries key types/functions by their
     /// qualified identity for internal resolution, and a handle spelled like
     /// the module identity (`const lib = import("lib")`) makes a user spelling
-    /// collide with that internal key — so the pub check must happen at lookup
-    /// (the C++ never registers handle-qualified keys for non-pub decls,
-    /// main.cpp:701-721). Returns the diagnostic when `Name` is private.
+    /// collide with that internal key — so the pub check must happen at lookup.
+    /// Returns the diagnostic when `Name` is private.
     pub fn namespace_privacy_violation(&self, dotted: &str) -> Option<String> {
         let (handle, bare) = dotted.split_once('.')?;
         let target = self.import_handle_module(handle)?;
@@ -1825,7 +1773,7 @@ impl<'ctx> CodegenContext<'ctx> {
 
     /// Walk a 3+-segment dotted access (`w.leaf.Point`): the first segment is an
     /// import handle, each intermediate segment a pub re-export module alias.
-    /// Returns `(leaf module identity, last segment)`. The C++ `walkChain`.
+    /// Returns `(leaf module identity, last segment)`.
     fn walk_chain(&self, dotted: &str) -> Option<(String, String)> {
         let segs: Vec<&str> = dotted.split('.').collect();
         if segs.len() < 3 {
@@ -1844,7 +1792,7 @@ impl<'ctx> CodegenContext<'ctx> {
     }
 
     /// Resolve a chained TYPE access (`w.leaf.Point`) to the leaf module's
-    /// canonical `Named` TypeIdx, or NONE. The C++ `resolveChainedType`.
+    /// canonical `Named` TypeIdx, or NONE.
     pub fn resolve_chained_type(&self, dotted: &str) -> TypeIdx {
         let Some((leaf, last)) = self.walk_chain(dotted) else {
             return TypeIdx::NONE;
@@ -1857,7 +1805,7 @@ impl<'ctx> CodegenContext<'ctx> {
     }
 
     /// Resolve a chained FUNCTION access (`w.leaf.makePoint`) to the leaf
-    /// module's function. The C++ `resolveChainedFunction`.
+    /// module's function.
     pub fn resolve_chained_function(&self, dotted: &str) -> Option<FunctionAST> {
         let (leaf, last) = self.walk_chain(dotted)?;
         self.get_function_ast(&format!("{leaf}.{last}"))
@@ -1874,10 +1822,6 @@ impl<'ctx> CodegenContext<'ctx> {
     // ---- type lowering ----
 
     /// Resolve a `TypeIdx` to its LLVM type, memoized per TypeIdx.
-    ///
-    /// `requalify_type` (which keys each module's same-named type separately) is
-    /// deferred to the decl/analyzer increment; until then the caller is
-    /// responsible for passing already-qualified TypeIdxs.
     pub fn get_llvm_type(&self, ty: TypeIdx) -> Result<Type<'ctx>, String> {
         // Requalify a bare imported-module type to its qualified registry name
         // against the module whose body is being lowered (no-op for the entry
@@ -1952,9 +1896,7 @@ impl<'ctx> CodegenContext<'ctx> {
                 if let Some(msg) = self.namespace_privacy_violation(&self.str_name(k.a)) {
                     return Err(msg);
                 }
-                // Registry-backed resolution. The substitution / alias /
-                // chained-reexport / privacy resolution order lands with the
-                // analyzer + substitution engine.
+                // Registry-backed resolution.
                 if let Some(t) = self.struct_llvm_type(ty) {
                     Ok(t)
                 } else if let Some(t) = self.union_llvm_type(ty) {
@@ -1997,7 +1939,7 @@ impl<'ctx> CodegenContext<'ctx> {
             ),
             TypeKind::Module => Err("Module type has no LLVM representation".into()),
             // An opaque pointer — the per-call-site signature is rebuilt by the
-            // CallIndirect path from the Fn TypeKey (the C++ codegen.cpp:244).
+            // CallIndirect path from the Fn TypeKey.
             TypeKind::Fn => Ok(self.ctx.pointer_type(0)),
         }
     }
@@ -2031,7 +1973,6 @@ impl<'ctx> CodegenContext<'ctx> {
             TypeKind::Array => Ok(k.b as u64 * self.type_size(TypeIdx::new(k.a))?),
             TypeKind::Enum => Ok(1), // unit-only enums lower to u8
             TypeKind::Struct | TypeKind::Named => {
-                // Deferred: substitution + alias resolution.
                 if let Some(fields) = self.struct_fields(ty) {
                     let mut off = 0u64;
                     let mut max_align = 1u64;
@@ -2110,7 +2051,7 @@ impl<'ctx> CodegenContext<'ctx> {
     }
 
     /// Alignment for a *standalone storage slot* (alloca / byref-aggregate
-    /// memcpy). Matches the C++ oracle's quirk: a payloaded, NON-generic enum
+    /// memcpy). Matches the oracle's quirk: a payloaded, NON-generic enum
     /// referenced by a *module-qualified* (imported) name reports slot
     /// alignment 1, because the imported enum's `max_payload_align` is never
     /// lifted past its initial 1 even though its LLVM body is laid out fully.
@@ -2194,17 +2135,17 @@ impl<'ctx> CodegenContext<'ctx> {
 
 /// Folds a `cfn` call encountered in a comptime position (`[bufLen(8)]u8`, a
 /// `cfn` calling another `cfn`) by running the callee's body in the evaluator.
-/// Mirrors the C++ `CompCallResolverImpl`. The depth / total-call budgets are
-/// shared `Cell`s so the whole instantiation chain is bounded.
+/// The depth / total-call budgets are shared `Cell`s so the whole
+/// instantiation chain is bounded.
 struct CfnResolver<'a, 'ctx> {
     ctx: &'a CodegenContext<'ctx>,
     depth: &'a Cell<u32>,
     total: &'a Cell<u32>,
 }
 
-/// Recursion cap (C++ `kMaxDepth`).
+/// Recursion cap.
 const CFN_MAX_DEPTH: u32 = 256;
-/// Total-call cap across one fold (C++ `kMaxTotalCalls`).
+/// Total-call cap across one fold.
 const CFN_MAX_TOTAL_CALLS: u32 = 1_000_000;
 
 impl CompCallResolver for CfnResolver<'_, '_> {
@@ -2215,8 +2156,8 @@ impl CompCallResolver for CfnResolver<'_, '_> {
         diags: &mut Diagnostics,
         loc: &SrcLoc,
     ) -> ComptimeValue {
-        // Resolve against the body module first (the C++ namespace walk), then
-        // the bare name — two modules may each define a same-named cfn.
+        // Resolve against the body module first, then the bare name — two
+        // modules may each define a same-named cfn.
         let cur = self.ctx.current_body_module();
         let f = if !cur.is_empty() && !name.contains('.') {
             self.ctx

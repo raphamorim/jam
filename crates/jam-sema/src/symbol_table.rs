@@ -7,18 +7,16 @@
 
 //! Exported-symbol registry — tracks the `pub` functions/types/consts/imports a
 //! module exposes, resolvable by module path, by bare name (destructuring
-//! imports), or through a registered binding. Ported from
-//! `src/symbol_table.{h,cpp}`.
+//! imports), or through a registered binding.
 //!
-//! The C++ stores raw `FunctionAST*` pointers into the parsed modules; here the
-//! table borrows the modules for its lifetime (`SymbolTable<'a>` holds
-//! `Option<&'a FunctionAST>`). Only `pub` functions carry the borrow — type /
-//! const / import re-exports store `None` (downstream finds the concrete
-//! decl through its own per-module registry; the table only answers existence).
+//! The table borrows the parsed modules for its lifetime. Only `pub` functions
+//! carry the borrow — type / const / import re-exports store `None` (downstream
+//! finds the concrete decl through its own per-module registry; the table only
+//! answers existence).
 //!
 //! The inner maps are `BTreeMap`, not hash maps: `lookup_by_name` returns the
 //! first match across modules, so a stable (path-sorted) scan order keeps the
-//! result deterministic (the C++ `std::unordered_map` order is impl-defined).
+//! result deterministic.
 
 use std::collections::BTreeMap;
 

@@ -5,25 +5,12 @@
  * Licensed under the Apache License, Version 2.0 with LLVM Exceptions.
  */
 
-//! JIR codegen — walks a fully-typed [`JirFunction`] and emits LLVM IR. By
-//! design this stage is mechanical: no type inference, no peer resolution. Each
-//! `JirInst` maps to a few LLVM instructions; the `JirRef -> LLVM Value` map
-//! carries the dataflow. Ported from `src/jir_codegen.{h,cpp}`.
-//!
-//! Two-step API (so forward references between functions resolve before any
-//! body is lowered): [`jir_declare_prototype`] emits the LLVM signature, then
-//! `jir_define_body` (next increment) lowers the instructions. The ABI
-//! classifier here is the single source of truth for the signature — call sites
-//! and arg lowering consult the same [`crate::abi`] routines, so caller and
-//! callee can't disagree on by-value/by-pointer or direct/sret.
-//!
-//! ## Scope of this increment
-//!
-//! Prototype emission only: the function signature, linkage, calling
-//! convention, and ABI attributes (sret / zeroext / noreturn). The 47-tag
-//! `JirInst` → LLVM lowering (`jir_define_body` + `emit_inst`) — which needs a
-//! broad jam_llvm Builder surface — lands next, validatable via `jir_verify`
-//! on hand-built `JirFunction`s, then end-to-end against `--emit-jir`/`--emit-ir`.
+//! JIR codegen — walks a fully-typed [`JirFunction`] and emits LLVM IR. Purely
+//! mechanical: no inference here, each `JirInst` maps to a few LLVM
+//! instructions. [`jir_declare_prototype`] emits signatures first (so forward
+//! references resolve), then [`jir_define_body`] lowers each body; both consult
+//! the same [`crate::abi`] classifier, so caller and callee can't disagree on
+//! by-value/by-pointer or direct/sret.
 
 use std::collections::HashMap;
 
@@ -172,9 +159,9 @@ struct JirCodegenCtx<'a, 'ctx> {
 }
 
 /// Look up the cached LLVM value for `r`, or emit it (recursing for
-/// subexpressions) and cache. The CACHE-BEFORE-RETURN here is load-bearing: a
-/// JirRef referenced across out-of-order block walks must lower to exactly one
-/// LLVM value, or reads split from writes (see project_jir_codegen_caching).
+/// subexpressions) and cache. The caching is load-bearing: a JirRef referenced
+/// across out-of-order block walks must lower to exactly one LLVM value, or
+/// reads split from writes.
 fn emit_inst<'ctx>(
     lctx: &mut JirCodegenCtx<'_, 'ctx>,
     r: JirRef,
@@ -310,7 +297,7 @@ fn emit_inst_impl<'ctx>(
         JirTag::ICmpUgt => icmp(lctx, &inst, IntPredicate::Ugt, "ugt"),
         JirTag::ICmpUge => icmp(lctx, &inst, IntPredicate::Uge, "uge"),
 
-        // Float comparison (ordered; `FCmpOne` maps to LLVM `une`, matching C++).
+        // Float comparison (ordered; note `FCmpOne` maps to LLVM `une`).
         JirTag::FCmpOeq => fcmp(lctx, &inst, RealPredicate::Oeq, "oeq"),
         JirTag::FCmpOne => fcmp(lctx, &inst, RealPredicate::Une, "one"),
         JirTag::FCmpOlt => fcmp(lctx, &inst, RealPredicate::Olt, "olt"),
@@ -344,8 +331,7 @@ fn emit_inst_impl<'ctx>(
             Ok(Some(lctx.ctx.builder().lshr(a, b, "lshr")))
         }
         JirTag::BitNot => {
-            // LLVM has no NOT; xor with all-ones of the operand's type (the C++
-            // shape, named "not").
+            // LLVM has no NOT; xor with all-ones of the operand's type.
             let v = emit_inst(lctx, inst.a)?.ok_or("BitNot operand")?;
             let ty = lctx.ctx.get_llvm_type(inst.ty)?;
             let ones = ty.const_int(!0u64, true);

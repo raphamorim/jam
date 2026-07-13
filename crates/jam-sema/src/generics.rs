@@ -10,9 +10,7 @@
 //! (`fn Pair(T: type) type { return struct { x: T } }`); a use `Pair(u64)` is a
 //! `GenericCall` TypeIdx that resolves by binding the parameter names to the
 //! concrete arguments and substituting them through the returned struct/enum
-//! body. [`substitute_type`] is the recursive type rewrite at the core of that
-//! (the C++ `substituteType`); `resolveGenericCall` / `instantiateStructExpr`
-//! build on it and land next (see the migration memory for the full blueprint).
+//! body. [`substitute_type`] is the recursive type rewrite at the core of that.
 
 use std::collections::HashMap;
 
@@ -114,9 +112,9 @@ pub fn substitute_type(
     }
 }
 
-/// Spell a concrete type argument for an instantiated generic's mangled name
-/// (the C++ `genericArgSpelling`): `Maybe(File)` → `Maybe__File`, `Vec(*const
-/// u8)` → `Vec__p_u8`, `[4]u8` arg → `arr4_u8`. Every distinct argument spells
+/// Spell a concrete type argument for an instantiated generic's mangled name:
+/// `Maybe(File)` → `Maybe__File`, `Vec(*const u8)` → `Vec__p_u8`, `[4]u8` arg
+/// → `arr4_u8`. Every distinct argument spells
 /// distinctly so instantiations never collide; the fallback embeds the TypeIdx.
 pub fn generic_arg_spelling(ty: TypeIdx, tp: &TypePool, sp: &StringPool) -> String {
     let k = tp.get(ty);

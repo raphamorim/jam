@@ -9,11 +9,10 @@
 //! 200100, the v2000.x line shipped in `/usr/lib/libc++.1.dylib`)
 //! `std::unordered_map<std::string, V>` iteration order.
 //!
-//! The C++ frontend iterates its loaded-modules
+//! The original frontend iterated its loaded-modules
 //! `std::unordered_map<std::string, ...>` in `begin()..end()` order to emit
-//! LLVM IR. To stay byte-compatible while porting the compiler to Rust we must
-//! reproduce that order exactly, which means reproducing three things bit for
-//! bit:
+//! LLVM IR. To keep the emitted IR byte-compatible we reproduce that order
+//! exactly, which means reproducing three things bit for bit:
 //!
 //! 1. `std::hash<std::string>` — libc++ routes this through
 //!    `__do_string_hash` → `__murmur2_or_cityhash<size_t>` which, for 64-bit
