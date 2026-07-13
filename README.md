@@ -24,6 +24,18 @@ brew tap raphamorim/jam https://github.com/raphamorim/jam
 brew install --HEAD jam
 ```
 
+## Building from source
+
+The compiler is written in Rust (it started as C++; that implementation is kept at the [`cpp-final`](https://github.com/raphamorim/jam/tree/cpp-final) tag). You need the Rust toolchain (1.96, picked up automatically via `rust-toolchain.toml`) and LLVM 22 — `brew install llvm`, or point `LLVM_CONFIG` at your `llvm-config`.
+
+```bash
+make build     # debug build (cargo build -p jam)
+make test      # Rust unit tests + the .jam corpus under tests/
+make install   # release build, installs jam + std to ~/.local
+```
+
+The installed `jam` finds the standard library relative to its own binary (`<prefix>/lib/jam/std`). During development it falls back to `./std` in the repo, and `JAM_STD_PATH` (or `--std-path`) overrides both.
+
 ## Contributing
 
 1. [Donate monthly](https://github.com/sponsors/raphamorim).
