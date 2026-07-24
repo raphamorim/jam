@@ -275,6 +275,11 @@ fn dump_node(
             o.extend_from_slice(&sp.get(StringIdx::new(n.lhs)));
             o.push(b'\n');
         }
+        AstTag::Spread => {
+            o.extend_from_slice(b"Spread ");
+            o.extend_from_slice(&sp.get(StringIdx::new(n.lhs)));
+            o.extend_from_slice(b"...\n");
+        }
         AstTag::MemberAccess => {
             o.extend_from_slice(b"MemberAccess .");
             o.extend_from_slice(&sp.get(StringIdx::new(n.rhs)));
@@ -1972,6 +1977,9 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
                 if !meth.is_pub && !meth.is_cfn {
                     continue;
                 }
+                if meth.is_generic() {
+                    continue;
+                }
                 let mut jfn = astgen_metadata(meth, &cg);
                 jfn.name = mangled_function_name(meth, &cg.type_pool, &cg.string_pool);
                 let _ = jir_declare_prototype(&jfn, &cg);
@@ -1981,6 +1989,9 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
     }
     for s in &module.structs {
         for meth in &s.methods {
+            if meth.is_generic() {
+                continue;
+            }
             let mut jfn = astgen_metadata(meth, &cg);
             jfn.name = mangled_function_name(meth, &cg.type_pool, &cg.string_pool);
             let _ = jir_declare_prototype(&jfn, &cg);
@@ -2023,6 +2034,9 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
                 for s in &m.structs {
                     for meth in &s.methods {
                         if !meth.is_pub && !meth.is_cfn {
+                            continue;
+                        }
+                        if meth.is_generic() {
                             continue;
                         }
                         if is_jir {
@@ -2071,6 +2085,9 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             }
             for s in &module.structs {
                 for m in &s.methods {
+                    if m.is_generic() {
+                        continue;
+                    }
                     if is_jir {
                         lower(cg, m, jir, errs);
                     } else {
@@ -2177,6 +2194,9 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
         }
         for s in &module.structs {
             for m in &s.methods {
+                if m.is_generic() {
+                    continue;
+                }
                 run_analysis_in(&cg, m, path);
             }
         }
@@ -2193,6 +2213,9 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
             }
             for s in &pair.1.structs {
                 for m in &s.methods {
+                    if m.is_generic() {
+                        continue;
+                    }
                     run_analysis_in(&cg, m, &imported_file);
                 }
             }

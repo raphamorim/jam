@@ -1,0 +1,65 @@
+// `@callC(R, addr, args...)` — indirect C call through a raw function
+// address, signature synthesized from the args' static types
+// (CALLC_PLAN.md). Exercises libc through raw addresses: int and float
+// args/returns (FP-register placement both directions), a mixed
+// int+float shape, a zero-arg tail, a void return, and a small
+// aggregate return.
+const { assert } = import("test");
+
+extern fn abs(x: i32) i32;
+extern fn fabs(x: f64) f64;
+extern fn fmax(a: f64, b: f64) f64;
+extern fn ldexp(x: f64, n: i32) f64;
+extern fn getpid() i32;
+extern fn malloc(size: u64) *mut[] u8;
+extern fn free(ptr: *mut[] u8);
+extern fn lldiv(numer: i64, denom: i64) i64;
+
+// lldiv(3) really returns lldiv_t { quot, rem } — two 64-bit words in
+// the x0/x1 return pair, the aggregate shape the guard admits. (div_t's
+// {i32,i32} is deliberately rejected: LLVM would split it across two
+// registers where C packs it into one.)
+const LldivT = struct { quot: i64, rem: i64 };
+
+tfn callcIntArgAndReturn() {
+    const addr: u64 = abs as u64;
+    assert(@callC(i32, addr, -7 as i32), 7);
+}
+
+tfn callcFloatArgAndReturn() {
+    // f64 through FP registers both directions (the SigF1 shape).
+    assert(@callC(f64, fabs as u64, -2.5) as i32, 2);
+}
+
+tfn callcTwoFloatArgs() {
+    // Both args must land in v0/v1 (the SigD2 shape).
+    assert(@callC(f64, fmax as u64, 1.5, 2.5) as i32, 2);
+}
+
+tfn callcMixedFloatIntArgs() {
+    // f64 in v0, i32 in w1 — the interleaving the C-varargs ABI would
+    // get wrong, and the whole reason @callC synthesizes a fixed
+    // signature. ldexp(1.5, 3) = 12.
+    assert(@callC(f64, ldexp as u64, 1.5, 3 as i32) as i32, 12);
+}
+
+tfn callcZeroArgs() {
+    const pid: i32 = @callC(i32, getpid as u64);
+    var ok: i32 = 0;
+    if (pid > 0) { ok = 1; }
+    assert(ok, 1);
+}
+
+tfn callcVoidReturn() {
+    var p: *mut[] u8 = malloc(16);
+    p[0] = 42;
+    assert(p[0] as i32, 42);
+    @callC(void, free as u64, p as u64);
+}
+
+tfn callcSmallStructReturn() {
+    // 16-byte two-word aggregate return rides the x0/x1 pair.
+    const d: LldivT = @callC(LldivT, lldiv as u64, 7 as i64, 2 as i64);
+    assert(d.quot as i32, 3);
+    assert(d.rem as i32, 1);
+}

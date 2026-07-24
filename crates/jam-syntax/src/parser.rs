@@ -1271,6 +1271,72 @@ impl<'a> Parser<'a> {
             // (flags=1, extra=[argCount=0]).
             let is_emit_family = name.starts_with(b"emit");
             let is_expr_intrinsic = is_emit_family || name.as_slice() == b"dropInPlace";
+            // `@callC(R, addr, args...)` is a hybrid: a leading type arg,
+            // then expression args. flags=3 (bit0 expr args, bit1 leading
+            // TypeIdx header); rhs = ExtraIdx -> [retTypeIdx, argCount,
+            // arg0, ...] so astgen's [count, args...] readers work from
+            // extra+1.
+            if name.as_slice() == b"callC" {
+                // `void` isn't a jam type keyword (return slots are omitted
+                // instead), but a C signature needs to spell "no return" —
+                // accept it here only.
+                let ret_ty = if self.check(TokenType::Identifier)
+                    && self.tokens[self.current].text(&self.source) == b"void"
+                {
+                    self.advance();
+                    builtin::VOID
+                } else {
+                    self.parse_type()?
+                };
+                let mut args = Vec::new();
+                while self.match_(TokenType::Comma) {
+                    let a = self.parse_logical_or()?;
+                    // `args...` pack spread, same as in plain call args.
+                    if self.check(TokenType::Ellipsis) {
+                        self.advance();
+                        let an = self.nodes.get(a);
+                        if an.tag != AstTag::Variable {
+                            return Err(self.parse_error("`...` must follow a pack name"));
+                        }
+                        let name_id = an.lhs;
+                        args.push(self.emit(AstNode {
+                            tag: AstTag::Spread,
+                            op: 0,
+                            flags: 0,
+                            main_token: 0,
+                            lhs: name_id,
+                            rhs: 0,
+                        }));
+                        continue;
+                    }
+                    args.push(a);
+                }
+                self.consume(
+                    TokenType::CloseParen,
+                    "Expected ')' after '@' intrinsic arguments",
+                )?;
+                if args.is_empty() {
+                    return Err(self.parse_error(
+                        "@callC expects a function address after the return type",
+                    ));
+                }
+                let e = self.nodes.reserve_extra(2 + args.len());
+                self.nodes.set_extra(e, ret_ty.raw());
+                self.nodes
+                    .set_extra(ExtraIdx::new(e.raw() + 1), args.len() as u32);
+                for (i, a) in args.iter().enumerate() {
+                    self.nodes
+                        .set_extra(ExtraIdx::new(e.raw() + 2 + i as u32), a.raw());
+                }
+                return Ok(self.emit(AstNode {
+                    tag: AstTag::AtCall,
+                    op: 0,
+                    flags: 3,
+                    main_token: 0,
+                    lhs: name_id.raw(),
+                    rhs: e.raw(),
+                }));
+            }
             if is_expr_intrinsic {
                 let mut args = Vec::new();
                 if !self.check(TokenType::CloseParen) {
@@ -1600,9 +1666,9 @@ impl<'a> Parser<'a> {
                     self.advance(); // consume '('
                     let mut args = Vec::new();
                     if !self.check(TokenType::CloseParen) {
-                        args.push(self.parse_comparison()?);
+                        args.push(self.parse_call_arg()?);
                         while self.match_(TokenType::Comma) {
-                            args.push(self.parse_comparison()?);
+                            args.push(self.parse_call_arg()?);
                         }
                     }
                     self.consume(
@@ -1710,6 +1776,30 @@ impl<'a> Parser<'a> {
             lhs: 0, // kNoType — patched by the caller
             rhs: extra.raw(),
         }))
+    }
+
+    /// One call argument: an expression, optionally wrapped by a trailing
+    /// `...` into a pack-spread node (`args...` — forwards a variadic cfn's
+    /// pack, CFN_VARIADIC_PLAN.md).
+    fn parse_call_arg(&mut self) -> PResult<NodeIdx> {
+        let e = self.parse_comparison()?;
+        if self.check(TokenType::Ellipsis) {
+            self.advance();
+            let n = self.nodes.get(e);
+            if n.tag != AstTag::Variable {
+                return Err(self.parse_error("`...` must follow a pack name"));
+            }
+            let name_id = n.lhs;
+            return Ok(self.emit(AstNode {
+                tag: AstTag::Spread,
+                op: 0,
+                flags: 0,
+                main_token: 0,
+                lhs: name_id,
+                rhs: 0,
+            }));
+        }
+        Ok(e)
     }
 
     /// Emit a `Call` node, choosing the direct (StringIdx callee) vs indirect
@@ -1997,6 +2087,7 @@ impl<'a> Parser<'a> {
 
         let mut args: Vec<crate::ast::Param> = Vec::new();
         let mut is_var_args = false;
+        let mut var_args_pack: Option<String> = None;
         if !self.check(TokenType::CloseParen) {
             loop {
                 if self.check(TokenType::Ellipsis) {
@@ -2013,6 +2104,26 @@ impl<'a> Parser<'a> {
                 self.consume(TokenType::Identifier, "Expected parameter name")?;
                 let pname = String::from_utf8_lossy(self.prev_text()).into_owned();
                 self.consume(TokenType::Colon, "Expected ':' after parameter name")?;
+                // Named variadic pack `name: ...` — cfn-only instantiation
+                // axis (CFN_VARIADIC_PLAN.md), must be the last parameter.
+                if self.check(TokenType::Ellipsis) {
+                    self.advance();
+                    if !is_cfn {
+                        return Err(
+                            self.parse_error("argument packs (`name: ...`) require `cfn`")
+                        );
+                    }
+                    if is_comp {
+                        return Err(self.parse_error("a variadic pack cannot be `comp`"));
+                    }
+                    if self.match_(TokenType::Comma) {
+                        return Err(
+                            self.parse_error("the variadic pack must be the last parameter")
+                        );
+                    }
+                    var_args_pack = Some(pname);
+                    break;
+                }
                 let mode = if self.match_(TokenType::Mut) {
                     jam_core::ParamMode::Mut
                 } else if self.match_(TokenType::Move) {
@@ -2060,6 +2171,7 @@ impl<'a> Parser<'a> {
             f.is_test = false; // extern fns are never tests
             f.is_var_args = is_var_args;
             f.is_cfn = is_cfn;
+            f.var_args_pack = var_args_pack;
             return Ok(f);
         }
         self.consume(TokenType::OpenBrace, "Expected '{' before function body")?;
@@ -2074,6 +2186,7 @@ impl<'a> Parser<'a> {
         f.is_test = is_test;
         f.is_var_args = false; // var-args only applies to extern decls
         f.is_cfn = is_cfn;
+        f.var_args_pack = var_args_pack;
         Ok(f)
     }
 
@@ -2580,6 +2693,166 @@ mod tests {
             p.parse_logical_or().expect("parse")
         };
         (ns, root)
+    }
+
+    /// Like `parse_expr` but the source must fail; returns the diagnostics.
+    fn parse_expr_err(src: &str) -> Vec<String> {
+        let mut lx = Lexer::new(src.as_bytes().to_vec());
+        lx.scan_tokens().unwrap();
+        let tokens = lx.tokens().to_vec();
+        let source = lx.source().to_vec();
+        let mut tp = TypePool::new();
+        let mut sp = StringPool::new();
+        let mut ns = NodeStore::new();
+        let mut diags = Diagnostics::new();
+        {
+            let mut p = Parser::new(
+                tokens, source, &mut tp, &mut sp, &mut ns, &mut diags, "t.jam",
+            );
+            p.parse_logical_or().expect_err("expected parse failure");
+        }
+        diags.all().iter().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn callc_parses_type_then_args() {
+        // @callC(f64, a, x, y) -> AtCall flags=3,
+        // extra = [F64, 3, addr, arg, arg].
+        let (ns, root) = parse_expr("@callC(f64, a, x, y)");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::AtCall);
+        assert_eq!(n.flags, 3);
+        let e = ExtraIdx::new(n.rhs);
+        assert_eq!(ns.get_extra(e), builtin::F64.raw());
+        assert_eq!(ns.get_extra(ExtraIdx::new(n.rhs + 1)), 3);
+        for i in 0..3 {
+            let arg = NodeIdx::new(ns.get_extra(ExtraIdx::new(n.rhs + 2 + i)));
+            assert_eq!(ns.get(arg).tag, AstTag::Variable);
+        }
+    }
+
+    #[test]
+    fn callc_zero_call_args_is_addr_only() {
+        let (ns, root) = parse_expr("@callC(u64, a)");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::AtCall);
+        assert_eq!(n.flags, 3);
+        assert_eq!(ns.get_extra(ExtraIdx::new(n.rhs)), builtin::U64.raw());
+        assert_eq!(ns.get_extra(ExtraIdx::new(n.rhs + 1)), 1);
+    }
+
+    #[test]
+    fn callc_named_return_type() {
+        // A user type as R parses through parse_type (Named, not builtin).
+        let (ns, root) = parse_expr("@callC(NSRect, a, r)");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::AtCall);
+        assert_eq!(n.flags, 3);
+        let ret_ty = ns.get_extra(ExtraIdx::new(n.rhs));
+        assert!(ret_ty > builtin::NORETURN.raw());
+        assert_eq!(ns.get_extra(ExtraIdx::new(n.rhs + 1)), 2);
+    }
+
+    #[test]
+    fn callc_void_return_type() {
+        // `void` is not a type keyword anywhere else in jam — the @callC
+        // branch accepts it as "no return" for C signatures.
+        let (ns, root) = parse_expr("@callC(void, a)");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::AtCall);
+        assert_eq!(n.flags, 3);
+        assert_eq!(ns.get_extra(ExtraIdx::new(n.rhs)), builtin::VOID.raw());
+    }
+
+    #[test]
+    fn callc_missing_addr_errors() {
+        let msgs = parse_expr_err("@callC(u64)");
+        assert!(
+            msgs.iter().any(|m| m.contains("function address")),
+            "got: {msgs:?}"
+        );
+    }
+
+    /// Like `parse_module` (defined below) but the source must fail; returns
+    /// the diagnostics.
+    fn parse_module_err(src: &str) -> Vec<String> {
+        let mut lx = Lexer::new(src.as_bytes().to_vec());
+        lx.scan_tokens().unwrap();
+        let tokens = lx.tokens().to_vec();
+        let source = lx.source().to_vec();
+        let mut tp = TypePool::new();
+        let mut sp = StringPool::new();
+        let mut ns = NodeStore::new();
+        let mut diags = Diagnostics::new();
+        {
+            let mut p = Parser::new(
+                tokens, source, &mut tp, &mut sp, &mut ns, &mut diags, "t.jam",
+            );
+            p.parse().expect_err("expected parse failure");
+        }
+        diags.all().iter().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn cfn_pack_param_parses() {
+        let m = parse_module(
+            "const S = struct { v: u64, cfn f(self: S, args: ...) u64 { return 0; } };",
+        );
+        let meth = &m.structs[0].methods[0];
+        assert_eq!(meth.var_args_pack.as_deref(), Some("args"));
+        assert!(!meth.is_var_args, "pack must not set the extern varargs flag");
+        assert!(meth.is_generic(), "pack-bearing cfn is an instantiation template");
+        assert_eq!(meth.args.len(), 1, "pack is not a Param");
+    }
+
+    #[test]
+    fn pack_on_fn_rejected() {
+        let msgs = parse_module_err("fn f(args: ...) u64 { return 0; }");
+        assert!(
+            msgs.iter().any(|m| m.contains("require `cfn`")),
+            "got: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn pack_not_last_rejected() {
+        let msgs = parse_module_err(
+            "const S = struct { v: u64, cfn f(self: S, args: ..., x: u64) {} };",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("last parameter")),
+            "got: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn spread_in_call_args_parses() {
+        let (ns, root) = parse_expr("g(x, args...)");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::Call);
+        let e = n.rhs;
+        assert_eq!(ns.get_extra(ExtraIdx::new(e)), 2);
+        let a1 = ns.get(NodeIdx::new(ns.get_extra(ExtraIdx::new(e + 2))));
+        assert_eq!(a1.tag, AstTag::Spread);
+    }
+
+    #[test]
+    fn spread_in_callc_args_parses() {
+        let (ns, root) = parse_expr("@callC(u64, a, args...)");
+        let n = ns.get(root);
+        assert_eq!(n.tag, AstTag::AtCall);
+        assert_eq!(ns.get_extra(ExtraIdx::new(n.rhs + 1)), 2);
+        let a1 = ns.get(NodeIdx::new(ns.get_extra(ExtraIdx::new(n.rhs + 3))));
+        assert_eq!(a1.tag, AstTag::Spread);
+    }
+
+    #[test]
+    fn spread_after_non_name_rejected() {
+        let msgs = parse_expr_err("g(1 + 2 ...)");
+        assert!(
+            msgs.iter().any(|m| m.contains("must follow a pack name")),
+            "got: {msgs:?}"
+        );
     }
 
     #[test]

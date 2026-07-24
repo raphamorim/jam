@@ -172,6 +172,13 @@ pub struct CodegenContext<'ctx> {
     // reference to a comp param (`k`) folds to the call-site constant.
     current_comp_subst: RefCell<HashMap<String, ComptimeValue>>,
 
+    // Variadic-pack context stack, parallel to instantiated-clone body
+    // lowering: `Some((pack_name, len))` while a variadic cfn clone's body is
+    // lowered (its pack materialized as `__va0..__va<len-1>` params), `None`
+    // frames for non-pack instantiations so an inner body never sees an outer
+    // pack. `args...` expansion reads the top frame.
+    current_pack: RefCell<Vec<Option<(String, u32)>>>,
+
     // module_path -> the module's anonymous struct bodies (the `return struct
     // {...}` of a generic factory), so generic instantiation can reach the body
     // a `StructExpr` node references (its `lhs` indexes this per-module list).
@@ -278,6 +285,7 @@ impl<'ctx> CodegenContext<'ctx> {
             requalify_map: RefCell::new(HashMap::new()),
             current_subst: RefCell::new(Vec::new()),
             current_comp_subst: RefCell::new(HashMap::new()),
+            current_pack: RefCell::new(Vec::new()),
             anon_structs: RefCell::new(HashMap::new()),
             anon_enums: RefCell::new(HashMap::new()),
             type_aliases: RefCell::new(HashMap::new()),
@@ -1031,6 +1039,21 @@ impl<'ctx> CodegenContext<'ctx> {
     /// Whether any substitution frame is active.
     pub fn has_active_subst(&self) -> bool {
         !self.current_subst.borrow().is_empty()
+    }
+
+    /// Push the variadic-pack frame for an instantiated clone body about to be
+    /// lowered (`None` for a pack-less instantiation, masking any outer pack).
+    pub fn push_pack(&self, frame: Option<(String, u32)>) {
+        self.current_pack.borrow_mut().push(frame);
+    }
+    /// Pop the innermost pack frame.
+    pub fn pop_pack(&self) {
+        self.current_pack.borrow_mut().pop();
+    }
+    /// The active pack (name, materialized length), if the body being lowered
+    /// belongs to a variadic cfn clone.
+    pub fn current_pack(&self) -> Option<(String, u32)> {
+        self.current_pack.borrow().last().cloned().flatten()
     }
 
     /// Install the comp-value substitution map active while a comp-instantiated

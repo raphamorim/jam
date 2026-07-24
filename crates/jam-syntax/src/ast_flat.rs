@@ -69,7 +69,9 @@ pub enum AstTag {
     EnumExpr,       // lhs = u32 (index into ModuleAST::AnonEnums)
     MatchNode,      // lhs = NodeIdx (scrutinee); rhs = ExtraIdx -> [armCount, ...]
     AsCast,         // lhs = NodeIdx (operand), rhs = TypeIdx (target)
-    AtCall,         // lhs = StringIdx (name); rhs = TypeIdx | ExtraIdx (flags bit0)
+    AtCall,         // lhs = StringIdx (name); rhs = TypeIdx | ExtraIdx (flags bit0);
+                    // flags bit1: extra has a leading TypeIdx header
+                    // ([retTypeIdx, argCount, arg0, ...] — @callC)
     TypeMethodCall, // lhs = TypeIdx (receiver); rhs = ExtraIdx -> [methodNameId, argCount, ...]
 
     // Pattern atoms (internal to MatchNode arms)
@@ -78,6 +80,8 @@ pub enum AstTag {
     PatWildcard,    // no payload
     PatOr,          // lhs = ExtraIdx -> [count, sub0, ...]
     PatEnumVariant, // lhs = StringIdx (enum), rhs = StringIdx (variant)
+
+    Spread, // lhs = StringIdx (pack name) — `args...` in a call-arg list
 
     Count, // sentinel for table sizing
 }

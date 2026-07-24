@@ -1,0 +1,4 @@
+// expect-error: @callC expects a function address after the return type
+fn f() u64 {
+    return @callC(u64);
+}

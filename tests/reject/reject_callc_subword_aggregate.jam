@@ -1,0 +1,9 @@
+// expect-error: unsupported by @callC
+// div_t's shape: 8 bytes, but sub-word fields — LLVM would split it
+// into two w-registers where the C ABI packs it into one x-register.
+// Rejected until phase-4 coercion (CALLC_PLAN.md).
+const DivT = struct { quot: i32, rem: i32 };
+
+fn f(p: u64, d: DivT) u64 {
+    return @callC(u64, p, d);
+}

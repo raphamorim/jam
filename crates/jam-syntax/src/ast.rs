@@ -61,6 +61,14 @@ pub struct FunctionAST {
     pub parent_struct: String,
     /// Owning module path (empty for the entry module / qualified clones).
     pub module_path: String,
+    /// Trailing variadic pack (`args: ...`) on a `cfn` — an instantiation
+    /// axis: the template is cloned per call-site tail shape, never lowered
+    /// as-declared. The pack name is spendable only as `args...` inside a
+    /// call-argument list (CFN_VARIADIC_PLAN.md).
+    pub var_args_pack: Option<String>,
+    /// On an instantiated clone: how many materialized pack params
+    /// (`__va0..__va<N-1>`) the signature tail carries. 0 elsewhere.
+    pub pack_len: u32,
 }
 
 impl FunctionAST {
@@ -84,12 +92,15 @@ impl FunctionAST {
             is_comp_time_fn: false,
             parent_struct: String::new(),
             module_path: String::new(),
+            var_args_pack: None,
+            pack_len: 0,
         }
     }
 
     /// A function is generic iff its return type is the meta-type `type`, it is
-    /// a compile-time fn, or any parameter is `type`-typed or `comp`. Generic
-    /// functions are instantiated per call site, not lowered at decl time.
+    /// a compile-time fn, or any parameter is `type`-typed or `comp`, or it
+    /// declares a variadic pack. Generic functions are instantiated per call
+    /// site, not lowered at decl time.
     pub fn is_generic(&self) -> bool {
         if self.return_type == builtin::TYPE {
             return true;
@@ -97,7 +108,22 @@ impl FunctionAST {
         if self.is_comp_time_fn {
             return true;
         }
+        if self.var_args_pack.is_some() {
+            return true;
+        }
         self.args.iter().any(|p| p.ty == builtin::TYPE || p.is_comp)
+    }
+
+    /// Callable only through per-callsite clone instantiation (comp params,
+    /// `type` params on a value-returning fn, or a variadic pack) — as opposed
+    /// to type-constructor generics (`return_type == type`) and comptime fns,
+    /// which have their own paths.
+    pub fn needs_instantiation(&self) -> bool {
+        if self.is_comp_time_fn || self.return_type == builtin::TYPE {
+            return false;
+        }
+        self.var_args_pack.is_some()
+            || self.args.iter().any(|p| p.is_comp || p.ty == builtin::TYPE)
     }
 }
 

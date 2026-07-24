@@ -1,0 +1,5 @@
+// expect-error: must be the last parameter
+const S = struct {
+    v: u64,
+    cfn f(self: S, args: ..., x: u64) u64 { return x; }
+};

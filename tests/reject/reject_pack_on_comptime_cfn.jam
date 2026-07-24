@@ -1,0 +1,9 @@
+// expect-error: variadic packs are not supported on comptime cfns
+// A top-level cfn (first param not `self`) is a comptime fn — its args
+// must fold to constants, so a pack of runtime values is meaningless.
+cfn log(tag: u64, args: ...) {
+}
+
+fn main() {
+    log(1, 2);
+}

@@ -1,0 +1,4 @@
+// expect-error: only valid inside a variadic cfn
+fn f(a: u64) u64 {
+    return @callC(u64, a, args...);
+}

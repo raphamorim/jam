@@ -264,6 +264,12 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 }
             }
             AstTag::Call => self.analyze_call(idx, state),
+            // `args...` spread: the pack params are materialized (always
+            // initialized) clone params — nothing to track.
+            AstTag::Spread => StmtResult {
+                state,
+                terminated: false,
+            },
             AstTag::TypeMethodCall => self.analyze_type_method_call(idx, &n, state),
             AstTag::BinaryOp => {
                 let r = self.analyze_node(NodeIdx::new(n.lhs), state);

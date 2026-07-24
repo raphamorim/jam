@@ -1,0 +1,4 @@
+// expect-error: @callC address must be a u64
+fn f(b: bool) u64 {
+    return @callC(u64, b);
+}

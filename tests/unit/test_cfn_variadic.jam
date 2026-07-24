@@ -1,0 +1,58 @@
+// Variadic cfn (`args: ...` — CFN_VARIADIC_PLAN.md): a struct cfn method
+// with a trailing pack is instantiated per call-site tail shape; the pack
+// forwards with `args...` into @callC (synthesizing the C signature from
+// the tail's static types) or into an extern C-variadic call.
+const { assert } = import("test");
+
+extern fn abs(x: i32) i32;
+extern fn fabs(x: f64) f64;
+extern fn fmax(a: f64, b: f64) f64;
+extern fn snprintf(buf: *mut[] u8, size: u64, fmt: *const[] u8, ...) i32;
+
+const Caller = struct {
+    addr: u64,
+    cfn callThrough(self: Caller, R: type, args: ...) R {
+        return @callC(R, self.addr, args...);
+    }
+};
+
+tfn packIntShape() {
+    const c: Caller = Caller { addr: abs as u64 };
+    assert(c.callThrough(i32, -7 as i32), 7);
+}
+
+tfn packFloatShape() {
+    // A different tail shape through the SAME cfn — its own clone.
+    const c: Caller = Caller { addr: fabs as u64 };
+    assert(c.callThrough(f64, -2.5) as i32, 2);
+}
+
+tfn packTwoFloatArgs() {
+    const c: Caller = Caller { addr: fmax as u64 };
+    assert(c.callThrough(f64, 1.5, 2.5) as i32, 2);
+}
+
+tfn packSameShapeMemoizes() {
+    // Two calls at one shape reuse one clone; results stay independent.
+    const c: Caller = Caller { addr: abs as u64 };
+    assert(c.callThrough(i32, -3 as i32), 3);
+    assert(c.callThrough(i32, 11 as i32), 11);
+}
+
+const Fmt = struct {
+    pad: u64,
+    cfn format(self: Fmt, buf: *mut[] u8, size: u64, fmt: *const[] u8, args: ...) i32 {
+        // Pack forwarding into an extern C-variadic (the varargs-tail path).
+        return snprintf(buf, size, fmt, args...);
+    }
+};
+
+tfn packForwardsToCVarargs() {
+    var b: [64]u8 = [0; 64];
+    const f: Fmt = Fmt { pad: 0 };
+    const fmtStr: str = "%d-%d";
+    const n: i32 = f.format(b.asMutPtr(), 64, fmtStr.ptr, 7 as i32, 42 as i32);
+    assert(n, 4); // "7-42"
+    assert(b[0] as i32, 55); // '7'
+    assert(b[1] as i32, 45); // '-'
+}

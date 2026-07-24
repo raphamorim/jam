@@ -1,0 +1,8 @@
+// expect-error: cannot return a void expression
+// Used to compile and crash at runtime before the void-expr return
+// was gated on the function's own return type.
+extern fn free(ptr: *mut[] u8);
+
+fn f(a: u64) u64 {
+    return @callC(void, a);
+}

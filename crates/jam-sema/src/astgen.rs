@@ -1247,6 +1247,13 @@ fn astgen_expr(gctx: &mut AstGenCtx, node: NodeIdx, expected: TypeIdx) -> Result
         AstTag::Call => astgen_call(gctx, &n, NO_JIR_REF),
         AstTag::TypeMethodCall => astgen_type_method_call(gctx, &n, NO_JIR_REF),
         AstTag::AtCall => astgen_at_call(gctx, &n),
+        // Reached only when `args...` appears somewhere other than the
+        // supported call-argument tails (@callC / direct calls).
+        AstTag::Spread => Ok(recover_here(
+            gctx,
+            "`...` pack spread is only valid as the last argument of a call".into(),
+            TypeIdx::NONE,
+        )),
         AstTag::StructLit => astgen_struct_lit(gctx, &n, expected),
         AstTag::ArrayLit => astgen_array_lit(gctx, &n, expected),
         AstTag::ArrayRepeat => astgen_array_repeat(gctx, &n, expected),
@@ -3020,32 +3027,72 @@ fn comp_value_spelling(v: &ComptimeValue, gctx: &AstGenCtx) -> String {
     }
 }
 
-/// A call to a fn with `comp` value params (`fn scale(comp k: u32, x: u32)`):
-/// fold each comp arg to a value, bake it into a per-instantiation symbol
-/// (`scale__u2`), and dispatch to that monomorphization passing only the
-/// runtime args. The instantiated body is emitted lazily by the backend and is
-/// not part of the JIR dump, so only the call site is lowered here.
+/// A call to a fn/method with comptime signature axes — `comp` value params
+/// (`fn scale(comp k: u32, x: u32)`), `T: type` params on a value-returning
+/// fn, and/or a trailing variadic pack (`cfn send(self: S, args: ...)`): fold
+/// each comptime arg, bake the shape into a per-instantiation symbol
+/// (`scale__u2`, `send__va2__p9__p12`), and dispatch to that monomorphization
+/// passing only the runtime args. Type params substitute through the clone's
+/// signature and body (a `current_subst` frame); pack args materialize as
+/// trailing `__va<i>` params typed by each call-site arg's static type.
+/// `recv` is the pre-lowered receiver arg for method calls (the `self` param,
+/// `args[0]`, is then skipped when mapping call args to params).
 fn astgen_comp_instantiated_call(
     gctx: &mut AstGenCtx,
-    n: &AstNode,
     fn_ast: &FunctionAST,
+    recv: Option<JirRef>,
+    args_extra: u32,
+    arg_count: u32,
     dest_ptr: JirRef,
 ) -> Result<JirRef, String> {
-    let args_extra = n.rhs;
-    let arg_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(args_extra));
+    let param_offset = usize::from(recv.is_some());
+    if recv.is_some() && fn_ast.args.is_empty() {
+        return Err(format!(
+            "astgen: method `{}` takes no `self` but was called on an instance",
+            fn_ast.name
+        ));
+    }
+    // Arity up front: without a pack the call must bind every param exactly;
+    // with one, everything past the fixed params is the pack tail.
+    let fixed = fn_ast.args.len() - param_offset;
+    let count = arg_count as usize;
+    if (fn_ast.var_args_pack.is_none() && count != fixed)
+        || (fn_ast.var_args_pack.is_some() && count < fixed)
+    {
+        let least = if fn_ast.var_args_pack.is_some() {
+            "at least "
+        } else {
+            ""
+        };
+        return Err(format!(
+            "astgen: `{}` expects {least}{fixed} arg(s), got {count}",
+            fn_ast.name
+        ));
+    }
     let mut suffix = String::new();
-    let mut runtime_idx: Vec<NodeIdx> = Vec::new();
     let mut runtime_params: Vec<jam_syntax::ast::Param> = Vec::new();
+    let mut arg_refs: Vec<JirRef> = Vec::new();
+    if let Some(r) = recv {
+        runtime_params.push(fn_ast.args[0].clone());
+        arg_refs.push(r);
+    }
     // The comp-param substitution baked into the clone's body: a body
     // reference to `k` folds to this call-site value.
     let mut comp_subst: HashMap<String, ComptimeValue> = HashMap::new();
+    // The type-param substitution: body/signature refs to `T` rewrite to the
+    // call site's concrete type.
+    let mut type_subst: HashMap<String, TypeIdx> = HashMap::new();
+    let mut pack_len = 0u32;
+    if fn_ast.var_args_pack.is_some() {
+        suffix.push_str("__va");
+    }
     for i in 0..arg_count {
         let arg_idx = NodeIdx::new(
             gctx.ctx
                 .node_store
                 .get_extra(ExtraIdx::new(args_extra + 1 + i)),
         );
-        match fn_ast.args.get(i as usize) {
+        match fn_ast.args.get(param_offset + i as usize) {
             Some(p) if p.is_comp => {
                 let v = gctx.ctx.fold_comptime_expr_in(arg_idx, &gctx.comp_scope);
                 if matches!(v, ComptimeValue::None) {
@@ -3062,25 +3109,88 @@ fn astgen_comp_instantiated_call(
                 suffix.push_str(&comp_value_spelling(&v, gctx));
                 comp_subst.insert(p.name.clone(), v);
             }
-            Some(p) => {
-                runtime_idx.push(arg_idx);
-                runtime_params.push(p.clone());
+            Some(p) if p.ty == builtin::TYPE => {
+                let t = type_arg_from_expr(gctx, arg_idx, &p.name)?;
+                suffix.push_str("__");
+                suffix.push_str(&comp_value_spelling(&ComptimeValue::Type(t), gctx));
+                type_subst.insert(p.name.clone(), t);
             }
-            None => runtime_idx.push(arg_idx),
+            Some(p) => {
+                // Fixed runtime param — lower against the (substituted)
+                // declared type. Type params conventionally precede runtime
+                // params, so the subst gathered so far applies.
+                let mut cp = p.clone();
+                cp.ty = crate::generics::substitute_type(
+                    cp.ty,
+                    &type_subst,
+                    &gctx.ctx.type_pool,
+                    &gctx.ctx.string_pool,
+                );
+                arg_refs.push(lower_arg(gctx, arg_idx, &cp)?);
+                runtime_params.push(cp);
+            }
+            None if fn_ast.var_args_pack.is_some() => {
+                // Pack tail: the arg's static type becomes a materialized
+                // trailing param (`__va<i>`), read-only by-value mode.
+                if gctx.ctx.node_store.get(arg_idx).tag == AstTag::Spread {
+                    return Err(
+                        "astgen: cannot re-spread a pack into a variadic cfn's pack \
+                         (forward it to @callC or a concrete call instead)"
+                            .into(),
+                    );
+                }
+                let r = astgen_expr(gctx, arg_idx, TypeIdx::NONE)?;
+                let ty = gctx.jfn.get_inst(r).ty;
+                suffix.push_str(&format!("__p{}", ty.raw()));
+                runtime_params.push(jam_syntax::ast::Param::new(format!("__va{pack_len}"), ty));
+                pack_len += 1;
+                arg_refs.push(r);
+            }
+            None => {
+                // Unreachable: the up-front arity check bounds pack-less
+                // calls to exactly `fixed` args.
+                return Err(format!(
+                    "astgen: internal: extra argument to `{}` past the arity check",
+                    fn_ast.name
+                ));
+            }
         }
     }
-    let base = if fn_ast.module_path.is_empty() {
-        fn_ast.name.clone()
-    } else {
-        format!("{}.{}", fn_ast.module_path, fn_ast.name)
-    };
-    // A clone whose signature drops the comp params; module_path empty so the
-    // mangler passes the instantiation name through unchanged.
+    // Instantiation base: module + owning struct + name — two same-named
+    // methods on different structs (`Class.msgSend` / `Object.msgSend`) must
+    // not share clones.
+    let mut base = String::new();
+    if !fn_ast.module_path.is_empty() {
+        base.push_str(&fn_ast.module_path);
+        base.push('.');
+    }
+    if !fn_ast.parent_struct.is_empty() {
+        base.push_str(&fn_ast.parent_struct);
+        base.push('.');
+    }
+    base.push_str(&fn_ast.name);
+    // A clone whose signature drops the comptime params and materializes the
+    // pack; module_path empty so the mangler passes the instantiation name
+    // through unchanged.
     let mut clone = fn_ast.clone();
     clone.name = format!("{base}{suffix}");
     clone.module_path = String::new();
     clone.parent_struct = String::new();
     clone.args = runtime_params;
+    clone.return_type = crate::generics::substitute_type(
+        fn_ast.return_type,
+        &type_subst,
+        &gctx.ctx.type_pool,
+        &gctx.ctx.string_pool,
+    );
+    // A type param bound to `void` (`obj.msgSend(void, ...)`) makes the clone
+    // an ordinary void fn — the pipeline spells that TypeIdx::NONE, never
+    // builtin::VOID.
+    if clone.return_type == builtin::VOID {
+        clone.return_type = TypeIdx::NONE;
+    }
+    clone.var_args_pack = None;
+    clone.pack_len = pack_len;
 
     // EAGERLY declare + define the clone the first time this instantiation is
     // seen: the clone body is never
@@ -3090,26 +3200,80 @@ fn astgen_comp_instantiated_call(
     if gctx.ctx.get_function_ast(&clone.name).is_none() {
         gctx.ctx
             .register_function_ast(clone.name.clone(), clone.clone());
-        // Metadata + LLVM prototype, then the body — with the comp subst
-        // active so body refs to comp params fold to the baked constants, and
-        // the defining module pushed so bare type/name refs resolve there.
+        // Metadata + LLVM prototype, then the body — with the comp/type
+        // substs and pack frame active so body refs to comp params fold to
+        // the baked constants, `T` refs rewrite to the concrete types, and
+        // `args...` expands to the materialized params; the defining module
+        // pushed so bare type/name refs resolve there.
         let mut jfn = astgen_metadata(&clone, gctx.ctx);
         jfn.name = clone.name.clone();
         let _ = jir_declare_prototype(&jfn, gctx.ctx);
         gctx.ctx.push_body_module(fn_ast.module_path.clone());
         gctx.ctx.set_current_comp_subst(comp_subst);
+        let has_ts = !type_subst.is_empty();
+        if has_ts {
+            gctx.ctx.push_subst(type_subst.clone());
+        }
+        gctx.ctx.push_pack(
+            fn_ast
+                .var_args_pack
+                .as_ref()
+                .map(|name| (name.clone(), pack_len)),
+        );
         let body_res = astgen_body_into(&mut jfn, &clone, gctx.ctx);
+        gctx.ctx.pop_pack();
+        if has_ts {
+            gctx.ctx.pop_subst();
+        }
         gctx.ctx.clear_current_comp_subst();
+        // LLVM lowering still inside the defining module's scope so the
+        // body's bare type references (`ObjcSuper`) requalify there.
+        let def_res = body_res.and_then(|_| jir_define_body(&jfn, gctx.ctx));
         gctx.ctx.pop_body_module();
-        body_res?;
-        jir_define_body(&jfn, gctx.ctx)?;
+        def_res?;
     }
 
-    let mut arg_refs: Vec<JirRef> = Vec::with_capacity(runtime_idx.len());
-    for (j, arg_idx) in runtime_idx.iter().enumerate() {
-        arg_refs.push(lower_arg(gctx, *arg_idx, &clone.args[j])?);
-    }
     emit_call(gctx, &clone, &arg_refs, dest_ptr)
+}
+
+/// Resolve a call argument bound to a `T: type` param to a concrete TypeIdx.
+/// The parser encodes a type name in expression position as a `Variable`
+/// (`f(u32, x)` / `f(NSRect, x)`); resolve builtin spellings directly, other
+/// names as (subst-applied, requalified) Named types.
+fn type_arg_from_expr(
+    gctx: &mut AstGenCtx,
+    arg_idx: NodeIdx,
+    param_name: &str,
+) -> Result<TypeIdx, String> {
+    let n = gctx.ctx.node_store.get(arg_idx);
+    if n.tag != AstTag::Variable {
+        return Err(format!(
+            "astgen: argument for type param `{param_name}` must be a type name"
+        ));
+    }
+    let name = str_at(gctx, n.lhs);
+    let t = match name.as_str() {
+        "void" => builtin::VOID,
+        "bool" | "u1" => builtin::BOOL,
+        "u8" => builtin::U8,
+        "i8" => builtin::I8,
+        "u16" => builtin::U16,
+        "i16" => builtin::I16,
+        "u32" => builtin::U32,
+        "i32" => builtin::I32,
+        "u64" => builtin::U64,
+        "i64" => builtin::I64,
+        "f32" => builtin::F32,
+        "f64" => builtin::F64,
+        _ => {
+            let sid = gctx.ctx.string_pool.intern(name.as_bytes());
+            let named = gctx.ctx.type_pool.intern_named(sid);
+            let named = gctx.ctx.apply_current_subst(named);
+            let bm = gctx.ctx.current_body_module();
+            gctx.ctx.requalify_type(named, &bm)
+        }
+    };
+    Ok(t)
 }
 
 /// Emit a `Call` to `fn_ast` with already-lowered `arg_refs`. sret-returning
@@ -3397,8 +3561,8 @@ fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<Ji
     if fn_ast.is_comp_time_fn {
         return astgen_comptime_fn_call(gctx, &fn_ast, args_extra, arg_count);
     }
-    if fn_ast.args.iter().any(|p| p.is_comp) {
-        return astgen_comp_instantiated_call(gctx, n, &fn_ast, dest_ptr);
+    if fn_ast.needs_instantiation() {
+        return astgen_comp_instantiated_call(gctx, &fn_ast, None, args_extra, arg_count, dest_ptr);
     }
 
     let mut arg_refs: Vec<JirRef> = Vec::with_capacity(arg_count as usize);
@@ -3408,6 +3572,17 @@ fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<Ji
                 .node_store
                 .get_extra(ExtraIdx::new(args_extra + 1 + i)),
         );
+        // `pack...` spread: expands to the enclosing clone's materialized
+        // pack params (only meaningful in a variadic-cfn body — e.g.
+        // forwarding into an extern C-variadic like printf).
+        if gctx.ctx.node_store.get(arg_idx).tag == AstTag::Spread {
+            if i + 1 != arg_count {
+                return Err("astgen: a pack spread must be the last argument".into());
+            }
+            let spread_name = str_at(gctx, gctx.ctx.node_store.get(arg_idx).lhs);
+            arg_refs.extend(expand_pack_spread(gctx, &spread_name)?);
+            continue;
+        }
         if (i as usize) < fn_ast.args.len() {
             arg_refs.push(lower_arg(gctx, arg_idx, &fn_ast.args[i as usize])?);
         } else {
@@ -4144,6 +4319,20 @@ fn astgen_comptime_fn_call(
     args_extra: u32,
     arg_count: u32,
 ) -> Result<JirRef, String> {
+    // A comptime cfn's args must fold to constants — a pack of runtime values
+    // is meaningless here. Packs live on struct cfn methods
+    // (CFN_VARIADIC_PLAN.md).
+    if fn_ast.var_args_pack.is_some() {
+        return Ok(recover_here(
+            gctx,
+            format!(
+                "variadic packs are not supported on comptime cfns; declare `{}` \
+                 as a struct method",
+                fn_ast.name
+            ),
+            TypeIdx::NONE,
+        ));
+    }
     if arg_count as usize != fn_ast.args.len() {
         // cfn doesn't support varargs.
         return Ok(recover_here(
@@ -4730,6 +4919,19 @@ fn astgen_dotted_call(
             },
         )
     };
+    // A method with comptime signature axes (type params, comp params, a
+    // variadic pack — e.g. `cfn msgSend(self: Object, R: type, args: ...)`)
+    // instantiates a per-shape clone instead of calling a fixed symbol.
+    if method.needs_instantiation() {
+        return Ok(Some(astgen_comp_instantiated_call(
+            gctx,
+            &method,
+            Some(recv_arg),
+            args_extra,
+            arg_count,
+            dest_ptr,
+        )?));
+    }
     let mut arg_refs = vec![recv_arg];
     arg_refs.extend(lower_method_args(gctx, &method, args_extra, arg_count)?);
     Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?))
@@ -4941,6 +5143,211 @@ fn build_indirect_call(
     ))
 }
 
+/// `@callC(R, addr, args...)` — indirect C call through a raw address with a
+/// fixed signature synthesized from the args' static types (CALLC_PLAN.md).
+/// extra = [retTypeIdx, argCount, addr, arg0, ...]. The address is punned to
+/// the synthesized `fn` type via IntToPtr, then flows through the same
+/// CallIndirect the union-pun pattern produces.
+fn astgen_call_c(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
+    let extra = n.rhs;
+    let mut ret_ty = TypeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra)));
+    ret_ty = gctx.ctx.apply_current_subst(ret_ty);
+    if gctx.ctx.type_pool.get(ret_ty).kind == TypeKind::ArrayExpr {
+        ret_ty = gctx.ctx.resolve_array_expr_instantiate(ret_ty)?;
+    }
+    ret_ty = gctx.ctx.resolve_generic_call_instantiate(ret_ty)?;
+    if ret_ty != builtin::VOID {
+        callc_check_abi(gctx, ret_ty, "return")?;
+    }
+
+    let count = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 1));
+    debug_assert!(count >= 1, "parser guarantees an address operand");
+    let addr_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 2)));
+    let addr_ref = astgen_expr(gctx, addr_idx, builtin::U64)?;
+    let ak = gctx.ctx.type_pool.get(gctx.jfn.get_inst(addr_ref).ty);
+    if ak.kind != TypeKind::Int || ak.a != 64 || ak.b != 0 {
+        return Err("astgen: @callC address must be a u64".into());
+    }
+
+    let mut arg_refs: Vec<u32> = Vec::with_capacity(count as usize - 1);
+    let mut param_tys: Vec<TypeIdx> = Vec::with_capacity(count as usize - 1);
+    for i in 1..count {
+        let arg_idx = NodeIdx::new(
+            gctx.ctx
+                .node_store
+                .get_extra(ExtraIdx::new(extra + 2 + i)),
+        );
+        // `pack...` — forward the enclosing variadic-cfn clone's pack; each
+        // materialized param contributes its own static type to the
+        // synthesized signature.
+        if gctx.ctx.node_store.get(arg_idx).tag == AstTag::Spread {
+            if i + 1 != count {
+                return Err("astgen: a pack spread must be the last argument".into());
+            }
+            let spread_name = str_at(gctx, gctx.ctx.node_store.get(arg_idx).lhs);
+            for r in expand_pack_spread(gctx, &spread_name)? {
+                let ty = gctx.jfn.get_inst(r).ty;
+                callc_check_abi(gctx, ty, "argument")?;
+                arg_refs.push(r);
+                param_tys.push(ty);
+            }
+            continue;
+        }
+        let arg_ref = astgen_expr(gctx, arg_idx, TypeIdx::NONE)?;
+        let arg_ty = gctx.jfn.get_inst(arg_ref).ty;
+        callc_check_abi(gctx, arg_ty, "argument")?;
+        arg_refs.push(arg_ref);
+        param_tys.push(arg_ty);
+    }
+
+    let fn_ty = gctx.ctx.type_pool.intern_fn(ret_ty, param_tys);
+    let callee = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::IntToPtr,
+            a: addr_ref,
+            ty: fn_ty,
+            ..Default::default()
+        },
+    );
+    let mut packed: Vec<u32> = Vec::with_capacity(1 + arg_refs.len());
+    packed.push(arg_refs.len() as u32);
+    packed.extend_from_slice(&arg_refs);
+    let args = gctx.jfn.push_extra(&packed);
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::CallIndirect,
+            a: callee,
+            b: args,
+            ty: ret_ty,
+            ..Default::default()
+        },
+    ))
+}
+
+/// Expand `name...` into loads of the enclosing variadic-cfn clone's
+/// materialized pack params (`__va0..__va<len-1>`), in declaration order.
+/// Errors outside a variadic-cfn clone body or on a pack-name mismatch.
+fn expand_pack_spread(gctx: &mut AstGenCtx, name: &str) -> Result<Vec<JirRef>, String> {
+    let Some((pack_name, len)) = gctx.ctx.current_pack() else {
+        return Err(format!(
+            "astgen: `{name}...` is only valid inside a variadic cfn"
+        ));
+    };
+    if name != pack_name {
+        return Err(format!(
+            "astgen: unknown pack `{name}` (the enclosing cfn's pack is `{pack_name}`)"
+        ));
+    }
+    let mut refs = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let pname = format!("__va{i}");
+        let (Some(&slot), Some(&ty)) = (gctx.locals.get(&pname), gctx.local_types.get(&pname))
+        else {
+            return Err(format!("astgen: internal: pack param `{pname}` missing"));
+        };
+        refs.push(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: slot,
+                ty,
+                ..Default::default()
+            },
+        ));
+    }
+    Ok(refs)
+}
+
+/// Reject `@callC` types the naive CallIndirect lowering can't pass per the
+/// AArch64 C ABI (CALLC_PLAN.md §4): comptime-only types always; aggregates
+/// unless they are a homogeneous float aggregate of <= 4 same-width fields
+/// (v0..v3) or <= 2 full 64-bit words (x-register pair). LLVM splits a
+/// first-class aggregate one member per register, which matches the C ABI's
+/// packing only for those two shapes — anything else (sub-word fields like
+/// `{i32,i32}`, mixed float/int, > 16 bytes) needs real byval/sret/coercion
+/// support (plan phase 4).
+fn callc_check_abi(gctx: &AstGenCtx, ty: TypeIdx, what: &str) -> Result<(), String> {
+    match gctx.ctx.type_pool.get(ty).kind {
+        TypeKind::Invalid | TypeKind::Void | TypeKind::NoReturn | TypeKind::Type
+        | TypeKind::Module => {
+            return Err(format!("astgen: @callC {what} has no runtime value"));
+        }
+        _ => {}
+    }
+    if !is_by_ref(ty, gctx.ctx) {
+        return Ok(());
+    }
+    if let Some((_bits, leaves)) = callc_float_leaves(gctx, ty) {
+        if (1..=4).contains(&leaves) {
+            return Ok(());
+        }
+    }
+    if let Some(words) = callc_word_leaves(gctx, ty) {
+        if (1..=2).contains(&words) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "astgen: aggregate {what} type unsupported by @callC (must be a homogeneous \
+         float aggregate of <= 4 floats or <= 2 64-bit words; anything else needs \
+         byval/sret ABI support)"
+    ))
+}
+
+/// Walk an aggregate's leaf fields; `Some((bits, count))` when every leaf is
+/// a float of one width — the homogeneous-float-aggregate shape AAPCS64
+/// passes in FP registers. `None` for any other composition.
+fn callc_float_leaves(gctx: &AstGenCtx, ty: TypeIdx) -> Option<(u32, u32)> {
+    let k = gctx.ctx.type_pool.get(ty);
+    match k.kind {
+        TypeKind::Float => Some((k.a, 1)),
+        TypeKind::Array => {
+            let (bits, n) = callc_float_leaves(gctx, TypeIdx::new(k.a))?;
+            Some((bits, n * k.b))
+        }
+        TypeKind::Struct | TypeKind::Named => {
+            let fields = gctx.ctx.struct_fields(ty)?;
+            let mut bits = 0u32;
+            let mut count = 0u32;
+            for (_, fty) in fields {
+                let (fbits, fcount) = callc_float_leaves(gctx, fty)?;
+                if bits == 0 {
+                    bits = fbits;
+                } else if bits != fbits {
+                    return None; // mixed widths — not an HFA
+                }
+                count += fcount;
+            }
+            if count == 0 { None } else { Some((bits, count)) }
+        }
+        _ => None,
+    }
+}
+
+/// Count an aggregate's leaves when every one is a full 64-bit word (64-bit
+/// int or a pointer) — the GP-register shape whose naive LLVM split matches
+/// the C ABI's packing. `None` for any sub-word, float, or unknown leaf.
+/// Unions are rejected (no dominant member to classify by).
+fn callc_word_leaves(gctx: &AstGenCtx, ty: TypeIdx) -> Option<u32> {
+    let k = gctx.ctx.type_pool.get(ty);
+    match k.kind {
+        TypeKind::Int if k.a == 64 => Some(1),
+        TypeKind::PtrSingle | TypeKind::PtrMany | TypeKind::Fn => Some(1),
+        TypeKind::Array => Some(callc_word_leaves(gctx, TypeIdx::new(k.a))? * k.b),
+        TypeKind::Struct | TypeKind::Named => {
+            let fields = gctx.ctx.struct_fields(ty)?;
+            let mut count = 0u32;
+            for (_, fty) in fields {
+                count += callc_word_leaves(gctx, fty)?;
+            }
+            if count == 0 { None } else { Some(count) }
+        }
+        _ => None,
+    }
+}
+
 /// Call through a Fn-typed local (`f(args)`) or a Fn-typed struct field
 /// (`recv.field(args)`). Returns `None` when the callee isn't one of those.
 fn astgen_indirect_fn_call(
@@ -5026,6 +5433,10 @@ fn astgen_indirect_fn_call(
 /// integer constant (an `[expr]T` argument resolves its comptime length first).
 fn astgen_at_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     let name = str_at(gctx, n.lhs);
+    // `@callC(R, addr, args...)` (flags&2: extra carries a leading TypeIdx).
+    if n.flags & 2 != 0 && name == "callC" {
+        return astgen_call_c(gctx, n);
+    }
     // `@dropInPlace(ptr)` (flags&1: n.rhs is an args ExtraIdx, not a type arg):
     // synthesize T's drop sequence at the pointee. Rust's `drop_in_place::<T>`.
     if n.flags & 1 != 0 && name == "dropInPlace" {
@@ -7271,6 +7682,27 @@ fn astgen_return(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
             }
         }
         val_ref = astgen_expr(gctx, val_idx, ret_ty)?;
+        // `return voidExpr;` (e.g. `return @callC(void, ...)` in a variadic
+        // cfn instantiated at R = void): evaluate, then return nothing —
+        // only legal when the function itself returns nothing.
+        if gctx.jfn.get_inst(val_ref).ty == builtin::VOID {
+            if !ret_ty.is_none() && ret_ty != builtin::VOID {
+                return Err(format!(
+                    "astgen: cannot return a void expression from `{}`, which declares \
+                     a return type",
+                    gctx.jfn.name
+                ));
+            }
+            emit_return_drops(gctx, moved_var.as_deref());
+            emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Ret,
+                    ..Default::default()
+                },
+            );
+            return Ok(());
+        }
         // Reconcile the returned value's type with the declared return type
         // (resolve-then-compare, like the var-decl declared-vs-init check).
         // A LOSSLESS narrower int widens (ZExt/SExt by the value's own
@@ -8332,6 +8764,437 @@ mod tests {
             m
         };
         astgen_function(&module.functions[0], &mut cg).map(|_| ())
+    }
+
+    /// Astgen the first function and hand the JIR + context to `check` — for
+    /// asserting on the emitted instructions (no LLVM lowering).
+    fn with_first_fn_jir(src: &str, check: impl FnOnce(&JirFunction, &CodegenContext)) {
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        let jfn = astgen_function(&module.functions[0], &mut cg).expect("astgen");
+        check(&jfn, &cg);
+    }
+
+    #[test]
+    fn callc_scalar_end_to_end() {
+        lower_first_fn("fn f(a: u64) u64 { return @callC(u64, a, 1 as u64, 2 as u64); }");
+    }
+
+    #[test]
+    fn callc_zero_call_args_end_to_end() {
+        lower_first_fn("fn f(a: u64) u64 { return @callC(u64, a); }");
+    }
+
+    #[test]
+    fn callc_f64_end_to_end() {
+        lower_first_fn("fn f(a: u64, x: f64) f64 { return @callC(f64, a, x); }");
+    }
+
+    #[test]
+    fn callc_void_return_statement() {
+        lower_first_fn("fn f(a: u64) { @callC(void, a); }");
+    }
+
+    #[test]
+    fn callc_synthesizes_fn_type_from_static_arg_types() {
+        // Each arg's static type becomes a param of the synthesized Fn
+        // type; the address is punned to it via IntToPtr.
+        with_first_fn_jir(
+            "fn f(a: u64, x: f64) f64 { return @callC(f64, a, x); }",
+            |jfn, cg| {
+                let call = jfn
+                    .insts
+                    .iter()
+                    .find(|i| i.tag == JirTag::CallIndirect)
+                    .expect("no CallIndirect emitted");
+                assert_eq!(call.ty, builtin::F64);
+                assert_eq!(jfn.get_extra(call.b), 1, "one call arg");
+                let callee = jfn.get_inst(call.a);
+                assert_eq!(callee.tag, JirTag::IntToPtr);
+                let k = cg.type_pool.get(callee.ty);
+                assert_eq!(k.kind, TypeKind::Fn);
+                assert_eq!(TypeIdx::new(k.a), builtin::F64);
+                assert_eq!(cg.type_pool.fn_params_at(k.b), vec![builtin::F64]);
+            },
+        );
+    }
+
+    #[test]
+    fn callc_hfa_struct_arg_admitted() {
+        // NSRect-shaped homogeneous float aggregate (4 x f64) passes the
+        // aggregate guard and becomes a by-value struct param.
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let src = "const R = struct { x: f64, y: f64, w: f64, h: f64 };\n\
+                   fn f(a: u64, r: R) u64 { return @callC(u64, a, r); }";
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        let st = &module.structs[0];
+        let named = cg.context().named_struct(&st.name);
+        cg.register_struct(st.name.clone(), named, st.fields.clone());
+        let f64t = cg.context().f64_type();
+        named.set_body(&[f64t, f64t, f64t, f64t], false);
+        let jfn = astgen_function(&module.functions[0], &mut cg).expect("astgen");
+        let call = jfn
+            .insts
+            .iter()
+            .find(|i| i.tag == JirTag::CallIndirect)
+            .expect("no CallIndirect emitted");
+        let k = cg.type_pool.get(jfn.get_inst(call.a).ty);
+        assert_eq!(cg.type_pool.fn_params_at(k.b).len(), 1);
+    }
+
+    #[test]
+    fn callc_rejects_large_non_hfa_aggregate() {
+        // {u64,u64,u64} = 24 bytes, not an HFA — the naive indirect lowering
+        // would miscompile it (needs byval/sret), so it must be a compile
+        // error until CALLC_PLAN.md phase 4.
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let src = "const S = struct { a: u64, b: u64, c: u64 };\n\
+                   fn f(p: u64, s: S) u64 { return @callC(u64, p, s); }";
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        let st = &module.structs[0];
+        let named = cg.context().named_struct(&st.name);
+        cg.register_struct(st.name.clone(), named, st.fields.clone());
+        let i64t = cg.context().i64_type();
+        named.set_body(&[i64t, i64t, i64t], false);
+        let err = astgen_function(&module.functions[0], &mut cg).unwrap_err();
+        assert!(
+            err.contains("unsupported by @callC"),
+            "expected aggregate guard error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn callc_rejects_subword_field_aggregate() {
+        // {i32,i32} is 8 bytes but NOT admissible: LLVM splits it into two
+        // w-registers while the C ABI packs it into one x-register (the
+        // div_t shape). Must be rejected until phase-4 coercion exists.
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let src = "const D = struct { quot: i32, rem: i32 };\n\
+                   fn f(p: u64, d: D) u64 { return @callC(u64, p, d); }";
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        let st = &module.structs[0];
+        let named = cg.context().named_struct(&st.name);
+        cg.register_struct(st.name.clone(), named, st.fields.clone());
+        let i32t = cg.context().i32_type();
+        named.set_body(&[i32t, i32t], false);
+        let err = astgen_function(&module.functions[0], &mut cg).unwrap_err();
+        assert!(
+            err.contains("unsupported by @callC"),
+            "expected aggregate guard error, got: {err}"
+        );
+    }
+
+    /// Parse a module with structs (+ cfn methods) and caller fns; register
+    /// each struct and its methods like the emit pipeline does, astgen the
+    /// `fn_index`-th function, and hand the result + context to `check`.
+    fn lower_struct_module(
+        src: &str,
+        fn_index: usize,
+        check: impl FnOnce(Result<JirFunction, String>, &CodegenContext),
+    ) {
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        for st in &module.structs {
+            let named = cg.context().named_struct(&st.name);
+            cg.register_struct(st.name.clone(), named, st.fields.clone());
+            // Test structs here carry only word-sized fields.
+            let i64t = cg.context().i64_type();
+            named.set_body(&vec![i64t; st.fields.len()], false);
+            for meth in &st.methods {
+                cg.register_function_ast(format!("{}.{}", st.name, meth.name), meth.clone());
+            }
+        }
+        let r = astgen_function(&module.functions[fn_index], &mut cg);
+        check(r, &cg);
+    }
+
+    const VARIADIC_CALLER: &str = "const Caller = struct {\n\
+         addr: u64,\n\
+         cfn callThrough(self: Caller, R: type, args: ...) R {\n\
+             return @callC(R, self.addr, args...);\n\
+         }\n\
+     };\n";
+
+    /// Callee names of every direct Call in the function, in emit order.
+    fn call_names(jfn: &JirFunction, cg: &CodegenContext) -> Vec<String> {
+        jfn.insts
+            .iter()
+            .filter(|i| i.tag == JirTag::Call)
+            .map(|i| {
+                String::from_utf8_lossy(&cg.string_pool.get(StringIdx::new(i.a))).into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn variadic_cfn_pack_forwards_into_callc() {
+        // The core contract: the call site's tail types shape the clone, and
+        // the clone's @callC synthesizes its signature from the pack.
+        let src = format!(
+            "{VARIADIC_CALLER}\
+             fn f(a: u64, x: f64) f64 {{\n\
+                 var c: Caller = Caller {{ addr: a }};\n\
+                 return c.callThrough(f64, x);\n\
+             }}\n"
+        );
+        lower_struct_module(&src, 0, |r, cg| {
+            let jfn = r.expect("astgen");
+            let names = call_names(&jfn, cg);
+            assert!(
+                names.iter().any(|n| n.contains("callThrough__va")),
+                "expected a call to a pack clone, got: {names:?}"
+            );
+            // The clone was registered with a materialized f64 tail param.
+            let clone_name = names
+                .iter()
+                .find(|n| n.contains("callThrough__va"))
+                .unwrap();
+            let clone = cg
+                .get_function_ast(clone_name)
+                .expect("clone registered");
+            assert_eq!(clone.pack_len, 1);
+            let last = clone.args.last().unwrap();
+            assert_eq!(last.name, "__va0");
+            assert_eq!(last.ty, builtin::F64);
+            assert_eq!(clone.return_type, builtin::F64);
+        });
+    }
+
+    #[test]
+    fn variadic_cfn_clones_memoize_per_shape() {
+        // Same tail shape twice -> one clone name; a different shape -> a
+        // different clone name.
+        let src = format!(
+            "{VARIADIC_CALLER}\
+             fn f(a: u64, x: f64) f64 {{\n\
+                 var c: Caller = Caller {{ addr: a }};\n\
+                 const r1: f64 = c.callThrough(f64, x);\n\
+                 const r2: f64 = c.callThrough(f64, r1);\n\
+                 const r3: u64 = c.callThrough(u64, a, a);\n\
+                 return r2;\n\
+             }}\n"
+        );
+        lower_struct_module(&src, 0, |r, cg| {
+            let jfn = r.expect("astgen");
+            let names: Vec<String> = call_names(&jfn, cg)
+                .into_iter()
+                .filter(|n| n.contains("callThrough__va"))
+                .collect();
+            assert_eq!(names.len(), 3, "three instantiated calls: {names:?}");
+            assert_eq!(names[0], names[1], "same shape must reuse the clone");
+            assert_ne!(names[1], names[2], "different shape must get its own clone");
+        });
+    }
+
+    #[test]
+    fn variadic_cfn_empty_pack_ok() {
+        let src = format!(
+            "{VARIADIC_CALLER}\
+             fn f(a: u64) u64 {{\n\
+                 var c: Caller = Caller {{ addr: a }};\n\
+                 return c.callThrough(u64);\n\
+             }}\n"
+        );
+        lower_struct_module(&src, 0, |r, cg| {
+            let jfn = r.expect("astgen");
+            let names = call_names(&jfn, cg);
+            let clone_name = names
+                .iter()
+                .find(|n| n.contains("callThrough__va"))
+                .expect("clone call");
+            let clone = cg.get_function_ast(clone_name).unwrap();
+            assert_eq!(clone.pack_len, 0);
+        });
+    }
+
+    #[test]
+    fn void_expr_return_in_valued_fn_rejected() {
+        // Used to compile and crash at runtime — the bare-Ret path must
+        // only apply when the function itself returns nothing.
+        let err = astgen_first_fn("fn f(a: u64) u64 { return @callC(void, a); }").unwrap_err();
+        assert!(
+            err.contains("cannot return a void expression"),
+            "got: {err}"
+        );
+    }
+
+    /// Parse a module, register every function, then astgen functions[0].
+    fn astgen_first_fn_registered(src: &str) -> Result<(), String> {
+        let owner = Context::new();
+        let mut cg = CodegenContext::new(&owner, "m");
+        let module = {
+            let mut lexer = Lexer::new(src.as_bytes().to_vec());
+            lexer.scan_tokens().expect("lex");
+            let tokens = lexer.tokens().to_vec();
+            let mut diags = jam_core::diag::Diagnostics::new();
+            let mut parser = Parser::new(
+                tokens,
+                src.as_bytes().to_vec(),
+                &mut cg.type_pool,
+                &mut cg.string_pool,
+                &mut cg.node_store,
+                &mut diags,
+                "test.jam",
+            );
+            let m = parser.parse().expect("parse");
+            assert!(!diags.has_errors(), "parse errors");
+            m
+        };
+        for f in &module.functions {
+            cg.register_function_ast(f.name.clone(), f.clone());
+        }
+        astgen_function(&module.functions[0], &mut cg).map(|_| ())
+    }
+
+    #[test]
+    fn instantiated_call_arity_checked() {
+        // Extra args used to be appended silently (an invalid call), and
+        // missing args surfaced as "unknown variable" from inside the clone.
+        let err = astgen_first_fn_registered(
+            "fn f() u64 { return pick(u32, 1 as u64, 2 as u64); }\n\
+             fn pick(T: type, x: u64) u64 { return x; }",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("expects 2 arg(s), got 3"),
+            "extra args must be an arity error, got: {err}"
+        );
+        let err = astgen_first_fn_registered(
+            "fn f() u64 { return pick(u32); }\n\
+             fn pick(T: type, x: u64) u64 { return x; }",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("expects 2 arg(s), got 1"),
+            "missing args must be an arity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spread_outside_variadic_cfn_rejected() {
+        let err =
+            astgen_first_fn("fn f(a: u64) u64 { return @callC(u64, a, args...); }").unwrap_err();
+        assert!(
+            err.contains("only valid inside a variadic cfn"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn spread_of_wrong_pack_name_rejected() {
+        let src = "const S = struct {\n\
+             addr: u64,\n\
+             cfn send(self: S, args: ...) u64 {\n\
+                 return @callC(u64, self.addr, argz...);\n\
+             }\n\
+         };\n\
+         fn f(a: u64) u64 {\n\
+             var s: S = S { addr: a };\n\
+             return s.send(a);\n\
+         }\n";
+        lower_struct_module(src, 0, |r, _| {
+            let err = r.unwrap_err();
+            assert!(err.contains("unknown pack `argz`"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn callc_rejects_non_u64_address() {
+        let err = astgen_first_fn("fn f(b: bool) u64 { return @callC(u64, b); }").unwrap_err();
+        assert!(
+            err.contains("@callC address must be a u64"),
+            "got: {err}"
+        );
     }
 
     /// Recoverable diagnostics accumulate: one pass over a body reports every

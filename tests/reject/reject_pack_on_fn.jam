@@ -1,0 +1,4 @@
+// expect-error: require `cfn`
+fn f(args: ...) u64 {
+    return 0;
+}
