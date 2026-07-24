@@ -17,7 +17,7 @@ use jam_core::index::{ExtraIdx, NodeIdx, StringIdx, TypeIdx};
 use jam_syntax::ast::{FunctionAST, Param};
 use jam_syntax::ast_flat::{AstNode, AstTag, TypeKind, TypePool, builtin};
 
-use crate::abi::{ParamAbiKind, ReturnAbiKind, classify_param, classify_return};
+use crate::abi::{ParamAbiKind, ReturnAbiKind, classify_param, classify_return, is_by_ref};
 use crate::codegen_context::CodegenContext;
 use crate::comptime::ComptimeValue;
 use crate::jir::{JirBlockRef, JirFunction, JirInst, JirRef, JirTag, NO_JIR_BLOCK, NO_JIR_REF};
