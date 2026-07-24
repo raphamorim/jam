@@ -4808,9 +4808,18 @@ fn astgen_dotted_call(
     }
 
     // 2. Prefix as an IMPORT HANDLE (`const lib = import("m"); lib.fn()`) -> the
-    // free function `m.fn`.
+    // free function `m.fn`. Externs/exports register under their bare C name
+    // only (module_path stays empty so the symbol isn't mangled), so a handle
+    // spelling like `objc.objc_getClass` falls back to the bare lookup.
     if let Some(module) = gctx.ctx.import_handle_module(prefix)
-        && let Some(method) = gctx.ctx.get_function_ast(&format!("{module}.{suffix}"))
+        && let Some(method) = gctx
+            .ctx
+            .get_function_ast(&format!("{module}.{suffix}"))
+            .or_else(|| {
+                gctx.ctx
+                    .get_function_ast(suffix)
+                    .filter(|f| f.is_extern || f.is_export)
+            })
     {
         // Privacy: a non-`pub` function reached through a module handle is not
         // exported. `extern`/`export` libc bare names stay accessible.
@@ -6997,6 +7006,26 @@ fn astgen_member_access(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, Str
                         ..Default::default()
                     },
                 ));
+            }
+        }
+        // Module const through an import handle (`metal.StorageModeShared`):
+        // inline it exactly like a bare module-const reference would.
+        if !gctx.locals.contains_key(&base_name)
+            && let Some(module) = gctx.ctx.import_handle_module(&base_name)
+        {
+            if let Some(mc) = gctx.ctx.get_module_const(&format!("{module}.{member}")) {
+                if mc.is_comp {
+                    let v = gctx.ctx.fold_comptime_expr(mc.init_expr);
+                    if !v.is_none() {
+                        return materialize_comptime_value(
+                            gctx,
+                            &v,
+                            mc.declared_type,
+                            &format!("comp const `{member}`"),
+                        );
+                    }
+                }
+                return astgen_expr(gctx, mc.init_expr, mc.declared_type);
             }
         }
     }

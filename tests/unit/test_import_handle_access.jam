@@ -1,0 +1,18 @@
+// Symbols reached through an import handle: pub fns always worked;
+// externs (registered under their bare C name) and module consts used
+// to miss and error.
+const { assert } = import("test");
+const h = import("mod_handle_access");
+
+tfn externThroughHandle() {
+    assert(h.labs(-4) as i32, 4);
+}
+
+tfn constThroughHandle() {
+    assert(h.MAGIC as i32, 42);
+    assert((h.WIDE == 70000) as u8, 1);
+}
+
+tfn fnThroughHandle() {
+    assert(h.double(21) as i32, 42);
+}

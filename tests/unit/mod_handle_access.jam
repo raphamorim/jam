@@ -1,0 +1,5 @@
+// Helper module for test_import_handle_access.jam.
+pub extern fn labs(x: i64) i64;
+pub const MAGIC: u64 = 42;
+pub const WIDE: u64 = 70000;
+pub fn double(x: u64) u64 { return x * 2; }
