@@ -675,10 +675,11 @@ name.
 Intrinsics are compiler builtins prefixed with `@`. They run at compile time and their
 results are substituted as constants before LLVM sees the code.
 
-| Intrinsic            | Description                                             |
-|----------------------|---------------------------------------------------------|
-| `@sizeOf(T)`         | Size of `T` in bytes (u64)                              |
-| `@alignOf(T)`        | Alignment of `T` in bytes (u64)                         |
+| Intrinsic                    | Description                                             |
+|------------------------------|---------------------------------------------------------|
+| `@sizeOf(T)`                 | Size of `T` in bytes (u64)                              |
+| `@alignOf(T)`                | Alignment of `T` in bytes (u64)                         |
+| `@callC(R, addr, args...)`   | Indirect C call through a raw `u64` address; the fixed C signature is synthesized from `R` and the args' static types (see extern / FFI) |
 
 ```jam
 fn bytesFor(n: u64) u64 {
@@ -719,6 +720,53 @@ fn allocOne() *mut[] u32 {
 Param types must match the C ABI. Slice arguments are passed as a `{ptr, len}` pair, and
 struct arguments larger than two words use sret-style return ABI, these match the
 platform's C compiler.
+
+### Calling raw function addresses: `@callC`
+
+When the callee is only known as an address (`dlsym` results,
+`objc_msgSend`-style dispatchers), `@callC(R, addr, args...)` performs an
+indirect call with the C calling convention. `R` is the return type (`void`
+is accepted here), `addr` is a `u64`, and each argument's *static* type
+becomes the corresponding parameter type of the synthesized signature — no
+coercion happens at the boundary, so spell scalar types explicitly
+(`0 as i64`, `x as u64`).
+
+```jam
+pub extern fn fabs(x: f64) f64;
+
+fn callThroughAddress() f64 {
+    const addr: u64 = fabs as u64;
+    return @callC(f64, addr, -2.5);        // fn(f64) f64, by address
+}
+```
+
+By-value aggregates are allowed when they are homogeneous float aggregates
+of at most 4 same-width floats (`{f64,f64,f64,f64}` — FP registers) or at
+most two full 64-bit words (`{u64,u64}` — GP registers); other shapes are
+rejected at compile time.
+
+### Variadic `cfn`: forwarding argument packs
+
+A `cfn` method may declare one trailing argument pack, `args: ...`. The
+method is instantiated per call-site shape (each pack argument's static
+type becomes a real parameter), and the pack's only use is forwarding —
+`args...` at the end of a call-argument list, most usefully into `@callC`
+or an extern C-variadic like `printf`:
+
+```jam
+const Caller = struct {
+    addr: u64,
+    cfn callThrough(self: Caller, R: type, args: ...) R {
+        return @callC(R, self.addr, args...);
+    }
+};
+
+const n: i32 = c.callThrough(i32, -7 as i32);   // fn(i32) i32
+const d: f64 = c.callThrough(f64, 1.5, 2.5);    // fn(f64, f64) f64
+```
+
+The pack cannot be read, indexed, or stored — only spread. Packs are not
+available on plain `fn` or on top-level (comptime) `cfn`s.
 
 ---
 
