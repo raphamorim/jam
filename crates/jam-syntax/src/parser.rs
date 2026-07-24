@@ -1290,6 +1290,9 @@ impl<'a> Parser<'a> {
                 };
                 let mut args = Vec::new();
                 while self.match_(TokenType::Comma) {
+                    if self.check(TokenType::CloseParen) {
+                        break; // trailing comma
+                    }
                     let a = self.parse_logical_or()?;
                     // `args...` pack spread, same as in plain call args.
                     if self.check(TokenType::Ellipsis) {
@@ -1342,6 +1345,9 @@ impl<'a> Parser<'a> {
                 if !self.check(TokenType::CloseParen) {
                     args.push(self.parse_logical_or()?);
                     while self.match_(TokenType::Comma) {
+                        if self.check(TokenType::CloseParen) {
+                            break; // trailing comma
+                        }
                         args.push(self.parse_logical_or()?);
                     }
                 }
@@ -1624,6 +1630,9 @@ impl<'a> Parser<'a> {
                                 if !self.check(TokenType::CloseParen) {
                                     margs.push(self.parse_comparison()?);
                                     while self.match_(TokenType::Comma) {
+                                        if self.check(TokenType::CloseParen) {
+                                            break; // trailing comma
+                                        }
                                         margs.push(self.parse_comparison()?);
                                     }
                                 }
@@ -1668,6 +1677,9 @@ impl<'a> Parser<'a> {
                     if !self.check(TokenType::CloseParen) {
                         args.push(self.parse_call_arg()?);
                         while self.match_(TokenType::Comma) {
+                            if self.check(TokenType::CloseParen) {
+                                break; // trailing comma
+                            }
                             args.push(self.parse_call_arg()?);
                         }
                     }
