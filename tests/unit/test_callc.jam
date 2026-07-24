@@ -14,12 +14,13 @@ extern fn getpid() i32;
 extern fn malloc(size: u64) *mut[] u8;
 extern fn free(ptr: *mut[] u8);
 extern fn lldiv(numer: i64, denom: i64) i64;
+extern fn div(numer: i32, denom: i32) i64;
 
-// lldiv(3) really returns lldiv_t { quot, rem } — two 64-bit words in
-// the x0/x1 return pair, the aggregate shape the guard admits. (div_t's
-// {i32,i32} is deliberately rejected: LLVM would split it across two
-// registers where C packs it into one.)
+// lldiv_t { quot, rem }: two 64-bit words in the x0/x1 return pair.
 const LldivT = struct { quot: i64, rem: i64 };
+// div_t { quot, rem }: two i32s packed into ONE register — the coerced
+// GP-word lowering (a naive per-member split read garbage here).
+const DivT = struct { quot: i32, rem: i32 };
 
 tfn callcIntArgAndReturn() {
     const addr: u64 = abs as u64;
@@ -62,4 +63,10 @@ tfn callcSmallStructReturn() {
     const d: LldivT = @callC(LldivT, lldiv as u64, 7 as i64, 2 as i64);
     assert(d.quot as i32, 3);
     assert(d.rem as i32, 1);
+}
+
+tfn callcSubwordStructReturn() {
+    const d: DivT = @callC(DivT, div as u64, 7 as i32, 2 as i32);
+    assert(d.quot, 3);
+    assert(d.rem, 1);
 }

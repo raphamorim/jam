@@ -1,6 +1,12 @@
 # `@callC` — plan
 
-**Status: IMPLEMENTED** (phases 1–3; phase 4 remains future work). Shipped
+**Status: IMPLEMENTED**, including phase 4 on AArch64: indirect calls now
+classify aggregates per the C ABI (`abi::classify_c_abi` — HFA / GP-word
+coercion / caller-copy + call-site sret), so the §1/§4 aggregate guard is
+gone. div_t-shaped returns, 24-byte args and 48-byte sret returns are
+covered by corpus/unit tests here and a live NSAffineTransformStruct
+round trip in jam-objc. x86_64 still needs its own (SysV) classifier.
+Phases 1–3 shipped
 with parser/astgen unit tests, `tests/unit/test_callc.jam`, and four
 `tests/reject/reject_callc_*.jam` corpus files. One correction discovered
 during implementation is folded into §1/§4: the aggregate guard admits

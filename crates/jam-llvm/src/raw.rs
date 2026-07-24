@@ -345,6 +345,7 @@ unsafe extern "C" {
         KindID: c_uint,
         type_ref: LLVMTypeRef,
     ) -> LLVMAttributeRef;
+    pub fn LLVMAddCallSiteAttribute(C: LLVMValueRef, Idx: LLVMAttributeIndex, A: LLVMAttributeRef);
     pub fn LLVMCreateStringAttribute(
         C: LLVMContextRef,
         K: *const c_char,

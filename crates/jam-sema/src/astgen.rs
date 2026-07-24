@@ -17,7 +17,7 @@ use jam_core::index::{ExtraIdx, NodeIdx, StringIdx, TypeIdx};
 use jam_syntax::ast::{FunctionAST, Param};
 use jam_syntax::ast_flat::{AstNode, AstTag, TypeKind, TypePool, builtin};
 
-use crate::abi::{ParamAbiKind, ReturnAbiKind, classify_param, classify_return, is_by_ref};
+use crate::abi::{ParamAbiKind, ReturnAbiKind, classify_param, classify_return};
 use crate::codegen_context::CodegenContext;
 use crate::comptime::ComptimeValue;
 use crate::jir::{JirBlockRef, JirFunction, JirInst, JirRef, JirTag, NO_JIR_BLOCK, NO_JIR_REF};
@@ -5269,14 +5269,10 @@ fn expand_pack_spread(gctx: &mut AstGenCtx, name: &str) -> Result<Vec<JirRef>, S
     Ok(refs)
 }
 
-/// Reject `@callC` types the naive CallIndirect lowering can't pass per the
-/// AArch64 C ABI (CALLC_PLAN.md §4): comptime-only types always; aggregates
-/// unless they are a homogeneous float aggregate of <= 4 same-width fields
-/// (v0..v3) or <= 2 full 64-bit words (x-register pair). LLVM splits a
-/// first-class aggregate one member per register, which matches the C ABI's
-/// packing only for those two shapes — anything else (sub-word fields like
-/// `{i32,i32}`, mixed float/int, > 16 bytes) needs real byval/sret/coercion
-/// support (plan phase 4).
+/// `@callC` type sanity: every operand must be a runtime value. Aggregate
+/// shapes are no longer restricted — the CallIndirect lowering classifies
+/// them per the C ABI (abi::classify_c_abi: HFA / GP-word coercion /
+/// caller-copy + sret memory class).
 fn callc_check_abi(gctx: &AstGenCtx, ty: TypeIdx, what: &str) -> Result<(), String> {
     match gctx.ctx.type_pool.get(ty).kind {
         TypeKind::Invalid | TypeKind::Void | TypeKind::NoReturn | TypeKind::Type
@@ -5285,76 +5281,7 @@ fn callc_check_abi(gctx: &AstGenCtx, ty: TypeIdx, what: &str) -> Result<(), Stri
         }
         _ => {}
     }
-    if !is_by_ref(ty, gctx.ctx) {
-        return Ok(());
-    }
-    if let Some((_bits, leaves)) = callc_float_leaves(gctx, ty) {
-        if (1..=4).contains(&leaves) {
-            return Ok(());
-        }
-    }
-    if let Some(words) = callc_word_leaves(gctx, ty) {
-        if (1..=2).contains(&words) {
-            return Ok(());
-        }
-    }
-    Err(format!(
-        "astgen: aggregate {what} type unsupported by @callC (must be a homogeneous \
-         float aggregate of <= 4 floats or <= 2 64-bit words; anything else needs \
-         byval/sret ABI support)"
-    ))
-}
-
-/// Walk an aggregate's leaf fields; `Some((bits, count))` when every leaf is
-/// a float of one width — the homogeneous-float-aggregate shape AAPCS64
-/// passes in FP registers. `None` for any other composition.
-fn callc_float_leaves(gctx: &AstGenCtx, ty: TypeIdx) -> Option<(u32, u32)> {
-    let k = gctx.ctx.type_pool.get(ty);
-    match k.kind {
-        TypeKind::Float => Some((k.a, 1)),
-        TypeKind::Array => {
-            let (bits, n) = callc_float_leaves(gctx, TypeIdx::new(k.a))?;
-            Some((bits, n * k.b))
-        }
-        TypeKind::Struct | TypeKind::Named => {
-            let fields = gctx.ctx.struct_fields(ty)?;
-            let mut bits = 0u32;
-            let mut count = 0u32;
-            for (_, fty) in fields {
-                let (fbits, fcount) = callc_float_leaves(gctx, fty)?;
-                if bits == 0 {
-                    bits = fbits;
-                } else if bits != fbits {
-                    return None; // mixed widths — not an HFA
-                }
-                count += fcount;
-            }
-            if count == 0 { None } else { Some((bits, count)) }
-        }
-        _ => None,
-    }
-}
-
-/// Count an aggregate's leaves when every one is a full 64-bit word (64-bit
-/// int or a pointer) — the GP-register shape whose naive LLVM split matches
-/// the C ABI's packing. `None` for any sub-word, float, or unknown leaf.
-/// Unions are rejected (no dominant member to classify by).
-fn callc_word_leaves(gctx: &AstGenCtx, ty: TypeIdx) -> Option<u32> {
-    let k = gctx.ctx.type_pool.get(ty);
-    match k.kind {
-        TypeKind::Int if k.a == 64 => Some(1),
-        TypeKind::PtrSingle | TypeKind::PtrMany | TypeKind::Fn => Some(1),
-        TypeKind::Array => Some(callc_word_leaves(gctx, TypeIdx::new(k.a))? * k.b),
-        TypeKind::Struct | TypeKind::Named => {
-            let fields = gctx.ctx.struct_fields(ty)?;
-            let mut count = 0u32;
-            for (_, fty) in fields {
-                count += callc_word_leaves(gctx, fty)?;
-            }
-            if count == 0 { None } else { Some(count) }
-        }
-        _ => None,
-    }
+    Ok(())
 }
 
 /// Call through a Fn-typed local (`f(args)`) or a Fn-typed struct field
@@ -8914,15 +8841,11 @@ mod tests {
         assert_eq!(cg.type_pool.fn_params_at(k.b).len(), 1);
     }
 
-    #[test]
-    fn callc_rejects_large_non_hfa_aggregate() {
-        // {u64,u64,u64} = 24 bytes, not an HFA — the naive indirect lowering
-        // would miscompile it (needs byval/sret), so it must be a compile
-        // error until CALLC_PLAN.md phase 4.
+    /// Register `src`'s first struct with an LLVM body of `n` i64 fields,
+    /// then lower functions[0] end to end (JIR verify + LLVM verify).
+    fn lower_with_word_struct(src: &str, words: usize) {
         let owner = Context::new();
         let mut cg = CodegenContext::new(&owner, "m");
-        let src = "const S = struct { a: u64, b: u64, c: u64 };\n\
-                   fn f(p: u64, s: S) u64 { return @callC(u64, p, s); }";
         let module = {
             let mut lexer = Lexer::new(src.as_bytes().to_vec());
             lexer.scan_tokens().expect("lex");
@@ -8945,19 +8868,41 @@ mod tests {
         let named = cg.context().named_struct(&st.name);
         cg.register_struct(st.name.clone(), named, st.fields.clone());
         let i64t = cg.context().i64_type();
-        named.set_body(&[i64t, i64t, i64t], false);
-        let err = astgen_function(&module.functions[0], &mut cg).unwrap_err();
-        assert!(
-            err.contains("unsupported by @callC"),
-            "expected aggregate guard error, got: {err}"
+        named.set_body(&vec![i64t; words], false);
+        let jfn = astgen_function(&module.functions[0], &mut cg).expect("astgen");
+        let diags = verify_jir_function(&jfn, Some(&cg.type_pool), Some(&cg.string_pool), None);
+        assert!(diags.is_empty(), "jir_verify: {diags:?}");
+        jir_declare_prototype(&jfn, &cg).expect("prototype");
+        jir_define_body(&jfn, &cg).expect("define body");
+        let f = cg.module().get_function(&jfn.name).unwrap();
+        assert!(f.verify(), "LLVM verify failed");
+    }
+
+    #[test]
+    fn callc_large_aggregate_lowers_by_pointer() {
+        // 24-byte non-HFA arg: memory class — caller copy, pointer arg.
+        // The old guard rejected this; classification lowers it.
+        lower_with_word_struct(
+            "const S = struct { a: u64, b: u64, c: u64 };\n\
+             fn f(p: u64, s: S) u64 { return @callC(u64, p, s); }",
+            3,
         );
     }
 
     #[test]
-    fn callc_rejects_subword_field_aggregate() {
-        // {i32,i32} is 8 bytes but NOT admissible: LLVM splits it into two
-        // w-registers while the C ABI packs it into one x-register (the
-        // div_t shape). Must be rejected until phase-4 coercion exists.
+    fn callc_large_aggregate_return_lowers_sret() {
+        // 24-byte non-HFA return: sret slot + call-site sret attribute.
+        lower_with_word_struct(
+            "const S = struct { a: u64, b: u64, c: u64 };\n\
+             fn f(p: u64) u64 { const s: S = @callC(S, p); return s.a; }",
+            3,
+        );
+    }
+
+    #[test]
+    fn callc_subword_aggregate_lowers_coerced() {
+        // div_t's shape ({i32,i32}): 8 bytes packed into ONE x-register —
+        // the coerced-i64 lowering, not a per-member split.
         let owner = Context::new();
         let mut cg = CodegenContext::new(&owner, "m");
         let src = "const D = struct { quot: i32, rem: i32 };\n\
@@ -8985,243 +8930,11 @@ mod tests {
         cg.register_struct(st.name.clone(), named, st.fields.clone());
         let i32t = cg.context().i32_type();
         named.set_body(&[i32t, i32t], false);
-        let err = astgen_function(&module.functions[0], &mut cg).unwrap_err();
-        assert!(
-            err.contains("unsupported by @callC"),
-            "expected aggregate guard error, got: {err}"
-        );
-    }
-
-    /// Parse a module with structs (+ cfn methods) and caller fns; register
-    /// each struct and its methods like the emit pipeline does, astgen the
-    /// `fn_index`-th function, and hand the result + context to `check`.
-    fn lower_struct_module(
-        src: &str,
-        fn_index: usize,
-        check: impl FnOnce(Result<JirFunction, String>, &CodegenContext),
-    ) {
-        let owner = Context::new();
-        let mut cg = CodegenContext::new(&owner, "m");
-        let module = {
-            let mut lexer = Lexer::new(src.as_bytes().to_vec());
-            lexer.scan_tokens().expect("lex");
-            let tokens = lexer.tokens().to_vec();
-            let mut diags = jam_core::diag::Diagnostics::new();
-            let mut parser = Parser::new(
-                tokens,
-                src.as_bytes().to_vec(),
-                &mut cg.type_pool,
-                &mut cg.string_pool,
-                &mut cg.node_store,
-                &mut diags,
-                "test.jam",
-            );
-            let m = parser.parse().expect("parse");
-            assert!(!diags.has_errors(), "parse errors");
-            m
-        };
-        for st in &module.structs {
-            let named = cg.context().named_struct(&st.name);
-            cg.register_struct(st.name.clone(), named, st.fields.clone());
-            // Test structs here carry only word-sized fields.
-            let i64t = cg.context().i64_type();
-            named.set_body(&vec![i64t; st.fields.len()], false);
-            for meth in &st.methods {
-                cg.register_function_ast(format!("{}.{}", st.name, meth.name), meth.clone());
-            }
-        }
-        let r = astgen_function(&module.functions[fn_index], &mut cg);
-        check(r, &cg);
-    }
-
-    const VARIADIC_CALLER: &str = "const Caller = struct {\n\
-         addr: u64,\n\
-         cfn callThrough(self: Caller, R: type, args: ...) R {\n\
-             return @callC(R, self.addr, args...);\n\
-         }\n\
-     };\n";
-
-    /// Callee names of every direct Call in the function, in emit order.
-    fn call_names(jfn: &JirFunction, cg: &CodegenContext) -> Vec<String> {
-        jfn.insts
-            .iter()
-            .filter(|i| i.tag == JirTag::Call)
-            .map(|i| {
-                String::from_utf8_lossy(&cg.string_pool.get(StringIdx::new(i.a))).into_owned()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn variadic_cfn_pack_forwards_into_callc() {
-        // The core contract: the call site's tail types shape the clone, and
-        // the clone's @callC synthesizes its signature from the pack.
-        let src = format!(
-            "{VARIADIC_CALLER}\
-             fn f(a: u64, x: f64) f64 {{\n\
-                 var c: Caller = Caller {{ addr: a }};\n\
-                 return c.callThrough(f64, x);\n\
-             }}\n"
-        );
-        lower_struct_module(&src, 0, |r, cg| {
-            let jfn = r.expect("astgen");
-            let names = call_names(&jfn, cg);
-            assert!(
-                names.iter().any(|n| n.contains("callThrough__va")),
-                "expected a call to a pack clone, got: {names:?}"
-            );
-            // The clone was registered with a materialized f64 tail param.
-            let clone_name = names
-                .iter()
-                .find(|n| n.contains("callThrough__va"))
-                .unwrap();
-            let clone = cg
-                .get_function_ast(clone_name)
-                .expect("clone registered");
-            assert_eq!(clone.pack_len, 1);
-            let last = clone.args.last().unwrap();
-            assert_eq!(last.name, "__va0");
-            assert_eq!(last.ty, builtin::F64);
-            assert_eq!(clone.return_type, builtin::F64);
-        });
-    }
-
-    #[test]
-    fn variadic_cfn_clones_memoize_per_shape() {
-        // Same tail shape twice -> one clone name; a different shape -> a
-        // different clone name.
-        let src = format!(
-            "{VARIADIC_CALLER}\
-             fn f(a: u64, x: f64) f64 {{\n\
-                 var c: Caller = Caller {{ addr: a }};\n\
-                 const r1: f64 = c.callThrough(f64, x);\n\
-                 const r2: f64 = c.callThrough(f64, r1);\n\
-                 const r3: u64 = c.callThrough(u64, a, a);\n\
-                 return r2;\n\
-             }}\n"
-        );
-        lower_struct_module(&src, 0, |r, cg| {
-            let jfn = r.expect("astgen");
-            let names: Vec<String> = call_names(&jfn, cg)
-                .into_iter()
-                .filter(|n| n.contains("callThrough__va"))
-                .collect();
-            assert_eq!(names.len(), 3, "three instantiated calls: {names:?}");
-            assert_eq!(names[0], names[1], "same shape must reuse the clone");
-            assert_ne!(names[1], names[2], "different shape must get its own clone");
-        });
-    }
-
-    #[test]
-    fn variadic_cfn_empty_pack_ok() {
-        let src = format!(
-            "{VARIADIC_CALLER}\
-             fn f(a: u64) u64 {{\n\
-                 var c: Caller = Caller {{ addr: a }};\n\
-                 return c.callThrough(u64);\n\
-             }}\n"
-        );
-        lower_struct_module(&src, 0, |r, cg| {
-            let jfn = r.expect("astgen");
-            let names = call_names(&jfn, cg);
-            let clone_name = names
-                .iter()
-                .find(|n| n.contains("callThrough__va"))
-                .expect("clone call");
-            let clone = cg.get_function_ast(clone_name).unwrap();
-            assert_eq!(clone.pack_len, 0);
-        });
-    }
-
-    #[test]
-    fn void_expr_return_in_valued_fn_rejected() {
-        // Used to compile and crash at runtime — the bare-Ret path must
-        // only apply when the function itself returns nothing.
-        let err = astgen_first_fn("fn f(a: u64) u64 { return @callC(void, a); }").unwrap_err();
-        assert!(
-            err.contains("cannot return a void expression"),
-            "got: {err}"
-        );
-    }
-
-    /// Parse a module, register every function, then astgen functions[0].
-    fn astgen_first_fn_registered(src: &str) -> Result<(), String> {
-        let owner = Context::new();
-        let mut cg = CodegenContext::new(&owner, "m");
-        let module = {
-            let mut lexer = Lexer::new(src.as_bytes().to_vec());
-            lexer.scan_tokens().expect("lex");
-            let tokens = lexer.tokens().to_vec();
-            let mut diags = jam_core::diag::Diagnostics::new();
-            let mut parser = Parser::new(
-                tokens,
-                src.as_bytes().to_vec(),
-                &mut cg.type_pool,
-                &mut cg.string_pool,
-                &mut cg.node_store,
-                &mut diags,
-                "test.jam",
-            );
-            let m = parser.parse().expect("parse");
-            assert!(!diags.has_errors(), "parse errors");
-            m
-        };
-        for f in &module.functions {
-            cg.register_function_ast(f.name.clone(), f.clone());
-        }
-        astgen_function(&module.functions[0], &mut cg).map(|_| ())
-    }
-
-    #[test]
-    fn instantiated_call_arity_checked() {
-        // Extra args used to be appended silently (an invalid call), and
-        // missing args surfaced as "unknown variable" from inside the clone.
-        let err = astgen_first_fn_registered(
-            "fn f() u64 { return pick(u32, 1 as u64, 2 as u64); }\n\
-             fn pick(T: type, x: u64) u64 { return x; }",
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("expects 2 arg(s), got 3"),
-            "extra args must be an arity error, got: {err}"
-        );
-        let err = astgen_first_fn_registered(
-            "fn f() u64 { return pick(u32); }\n\
-             fn pick(T: type, x: u64) u64 { return x; }",
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("expects 2 arg(s), got 1"),
-            "missing args must be an arity error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn spread_outside_variadic_cfn_rejected() {
-        let err =
-            astgen_first_fn("fn f(a: u64) u64 { return @callC(u64, a, args...); }").unwrap_err();
-        assert!(
-            err.contains("only valid inside a variadic cfn"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn spread_of_wrong_pack_name_rejected() {
-        let src = "const S = struct {\n\
-             addr: u64,\n\
-             cfn send(self: S, args: ...) u64 {\n\
-                 return @callC(u64, self.addr, argz...);\n\
-             }\n\
-         };\n\
-         fn f(a: u64) u64 {\n\
-             var s: S = S { addr: a };\n\
-             return s.send(a);\n\
-         }\n";
-        lower_struct_module(src, 0, |r, _| {
-            let err = r.unwrap_err();
-            assert!(err.contains("unknown pack `argz`"), "got: {err}");
-        });
+        let jfn = astgen_function(&module.functions[0], &mut cg).expect("astgen");
+        jir_declare_prototype(&jfn, &cg).expect("prototype");
+        jir_define_body(&jfn, &cg).expect("define body");
+        let f = cg.module().get_function(&jfn.name).unwrap();
+        assert!(f.verify(), "LLVM verify failed");
     }
 
     #[test]

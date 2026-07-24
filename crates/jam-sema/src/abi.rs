@@ -128,6 +128,73 @@ pub fn is_by_ref(ty: TypeIdx, ctx: &CodegenContext) -> bool {
     }
 }
 
+/// C-ABI class of a type crossing an indirect C call (AArch64 AAPCS64 /
+/// Apple arm64 — the only target today). `Direct` covers scalars, pointers,
+/// slices and unit enums, whose natural LLVM types already land in the right
+/// registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CAbiClass {
+    Direct,
+    /// Homogeneous float aggregate of <= 4 same-width members — passed and
+    /// returned in v0..v3 as its natural struct type (LLVM splits it right).
+    Hfa,
+    /// Any other aggregate <= 16 bytes — coerced to `words` 64-bit GP words
+    /// (the clang lowering; a naive per-member split puts `{i32,i32}` in two
+    /// registers where C packs it into one).
+    IntWords { words: u32 },
+    /// Aggregate > 16 bytes: the caller passes a pointer to a copy; returns
+    /// go through an sret pointer (x8).
+    Memory,
+}
+
+pub fn classify_c_abi(ty: TypeIdx, ctx: &CodegenContext) -> Result<CAbiClass, String> {
+    if !is_by_ref(ty, ctx) {
+        return Ok(CAbiClass::Direct);
+    }
+    if let Some((_bits, leaves)) = c_abi_float_leaves(ty, ctx) {
+        if (1..=4).contains(&leaves) {
+            return Ok(CAbiClass::Hfa);
+        }
+    }
+    let size = ctx.type_size(ty)?;
+    if size <= 16 {
+        let words = (size.div_ceil(8)).max(1) as u32;
+        return Ok(CAbiClass::IntWords { words });
+    }
+    Ok(CAbiClass::Memory)
+}
+
+/// Walk an aggregate's leaf fields; `Some((bits, count))` when every leaf is
+/// a float of one width — the homogeneous-float-aggregate shape AAPCS64
+/// carries in FP registers. `None` for any other composition (unions
+/// included: no dominant member to classify by).
+fn c_abi_float_leaves(ty: TypeIdx, ctx: &CodegenContext) -> Option<(u32, u32)> {
+    let k = ctx.type_pool.get(ty);
+    match k.kind {
+        TypeKind::Float => Some((k.a, 1)),
+        TypeKind::Array => {
+            let (bits, n) = c_abi_float_leaves(TypeIdx::new(k.a), ctx)?;
+            Some((bits, n * k.b))
+        }
+        TypeKind::Struct | TypeKind::Named => {
+            let fields = ctx.struct_fields(ty)?;
+            let mut bits = 0u32;
+            let mut count = 0u32;
+            for (_, fty) in fields {
+                let (fbits, fcount) = c_abi_float_leaves(fty, ctx)?;
+                if bits == 0 {
+                    bits = fbits;
+                } else if bits != fbits {
+                    return None; // mixed widths — not an HFA
+                }
+                count += fcount;
+            }
+            if count == 0 { None } else { Some((bits, count)) }
+        }
+        _ => None,
+    }
+}
+
 /// Classify a parameter `(mode, type)` pair. `mut` always carries a pointer to
 /// caller-owned storage regardless of the type's classification.
 pub fn classify_param<'ctx>(

@@ -22,7 +22,8 @@ use jam_llvm::{
 use jam_syntax::ast_flat::{TypeKind, builtin};
 
 use crate::abi::{
-    ParamAbi, ParamAbiKind, ReturnAbi, ReturnAbiKind, classify_param, classify_return, is_by_ref,
+    CAbiClass, ParamAbi, ParamAbiKind, ReturnAbi, ReturnAbiKind, classify_c_abi, classify_param,
+    classify_return, is_by_ref,
 };
 use crate::codegen_context::CodegenContext;
 use crate::jir::{JirBlockRef, JirFunction, JirInst, JirRef, JirTag, NO_JIR_REF};
@@ -788,6 +789,15 @@ fn emit_inst_impl<'ctx>(
             Ok(Some(lctx.ctx.builder().call(f, &args, name)))
         }
         JirTag::CallIndirect => {
+            // Indirect calls target the C ABI (that's what fn-typed values
+            // exist for: objc_msgSend puns, dlsym'd addresses, @callC).
+            // Per-type classification, AArch64 rules — see abi::classify_c_abi:
+            //   Direct    natural LLVM type
+            //   Hfa       natural struct value; LLVM splits it into v0..v3
+            //   IntWords  coerced to i64 / [2 x i64] (clang-style) so
+            //             sub-word fields pack per-register, not per-member
+            //   Memory    args: caller copy passed as a pointer
+            //             return: sret pointer (x8)
             let callee_val = emit_inst(lctx, inst.a)?.ok_or("CallIndirect callee")?;
             let callee_ty = lctx.jfn.get_inst(inst.a).ty;
             let k = lctx.ctx.type_pool.get(callee_ty);
@@ -796,31 +806,90 @@ fn emit_inst_impl<'ctx>(
             }
             let ret_ty = TypeIdx::new(k.a);
             let param_tys: Vec<TypeIdx> = lctx.ctx.type_pool.fn_params_at(k.b).to_vec();
-            let mut llvm_params = Vec::with_capacity(param_tys.len());
-            for &pt in &param_tys {
-                llvm_params.push(lctx.ctx.get_llvm_type(pt)?);
-            }
-            let llvm_ret = if ret_ty.is_none() {
-                lctx.ctx.context().void_type()
+            let i64t = lctx.ctx.context().i64_type();
+            let ptr_t = lctx.ctx.context().pointer_type(0);
+            let coerce_ty = |words: u32| {
+                if words <= 1 { i64t } else { i64t.array_type(words as u64) }
+            };
+
+            let ret_class = if ret_ty.is_none() {
+                CAbiClass::Direct
             } else {
-                lctx.ctx.get_llvm_type(ret_ty)?
+                classify_c_abi(ret_ty, lctx.ctx)?
+            };
+            let mut sret_slot = None;
+
+            let mut llvm_params = Vec::with_capacity(param_tys.len() + 1);
+            if ret_class == CAbiClass::Memory {
+                let agg_ty = lctx.ctx.get_llvm_type(ret_ty)?;
+                let align = lctx.ctx.type_align(ret_ty)?;
+                sret_slot = Some(lctx.ctx.builder().alloca(agg_ty, align, "ret.sret"));
+                llvm_params.push(ptr_t);
+            }
+            let mut param_classes = Vec::with_capacity(param_tys.len());
+            for &pt in &param_tys {
+                let class = classify_c_abi(pt, lctx.ctx)?;
+                llvm_params.push(match class {
+                    CAbiClass::Direct | CAbiClass::Hfa => lctx.ctx.get_llvm_type(pt)?,
+                    CAbiClass::IntWords { words } => coerce_ty(words),
+                    CAbiClass::Memory => ptr_t,
+                });
+                param_classes.push(class);
+            }
+            let llvm_ret = match ret_class {
+                CAbiClass::Memory => lctx.ctx.context().void_type(),
+                CAbiClass::IntWords { words } => coerce_ty(words),
+                _ if ret_ty.is_none() => lctx.ctx.context().void_type(),
+                _ => lctx.ctx.get_llvm_type(ret_ty)?,
             };
             let llvm_fn_ty = llvm_ret.fn_type(&llvm_params, false);
+
             let extra = inst.b;
             let arg_count = lctx.jfn.get_extra(extra);
-            let mut args = Vec::with_capacity(arg_count as usize);
+            let mut args = Vec::with_capacity(arg_count as usize + 1);
+            if let Some(slot) = sret_slot {
+                args.push(slot);
+            }
             for i in 0..arg_count {
                 let ar = lctx.jfn.get_extra(extra + 1 + i);
-                let mut av = emit_inst(lctx, ar)?.ok_or("CallIndirect arg")?;
-                // The indirect signature passes aggregates by value, but a
-                // byref aggregate is a pointer in our SSA model — load it.
-                if (i as usize) < param_tys.len() && is_by_ref(param_tys[i as usize], lctx.ctx) {
-                    let agg_ty = lctx.ctx.get_llvm_type(param_tys[i as usize])?;
-                    av = lctx.ctx.builder().load(agg_ty, av, "arg.byval");
-                }
-                args.push(av);
+                let av = emit_inst(lctx, ar)?.ok_or("CallIndirect arg")?;
+                let (pt, class) = match param_tys.get(i as usize) {
+                    Some(&pt) => (pt, param_classes[i as usize]),
+                    None => {
+                        args.push(av);
+                        continue;
+                    }
+                };
+                // Byref aggregates arrive as pointers in our SSA model.
+                args.push(match class {
+                    CAbiClass::Direct => av,
+                    CAbiClass::Hfa => {
+                        let agg_ty = lctx.ctx.get_llvm_type(pt)?;
+                        lctx.ctx.builder().load(agg_ty, av, "arg.hfa")
+                    }
+                    CAbiClass::IntWords { words } => {
+                        // memcpy into a word-aligned temp so a 12-byte struct
+                        // never over-reads, then load the coerced value.
+                        let ct = coerce_ty(words);
+                        let size = lctx.ctx.type_size(pt)?;
+                        let align = lctx.ctx.type_align(pt)?;
+                        let tmp = lctx.ctx.builder().alloca(ct, 8, "arg.coerce");
+                        lctx.ctx.builder().memcpy(tmp, 8, av, align, size);
+                        lctx.ctx.builder().load(ct, tmp, "arg.coerce.v")
+                    }
+                    CAbiClass::Memory => {
+                        // The callee owns the copy (AAPCS64): never hand it
+                        // the caller's storage.
+                        let agg_ty = lctx.ctx.get_llvm_type(pt)?;
+                        let size = lctx.ctx.type_size(pt)?;
+                        let align = lctx.ctx.type_align(pt)?;
+                        let copy = lctx.ctx.builder().alloca(agg_ty, align, "arg.mem.copy");
+                        lctx.ctx.builder().memcpy(copy, align, av, align, size);
+                        copy
+                    }
+                });
             }
-            let name = if inst.ty.is_none() {
+            let name = if inst.ty.is_none() || ret_class == CAbiClass::Memory {
                 ""
             } else {
                 "call.indirect"
@@ -829,16 +898,30 @@ fn emit_inst_impl<'ctx>(
                 .ctx
                 .builder()
                 .indirect_call(llvm_fn_ty, callee_val, &args, name);
-            // A byref aggregate return arrives as an SSA value; spill to a slot
-            // and hand back the pointer to match the byref model.
-            if !inst.ty.is_none() && is_by_ref(inst.ty, lctx.ctx) {
-                let agg_ty = lctx.ctx.get_llvm_type(inst.ty)?;
-                let align = lctx.ctx.type_align(inst.ty)?;
-                let slot = lctx.ctx.builder().alloca(agg_ty, align, "ret.byval");
-                lctx.ctx.builder().store(result, slot);
-                return Ok(Some(slot));
+            match ret_class {
+                CAbiClass::Memory => {
+                    let agg_ty = lctx.ctx.get_llvm_type(ret_ty)?;
+                    let align = lctx.ctx.type_align(ret_ty)?;
+                    result.add_call_site_sret(0, agg_ty, align as u32);
+                    Ok(Some(sret_slot.expect("sret slot exists for Memory returns")))
+                }
+                CAbiClass::IntWords { words } => {
+                    // Spill the coerced words; the byref consumer reads the
+                    // struct's fields through the (word-aligned) pointer.
+                    let ct = coerce_ty(words);
+                    let slot = lctx.ctx.builder().alloca(ct, 8, "ret.coerce");
+                    lctx.ctx.builder().store(result, slot);
+                    Ok(Some(slot))
+                }
+                CAbiClass::Hfa => {
+                    let agg_ty = lctx.ctx.get_llvm_type(ret_ty)?;
+                    let align = lctx.ctx.type_align(ret_ty)?;
+                    let slot = lctx.ctx.builder().alloca(agg_ty, align, "ret.byval");
+                    lctx.ctx.builder().store(result, slot);
+                    Ok(Some(slot))
+                }
+                CAbiClass::Direct => Ok(Some(result)),
             }
-            Ok(Some(result))
         }
 
         JirTag::Invalid => Err("jir_codegen: Invalid tag in instruction stream".into()),

@@ -872,6 +872,27 @@ impl<'ctx> Value<'ctx> {
         unsafe { raw::LLVMSetValueName2(self.0, name.as_ptr() as *const _, name.len()) }
     }
 
+    /// Mark call-site argument `arg_idx` of a call instruction as
+    /// `sret(pointee)` (+ noalias, align). Required when an INDIRECT call
+    /// returns a big aggregate: AAPCS64 wants the result pointer in x8, and
+    /// LLVM only routes it there for sret-attributed args.
+    pub fn add_call_site_sret(self, arg_idx: u32, pointee: Type<'ctx>, align: u32) {
+        let idx = attr_param_index(arg_idx);
+        unsafe {
+            let ctx = value_context(self.0);
+            let sret_kind = raw::LLVMGetEnumAttributeKindForName("sret".as_ptr() as *const _, 4);
+            let sret = raw::LLVMCreateTypeAttribute(ctx, sret_kind, pointee.as_ptr());
+            raw::LLVMAddCallSiteAttribute(self.0, idx, sret);
+            let na_kind =
+                raw::LLVMGetEnumAttributeKindForName("noalias".as_ptr() as *const _, 7);
+            let na = raw::LLVMCreateEnumAttribute(ctx, na_kind, 0);
+            raw::LLVMAddCallSiteAttribute(self.0, idx, na);
+            let al_kind = raw::LLVMGetEnumAttributeKindForName("align".as_ptr() as *const _, 5);
+            let al = raw::LLVMCreateEnumAttribute(ctx, al_kind, align as u64);
+            raw::LLVMAddCallSiteAttribute(self.0, idx, al);
+        }
+    }
+
     pub fn set_global_constant(self, is_constant: bool) {
         unsafe { raw::LLVMSetGlobalConstant(self.0, is_constant as raw::LLVMBool) }
     }

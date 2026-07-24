@@ -1,9 +1,0 @@
-// expect-error: unsupported by @callC
-// 24-byte non-HFA aggregate: the naive indirect lowering would
-// miscompile it (needs byval/sret — CALLC_PLAN.md phase 4), so it must
-// be rejected at compile time.
-const S = struct { a: u64, b: u64, c: u64 };
-
-fn f(p: u64, s: S) u64 {
-    return @callC(u64, p, s);
-}
