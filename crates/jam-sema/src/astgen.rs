@@ -5401,7 +5401,13 @@ fn astgen_at_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
                 ty_arg = gctx.ctx.resolve_array_expr_instantiate(ty_arg)?;
             }
             if name == "sizeOf" {
-                let bytes = gctx.ctx.type_size(ty_arg)?;
+                // `@sizeOf(void)` is 0 — reachable when a type param is
+                // bound to void and the body sizes it.
+                let bytes = if ty_arg == builtin::VOID {
+                    0
+                } else {
+                    gctx.ctx.type_size(ty_arg)?
+                };
                 Ok(emit(
                     gctx,
                     JirInst {
@@ -5424,6 +5430,25 @@ fn astgen_at_call(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
                     },
                 ))
             }
+        }
+        "isX86_64" | "isAarch64" => {
+            // Target-arch predicates fold to a Bool literal (honours
+            // `-C target`); emit_cond_br then drops the dead arm.
+            use crate::target::{Arch, Target};
+            let arch = Target::from_triple_str(&jam_llvm::default_target_triple()).arch;
+            let v = match name.as_str() {
+                "isX86_64" => arch == Arch::X86_64,
+                _ => arch == Arch::AArch64,
+            };
+            Ok(emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Bool,
+                    a: u32::from(v),
+                    ty: builtin::BOOL,
+                    ..Default::default()
+                },
+            ))
         }
         "isDarwin" | "isLinux" | "isWindows" | "isUnix" => {
             // Target-OS predicates fold to a `Bool` literal from the host OS;

@@ -95,7 +95,24 @@ pub fn init_all_targets() {
     }
 }
 
+/// Cross-compilation override (`-C target=<triple>`), set once by the CLI
+/// before any compilation starts. Every consumer — object emission, the
+/// OS/arch predicates, ABI classification, the linker flags — reads the
+/// triple through [`default_target_triple`], so this is the single switch.
+static TRIPLE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_target_triple_override(triple: &str) {
+    let _ = TRIPLE_OVERRIDE.set(triple.to_string());
+}
+
+pub fn target_triple_is_overridden() -> bool {
+    TRIPLE_OVERRIDE.get().is_some()
+}
+
 pub fn default_target_triple() -> String {
+    if let Some(t) = TRIPLE_OVERRIDE.get() {
+        return t.clone();
+    }
     unsafe { take_message(raw::LLVMGetDefaultTargetTriple()) }
 }
 

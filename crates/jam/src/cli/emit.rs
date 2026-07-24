@@ -2303,15 +2303,19 @@ pub fn emit_jir(path: &str, mode: EmitMode, opt: OptLevel, lto: Lto, strip: Stri
 /// Optimize the module and emit the intermediate object (or bitcode, under
 /// LTO) next to `output`. Returns the intermediate's path.
 fn emit_object(cg: &CodegenContext, output: &str, opt: OptLevel, lto: Lto) -> Result<String, i32> {
-    // Initialize the native target + asm printer before creating the target
-    // machine (object emission needs the backend registered).
-    jam_llvm::init_native_target();
-    jam_llvm::init_native_asm_printer();
+    // Register both backends — the triple may be a `-C target` override.
+    jam_llvm::init_all_targets();
     let triple = default_target_triple();
     cg.module().set_target_triple(&triple);
     let host = Target::from_triple_str(&triple);
     let pic = host.requires_pie() || host.requires_pic();
-    let Some(tm) = TargetMachine::new(&triple, "generic", "", pic, opt, lto) else {
+    // LLVM's "generic" x86 CPU is 32-bit; "x86-64" is the 64-bit baseline.
+    let cpu = if matches!(host.arch, jam_sema::target::Arch::X86_64) {
+        "x86-64"
+    } else {
+        "generic"
+    };
+    let Some(tm) = TargetMachine::new(&triple, cpu, "", pic, opt, lto) else {
         eprintln!("Failed to create target machine");
         return Err(1);
     };
@@ -2405,6 +2409,10 @@ fn link_flags(
 /// and returns 1.
 fn run_clang_link(obj: &str, out: &str, flags: &[String]) -> i32 {
     let mut cmd = std::process::Command::new("clang");
+    // Cross builds: hand clang the same triple the object was emitted for.
+    if jam_llvm::target_triple_is_overridden() {
+        cmd.arg(format!("--target={}", default_target_triple()));
+    }
     cmd.arg(obj).arg("-o").arg(out);
     for f in flags {
         cmd.arg(f);

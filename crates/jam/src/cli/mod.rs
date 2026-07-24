@@ -41,6 +41,8 @@ Options:
                     none       keep all symbols & debug info
                     debuginfo  strip DWARF / debug sections only
                     symbols    strip debug + local symbols
+  -C target=T     Cross-compile for triple T (default: host).
+                    x86_64-apple-darwin runs under Rosetta 2
   --emit-ir       Print LLVM IR to stdout
   --target-info   Show host target info (arch, triple, ...)
   --std-path <dir>

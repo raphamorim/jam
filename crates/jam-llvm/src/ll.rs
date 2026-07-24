@@ -872,6 +872,22 @@ impl<'ctx> Value<'ctx> {
         unsafe { raw::LLVMSetValueName2(self.0, name.as_ptr() as *const _, name.len()) }
     }
 
+    /// Mark call-site argument `arg_idx` as `byval(pointee)` (+ align) —
+    /// x86-64 SysV passes memory-class aggregates on the stack, and LLVM
+    /// only does the stack copy for byval-attributed pointer args.
+    pub fn add_call_site_byval(self, arg_idx: u32, pointee: Type<'ctx>, align: u32) {
+        let idx = attr_param_index(arg_idx);
+        unsafe {
+            let ctx = value_context(self.0);
+            let kind = raw::LLVMGetEnumAttributeKindForName("byval".as_ptr() as *const _, 5);
+            let byval = raw::LLVMCreateTypeAttribute(ctx, kind, pointee.as_ptr());
+            raw::LLVMAddCallSiteAttribute(self.0, idx, byval);
+            let al_kind = raw::LLVMGetEnumAttributeKindForName("align".as_ptr() as *const _, 5);
+            let al = raw::LLVMCreateEnumAttribute(ctx, al_kind, align as u64);
+            raw::LLVMAddCallSiteAttribute(self.0, idx, al);
+        }
+    }
+
     /// Mark call-site argument `arg_idx` of a call instruction as
     /// `sret(pointee)` (+ noalias, align). Required when an INDIRECT call
     /// returns a big aggregate: AAPCS64 wants the result pointer in x8, and
@@ -1080,6 +1096,12 @@ impl<'ctx> Function<'ctx> {
             self.add_enum_attr(ATTR_FUNCTION_INDEX, "uwtable", UWTABLE_SYNC);
         }
         self.add_string_attr(ATTR_FUNCTION_INDEX, "frame-pointer", "all");
+        // Cross builds must not stamp the host CPU/features onto functions:
+        // the per-function attributes override the target machine's CPU (an
+        // apple-m4 x86 subtarget can't even do 64-bit code).
+        if crate::target::target_triple_is_overridden() {
+            return;
+        }
         let cpu = crate::target::host_cpu_name();
         if !cpu.is_empty() {
             self.add_string_attr(ATTR_FUNCTION_INDEX, "target-cpu", &cpu);

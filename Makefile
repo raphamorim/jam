@@ -1,4 +1,4 @@
-.PHONY: build release test test-unit test-release install uninstall clean fmt lint check-format info docs
+.PHONY: build release test test-unit test-release test-x86_64 install uninstall clean fmt lint check-format info docs
 .DEFAULT_GOAL := build
 
 # Check if we're on macOS or Linux
@@ -40,6 +40,11 @@ test-unit: build
 test-release: release
 	./target/release/jam -C opt-level=3 test tests
 
+# The whole corpus cross-compiled for x86_64 and executed under
+# Rosetta 2 (macOS runs the binaries transparently).
+test-x86_64: build
+	./target/debug/jam -C target=x86_64-apple-darwin test tests
+
 install: release
 	@echo "Installing Jam compiler to $(PREFIX)..."
 	@echo "Platform: $(PLATFORM)"
@@ -80,6 +85,7 @@ info:
 	@echo "  make test           - Rust unit tests + the .jam corpus"
 	@echo "  make test-unit      - Run the must-pass .jam corpus only"
 	@echo "  make test-release   - Corpus at -C opt-level=3"
+	@echo "  make test-x86_64    - Corpus as x86_64 under Rosetta"
 	@echo "  make install        - Install jam + std to $(PREFIX)"
 	@echo "  make fmt            - cargo fmt"
 	@echo "  make lint           - fmt --check + clippy"

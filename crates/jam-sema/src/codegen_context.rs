@@ -1041,6 +1041,13 @@ impl<'ctx> CodegenContext<'ctx> {
         !self.current_subst.borrow().is_empty()
     }
 
+    /// The compilation target's architecture (honours `-C target`), for ABI
+    /// classification. Cheap enough to parse on demand; the triple never
+    /// changes mid-process.
+    pub fn target_arch(&self) -> crate::target::Arch {
+        crate::target::Target::from_triple_str(&jam_llvm::default_target_triple()).arch
+    }
+
     /// Push the variadic-pack frame for an instantiated clone body about to be
     /// lowered (`None` for a pack-less instantiation, masking any outer pack).
     pub fn push_pack(&self, frame: Option<(String, u32)>) {

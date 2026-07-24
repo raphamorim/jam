@@ -128,40 +128,68 @@ pub fn is_by_ref(ty: TypeIdx, ctx: &CodegenContext) -> bool {
     }
 }
 
-/// C-ABI class of a type crossing an indirect C call (AArch64 AAPCS64 /
-/// Apple arm64 — the only target today). `Direct` covers scalars, pointers,
-/// slices and unit enums, whose natural LLVM types already land in the right
-/// registers.
+/// One coerced 64-bit word of a small aggregate crossing the C ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CWord {
+    Int,
+    Fp,
+}
+
+/// C-ABI class of a type crossing an indirect C call. `Direct` covers
+/// scalars, pointers, slices and unit enums, whose natural LLVM types
+/// already land in the right registers. The rest is per-arch:
+///
+///   AArch64 (AAPCS64): HFAs of <= 4 same-width floats go in v0..v3 as
+///   their natural struct type; other aggregates <= 16 bytes coerce to
+///   one or two GP words; bigger ones pass as a pointer to a caller
+///   copy and return through sret (x8).
+///
+///   x86-64 (SysV): no HFA rule — aggregates <= 16 bytes classify per
+///   eightbyte (SSE when every leaf overlapping the word is a float,
+///   INTEGER otherwise), coercing to i64/double words; bigger ones go
+///   on the stack (byval) and return through sret (rdi).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CAbiClass {
     Direct,
-    /// Homogeneous float aggregate of <= 4 same-width members — passed and
-    /// returned in v0..v3 as its natural struct type (LLVM splits it right).
+    /// AArch64 only: homogeneous float aggregate, natural struct value.
     Hfa,
-    /// Any other aggregate <= 16 bytes — coerced to `words` 64-bit GP words
-    /// (the clang lowering; a naive per-member split puts `{i32,i32}` in two
-    /// registers where C packs it into one).
-    IntWords { words: u32 },
-    /// Aggregate > 16 bytes: the caller passes a pointer to a copy; returns
-    /// go through an sret pointer (x8).
-    Memory,
+    /// <= 16 bytes, coerced to one or two 64-bit words.
+    Coerce { w0: CWord, w1: Option<CWord> },
+    /// > 16 bytes. Args: caller copy — a plain pointer on aarch64,
+    /// byval on x86-64. Returns: sret on both.
+    Memory { byval: bool },
 }
 
 pub fn classify_c_abi(ty: TypeIdx, ctx: &CodegenContext) -> Result<CAbiClass, String> {
     if !is_by_ref(ty, ctx) {
         return Ok(CAbiClass::Direct);
     }
-    if let Some((_bits, leaves)) = c_abi_float_leaves(ty, ctx) {
-        if (1..=4).contains(&leaves) {
-            return Ok(CAbiClass::Hfa);
+    match ctx.target_arch() {
+        crate::target::Arch::X86_64 => {
+            let size = ctx.type_size(ty)?;
+            if size <= 16 {
+                let w = sysv_words(ty, ctx)?;
+                let w0 = w[0].unwrap_or(CWord::Int);
+                let w1 = if size > 8 { Some(w[1].unwrap_or(CWord::Int)) } else { None };
+                return Ok(CAbiClass::Coerce { w0, w1 });
+            }
+            Ok(CAbiClass::Memory { byval: true })
+        }
+        // AArch64 rules for everything else — the only other arch today.
+        _ => {
+            if let Some((_bits, leaves)) = c_abi_float_leaves(ty, ctx) {
+                if (1..=4).contains(&leaves) {
+                    return Ok(CAbiClass::Hfa);
+                }
+            }
+            let size = ctx.type_size(ty)?;
+            if size <= 16 {
+                let w1 = if size > 8 { Some(CWord::Int) } else { None };
+                return Ok(CAbiClass::Coerce { w0: CWord::Int, w1 });
+            }
+            Ok(CAbiClass::Memory { byval: false })
         }
     }
-    let size = ctx.type_size(ty)?;
-    if size <= 16 {
-        let words = (size.div_ceil(8)).max(1) as u32;
-        return Ok(CAbiClass::IntWords { words });
-    }
-    Ok(CAbiClass::Memory)
 }
 
 /// Walk an aggregate's leaf fields; `Some((bits, count))` when every leaf is
@@ -192,6 +220,84 @@ fn c_abi_float_leaves(ty: TypeIdx, ctx: &CodegenContext) -> Option<(u32, u32)> {
             if count == 0 { None } else { Some((bits, count)) }
         }
         _ => None,
+    }
+}
+
+/// SysV eightbyte classes of an aggregate <= 16 bytes: walk every leaf
+/// with its byte offset (natural layout — align each field, elements at
+/// their aligned stride) and mark the 8-byte words it spans. A word is
+/// SSE (`Fp`) only when floats are all it ever sees; INTEGER wins any mix.
+fn sysv_words(ty: TypeIdx, ctx: &CodegenContext) -> Result<[Option<CWord>; 2], String> {
+    let mut w = [None, None];
+    sysv_walk(ty, ctx, 0, &mut w)?;
+    Ok(w)
+}
+
+fn sysv_mark(w: &mut [Option<CWord>; 2], base: u64, size: u64, cls: CWord) {
+    if size == 0 {
+        return;
+    }
+    for word in (base / 8)..=((base + size - 1) / 8) {
+        if (word as usize) < 2 {
+            let slot = &mut w[word as usize];
+            *slot = Some(match (*slot, cls) {
+                (Some(CWord::Int), _) | (_, CWord::Int) => CWord::Int,
+                _ => CWord::Fp,
+            });
+        }
+    }
+}
+
+fn sysv_walk(
+    ty: TypeIdx,
+    ctx: &CodegenContext,
+    base: u64,
+    w: &mut [Option<CWord>; 2],
+) -> Result<(), String> {
+    let ty = ctx.requalify_type(ty, &ctx.current_body_module());
+    let k = ctx.type_pool.get(ty);
+    let align_up = |off: u64, a: u64| -> u64 {
+        if a == 0 { off } else { off.div_ceil(a) * a }
+    };
+    match k.kind {
+        TypeKind::Float => {
+            sysv_mark(w, base, (k.a as u64) / 8, CWord::Fp);
+            Ok(())
+        }
+        TypeKind::Array => {
+            let elem = TypeIdx::new(k.a);
+            let stride = align_up(ctx.type_size(elem)?, ctx.type_align(elem)?);
+            for i in 0..(k.b as u64) {
+                sysv_walk(elem, ctx, base + i * stride, w)?;
+            }
+            Ok(())
+        }
+        TypeKind::Struct | TypeKind::Named if ctx.struct_fields(ty).is_some() => {
+            let mut off = base;
+            for (_, fty) in ctx.struct_fields(ty).unwrap() {
+                off = align_up(off, ctx.type_align(fty)?);
+                sysv_walk(fty, ctx, off, w)?;
+                off += ctx.type_size(fty)?;
+            }
+            Ok(())
+        }
+        TypeKind::Union | TypeKind::Named if ctx.union_fields(ty).is_some() => {
+            for (_, fty) in ctx.union_fields(ty).unwrap() {
+                sysv_walk(fty, ctx, base, w)?;
+            }
+            Ok(())
+        }
+        TypeKind::Slice => {
+            sysv_mark(w, base, 16, CWord::Int);
+            Ok(())
+        }
+        // Ints, bools, pointers, fn pointers, enums (tagged payloads are
+        // jam-internal, never a real C type) — and any unresolved leaf —
+        // conservatively INTEGER over the type's span.
+        _ => {
+            sysv_mark(w, base, ctx.type_size(ty)?, CWord::Int);
+            Ok(())
+        }
     }
 }
 

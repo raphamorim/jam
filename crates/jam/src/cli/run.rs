@@ -80,8 +80,15 @@ fn parse_codegen_opt(
                 }
             }
         }
+        "target" => {
+            // Cross-compilation triple (`-C target=x86_64-apple-darwin`).
+            // Registered as a process-wide override: object emission, the
+            // @os/@arch predicates, ABI classification and the link step all
+            // read the triple through jam_llvm::default_target_triple.
+            jam_llvm::set_target_triple_override(value);
+        }
         _ => {
-            eprintln!("Error: unknown -C key `{key}` (supported: opt-level, lto, strip)");
+            eprintln!("Error: unknown -C key `{key}` (supported: opt-level, lto, strip, target)");
             return Err(1);
         }
     }
