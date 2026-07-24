@@ -1,0 +1,50 @@
+// Pointer casts inside generic instantiations, and derefs of aggregate
+// pointees. Both used to miscompile: the cast target skipped the active
+// substitution, and `return p.*;` of a struct handed Ret a loaded value
+// where the byref model wanted a pointer (block.jam in jam-objc hoisted
+// its casts out of the generic to dodge this).
+const { assert } = import("test");
+
+extern fn malloc(size: u64) *mut[] u8;
+extern fn free(ptr: *mut[] u8);
+
+const Pair = struct { x: i32, y: i32 };
+
+fn Holder(T: type) type {
+    return struct {
+        pub fn readThrough(addr: u64) T {
+            var p: *const T = addr as *const T;
+            return p.*;
+        }
+        pub fn heapPair(n: u64) u64 {
+            var d: *mut Pair = malloc(@sizeOf(Pair)) as *mut Pair;
+            d.* = Pair { x: n as i32, y: 2 };
+            const r: u64 = (d.*.x + d.*.y) as u64;
+            free(d as *mut[] u8);
+            return r;
+        }
+    };
+}
+
+const H = Holder(Pair);
+
+tfn genericPointeeCastAndDeref() {
+    var caps: Pair = Pair { x: 2, y: 3 };
+    const got: Pair = H.readThrough((&caps) as u64);
+    assert(got.x + got.y, 5);
+}
+
+tfn concreteCastInsideGenericBody() {
+    assert(H.heapPair(40) as i32, 42);
+}
+
+fn wholeConcrete(addr: u64) Pair {
+    var p: *const Pair = addr as *const Pair;
+    return p.*;
+}
+
+tfn derefAggregateReturn() {
+    var caps: Pair = Pair { x: 20, y: 30 };
+    const got: Pair = wholeConcrete((&caps) as u64);
+    assert(got.x + got.y, 50);
+}

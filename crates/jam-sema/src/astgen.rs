@@ -2630,7 +2630,9 @@ fn astgen_unary_op(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Resu
 /// bool→int, ptr↔ptr, ptr↔int, int↔int, int↔float, float↔float.
 fn astgen_as_cast(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     let operand_idx = NodeIdx::new(n.lhs);
-    let mut dst_ty = TypeIdx::new(n.rhs);
+    // Inside an instantiated body the target type may spell a generic param
+    // (`addr as *const Caps`) — substitute it like every declared type.
+    let mut dst_ty = gctx.ctx.apply_current_subst(TypeIdx::new(n.rhs));
     if gctx.ctx.type_pool.get(dst_ty).kind == TypeKind::GenericCall {
         let r = gctx.ctx.resolve_generic_call(dst_ty);
         if !r.is_none() {

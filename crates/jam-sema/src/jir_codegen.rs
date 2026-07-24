@@ -441,6 +441,13 @@ fn emit_inst_impl<'ctx>(
         JirTag::AddrOf => emit_inst(lctx, inst.a),
         JirTag::Deref => {
             let ptr = emit_inst(lctx, inst.a)?.ok_or("Deref ptr")?;
+            // Aggregate pointees keep the pointer — that's the byref model's
+            // value form (consumers copy at their boundary: Ret memcpys into
+            // sret, stores go field-wise). Loading here handed Ret a struct
+            // VALUE where it expected a pointer and it memcpy'd from garbage.
+            if is_by_ref(inst.ty, lctx.ctx) {
+                return Ok(Some(ptr));
+            }
             let ty = lctx.ctx.get_llvm_type(inst.ty)?;
             Ok(Some(lctx.ctx.builder().load(ty, ptr, "deref")))
         }
