@@ -1,0 +1,7 @@
+// expect-error: declared twice with different signatures
+extern fn labs(x: i64) i64;
+extern fn labs(x: i64, y: i64) i64;
+
+fn main() u8 {
+    return labs(-3) as u8;
+}

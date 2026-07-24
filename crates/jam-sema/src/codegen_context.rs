@@ -1076,9 +1076,40 @@ impl<'ctx> CodegenContext<'ctx> {
 
     // ---- function registry ----
     /// Register a function/method signature under `name` (the call-site lookup
-    /// key). Last registration wins.
+    /// key). Last registration wins. Re-declaring an extern with a DIFFERENT
+    /// signature is an error — LLVM would silently rename the duplicate
+    /// (`objc_msgSend.1`) and miscompile every call through it.
     pub fn register_function_ast(&self, name: impl Into<String>, f: FunctionAST) {
-        self.function_asts.borrow_mut().insert(name.into(), f);
+        let name = name.into();
+        if f.is_extern
+            && let Some(prev) = self.function_asts.borrow().get(&name)
+            && prev.is_extern
+        {
+            let same_sig = prev.return_type == f.return_type
+                && prev.is_var_args == f.is_var_args
+                && prev.args.len() == f.args.len()
+                && prev
+                    .args
+                    .iter()
+                    .zip(f.args.iter())
+                    .all(|(a, b)| a.ty == b.ty && a.mode == b.mode);
+            if !same_sig {
+                // Registration loops re-run; report each clash once.
+                let msg = format!(
+                    "extern `{name}` is declared twice with different signatures; \
+                     every declaration of a C symbol must agree"
+                );
+                let already = self
+                    .diagnostics()
+                    .all()
+                    .iter()
+                    .any(|d| d.message == msg);
+                if !already {
+                    self.push_error(jam_core::diag::SrcLoc::none(), msg);
+                }
+            }
+        }
+        self.function_asts.borrow_mut().insert(name, f);
     }
     /// Withdraw a conditionally-instantiated method whose body failed to compile
     /// for these type args.
