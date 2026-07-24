@@ -1109,6 +1109,18 @@ impl<'ctx> CodegenContext<'ctx> {
                 }
             }
         }
+        // A BARE name belongs to the first module that claims it (the entry
+        // registers first, so its `nsString` isn't shadowed by an imported
+        // module's private fn of the same name). Same-module re-registration
+        // still overwrites (the requalify pass updates signatures in place);
+        // other modules stay reachable through their qualified spelling, and
+        // each module's own bodies resolve body-module-first anyway.
+        if !name.contains('.')
+            && let Some(prev) = self.function_asts.borrow().get(&name)
+            && prev.module_path != f.module_path
+        {
+            return;
+        }
         self.function_asts.borrow_mut().insert(name, f);
     }
     /// Withdraw a conditionally-instantiated method whose body failed to compile

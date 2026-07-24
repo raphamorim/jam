@@ -1,0 +1,18 @@
+// Same-named fns in different modules stay separate: the entry's bare
+// name isn't clobbered by an imported module's private fn (this used to
+// resolve calls to whichever registered last), and the imported module
+// keeps reaching its own.
+const { assert } = import("test");
+const dep = import("mod_shadow_dep");
+
+fn label(v: u64) u64 {
+    return v + 1;
+}
+
+tfn entryFnKeepsItsBareName() {
+    assert(label(1) as i32, 2);
+}
+
+tfn importedModuleUsesItsOwnFn() {
+    assert(dep.useLabel(1) as i32, 1001);
+}

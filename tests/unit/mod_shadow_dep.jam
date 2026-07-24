@@ -1,0 +1,9 @@
+// Helper for test_bare_name_shadowing.jam: a PRIVATE fn whose name
+// collides with one in the importing file.
+fn label(v: u64) u64 {
+    return v + 1000;
+}
+
+pub fn useLabel(v: u64) u64 {
+    return label(v);
+}
