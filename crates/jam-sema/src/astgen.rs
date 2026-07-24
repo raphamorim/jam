@@ -7981,6 +7981,13 @@ fn astgen_for(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
                 start_hint = t;
             }
         }
+        // A literal end bound makes the loop var u64. It used to type from
+        // the START literal (`0` -> u8), so `for i in 0:256` truncated the
+        // bound through u8 and never ran; smallest-fit on the end is no
+        // better (`i * i` wraps at u16 for `0:1024`). Indices are u64.
+        if en.tag == AstTag::NumberLit && en.flags & 3 == 0 {
+            start_hint = builtin::U64;
+        }
     }
     let start_ref = astgen_expr(gctx, start_idx, start_hint)?;
     let idx_ty = gctx.jfn.get_inst(start_ref).ty;

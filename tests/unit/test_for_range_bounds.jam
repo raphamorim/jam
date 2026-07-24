@@ -1,0 +1,28 @@
+// The loop index takes its width from a literal end bound. It used to
+// type from the start literal (`0` -> u8), so `for i in 0:256` truncated
+// the bound through u8 and never ran.
+const { assert } = import("test");
+
+tfn forBoundPastU8() {
+    var count: u64 = 0;
+    for i in 0:256 {
+        count = count + 1;
+    }
+    assert(count as i32, 256);
+}
+
+tfn forBoundPastU16() {
+    var count: u64 = 0;
+    for i in 0:70000 {
+        count = count + 1;
+    }
+    assert((count == 70000) as u8, 1);
+}
+
+tfn forSmallBoundStillWorks() {
+    var sum: u64 = 0;
+    for i in 0:10 {
+        sum = sum + i;
+    }
+    assert(sum as i32, 45);
+}
