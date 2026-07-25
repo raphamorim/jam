@@ -1,0 +1,55 @@
+// Container index sugar on field bases: `h.buf[i]` dispatches `cfn at`
+// and `h.buf[i] = x` dispatches `cfn setAt` through the addressable
+// chain, same as a plain `v[i]`. Read-only rejections live in
+// reject_param_readonly_write.jam.
+
+const { assert } = import("test");
+const { Vec } = import("std").collections;
+
+const Holder = struct {
+    tag: u32,
+    buf: Vec(u8),
+};
+
+const Nested = struct {
+    inner: Holder,
+};
+
+fn readField(h: Holder) u8 {
+    return h.buf[0];
+}
+
+fn writeField(h: mut Holder) {
+    h.buf[0] = 42;
+}
+
+tfn fieldBaseReadsAndWrites() {
+    var h: Holder = Holder { tag: 7, buf: Vec(u8).empty() };
+    h.buf.push(5);
+    h.buf.push(6);
+    assert(readField(h) as u32, 5);
+    writeField(h);
+    assert(readField(h) as u32, 42);
+    assert(h.buf[1] as u32, 6);
+}
+
+tfn localFieldBaseWrites() {
+    var h: Holder = Holder { tag: 0, buf: Vec(u8).empty() };
+    h.buf.push(1);
+    h.buf[0] = 9;
+    assert(h.buf[0] as u32, 9);
+}
+
+fn readDeep(n: Nested) u8 {
+    return n.inner.buf[1];
+}
+
+tfn twoLevelChain() {
+    var h: Holder = Holder { tag: 0, buf: Vec(u8).empty() };
+    h.buf.push(3);
+    h.buf.push(4);
+    var n: Nested = Nested { inner: h };
+    assert(readDeep(n) as u32, 4);
+    n.inner.buf[1] = 8;
+    assert(n.inner.buf[1] as u32, 8);
+}

@@ -6697,28 +6697,30 @@ fn astgen_match(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Result<
     }
 }
 
-/// Peek (no JIR emitted) whether `node` resolves to a fixed `Array` through an
-/// addressable chain — a local `Variable`, or a `MemberAccess` on a local
-/// struct. Returns the array type for the index fast path, else `None`.
-fn peek_addressable_array_leaf_type(gctx: &AstGenCtx, node: NodeIdx) -> Option<TypeIdx> {
+/// Peek (no JIR emitted) the leaf type of an addressable chain — a local
+/// `Variable` or nested `MemberAccess` down from one. `None` off-chain,
+/// so callers fall through without having emitted anything.
+fn peek_lvalue_chain_type(gctx: &AstGenCtx, node: NodeIdx) -> Option<TypeIdx> {
     let n = *gctx.ctx.node_store.get(node);
-    let ty = match n.tag {
-        AstTag::Variable => *gctx.local_types.get(&str_at(gctx, n.lhs))?,
+    match n.tag {
+        AstTag::Variable => gctx.local_types.get(&str_at(gctx, n.lhs)).copied(),
         AstTag::MemberAccess => {
-            let parent = *gctx.ctx.node_store.get(NodeIdx::new(n.lhs));
-            if parent.tag != AstTag::Variable {
-                return None;
-            }
-            let parent_ty = *gctx.local_types.get(&str_at(gctx, parent.lhs))?;
+            let parent_ty = peek_lvalue_chain_type(gctx, NodeIdx::new(n.lhs))?;
             let field = str_at(gctx, n.rhs);
             gctx.ctx
                 .struct_fields(parent_ty)?
                 .into_iter()
                 .find(|(nm, _)| *nm == field)
-                .map(|(_, t)| t)?
+                .map(|(_, t)| t)
         }
-        _ => return None,
-    };
+        _ => None,
+    }
+}
+
+/// Peek (no JIR emitted) whether `node` resolves to a fixed `Array` through an
+/// addressable chain. Returns the array type for the index fast path.
+fn peek_addressable_array_leaf_type(gctx: &AstGenCtx, node: NodeIdx) -> Option<TypeIdx> {
+    let ty = peek_lvalue_chain_type(gctx, node)?;
     if gctx.ctx.type_pool.get(ty).kind == TypeKind::Array {
         Some(ty)
     } else {
@@ -6893,28 +6895,23 @@ fn astgen_array_repeat(
     ))
 }
 
-/// The receiver `JirRef` for a `cfn` index method on a `Variable` container base
-/// (`v[i]` / `v[i] = x`): `AddrOf`/`Load` of the local slot per the `self` ABI,
-/// plus the resolved method AST + its instance type. `None` when the base isn't a
-/// local struct with the named `cfn` method (caller falls through / errors).
+/// The receiver `JirRef` for a `cfn` index method on a container base
+/// (`v[i]` / `v[i] = x`, including field chains `h.buf[i]`): `AddrOf`/`Load`
+/// of the storage per the `self` ABI, plus the resolved method AST + its
+/// instance type. `None` when the base isn't an addressable struct with the
+/// named `cfn` method (caller falls through / errors).
 fn container_index_recv(
     gctx: &mut AstGenCtx,
     base_idx: NodeIdx,
     method_suffix: &str,
 ) -> Result<Option<(JirRef, FunctionAST)>, String> {
     let bnode = *gctx.ctx.node_store.get(base_idx);
-    if bnode.tag != AstTag::Variable {
+    if bnode.tag != AstTag::Variable && bnode.tag != AstTag::MemberAccess {
         return Ok(None);
     }
-    let name = str_at(gctx, bnode.lhs);
-    if !gctx.locals.contains_key(&name) {
+    let Some(inst_ty) = peek_lvalue_chain_type(gctx, base_idx) else {
         return Ok(None);
-    }
-    let inst_ty = gctx
-        .local_types
-        .get(&name)
-        .copied()
-        .unwrap_or(TypeIdx::NONE);
+    };
     let Some(recv_name) = gctx.ctx.struct_name_of(inst_ty) else {
         return Ok(None);
     };
