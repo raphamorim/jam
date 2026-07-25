@@ -1,0 +1,59 @@
+// std.Result(T, E) — the generic Ok/Err enum, used both inline and
+// through a module-scope alias (the alias exercises named-type
+// resolution of a generic instantiation).
+
+const { assert } = import("test");
+const { Result } = import("std").result;
+const { eq } = import("std").string;
+
+fn parseInline(s: []u8) Result(u64, str) {
+    if (s.len == 0) {
+        return Result(u64, str).Err("empty input");
+    }
+    return Result(u64, str).Ok(s.len);
+}
+
+tfn resultInline() {
+    match (parseInline("hello")) {
+        Ok(v)  { assert(v as u32, 5); }
+        Err(e) { assert(1, 0); }
+    }
+    match (parseInline("")) {
+        Ok(v)  { assert(1, 0); }
+        Err(e) { assert(eq(e, "empty input") as u8, 1); }
+    }
+}
+
+const ParseResult = Result(u64, str);
+
+fn parseAliased(s: []u8) ParseResult {
+    if (s.len == 0) {
+        return ParseResult.Err("empty input");
+    }
+    return ParseResult.Ok(s.len);
+}
+
+tfn resultAliased() {
+    match (parseAliased("seven!!")) {
+        Ok(v)  { assert(v as u32, 7); }
+        Err(e) { assert(1, 0); }
+    }
+    match (parseAliased("")) {
+        Ok(v)  { assert(1, 0); }
+        Err(e) { assert(eq(e, "empty input") as u8, 1); }
+    }
+}
+
+// Both payloads carry non-trivial types: struct Ok, slice Err.
+const Pair = struct {
+    x: i32,
+    y: i32,
+};
+
+tfn resultStructPayload() {
+    const r: Result(Pair, str) = Result(Pair, str).Ok(Pair { x: 3, y: 4 });
+    match (r) {
+        Ok(p)  { assert(p.x + p.y, 7); }
+        Err(e) { assert(1, 0); }
+    }
+}

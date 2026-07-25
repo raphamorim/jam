@@ -1,0 +1,23 @@
+// std.result — Result(T, E): a success value or a typed error.
+//
+//     const { Result } = import("std").result;
+//     const ParseResult = Result(u64, str);
+//
+//     fn parse(s: []u8) ParseResult {
+//         if (s.len == 0) {
+//             return ParseResult.Err("empty input");
+//         }
+//         return ParseResult.Ok(42);
+//     }
+//
+//     match (parse(input)) {
+//         Ok(v)  { use(v); }
+//         Err(e) { report(e); }
+//     }
+
+pub fn Result(T: type, E: type) type {
+    return enum {
+        Ok(T),
+        Err(E),
+    };
+}
