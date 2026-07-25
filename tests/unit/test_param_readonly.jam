@@ -88,3 +88,50 @@ tfn readingParamElementsIsFine() {
     var a: [4]u16 = [10, 20, 30, 40];
     assert(sumReadonly(a), 100);
 }
+
+const { Vec } = import("std").collections;
+
+fn fillThroughView(v: mut Vec(u8), b: u8) {
+    for x in v.asSlice() {
+        x = b;
+    }
+}
+
+tfn mutParamViewIsWritable() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    v.push(2);
+    fillThroughView(v, 9);
+    assert(v[0] as u32, 9);
+    assert(v[1] as u32, 9);
+}
+
+tfn localViewIsWritable() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    var s: []u8 = v.asSlice();
+    s[0] = 7;
+    assert(v[0] as u32, 7);
+}
+
+tfn rebindRestoresWritability() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    var arr: [2]u8 = [0, 0];
+    var s: []u8 = v.asSlice();
+    s = arr[0..2];       // now views owned storage again
+    s[1] = 5;
+    assert(arr[1], 5);
+}
+
+fn viewLen(v: Vec(u8)) u64 {
+    const s: []u8 = v.asSlice();
+    return s.len;        // reading through a view stays legal
+}
+
+tfn readingViewsIsFine() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(4);
+    v.push(5);
+    assert(viewLen(v) as u32, 2);
+}

@@ -1,0 +1,50 @@
+// Return-value provenance: a slice returned by a call views the storage
+// of the arguments it derives from (per the callee's return chains), so
+// read-only-parameter storage cannot be written through `v.asSlice()`,
+// a binding of it, a wrapper fn's result, a `mut` arg, or a `mut self`
+// method — each escape hatch below is closed.
+// expect-error: cannot write through `b` — it views elements of a read-only parameter
+// expect-error: cannot write through `s` — it views elements of a read-only parameter
+// expect-error: cannot write through `w` — it views elements of a read-only parameter
+// expect-error: cannot pass `buf` as a `mut` argument
+// expect-error: cannot call `mut self` method `push` through `v`
+
+const { Vec } = import("std").collections;
+
+fn pokeForEach(v: Vec(u8)) {
+    for b in v.asSlice() {
+        b = 0;
+    }
+}
+
+fn pokeBound(v: Vec(u8)) {
+    var s: []u8 = v.asSlice();
+    s[0] = 1;
+}
+
+fn window(v: Vec(u8)) []u8 {
+    return v.asSlice();
+}
+
+fn pokeTransitive(v: Vec(u8)) {
+    var w: []u8 = window(v);
+    w[0] = 1;
+}
+
+fn fill(out: mut []u8, b: u8) {
+    for x in out {
+        x = b;
+    }
+}
+
+fn pokeViaMutArg(buf: []u8) {
+    fill(buf, 0);
+}
+
+fn pokeViaMutMethod(v: Vec(u8)) {
+    v.push(1);
+}
+
+fn main() u8 {
+    return 0;
+}

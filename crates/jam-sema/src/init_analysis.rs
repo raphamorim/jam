@@ -124,8 +124,14 @@ struct Analyzer<'a, 'ctx> {
     moved_drop_bearing: HashSet<String>,
     /// For-each loop vars that view elements of a read-only parameter —
     /// writes through them land in the caller's storage, so they are
-    /// rejected like writes into the parameter itself.
+    /// rejected like writes into the parameter itself. Slice bindings
+    /// initialized from such storage (directly or through a call that
+    /// returns a view, e.g. `v.asSlice()`) join the set too.
     readonly_views: HashSet<String>,
+    /// Cache: fn name -> parameter indices whose storage the fn's returned
+    /// slice may view (see `return_view_params`). Shared across the run;
+    /// summaries are position-independent facts about the callee.
+    view_summaries: std::cell::RefCell<HashMap<String, Vec<usize>>>,
 }
 
 impl<'a, 'ctx> Analyzer<'a, 'ctx> {
@@ -142,6 +148,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             moved_bindings: HashSet::new(),
             moved_drop_bearing: HashSet::new(),
             readonly_views: HashSet::new(),
+            view_summaries: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -389,6 +396,19 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         // Re-declaration (inner-block shadow) starts a fresh binding.
         self.moved_bindings.remove(&name);
         self.moved_drop_bearing.remove(&name);
+        // A slice binding initialized from a read-only borrow's storage
+        // (`const s = v.asSlice();`, `const t = s[1..3];`) is itself a
+        // read-only view.
+        self.readonly_views.remove(&name);
+        if !type_idx.is_none()
+            && !init_idx.is_none()
+            && self.ctx.type_pool.get(type_idx).kind == TypeKind::Slice
+            && self
+                .write_root(init_idx)
+                .is_some_and(|r| self.is_readonly_root(&r))
+        {
+            self.readonly_views.insert(name.clone());
+        }
 
         if init_idx.is_none() {
             state.insert(name, InitState::Init);
@@ -448,6 +468,33 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             let src = self.str_name(self.ctx.node_store.get(NodeIdx::new(n.rhs)).lhs);
             if self.binding_is_drop_bearing(&src) {
                 self.apply_move_to_binding(&src, NodeIdx::new(n.rhs), &mut r.state);
+            }
+        }
+
+        // Rebinding a slice variable recomputes its view membership from
+        // the new RHS (it may start or stop viewing read-only storage).
+        {
+            let target = *self.ctx.node_store.get(NodeIdx::new(n.lhs));
+            if target.tag == AstTag::Variable {
+                let tname = self.str_name(target.lhs);
+                let is_slice_local = self
+                    .var_types
+                    .get(&tname)
+                    .is_some_and(|&t| self.ctx.type_pool.get(t).kind == TypeKind::Slice)
+                    && self.param_modes.get(&tname).is_none_or(|_| {
+                        // params keep their mode-derived status
+                        self.decl_depth.contains_key(&tname)
+                    });
+                if is_slice_local {
+                    if self
+                        .write_root(NodeIdx::new(n.rhs))
+                        .is_some_and(|r| self.is_readonly_root(&r))
+                    {
+                        self.readonly_views.insert(tname);
+                    } else {
+                        self.readonly_views.remove(&tname);
+                    }
+                }
             }
         }
 
@@ -785,6 +832,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         let mut callee: Option<FunctionAST> = None;
         let mut arg_mode_offset = 0usize;
         let mut is_variant_ctor = false;
+        let mut recv_name: Option<String> = None;
 
         if n.flags & 1 == 0 {
             let callee_name = self.str_name(n.lhs);
@@ -812,10 +860,29 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                         {
                             callee = Some(f);
                             arg_mode_offset = 1;
+                            recv_name = Some(recv.to_string());
                         }
                     }
                 }
             }
+        }
+
+        // A `mut self` method writes into the receiver's storage — reject
+        // calling one through a read-only borrow.
+        if let (Some(c), Some(rn)) = (&callee, &recv_name)
+            && !c.args.is_empty()
+            && c.args[0].mode == ParamMode::Mut
+            && self.is_readonly_root(rn)
+        {
+            let method = &c.name[c.name.rfind('.').map_or(0, |d| d + 1)..];
+            self.emit_error(
+                format!(
+                    "cannot call `mut self` method `{method}` through `{rn}` — it is a \
+                     read-only borrow; take the parameter as `mut` in the signature"
+                ),
+                idx,
+                rn.clone(),
+            );
         }
 
         let extra = n.rhs;
@@ -917,6 +984,23 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                         bname,
                     );
                 }
+            }
+
+            // A `mut`-mode arg lets the callee write into the arg's storage —
+            // reject when that storage is a read-only borrow. (Closes the
+            // wrap-the-write-in-a-helper bypass of the P2 write check.)
+            if info.mode == ParamMode::Mut
+                && let Some(root) = self.write_root(info.arg_idx)
+                && self.is_readonly_root(&root)
+            {
+                self.emit_error(
+                    format!(
+                        "cannot pass `{root}` as a `mut` argument — it is a read-only \
+                         borrow; take the parameter as `mut` in this fn's signature too"
+                    ),
+                    info.arg_idx,
+                    root,
+                );
             }
 
             // `move`-mode arg moves the caller's base binding.
@@ -1395,6 +1479,10 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                     _ => None,
                 }
             }
+            AstTag::Call => {
+                let (callee, _, _) = self.resolve_call(idx, None)?;
+                (!callee.return_type.is_none()).then_some(callee.return_type)
+            }
             _ => None,
         }
     }
@@ -1427,7 +1515,211 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                     _ => None,
                 }
             }
+            // A call that returns a slice viewing one of its arguments
+            // (per the callee's provenance summary): the storage is the
+            // argument's. Surfaces a root only when that root is a
+            // read-only borrow — other derivations stay permissive.
+            AstTag::Call => {
+                let (callee, recv, args) = self.resolve_call(idx, None)?;
+                let viewed = self.return_view_params(&callee, 4);
+                let offset = usize::from(recv.is_some());
+                for k in viewed {
+                    let root = if k == 0 && offset == 1 {
+                        recv.clone()
+                    } else {
+                        args.get(k - offset).and_then(|&a| self.write_root(a))
+                    };
+                    if let Some(r) = root
+                        && self.is_readonly_root(&r)
+                    {
+                        return Some(r);
+                    }
+                }
+                None
+            }
             _ => None,
+        }
+    }
+
+    /// Resolve a direct Call node to (callee AST, receiver name, arg nodes).
+    /// Mirrors `analyze_call`'s resolution: the stored callee name first,
+    /// then `recv.method` through the receiver's static type. Receiver
+    /// types come from `param_ctx`'s parameter list when summarizing a
+    /// callee body, else from the current function's bindings. None for
+    /// indirect calls (`expr.method(...)`) and unresolved names.
+    fn resolve_call(
+        &self,
+        idx: NodeIdx,
+        param_ctx: Option<&FunctionAST>,
+    ) -> Option<(FunctionAST, Option<String>, Vec<NodeIdx>)> {
+        let n = *self.ctx.node_store.get(idx);
+        if n.tag != AstTag::Call || n.flags & 1 != 0 {
+            return None;
+        }
+        let callee_name = self.str_name(n.lhs);
+        let extra = n.rhs;
+        let arg_count = self.extra(extra);
+        let args: Vec<NodeIdx> = (0..arg_count)
+            .map(|i| NodeIdx::new(self.extra(extra + 1 + i)))
+            .collect();
+        if let Some(f) = self.ctx.get_function_ast(&callee_name) {
+            return Some((f, None, args));
+        }
+        let dot = callee_name.find('.')?;
+        if callee_name.rfind('.') != Some(dot) {
+            return None;
+        }
+        let recv = &callee_name[..dot];
+        let method = &callee_name[dot + 1..];
+        let recv_ty = match param_ctx {
+            Some(f) => f.args.iter().find(|p| p.name == recv).map(|p| p.ty)?,
+            None => self.var_types.get(recv).copied()?,
+        };
+        let recv_ty = self
+            .ctx
+            .requalify_type(recv_ty, &self.ctx.current_body_module());
+        let k = self.ctx.type_pool.get(recv_ty);
+        if !matches!(
+            k.kind,
+            TypeKind::Struct | TypeKind::Named | TypeKind::GenericCall
+        ) {
+            return None;
+        }
+        let type_name = self.str_name(k.a);
+        let f = self.ctx.get_function_ast(&format!("{type_name}.{method}"))?;
+        Some((f, Some(recv.to_string()), args))
+    }
+
+    /// Collect the operands of every `return` reachable in `stmts`
+    /// (recursing through if/while/for/match bodies).
+    fn collect_returns(&self, stmts: &[NodeIdx], out: &mut Vec<NodeIdx>) {
+        for &s in stmts {
+            if s.is_none() {
+                continue;
+            }
+            let n = *self.ctx.node_store.get(s);
+            match n.tag {
+                AstTag::Return => {
+                    if !NodeIdx::new(n.lhs).is_none() {
+                        out.push(NodeIdx::new(n.lhs));
+                    }
+                }
+                AstTag::IfNode => {
+                    let extra = n.rhs;
+                    let count = self.extra(extra) + self.extra(extra + 1);
+                    let body: Vec<NodeIdx> = (0..count)
+                        .map(|i| NodeIdx::new(self.extra(extra + 2 + i)))
+                        .collect();
+                    self.collect_returns(&body, out);
+                }
+                AstTag::WhileNode => {
+                    let extra = n.rhs;
+                    let count = self.extra(extra);
+                    let body: Vec<NodeIdx> = (0..count)
+                        .map(|i| NodeIdx::new(self.extra(extra + 1 + i)))
+                        .collect();
+                    self.collect_returns(&body, out);
+                }
+                AstTag::ForNode => {
+                    let extra = n.lhs;
+                    let count = self.extra(extra + 3);
+                    let body: Vec<NodeIdx> = (0..count)
+                        .map(|i| NodeIdx::new(self.extra(extra + 4 + i)))
+                        .collect();
+                    self.collect_returns(&body, out);
+                }
+                AstTag::MatchNode => {
+                    let extra = n.rhs;
+                    let arm_count = self.extra(extra);
+                    let mut cursor = 1u32;
+                    let mut body: Vec<NodeIdx> = Vec::new();
+                    for _ in 0..arm_count {
+                        cursor += 1; // pattern
+                        let c = self.extra(extra + cursor);
+                        cursor += 1;
+                        for i in 0..c {
+                            body.push(NodeIdx::new(self.extra(extra + cursor + i)));
+                        }
+                        cursor += c;
+                    }
+                    self.collect_returns(&body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Parameter indices whose storage (or owned tree — pointer FIELDS
+    /// included, the ownership traversal) the returned slice of `callee`
+    /// may view. Raw-pointer PARAMETERS are excluded: their pointee is
+    /// governed by the pointer's own `mut`/`const`, not the parameter
+    /// mode. Non-slice returns and extern fns view nothing. Summaries
+    /// are cached by fn name; `depth` bounds transitive call chasing.
+    fn return_view_params(&self, callee: &FunctionAST, depth: u32) -> Vec<usize> {
+        if depth == 0 || callee.is_extern || callee.return_type.is_none() {
+            return Vec::new();
+        }
+        if self.ctx.type_pool.get(callee.return_type).kind != TypeKind::Slice {
+            return Vec::new();
+        }
+        if let Some(v) = self.view_summaries.borrow().get(&callee.name) {
+            return v.clone();
+        }
+        let mut returns = Vec::new();
+        self.collect_returns(&callee.body, &mut returns);
+        let mut out: Vec<usize> = Vec::new();
+        for r in returns {
+            self.expr_view_params(callee, r, depth, &mut out);
+        }
+        out.sort_unstable();
+        out.dedup();
+        self.view_summaries
+            .borrow_mut()
+            .insert(callee.name.clone(), out.clone());
+        out
+    }
+
+    /// Which of `fn_ast`'s parameters the expression at `idx` (inside
+    /// `fn_ast`'s body) derives from, chasing projections and calls.
+    fn expr_view_params(
+        &self,
+        fn_ast: &FunctionAST,
+        idx: NodeIdx,
+        depth: u32,
+        out: &mut Vec<usize>,
+    ) {
+        let push_param = |name: &str, out: &mut Vec<usize>| {
+            if let Some(k) = fn_ast.args.iter().position(|p| p.name == name) {
+                let pk = self.ctx.type_pool.get(fn_ast.args[k].ty).kind;
+                if pk != TypeKind::PtrSingle && pk != TypeKind::PtrMany {
+                    out.push(k);
+                }
+            }
+        };
+        let n = *self.ctx.node_store.get(idx);
+        match n.tag {
+            AstTag::Variable => push_param(&self.str_name(n.lhs), out),
+            AstTag::MemberAccess
+            | AstTag::Index
+            | AstTag::Slice
+            | AstTag::Deref
+            | AstTag::AsCast => {
+                self.expr_view_params(fn_ast, NodeIdx::new(n.lhs), depth, out);
+            }
+            AstTag::Call => {
+                if let Some((inner, recv, args)) = self.resolve_call(idx, Some(fn_ast)) {
+                    let viewed = self.return_view_params(&inner, depth - 1);
+                    let offset = usize::from(recv.is_some());
+                    for k in viewed {
+                        if k == 0 && offset == 1 {
+                            push_param(recv.as_deref().unwrap_or(""), out);
+                        } else if let Some(&a) = args.get(k - offset) {
+                            self.expr_view_params(fn_ast, a, depth, out);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1449,6 +1741,16 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             return;
         };
         if !self.is_readonly_root(&root) {
+            return;
+        }
+        // Rebinding a slice-typed VIEW variable (`s = other;`) writes the
+        // local {ptr, len} pair, not the viewed elements — allowed; the
+        // assign hook recomputes its view membership. (For-each loop vars
+        // have no var_types entry: their bare writes ARE element writes.)
+        if self.node_tag(target) == AstTag::Variable
+            && self.readonly_views.contains(&root)
+            && self.var_types.contains_key(&root)
+        {
             return;
         }
         let msg = if self.readonly_views.contains(&root) {
