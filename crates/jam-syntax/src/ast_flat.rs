@@ -76,7 +76,7 @@ pub enum AstTag {
 
     // Pattern atoms (internal to MatchNode arms)
     PatLit,         // lhs = lo32, rhs = hi32, flags bit0 = isNeg
-    PatRange,       // lhs = lo32 low, rhs = lo32 high
+    PatRange,       // lhs = ExtraIdx -> [lo_lo, lo_hi, hi_lo, hi_hi]; flags bit0/1 = lo/hi negative
     PatWildcard,    // no payload
     PatOr,          // lhs = ExtraIdx -> [count, sub0, ...]
     PatEnumVariant, // lhs = StringIdx (enum), rhs = StringIdx (variant)

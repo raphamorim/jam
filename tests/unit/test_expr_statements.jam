@@ -1,0 +1,28 @@
+// Call arguments take the full expression ladder (logical ops without
+// extra parens), and Type(args).method(...) works in statement position.
+const { assert } = import("test");
+
+fn pick(cond: bool, a: u64, b: u64) u64 {
+    if (cond) { return a; }
+    return b;
+}
+
+fn Buf(T: type) type {
+    return struct {
+        pub fn writeAt(addr: u64, i: u64, v: T) {
+            var p: *mut[] T = addr as *mut[] T;
+            p[i] = v;
+        }
+    };
+}
+
+tfn logicalOpsInCallArgs() {
+    assert(pick(1 == 1 && 2 > 1, 7, 9) as i32, 7);
+    assert(pick(1 == 2 || 3 < 2, 7, 9) as i32, 9);
+}
+
+tfn typeMethodCallStatement() {
+    var arr: [4]u16 = [10, 20, 30, 40];
+    Buf(u16).writeAt((&arr[0]) as u64, 3, 77);
+    assert(arr[3] as i32, 77);
+}

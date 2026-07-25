@@ -3278,6 +3278,31 @@ fn type_arg_from_expr(
     Ok(t)
 }
 
+/// Direct-call arity: a non-varargs fn takes exactly its declared count;
+/// extern varargs take at least the fixed params. `provided` counts source
+/// args (no receiver). Extra args used to lower silently as a "varargs
+/// tail" even for non-varargs fns — a malformed call by the time LLVM saw
+/// it.
+fn check_call_arity(fn_ast: &FunctionAST, provided: usize, recv: bool) -> Result<(), String> {
+    let fixed = fn_ast.args.len() - usize::from(recv);
+    if fn_ast.is_var_args {
+        if provided < fixed {
+            return Err(format!(
+                "astgen: `{}` expects at least {fixed} arg(s), got {provided}",
+                fn_ast.name
+            ));
+        }
+        return Ok(());
+    }
+    if provided != fixed {
+        return Err(format!(
+            "astgen: `{}` expects {fixed} arg(s), got {provided}",
+            fn_ast.name
+        ));
+    }
+    Ok(())
+}
+
 /// Emit a `Call` to `fn_ast` with already-lowered `arg_refs`. sret-returning
 /// callees get their result slot as a leading arg (the caller's `dest_ptr`
 /// when supplied, else a fresh alloca). The arg list is packed
@@ -3588,10 +3613,12 @@ fn astgen_call(gctx: &mut AstGenCtx, n: &AstNode, dest_ptr: JirRef) -> Result<Ji
         if (i as usize) < fn_ast.args.len() {
             arg_refs.push(lower_arg(gctx, arg_idx, &fn_ast.args[i as usize])?);
         } else {
-            // varargs tail — pass by value.
+            // varargs tail — pass by value (arity-checked below; only an
+            // extern varargs fn may actually take a tail).
             arg_refs.push(astgen_expr(gctx, arg_idx, TypeIdx::NONE)?);
         }
     }
+    check_call_arity(&fn_ast, arg_refs.len(), false)?;
     emit_call(gctx, &fn_ast, &arg_refs, dest_ptr)
 }
 
@@ -4759,6 +4786,7 @@ fn astgen_dotted_call(
                     gctx, &method, args_extra, arg_count,
                 )?));
             }
+            check_call_arity(&method, arg_count as usize, false)?;
             let arg_refs = lower_call_args(gctx, &method.args, args_extra, arg_count)?;
             return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
         }
@@ -4770,6 +4798,7 @@ fn astgen_dotted_call(
         {
             let qual = format!("{module}.{type_name}");
             if let Some(method) = gctx.ctx.get_function_ast(&format!("{qual}.{suffix}")) {
+                check_call_arity(&method, arg_count as usize, false)?;
                 let arg_refs = lower_call_args(gctx, &method.args, args_extra, arg_count)?;
                 return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
             }
@@ -4795,6 +4824,7 @@ fn astgen_dotted_call(
         }
         let qualified = format!("{en}.{suffix}");
         if let Some(method) = gctx.ctx.get_function_ast(&qualified) {
+            check_call_arity(&method, arg_count as usize, false)?;
             let arg_refs = lower_call_args(gctx, &method.args, args_extra, arg_count)?;
             return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
         }
@@ -4805,6 +4835,7 @@ fn astgen_dotted_call(
             .ctx
             .get_function_ast(&qualified)
             .ok_or_else(|| format!("astgen: type `{sn}` has no method `{suffix}`"))?;
+        check_call_arity(&method, arg_count as usize, false)?;
         let arg_refs = lower_call_args(gctx, &method.args, args_extra, arg_count)?;
         return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
     }
@@ -4836,6 +4867,7 @@ fn astgen_dotted_call(
                 gctx, &method, args_extra, arg_count,
             )?));
         }
+        check_call_arity(&method, arg_count as usize, false)?;
         let arg_refs = lower_call_args(gctx, &method.args, args_extra, arg_count)?;
         return Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?));
     }
@@ -4943,6 +4975,7 @@ fn astgen_dotted_call(
             dest_ptr,
         )?));
     }
+    check_call_arity(&method, arg_count as usize, true)?;
     let mut arg_refs = vec![recv_arg];
     arg_refs.extend(lower_method_args(gctx, &method, args_extra, arg_count)?);
     Ok(Some(emit_call(gctx, &method, &arg_refs, dest_ptr)?))
@@ -5757,11 +5790,18 @@ fn astgen_pattern_compare(
             Ok(())
         }
         AstTag::PatRange => {
+            let ex = p.lhs;
+            let lo_lo = gctx.ctx.node_store.get_extra(ExtraIdx::new(ex));
+            let lo_hi = gctx.ctx.node_store.get_extra(ExtraIdx::new(ex + 1));
+            let hi_lo = gctx.ctx.node_store.get_extra(ExtraIdx::new(ex + 2));
+            let hi_hi = gctx.ctx.node_store.get_extra(ExtraIdx::new(ex + 3));
             let lo_k = emit(
                 gctx,
                 JirInst {
                     tag: JirTag::Int,
-                    a: p.lhs,
+                    a: lo_lo,
+                    b: lo_hi,
+                    flags: u16::from(p.flags & 1 != 0),
                     ty: scrut_ty,
                     ..Default::default()
                 },
@@ -5770,7 +5810,9 @@ fn astgen_pattern_compare(
                 gctx,
                 JirInst {
                     tag: JirTag::Int,
-                    a: p.rhs,
+                    a: hi_lo,
+                    b: hi_hi,
+                    flags: u16::from(p.flags & 2 != 0),
                     ty: scrut_ty,
                     ..Default::default()
                 },
@@ -6055,6 +6097,58 @@ fn astgen_pattern_compare_enum(
 /// single integer/variant equality, else a `CondBr` chain (ranges, payload
 /// bindings). A drop-bearing enum scrutinee is consumed and its residual
 /// payload dropped on non-binding arms (match-move).
+/// Collect the variant names a pattern covers (recursing or-patterns), and
+/// resolve the enum the patterns name when a qualified receiver appears
+/// (`Color.Red` / `Option(i32).Some`) — a match on `b as Color` has a u8
+/// scrutinee, so the enum is only knowable from the patterns. `false` when
+/// the pattern isn't variant-shaped, so coverage can't be proven from it.
+fn pattern_variant_names(
+    gctx: &AstGenCtx,
+    pat: NodeIdx,
+    out: &mut std::collections::HashSet<String>,
+    enum_out: &mut Option<String>,
+) -> bool {
+    let p = *gctx.ctx.node_store.get(pat);
+    match p.tag {
+        AstTag::PatEnumVariant => {
+            let has_bindings = p.flags & 1 != 0;
+            let type_idx_receiver = p.flags & 2 != 0;
+            let infer_receiver = p.flags & 4 != 0;
+            let (recv_slot, name_id) = if has_bindings {
+                (
+                    gctx.ctx.node_store.get_extra(ExtraIdx::new(p.lhs)),
+                    gctx.ctx.node_store.get_extra(ExtraIdx::new(p.lhs + 1)),
+                )
+            } else {
+                (p.lhs, p.rhs)
+            };
+            if enum_out.is_none() && !infer_receiver {
+                if type_idx_receiver {
+                    *enum_out = gctx.ctx.enum_name_of(TypeIdx::new(recv_slot));
+                } else {
+                    let spelling = str_at(gctx, recv_slot);
+                    let sid = gctx.ctx.string_pool.intern(spelling.as_bytes());
+                    let named = gctx.ctx.type_pool.intern_named(sid);
+                    let bm = gctx.ctx.current_body_module();
+                    let named = gctx.ctx.requalify_type(named, &bm);
+                    *enum_out = gctx.ctx.enum_name_of(named);
+                }
+            }
+            out.insert(str_at(gctx, name_id));
+            true
+        }
+        AstTag::PatOr => {
+            let ex = p.lhs;
+            let cnt = gctx.ctx.node_store.get_extra(ExtraIdx::new(ex));
+            (0..cnt).all(|i| {
+                let sub = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(ex + 1 + i)));
+                pattern_variant_names(gctx, sub, out, enum_out)
+            })
+        }
+        _ => false,
+    }
+}
+
 fn astgen_match(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Result<JirRef, String> {
     let scrut_idx = NodeIdx::new(n.lhs);
     let arms_extra = n.rhs;
@@ -6171,6 +6265,38 @@ fn astgen_match(gctx: &mut AstGenCtx, n: &AstNode, expected: TypeIdx) -> Result<
     let scrut_is_int = gctx.ctx.type_pool.get(scrut_ty).kind == TypeKind::Int;
     let enum_name = gctx.ctx.enum_name_of(scrut_ty);
     let scrut_is_enum = enum_name.is_some();
+
+    // A match EXPRESSION must be exhaustive — a fallthrough would read the
+    // uninitialized result slot as undef. Statement matches keep their
+    // C-switch fallthrough semantics.
+    if result_slot != NO_JIR_REF && wildcard_arm_idx < 0 {
+        let mut proven = false;
+        let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pat_enum: Option<String> = None;
+        let all_variant_pats = arms
+            .iter()
+            .all(|(pat, _)| pattern_variant_names(gctx, *pat, &mut covered, &mut pat_enum));
+        if let Some(en) = enum_name.clone().or(pat_enum) {
+            if all_variant_pats {
+                let variants = gctx.ctx.enum_variants_by_name(&en).unwrap_or_default();
+                if let Some(missing) = variants.iter().find(|v| !covered.contains(&v.name)) {
+                    return Err(format!(
+                        "astgen: match expression is not exhaustive — variant `{}` of `{en}` \
+                         is unhandled (cover it or add a `_` arm)",
+                        missing.name
+                    ));
+                }
+                proven = true;
+            }
+        }
+        if !proven {
+            return Err(
+                "astgen: match expression needs a `_` arm — a fallthrough would leave \
+                 its result undefined"
+                    .into(),
+            );
+        }
+    }
     let mut trying_switch = scrut_is_int || scrut_is_enum;
     let mut switch_cases: Vec<SwitchCase> = Vec::new();
     if trying_switch {

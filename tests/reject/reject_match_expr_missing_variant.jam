@@ -1,0 +1,13 @@
+// expect-error: variant `Blue` of `Color` is unhandled
+const Color = enum { Red, Green, Blue };
+
+fn score(c: Color) u32 {
+    return match (c) {
+        Color.Red   { 100 }
+        Color.Green { 200 }
+    };
+}
+
+fn main() u8 {
+    return score(Color.Red) as u8;
+}

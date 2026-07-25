@@ -1,0 +1,12 @@
+// expect-error: expects 1 arg(s), got 2
+const S = struct {
+    v: u64,
+    pub fn plus(self: S, x: u64) u64 {
+        return self.v + x;
+    }
+};
+
+fn main() u8 {
+    const s: S = S { v: 1 };
+    return s.plus(2, 3) as u8;
+}

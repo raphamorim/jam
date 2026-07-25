@@ -685,7 +685,8 @@ impl<'a> Parser<'a> {
             }
             // Call-statement consumes `;`; a bare Variable/MemberAccess value
             // (e.g. a block's final expression) does not.
-            if self.nodes.get(target).tag == AstTag::Call {
+            let ttag = self.nodes.get(target).tag;
+            if ttag == AstTag::Call || ttag == AstTag::TypeMethodCall {
                 self.consume(TokenType::Semi, "Expected ';' after function call")?;
             }
             return Ok(target);
@@ -1041,20 +1042,36 @@ impl<'a> Parser<'a> {
             if self.match_(TokenType::DotDotEq) {
                 self.consume(TokenType::Number, "Expected upper bound after `..=`")?;
                 let hilex = self.prev_text().to_vec();
-                let (hi, _hineg, hifloat) = self.parse_num_lexeme(&hilex)?;
+                let (hi, hineg, hifloat) = self.parse_num_lexeme(&hilex)?;
                 if hifloat {
                     return Err(
                         self.parse_error("Float literals are not allowed in `match` patterns")
                     );
                 }
-                // bounds truncate to u32
+                // Full 64-bit bounds in the extra pool (they used to truncate
+                // to u32); flags carry the signs.
+                let lo_signed = if is_negative { (lo as i64).wrapping_neg() } else { lo as i64 };
+                let hi_signed = if hineg { (hi as i64).wrapping_neg() } else { hi as i64 };
+                if lo_signed > hi_signed {
+                    return Err(self.parse_error("empty `..=` range (low is above high)"));
+                }
+                let e = self.nodes.reserve_extra(4);
+                self.nodes.set_extra(e, (lo & 0xFFFF_FFFF) as u32);
+                self.nodes
+                    .set_extra(ExtraIdx::new(e.raw() + 1), (lo >> 32) as u32);
+                self.nodes
+                    .set_extra(ExtraIdx::new(e.raw() + 2), (hi & 0xFFFF_FFFF) as u32);
+                self.nodes
+                    .set_extra(ExtraIdx::new(e.raw() + 3), (hi >> 32) as u32);
+                let flags: u16 =
+                    u16::from(is_negative) | (u16::from(hineg) << 1);
                 return Ok(self.emit(AstNode {
                     tag: AstTag::PatRange,
                     op: 0,
-                    flags: 0,
+                    flags,
                     main_token: 0,
-                    lhs: (lo & 0xFFFF_FFFF) as u32,
-                    rhs: (hi & 0xFFFF_FFFF) as u32,
+                    lhs: e.raw(),
+                    rhs: 0,
                 }));
             }
             let flags: u16 = if is_negative { 1 } else { 0 };
@@ -1628,12 +1645,12 @@ impl<'a> Parser<'a> {
                                 )?;
                                 let mut margs = Vec::new();
                                 if !self.check(TokenType::CloseParen) {
-                                    margs.push(self.parse_comparison()?);
+                                    margs.push(self.parse_logical_or()?);
                                     while self.match_(TokenType::Comma) {
                                         if self.check(TokenType::CloseParen) {
                                             break; // trailing comma
                                         }
-                                        margs.push(self.parse_comparison()?);
+                                        margs.push(self.parse_logical_or()?);
                                     }
                                 }
                                 self.consume(
@@ -1790,11 +1807,11 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// One call argument: an expression, optionally wrapped by a trailing
-    /// `...` into a pack-spread node (`args...` — forwards a variadic cfn's
-    /// pack, CFN_VARIADIC_PLAN.md).
+    /// One call argument: a full expression (so `f(a && b)` needs no extra
+    /// parens), optionally wrapped by a trailing `...` into a pack-spread
+    /// node (`args...` — forwards a variadic cfn's pack).
     fn parse_call_arg(&mut self) -> PResult<NodeIdx> {
-        let e = self.parse_comparison()?;
+        let e = self.parse_logical_or()?;
         if self.check(TokenType::Ellipsis) {
             self.advance();
             let n = self.nodes.get(e);

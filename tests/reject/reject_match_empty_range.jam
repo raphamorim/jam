@@ -1,0 +1,8 @@
+// expect-error: empty `..=` range
+fn f(v: u64) u8 {
+    match (v) {
+        9..=3 { return 1; }
+        _     { return 2; }
+    }
+    return 0;
+}

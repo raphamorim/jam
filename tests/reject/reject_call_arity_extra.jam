@@ -1,0 +1,8 @@
+// expect-error: expects 2 arg(s), got 3
+fn add(a: u64, b: u64) u64 {
+    return a + b;
+}
+
+fn main() u8 {
+    return add(1, 2, 3) as u8;
+}

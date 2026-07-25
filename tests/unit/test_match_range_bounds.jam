@@ -1,0 +1,33 @@
+// `..=` range patterns carry full 64-bit signed bounds (they used to
+// truncate to u32 at parse time).
+const { assert } = import("test");
+
+fn bucket(v: u64) u8 {
+    match (v) {
+        0..=255          { return 1; }
+        256..=5000000000 { return 2; }
+        _                { return 3; }
+    }
+    return 0;
+}
+
+fn sbucket(v: i64) u8 {
+    match (v) {
+        -100..=-1 { return 1; }
+        0..=100   { return 2; }
+        _         { return 3; }
+    }
+    return 0;
+}
+
+tfn wideRangeBounds() {
+    assert(bucket(100) as i32, 1);
+    assert(bucket(4000000000) as i32, 2);
+    assert(bucket(6000000000) as i32, 3);
+}
+
+tfn negativeRangeBounds() {
+    assert(sbucket(-50) as i32, 1);
+    assert(sbucket(50) as i32, 2);
+    assert(sbucket(-200) as i32, 3);
+}

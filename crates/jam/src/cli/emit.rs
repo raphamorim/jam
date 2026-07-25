@@ -492,10 +492,20 @@ fn dump_node(
             o.extend_from_slice(if n.flags & 1 != 0 { b" neg\n" } else { b"\n" });
         }
         AstTag::PatRange => {
+            let ex = ExtraIdx::new(n.lhs);
+            let lo = (ns.get_extra(ex) as u64) | ((ns.get_extra(ExtraIdx::new(n.lhs + 1)) as u64) << 32);
+            let hi = (ns.get_extra(ExtraIdx::new(n.lhs + 2)) as u64)
+                | ((ns.get_extra(ExtraIdx::new(n.lhs + 3)) as u64) << 32);
             o.extend_from_slice(b"PatRange ");
-            num(o, n.lhs as u64);
+            if n.flags & 1 != 0 {
+                o.push(b'-');
+            }
+            num(o, lo);
             o.extend_from_slice(b"..");
-            num(o, n.rhs as u64);
+            if n.flags & 2 != 0 {
+                o.push(b'-');
+            }
+            num(o, hi);
             o.push(b'\n');
         }
         AstTag::PatWildcard => o.extend_from_slice(b"PatWildcard\n"),

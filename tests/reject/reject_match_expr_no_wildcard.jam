@@ -1,0 +1,11 @@
+// expect-error: match expression needs a `_` arm
+fn score(v: u64) u32 {
+    return match (v) {
+        0 { 100 }
+        1 { 200 }
+    };
+}
+
+fn main() u8 {
+    return score(0) as u8;
+}
