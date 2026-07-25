@@ -1,0 +1,57 @@
+// Per-field view state: `p.field = rhs` updates just that field's
+// read-only-ness — rebinding onto owned storage releases it, a later
+// readonly RHS re-views it, and a whole rebind resets the field map.
+// Rejections live in reject_field_view_writes.jam.
+
+const { assert } = import("test");
+const { Vec } = import("std").collections;
+
+const Pair = struct {
+    data: []u8,
+    n: u32,
+};
+
+fn label() Pair {
+    return Pair { data: "static", n: 0 };
+}
+
+tfn fieldRebindReleasesTheView() {
+    var p: Pair = label();
+    var owned: [1]u8 = [65];
+    p.data = owned[0..1];
+    p.data[0] = 66;
+    assert(owned[0] as u32, 66);
+    assert(p.data[0] as u32, 66);
+}
+
+const Duo = struct {
+    a: []u8,
+    b: []u8,
+};
+
+fn mixedFields(v: mut Vec(u8)) u8 {
+    var owned: [2]u8 = [3, 4];
+    var d: Duo = Duo { a: "", b: "" };
+    d.a = v.asSlice();
+    d.b = owned[0..2];
+    d.a[0] = 9;          // mut param: legal, flows back
+    d.b[1] = 8;          // owned: always legal
+    return d.b[1];
+}
+
+tfn fieldsTrackIndependently() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    assert(mixedFields(v) as u32, 8);
+    assert(v[0] as u32, 9);
+}
+
+tfn wholeRebindAfterFieldClear() {
+    var p: Pair = label();
+    var owned: [1]u8 = [65];
+    p.data = owned[0..1];
+    p.data[0] = 66;
+    p = label();                      // viewed again; reads only
+    assert(p.data[0] as u32, 115);    // 's'
+    assert(owned[0] as u32, 66);
+}

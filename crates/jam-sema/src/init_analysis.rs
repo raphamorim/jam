@@ -100,6 +100,10 @@ struct WriteRoot {
     via_slice: bool,
     /// Rooted at a string literal — the bytes live in read-only data.
     literal: bool,
+    /// First field hop off the root (`p.data[0]` → `data`), when the
+    /// chain leaves the root through a MemberAccess. Field-level view
+    /// state is keyed on it.
+    first_field: Option<String>,
 }
 
 impl WriteRoot {
@@ -108,6 +112,7 @@ impl WriteRoot {
             name,
             via_slice: false,
             literal: false,
+            first_field: None,
         }
     }
     fn literal() -> Self {
@@ -115,7 +120,32 @@ impl WriteRoot {
             name: String::new(),
             via_slice: false,
             literal: true,
+            first_field: None,
         }
+    }
+}
+
+/// Read-only-view state of one binding. `whole` covers the entire value
+/// (a call result, a decl init); `fields` records later per-field
+/// assignments — `Some(src)` re-views the field, `None` rebinds it onto
+/// owned storage. Field entries override `whole` for writes entering
+/// through that field.
+#[derive(Clone, Default)]
+struct ViewState {
+    whole: Option<ViewSource>,
+    fields: HashMap<String, Option<ViewSource>>,
+}
+
+impl ViewState {
+    fn whole(src: ViewSource) -> Self {
+        ViewState {
+            whole: Some(src),
+            fields: HashMap::new(),
+        }
+    }
+    /// Any part of the binding still a view?
+    fn any(&self) -> bool {
+        self.whole.is_some() || self.fields.values().any(|v| v.is_some())
     }
 }
 
@@ -180,7 +210,7 @@ struct Analyzer<'a, 'ctx> {
     /// rejected like writes into the parameter itself. Slice bindings
     /// initialized from such storage (directly or through a call that
     /// returns a view, e.g. `v.asSlice()`) join the set too.
-    readonly_views: HashMap<String, ViewSource>,
+    readonly_views: HashMap<String, ViewState>,
     /// Cache: fn name -> return-provenance summary (see
     /// `return_view_params`). Shared across the run; summaries are
     /// position-independent facts about the callee.
@@ -464,7 +494,8 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 .write_root(init_idx)
                 .and_then(|r| self.root_source(&r))
         {
-            self.readonly_views.insert(name.clone(), src);
+            self.readonly_views
+                .insert(name.clone(), ViewState::whole(src));
         }
 
         if init_idx.is_none() {
@@ -530,6 +561,8 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
         // Rebinding a slice-carrying variable recomputes its view membership
         // from the new RHS (it may start or stop viewing read-only storage).
+        // A FIELD rebind (`p.data = rhs;`) updates just that field's state:
+        // re-viewing it, or releasing it onto owned storage.
         {
             let target = *self.ctx.node_store.get(NodeIdx::new(n.lhs));
             if target.tag == AstTag::Variable {
@@ -548,12 +581,35 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                         .and_then(|r| self.root_source(&r))
                     {
                         Some(src) => {
-                            self.readonly_views.insert(tname, src);
+                            self.readonly_views
+                                .insert(tname, ViewState::whole(src));
                         }
                         None => {
                             self.readonly_views.remove(&tname);
                         }
                     }
+                }
+            } else if target.tag == AstTag::MemberAccess
+                && let Some(twr) = self.write_root(NodeIdx::new(n.lhs))
+                && let Some(field) = twr.first_field.clone()
+                && !twr.via_slice
+                && self.var_types.contains_key(&twr.name)
+                && self.param_modes.get(&twr.name).is_none_or(|_| {
+                    self.decl_depth.contains_key(&twr.name)
+                })
+                && self
+                    .lvalue_type(NodeIdx::new(n.lhs))
+                    .is_some_and(|t| self.type_contains_slice(t, 8))
+            {
+                let src = self
+                    .write_root(NodeIdx::new(n.rhs))
+                    .and_then(|r| self.root_source(&r));
+                if src.is_some() || self.readonly_views.contains_key(&twr.name) {
+                    self.readonly_views
+                        .entry(twr.name)
+                        .or_default()
+                        .fields
+                        .insert(field, src);
                 }
             }
         }
@@ -756,7 +812,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         // A for-each var binds elements in place; when the iterable's storage
         // belongs to a read-only parameter, the var is a read-only view for
         // the body (membership is save/restored around shadowing).
-        let was_view = self.readonly_views.get(&var_name).copied();
+        let was_view = self.readonly_views.get(&var_name).cloned();
         let view_src = if n.op == 1 {
             self.write_root(start_idx)
                 .and_then(|root| self.root_source(&root))
@@ -765,7 +821,8 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         };
         match view_src {
             Some(src) => {
-                self.readonly_views.insert(var_name.clone(), src);
+                self.readonly_views
+                    .insert(var_name.clone(), ViewState::whole(src));
             }
             None => {
                 self.readonly_views.remove(&var_name);
@@ -787,8 +844,8 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         self.cond_depth -= 1;
 
         match was_view {
-            Some(src) => {
-                self.readonly_views.insert(var_name, src);
+            Some(state) => {
+                self.readonly_views.insert(var_name, state);
             }
             None => {
                 self.readonly_views.remove(&var_name);
@@ -857,7 +914,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
             // Type and mark (or shadow-clear) this arm's payload bindings;
             // both are restored after the arm body.
-            let mut saved_views: Vec<(String, Option<ViewSource>)> = Vec::new();
+            let mut saved_views: Vec<(String, Option<ViewState>)> = Vec::new();
             let mut saved_types: Vec<(String, Option<TypeIdx>)> = Vec::new();
             if let Some((variant, names)) = self.pattern_payload_bindings(pat_idx) {
                 for (i, bname) in names.iter().enumerate() {
@@ -875,12 +932,13 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                             self.var_types.remove(bname);
                         }
                     }
-                    saved_views.push((bname.clone(), self.readonly_views.get(bname).copied()));
+                    saved_views.push((bname.clone(), self.readonly_views.get(bname).cloned()));
                     // Untypeable payload on a viewed scrutinee: conservative.
                     let carries = payload_ty.is_none_or(|t| self.type_contains_slice(t, 8));
                     match scrut_src {
                         Some(src) if carries => {
-                            self.readonly_views.insert(bname.clone(), src);
+                            self.readonly_views
+                                .insert(bname.clone(), ViewState::whole(src));
                         }
                         _ => {
                             self.readonly_views.remove(bname);
@@ -906,8 +964,8 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
             for (bname, was) in saved_views {
                 match was {
-                    Some(src) => {
-                        self.readonly_views.insert(bname, src);
+                    Some(state) => {
+                        self.readonly_views.insert(bname, state);
                     }
                     None => {
                         self.readonly_views.remove(&bname);
@@ -1702,7 +1760,11 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 if k == TypeKind::PtrSingle || k == TypeKind::PtrMany {
                     return None;
                 }
-                self.write_root(base)
+                let mut wr = self.write_root(base)?;
+                if self.node_tag(base) == AstTag::Variable {
+                    wr.first_field = Some(self.str_name(n.rhs));
+                }
+                Some(wr)
             }
             AstTag::Index | AstTag::Slice => {
                 let base = NodeIdx::new(n.lhs);
@@ -2305,20 +2367,29 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     /// default-mode parameter (not shadowed by a local) or a for-each view
     /// over one?
     fn is_readonly_root(&self, name: &str) -> bool {
-        if self.readonly_views.contains_key(name) {
+        if self.readonly_views.get(name).is_some_and(ViewState::any) {
             return true;
         }
         self.param_modes.get(name) == Some(&ParamMode::Let)
             && !self.decl_depth.contains_key(name)
     }
 
-    /// Why (if at all) `wr`'s storage is read-only.
+    /// Why (if at all) `wr`'s storage is read-only. A per-field entry
+    /// (from a later `p.field = ...` assignment) overrides the binding's
+    /// whole-value state for writes entering through that field.
     fn root_source(&self, wr: &WriteRoot) -> Option<ViewSource> {
         if wr.literal {
             return Some(ViewSource::Literal);
         }
-        if let Some(&src) = self.readonly_views.get(&wr.name) {
-            return Some(src);
+        if let Some(vs) = self.readonly_views.get(&wr.name) {
+            if let Some(f) = &wr.first_field
+                && let Some(&over) = vs.fields.get(f)
+            {
+                return over;
+            }
+            if vs.whole.is_some() {
+                return vs.whole;
+            }
         }
         (self.param_modes.get(&wr.name) == Some(&ParamMode::Let)
             && !self.decl_depth.contains_key(&wr.name))

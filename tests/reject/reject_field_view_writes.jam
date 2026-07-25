@@ -1,0 +1,47 @@
+// Per-field view state, the rejecting direction: assembling a view into
+// a local's field is caught (previously a hole), a re-viewed field
+// rejects again after being released, and a whole rebind resets any
+// field-level release.
+// expect-error: cannot write through `p` — it views elements of a read-only parameter
+// expect-error: cannot write through `x` — it views elements of a read-only parameter
+// expect-error: cannot write through `q` — it views string literal bytes
+
+const { Vec } = import("std").collections;
+
+const Pair = struct {
+    data: []u8,
+    n: u32,
+};
+
+fn assembleAndPoke(v: Vec(u8)) {
+    var p: Pair = Pair { data: "", n: 0 };
+    p.data = v.asSlice();
+    p.data[0] = 1;
+}
+
+fn reViewAndPoke(v: Vec(u8)) {
+    var owned: [1]u8 = [0];
+    var r: Pair = Pair { data: "", n: 0 };
+    r.data = owned[0..1];
+    r.data[0] = 1;          // fine: owned
+    r.data = v.asSlice();   // re-viewed
+    for x in r.data {
+        x = 0;
+    }
+}
+
+fn label() Pair {
+    return Pair { data: "static", n: 0 };
+}
+
+fn wholeRebindResets() {
+    var owned: [1]u8 = [65];
+    var q: Pair = label();
+    q.data = owned[0..1];
+    q = label();            // field release is gone
+    q.data[0] = 1;
+}
+
+fn main() u8 {
+    return 0;
+}
