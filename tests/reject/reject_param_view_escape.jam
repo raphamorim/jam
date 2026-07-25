@@ -10,6 +10,8 @@
 // expect-error: cannot call `mut self` method `push` through `v`
 // expect-error: cannot call `mut self` method `push` through `h`
 // expect-error: cannot write through `fb` — it views elements of a read-only parameter
+// expect-error: cannot write through `p` — it views elements of a read-only parameter
+// expect-error: cannot write through `sb` — it views elements of a read-only parameter
 
 const { Vec } = import("std").collections;
 
@@ -61,6 +63,28 @@ fn pokeFieldMethod(h: Holder) {
 fn pokeFieldView(h: Holder) {
     for fb in h.buf.asSlice() {
         fb = 0;
+    }
+}
+
+const Pair = struct {
+    data: []u8,
+    n: u32,
+};
+
+fn wrap(v: Vec(u8)) Pair {
+    return Pair { data: v.asSlice(), n: 0 };
+}
+
+// A returned struct's slice field views the argument; writes through it
+// (bound or direct) are writes into the read-only parameter's tree.
+fn pokeStructField(v: Vec(u8)) {
+    var p: Pair = wrap(v);
+    p.data[0] = 1;
+}
+
+fn pokeStructDirect(v: Vec(u8)) {
+    for sb in wrap(v).data {
+        sb = 0;
     }
 }
 

@@ -1,0 +1,68 @@
+// Struct returns that carry slice views: the provenance summary chases
+// StructLit field initializers, so a `Pair { data: v.asSlice(), n }`
+// binds its holder to the viewed storage. A view struct still owns its
+// INLINE fields — those writes (and whole rebinds) stay legal; only
+// element writes through the slice are gated (rejections live in
+// reject_param_view_escape.jam).
+
+const { assert } = import("test");
+const { Vec } = import("std").collections;
+
+const Pair = struct {
+    data: []u8,
+    n: u32,
+};
+
+fn wrap(v: Vec(u8)) Pair {
+    return Pair { data: v.asSlice(), n: 0 };
+}
+
+fn labelOnly(v: Vec(u8)) u32 {
+    var p: Pair = wrap(v);
+    p.n = 5;            // the struct's own field — not the viewed elements
+    return p.n;
+}
+
+tfn ownFieldsStayWritable() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    assert(labelOnly(v), 5);
+}
+
+tfn localStructViewWrites() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(10);
+    v.push(20);
+    var p: Pair = wrap(v);
+    p.data[0] = 7;
+    assert(v[0] as u32, 7);
+    for b in p.data {
+        b = 9;
+    }
+    assert(v[1] as u32, 9);
+}
+
+fn statik() Pair {
+    return Pair { data: "hi", n: 1 };
+}
+
+tfn wholeRebindReleasesTheView() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    var p: Pair = wrap(v);
+    p = statik();
+    assert(p.n, 1);
+    assert(p.data[0] as u32, 104);   // 'h'
+}
+
+fn bumpViaStruct(v: mut Vec(u8)) {
+    var p: Pair = wrap(v);
+    p.data[0] = 42;
+}
+
+tfn mutParamStructViewFlowsBack() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    bumpViaStruct(v);
+    assert(v[0] as u32, 42);
+}

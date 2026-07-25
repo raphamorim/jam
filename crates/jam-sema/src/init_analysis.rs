@@ -90,6 +90,25 @@ enum Recv {
     Expr(NodeIdx),
 }
 
+/// Result of `write_root`: the binding whose storage a write lands in,
+/// and whether the path crossed a slice's pointee on the way (an element
+/// or sub-slice of a slice-typed step). For a VIEW binding the crossing
+/// is what distinguishes borrowed element writes (`p.data[0] = x`) from
+/// writes to the binding's own storage (`p.n = x`, rebinding `s`).
+struct WriteRoot {
+    name: String,
+    via_slice: bool,
+}
+
+impl WriteRoot {
+    fn direct(name: String) -> Self {
+        WriteRoot {
+            name,
+            via_slice: false,
+        }
+    }
+}
+
 /// Result of analyzing a statement or expression.
 struct StmtResult {
     state: NameMap,
@@ -404,16 +423,15 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         // Re-declaration (inner-block shadow) starts a fresh binding.
         self.moved_bindings.remove(&name);
         self.moved_drop_bearing.remove(&name);
-        // A slice binding initialized from a read-only borrow's storage
-        // (`const s = v.asSlice();`, `const t = s[1..3];`) is itself a
-        // read-only view.
+        // A slice-carrying binding initialized from a read-only borrow's
+        // storage (`const s = v.asSlice();`, `const t = s[1..3];`, a
+        // returned struct with a slice field) is itself a read-only view.
         self.readonly_views.remove(&name);
-        if !type_idx.is_none()
-            && !init_idx.is_none()
-            && self.ctx.type_pool.get(type_idx).kind == TypeKind::Slice
+        if !init_idx.is_none()
+            && self.type_contains_slice(type_idx, 8)
             && self
                 .write_root(init_idx)
-                .is_some_and(|r| self.is_readonly_root(&r))
+                .is_some_and(|r| self.is_readonly_root(&r.name))
         {
             self.readonly_views.insert(name.clone());
         }
@@ -479,24 +497,24 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             }
         }
 
-        // Rebinding a slice variable recomputes its view membership from
-        // the new RHS (it may start or stop viewing read-only storage).
+        // Rebinding a slice-carrying variable recomputes its view membership
+        // from the new RHS (it may start or stop viewing read-only storage).
         {
             let target = *self.ctx.node_store.get(NodeIdx::new(n.lhs));
             if target.tag == AstTag::Variable {
                 let tname = self.str_name(target.lhs);
-                let is_slice_local = self
+                let is_view_carrier_local = self
                     .var_types
                     .get(&tname)
-                    .is_some_and(|&t| self.ctx.type_pool.get(t).kind == TypeKind::Slice)
+                    .is_some_and(|&t| self.type_contains_slice(t, 8))
                     && self.param_modes.get(&tname).is_none_or(|_| {
                         // params keep their mode-derived status
                         self.decl_depth.contains_key(&tname)
                     });
-                if is_slice_local {
+                if is_view_carrier_local {
                     if self
                         .write_root(NodeIdx::new(n.rhs))
-                        .is_some_and(|r| self.is_readonly_root(&r))
+                        .is_some_and(|r| self.is_readonly_root(&r.name))
                     {
                         self.readonly_views.insert(tname);
                     } else {
@@ -708,7 +726,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         let is_view = n.op == 1
             && self
                 .write_root(start_idx)
-                .is_some_and(|root| self.is_readonly_root(&root));
+                .is_some_and(|root| self.is_readonly_root(&root.name));
         if is_view {
             self.readonly_views.insert(var_name.clone());
         } else {
@@ -891,7 +909,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         // calling one through a read-only borrow.
         let recv_root = recv_name
             .clone()
-            .or_else(|| recv_expr.and_then(|e| self.write_root(e)));
+            .or_else(|| recv_expr.and_then(|e| self.write_root(e).map(|w| w.name)));
         if let (Some(c), Some(rn)) = (&callee, &recv_root)
             && !c.args.is_empty()
             && c.args[0].mode == ParamMode::Mut
@@ -1014,8 +1032,9 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             // wrap-the-write-in-a-helper bypass of the P2 write check.)
             if info.mode == ParamMode::Mut
                 && let Some(root) = self.write_root(info.arg_idx)
-                && self.is_readonly_root(&root)
+                && self.is_readonly_root(&root.name)
             {
+                let root = root.name;
                 self.emit_error(
                     format!(
                         "cannot pass `{root}` as a `mut` argument — it is a read-only \
@@ -1528,10 +1547,10 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     /// the root. None when the chain passes through pointer indirection
     /// (`.*`, a many-item pointer, a pointer-typed field) or a non-lvalue —
     /// those writes are not the root binding's own storage.
-    fn write_root(&self, idx: NodeIdx) -> Option<String> {
+    fn write_root(&self, idx: NodeIdx) -> Option<WriteRoot> {
         let n = *self.ctx.node_store.get(idx);
         match n.tag {
-            AstTag::Variable => Some(self.str_name(n.lhs)),
+            AstTag::Variable => Some(WriteRoot::direct(self.str_name(n.lhs))),
             AstTag::MemberAccess => {
                 let base = NodeIdx::new(n.lhs);
                 let k = self.ctx.type_pool.get(self.lvalue_type(base)?).kind;
@@ -1547,7 +1566,12 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                     // A slice's elements are the borrowed pointee — a
                     // read-only borrow covers them (mode table: default
                     // mode's pointee is read-only).
-                    TypeKind::Array | TypeKind::Slice => self.write_root(base),
+                    TypeKind::Slice => self.write_root(base).map(|mut w| {
+                        w.via_slice = true;
+                        w
+                    }),
+                    // Array elements are the base's inline storage.
+                    TypeKind::Array => self.write_root(base),
                     // Container `v[i] = x` dispatches its `cfn setAt`
                     // (`mut self`) — the write is the container's.
                     TypeKind::Struct | TypeKind::Named | TypeKind::GenericCall
@@ -1558,8 +1582,8 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                     _ => None,
                 }
             }
-            // A call that returns a slice viewing one of its arguments
-            // (per the callee's provenance summary): the storage is the
+            // A call whose return value views one of its arguments (per
+            // the callee's provenance summary): the storage is the
             // argument's. Surfaces a root only when that root is a
             // read-only borrow — other derivations stay permissive.
             AstTag::Call => {
@@ -1569,22 +1593,49 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 for k in viewed {
                     let root = if k == 0 && offset == 1 {
                         match recv.as_ref() {
-                            Some(Recv::Name(s)) => Some(s.clone()),
+                            Some(Recv::Name(s)) => Some(WriteRoot::direct(s.clone())),
                             Some(Recv::Expr(e)) => self.write_root(*e),
                             None => None,
                         }
                     } else {
                         args.get(k - offset).and_then(|&a| self.write_root(a))
                     };
-                    if let Some(r) = root
-                        && self.is_readonly_root(&r)
+                    if let Some(mut r) = root
+                        && self.is_readonly_root(&r.name)
                     {
+                        // The call boundary itself is a borrow of the
+                        // argument's tree: writes through the result are
+                        // never the result binding's own storage.
+                        r.via_slice = true;
                         return Some(r);
                     }
                 }
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Does `ty` transitively contain a slice (making a value of it a
+    /// potential view carrier)? Raw pointers don't count — their pointee
+    /// is governed by their own qualifier. Depth-capped for recursive
+    /// struct definitions.
+    fn type_contains_slice(&self, ty: TypeIdx, depth: u32) -> bool {
+        if ty.is_none() || depth == 0 {
+            return false;
+        }
+        let k = self.ctx.type_pool.get(ty);
+        match k.kind {
+            TypeKind::Slice => true,
+            TypeKind::Array => self.type_contains_slice(TypeIdx::new(k.a), depth - 1),
+            TypeKind::Struct | TypeKind::Named | TypeKind::GenericCall => self
+                .ctx
+                .struct_fields(ty)
+                .is_some_and(|fs| {
+                    fs.iter()
+                        .any(|(_, t)| self.type_contains_slice(*t, depth - 1))
+                }),
+            _ => false,
         }
     }
 
@@ -1717,16 +1768,17 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     }
 
     /// Parameter indices whose storage (or owned tree — pointer FIELDS
-    /// included, the ownership traversal) the returned slice of `callee`
-    /// may view. Raw-pointer PARAMETERS are excluded: their pointee is
-    /// governed by the pointer's own `mut`/`const`, not the parameter
-    /// mode. Non-slice returns and extern fns view nothing. Summaries
-    /// are cached by fn name; `depth` bounds transitive call chasing.
+    /// included, the ownership traversal) the returned value of `callee`
+    /// may view. Applies to any slice-carrying return type (a bare slice
+    /// or a struct with slice fields). Raw-pointer PARAMETERS are
+    /// excluded: their pointee is governed by the pointer's own
+    /// `mut`/`const`, not the parameter mode. Extern fns view nothing.
+    /// Summaries are cached by fn name; `depth` bounds transitive chasing.
     fn return_view_params(&self, callee: &FunctionAST, depth: u32) -> Vec<usize> {
         if depth == 0 || callee.is_extern || callee.return_type.is_none() {
             return Vec::new();
         }
-        if self.ctx.type_pool.get(callee.return_type).kind != TypeKind::Slice {
+        if !self.type_contains_slice(callee.return_type, 8) {
             return Vec::new();
         }
         if let Some(v) = self.view_summaries.borrow().get(&callee.name) {
@@ -1773,6 +1825,24 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             | AstTag::AsCast => {
                 self.expr_view_params(fn_ast, NodeIdx::new(n.lhs), depth, out);
             }
+            // Aggregate literals carry views built from their element /
+            // field initializers (`Pair { data: v.asSlice(), n: 0 }`).
+            AstTag::StructLit => {
+                let extra = n.rhs;
+                let count = self.extra(extra);
+                for i in 0..count {
+                    let field_expr = NodeIdx::new(self.extra(extra + 2 + i * 2));
+                    self.expr_view_params(fn_ast, field_expr, depth, out);
+                }
+            }
+            AstTag::ArrayLit => {
+                let extra = n.rhs;
+                let count = self.extra(extra);
+                for i in 0..count {
+                    let elem = NodeIdx::new(self.extra(extra + 1 + i));
+                    self.expr_view_params(fn_ast, elem, depth, out);
+                }
+            }
             AstTag::Call => {
                 if let Some((inner, recv, args)) = self.resolve_call(idx, Some(fn_ast)) {
                     let viewed = self.return_view_params(&inner, depth - 1);
@@ -1808,36 +1878,45 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     }
 
     /// Reject an assignment whose destination is owned by a read-only
-    /// parameter (directly or through a for-each element view).
+    /// parameter (directly or through a view of one).
     fn check_readonly_param_write(&mut self, target: NodeIdx) {
-        let Some(root) = self.write_root(target) else {
+        let Some(wr) = self.write_root(target) else {
             return;
         };
+        let root = wr.name;
         if !self.is_readonly_root(&root) {
             return;
         }
-        // Rebinding a slice-typed VIEW variable (`s = other;`) writes the
-        // local {ptr, len} pair, not the viewed elements — allowed; the
-        // assign hook recomputes its view membership. (For-each loop vars
-        // have no var_types entry: their bare writes ARE element writes.)
-        if self.node_tag(target) == AstTag::Variable
-            && self.readonly_views.contains(&root)
-            && self.var_types.contains_key(&root)
+        if self.param_modes.get(&root) == Some(&ParamMode::Let)
+            && !self.decl_depth.contains_key(&root)
         {
+            self.emit_error(
+                format!(
+                    "cannot write into parameter `{root}` — parameters are read-only \
+                     borrows by default; declare it `{root}: mut ...` in the signature"
+                ),
+                target,
+                root,
+            );
             return;
         }
-        let msg = if self.readonly_views.contains(&root) {
+        // A VIEW binding owns its own storage (a slice's {ptr, len} pair, a
+        // returned struct's inline fields) — writes there are fine
+        // (`s = other;`, `p.n = 5;`); the assign hook recomputes membership.
+        // Only writes that cross into a slice's pointee reach the borrowed
+        // elements. (For-each loop vars have no var_types entry: the binding
+        // IS the borrowed element, so every write through them is rejected.)
+        if self.var_types.contains_key(&root) && !wr.via_slice {
+            return;
+        }
+        self.emit_error(
             format!(
                 "cannot write through `{root}` — it views elements of a read-only \
                  parameter; take the parameter as `mut` in the signature"
-            )
-        } else {
-            format!(
-                "cannot write into parameter `{root}` — parameters are read-only \
-                 borrows by default; declare it `{root}: mut ...` in the signature"
-            )
-        };
-        self.emit_error(msg, target, root);
+            ),
+            target,
+            root,
+        );
     }
 
     fn emit_error(&mut self, message: String, anchor: NodeIdx, var_name: String) {
