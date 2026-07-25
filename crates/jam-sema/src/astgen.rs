@@ -1783,6 +1783,62 @@ fn astgen_binary_op(
     expected: TypeIdx,
 ) -> Result<JirRef, String> {
     let mut lhs_ref = astgen_expr(gctx, NodeIdx::new(n.lhs), expected)?;
+    // Short-circuit LogAnd (11) / LogOr (12): the RHS must lower INSIDE its
+    // branch so its side effects only run when the LHS doesn't decide —
+    // eager lowering here used to evaluate `b()` in `false && b()`.
+    if n.op == 11 || n.op == 12 {
+        let is_and = n.op == 11;
+        let res_slot = emit_alloca_hoisted(
+            gctx,
+            JirInst {
+                tag: JirTag::Alloca,
+                ty: builtin::BOOL,
+                ..Default::default()
+            },
+        );
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: res_slot,
+                b: lhs_ref,
+                ..Default::default()
+            },
+        );
+        let rhs_b = gctx
+            .jfn
+            .push_block(if is_and { "and.rhs" } else { "or.rhs" });
+        let end_b = gctx
+            .jfn
+            .push_block(if is_and { "and.end" } else { "or.end" });
+        if is_and {
+            emit_cond_br(gctx, lhs_ref, rhs_b, end_b);
+        } else {
+            emit_cond_br(gctx, lhs_ref, end_b, rhs_b);
+        }
+        gctx.current_block = rhs_b;
+        let rhs_ref = astgen_expr(gctx, NodeIdx::new(n.rhs), builtin::BOOL)?;
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Store,
+                a: res_slot,
+                b: rhs_ref,
+                ..Default::default()
+            },
+        );
+        emit_br(gctx, end_b);
+        gctx.current_block = end_b;
+        return Ok(emit(
+            gctx,
+            JirInst {
+                tag: JirTag::Load,
+                a: res_slot,
+                ty: builtin::BOOL,
+                ..Default::default()
+            },
+        ));
+    }
     // Peer-type hint: lower the RHS at the LHS's resolved width.
     let mut lhs_type = gctx.jfn.get_inst(lhs_ref).ty;
     let mut rhs_ref = astgen_expr(gctx, NodeIdx::new(n.rhs), lhs_type)?;
@@ -1828,64 +1884,6 @@ fn astgen_binary_op(
                 },
             );
         }
-    }
-
-    // Short-circuit LogAnd (11) / LogOr (12) lower as an if-expression over a
-    // bool result slot. Both operands were eagerly emitted above (and are i1,
-    // so the reconciliation was a no-op); the RHS value is *stored* only on the
-    // branch that needs it — `LogAnd: lhs ? rhs : false`, `LogOr: lhs ? true :
-    // rhs`. (jir_codegen folds the slot to a phi at -O2.)
-    if n.op == 11 || n.op == 12 {
-        let is_and = n.op == 11;
-        let res_slot = emit_alloca_hoisted(
-            gctx,
-            JirInst {
-                tag: JirTag::Alloca,
-                ty: builtin::BOOL,
-                ..Default::default()
-            },
-        );
-        emit(
-            gctx,
-            JirInst {
-                tag: JirTag::Store,
-                a: res_slot,
-                b: lhs_ref,
-                ..Default::default()
-            },
-        );
-        let rhs_b = gctx
-            .jfn
-            .push_block(if is_and { "and.rhs" } else { "or.rhs" });
-        let end_b = gctx
-            .jfn
-            .push_block(if is_and { "and.end" } else { "or.end" });
-        if is_and {
-            emit_cond_br(gctx, lhs_ref, rhs_b, end_b);
-        } else {
-            emit_cond_br(gctx, lhs_ref, end_b, rhs_b);
-        }
-        gctx.current_block = rhs_b;
-        emit(
-            gctx,
-            JirInst {
-                tag: JirTag::Store,
-                a: res_slot,
-                b: rhs_ref,
-                ..Default::default()
-            },
-        );
-        emit_br(gctx, end_b);
-        gctx.current_block = end_b;
-        return Ok(emit(
-            gctx,
-            JirInst {
-                tag: JirTag::Load,
-                a: res_slot,
-                ty: builtin::BOOL,
-                ..Default::default()
-            },
-        ));
     }
 
     let k = gctx.ctx.type_pool.get(lhs_type);

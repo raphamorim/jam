@@ -84,3 +84,29 @@ tfn bool_in_if() {
     assert(bool_in_if(true), 42);
     assert(bool_in_if(false), 0);
 }
+
+// Short-circuit proofs: the rhs must not evaluate when the lhs decides.
+fn bump(counter: *mut u64) bool {
+    counter.* = counter.* + 1;
+    return true;
+}
+
+tfn andShortCircuits() {
+    var n: u64 = 0;
+    const dead: bool = false && bump(&n);
+    assert(dead as u8, 0);
+    assert(n as i32, 0);
+    const live: bool = true && bump(&n);
+    assert(live as u8, 1);
+    assert(n as i32, 1);
+}
+
+tfn orShortCircuits() {
+    var n: u64 = 0;
+    const dead: bool = true || bump(&n);
+    assert(dead as u8, 1);
+    assert(n as i32, 0);
+    const live: bool = false || bump(&n);
+    assert(live as u8, 1);
+    assert(n as i32, 1);
+}
