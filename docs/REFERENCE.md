@@ -25,6 +25,8 @@ sidebar:
         url: "#fn-declaration"
       - name: Type Casts
         url: "#casts"
+      - name: Function Pointers
+        url: "#fn-pointers"
   - title: Types
     items:
       - name: Structs
@@ -39,6 +41,10 @@ sidebar:
         url: "#generics"
   - title: System
     items:
+      - name: Compile-Time Execution
+        url: "#comptime"
+      - name: Testing
+        url: "#testing"
       - name: Modules & Imports
         url: "#imports"
       - name: Comptime Intrinsics
@@ -113,7 +119,6 @@ unsigned (`u`) integers of various sizes.
 | 16-bit | `i16`   | `u16`    | -32,768 to 32,767                                         | 0 to 65,535                   |
 | 32-bit | `i32`   | `u32`    | -2,147,483,648 to 2,147,483,647                           | 0 to 4,294,967,295            |
 | 64-bit | `i64`   | `u64`    | -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807   | 0 to 18,446,744,073,709,551,615 |
-| Arch   | `isize` | `usize`  | Depends on computer architecture (32 or 64-bit)           |                               |
 
 ```jam
 fn main() u8 {
@@ -165,19 +170,20 @@ Jam provides three logical operators for working with boolean values:
 | Operator | Name | Description                                                            |
 |----------|------|------------------------------------------------------------------------|
 | `!`      | NOT  | Negates a boolean value                                                |
-| `and`    | AND  | Returns true if both operands are true (short-circuits if first is false) |
-| `or`     | OR   | Returns true if either operand is true (short-circuits if first is true)  |
+| `&&`     | AND  | Returns true if both operands are true (short-circuits if first is false) |
+| `\|\|`     | OR   | Returns true if either operand is true (short-circuits if first is true)  |
 
-The `and` and `or` operators use **short-circuit evaluation**: if the result can be
-determined from the first operand alone, the second operand is not evaluated.
+The `&&` and `\|\|` operators use **short-circuit evaluation**: if the result can
+be determined from the first operand alone, the second operand is not
+evaluated — a call on the right-hand side does not run.
 
 ```jam
 fn checkAccess(isAdmin: bool, isOwner: bool) bool {
-    return isAdmin or isOwner;
+    return isAdmin || isOwner;
 }
 
 fn validate(hasEmail: bool, hasPassword: bool) bool {
-    return hasEmail and hasPassword;
+    return hasEmail && hasPassword;
 }
 ```
 
@@ -334,6 +340,22 @@ fn fillIndices() [16]u8 {
 ```
 
 The `for` loop iterates a half-open integer range, `for i in 0:N` binds `i = 0, 1, …, N-1`.
+With a literal end bound the index is a `u64`; with a variable bound it takes that
+variable's type.
+
+`loop { … }` runs forever (sugar for `while (true)`); `break` exits the innermost
+loop and `continue` jumps to its next iteration.
+
+```jam
+fn firstPowerAbove(n: u64) u64 {
+    var p: u64 = 1;
+    loop {
+        p = p * 2;
+        if (p > n) { break; }
+    }
+    return p;
+}
+```
 
 ---
 
@@ -400,11 +422,36 @@ numeric conversions.
 
 ---
 
+## Function Pointers {#fn-pointers}
+
+`fn(params) Ret` is a first-class type: store one in a local or a struct field
+and call it through the binding. `someFn as u64` takes a function's raw
+address (for FFI hand-off and `@callC`).
+
+```jam
+fn add(a: i32, b: i32) i32 { return a + b; }
+fn mul(a: i32, b: i32) i32 { return a * b; }
+
+const Op = struct { name: str, apply: fn(i32, i32) i32 };
+
+fn run() i32 {
+    var f: fn(i32, i32) i32 = add;
+    const r: i32 = f(2, 3);          // 5
+    const op: Op = Op { name: "mul", apply: mul };
+    return r + op.apply(2, 3);       // 5 + 6
+}
+```
+
+There are no closures — a callback that needs state takes an explicit context
+argument (see `std/box` and jam-objc's block support for the pattern).
+
+---
+
 ## Structs {#structs}
 
 A struct groups fields under a single name. Top-level structs are declared via
 `const Name = struct { … };`. Field names are `field: Type`; instances are built with
-`{ field: value, … }`.
+`TypeName { field: value, … }` — literals always name their type.
 
 ```jam
 const Vec3   = struct { x: f32, y: f32, z: f32 };
@@ -412,14 +459,14 @@ const Pixel  = struct { r: u8, g: u8, b: u8 };
 const Player = struct { hp: u32, level: u8, alive: bool };
 
 fn main() {
-    const v: Vec3 = { x: 0, y: 100, z: 50 };
-    var px:  Pixel = { r: 10, g: 20, b: 30 };
+    const v: Vec3 = Vec3 { x: 0.0, y: 100.0, z: 50.0 };
+    var px:  Pixel = Pixel { r: 10, g: 20, b: 30 };
     px.r = 100;
 
     // Nested literals work the same way.
     const Outer = struct { inner: Pixel, c: u8 };
-    const x: Outer = {
-        inner: { r: 1, g: 2, b: 3 },
+    const x: Outer = Outer {
+        inner: Pixel { r: 1, g: 2, b: 3 },
         c: 4,
     };
 }
@@ -443,7 +490,7 @@ const Counter = struct {
 
 fn observe() u32 {
     var hits: u32 = 0;
-    var c: Counter = { value: 5, sink: &hits };
+    var c: Counter = Counter { value: 5, sink: &hits };
     return c.value;
     // c.drop() fires automatically here, see Drop, below.
 }
@@ -527,7 +574,7 @@ const FloatBits = union {
 };
 
 fn floatBits(x: f32) u32 {
-    var b: FloatBits = { f: x };
+    var b: FloatBits = FloatBits { f: x };
     return b.i;
 }
 ```
@@ -546,13 +593,17 @@ enum variants (with or without payloads), and `_` as a wildcard.
 fn dispatch(x: u8) u8 {
     match (x) {
         0           { return 10; }
-        1 or 2 or 3 { return 20; }       // `or`-joined patterns
+        1 | 2 | 3   { return 20; }       // `|`-joined patterns
         4..=9       { return 30; }       // inclusive range
         _           { return 255; }
     }
     return 99;
 }
 ```
+
+Range bounds are full 64-bit and may be negative (`-100..=-1`); an inverted
+range is a compile error. When the scrutinee's enum type is unambiguous the
+variant may be written bare: `Some(x)` instead of `Option(i32).Some(x)`.
 
 A `match` can also be used as an *expression*, each arm produces a value, and the result
 is the value of the matched arm.
@@ -567,6 +618,10 @@ fn unwrap(o: Option(i32), fallback: i32) i32 {
 ```
 
 Arms that bind payload fields introduce those names into the arm's scope.
+
+A match **expression** must be exhaustive — cover every variant of the enum or
+add a `_` arm; anything else is a compile error (a fallthrough would leave the
+result undefined). Statement-position matches keep switch-style fallthrough.
 
 ---
 
@@ -591,8 +646,8 @@ fn Pair(A: type, B: type) type {
 }
 
 fn main() {
-    var b: Box(i32)        = { value: 17 };
-    var p: Pair(i32, u8)   = { first: 7, second: 35 };
+    var b: Box(i32)      = Box(i32) { value: 17 };
+    var p: Pair(i32, u8) = Pair(i32, u8) { first: 7, second: 35 };
 }
 ```
 
@@ -601,7 +656,7 @@ uses resolve to the same instantiated struct.
 
 ```jam
 const BoxI32 = Box(i32);
-var b: BoxI32 = { value: 17 };
+var b: BoxI32 = BoxI32 { value: 17 };
 ```
 
 ### Generic Methods
@@ -642,6 +697,58 @@ Construct variants by qualifying with the instantiated type: `Option(i32).Some(4
 
 ---
 
+## Compile-Time Execution {#comptime}
+
+`comp` marks bindings and parameters the compiler evaluates during
+compilation. A `comp const`/`comp var` folds to a constant; `comp if` selects
+a branch at compile time and the dead arm is never lowered; a `comp`
+parameter specializes the function per call-site value (each distinct value
+gets its own clone).
+
+```jam
+comp const WORDS: u32 = 4;
+
+fn scale(comp k: u32, x: u32) u32 {   // one clone per distinct k
+    return x * k;
+}
+
+fn size() u32 {
+    comp if (WORDS > 2) {
+        return scale(8, WORDS);
+    } else {
+        return scale(2, WORDS);
+    }
+}
+```
+
+`cfn` is the second compile-time form. A top-level `cfn` runs its body at
+compile time and emits code into the caller (`std.fmt.print` is one — the
+format string is parsed during compilation). A `cfn` **method** is an
+ordinary runtime function that opts into compiler-synthesized call sites:
+`cfn drop` registers with automatic drop, `cfn clone` with `.clone()`,
+`cfn at`/`setAt`/`len` with `v[i]` indexing — and a `cfn` method may declare
+a variadic pack (see extern / FFI).
+
+---
+
+## Testing {#testing}
+
+`tfn` declares a test. `jam test <file-or-dir>` compiles every `tfn`,
+synthesizes a `main` that runs them, and reports each by name.
+`import("test")` exports `assert(actual, expected)`.
+
+```jam
+const { assert } = import("test");
+
+fn double(x: u64) u64 { return x * 2; }
+
+tfn doubling() {
+    assert(double(21) as i32, 42);
+}
+```
+
+---
+
 ## Modules & Imports {#imports}
 
 `import("name")` returns a *module value*, a compile-time record of the symbols another
@@ -677,8 +784,12 @@ results are substituted as constants before LLVM sees the code.
 
 | Intrinsic                    | Description                                             |
 |------------------------------|---------------------------------------------------------|
-| `@sizeOf(T)`                 | Size of `T` in bytes (u64)                              |
+| `@sizeOf(T)`                 | Size of `T` in bytes (u64); `@sizeOf(void)` is 0        |
 | `@alignOf(T)`                | Alignment of `T` in bytes (u64)                         |
+| `@os()`                      | Target OS name as a `str` (`"macos"`, `"linux"`, ...)   |
+| `@isDarwin()` `@isLinux()` `@isWindows()` `@isUnix()` | Target-OS predicates; fold to a `bool` literal and dead arms drop |
+| `@isX86_64()` `@isAarch64()` | Target-arch predicates (honour `-C target`); same folding |
+| `@dropInPlace(ptr)`          | Run the pointee type's drop glue at `ptr`               |
 | `@callC(R, addr, args...)`   | Indirect C call through a raw `u64` address; the fixed C signature is synthesized from `R` and the args' static types (see extern / FFI) |
 
 ```jam
@@ -818,7 +929,7 @@ Call sites are sigil-free for every mode — the signature's mode declaration do
 the work, and the argument is always a plain expression:
 
 ```jam
-var p: Point = { x: 3.0, y: 4.0 };
+var p: Point = Point { x: 3.0, y: 4.0 };
 scale(p, 2.0);                   // mut access, no sigil
 distance(p, otherPoint);         // read-only, no sigil
 ```

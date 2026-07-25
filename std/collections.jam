@@ -3,7 +3,7 @@
 // `Vec(T)` — growable dynamic array. Uses libc malloc / free /
 // realloc as the backing allocator. MVS auto-drops the backing
 // buffer at scope exit. A user-pluggable Allocator interface is
-// deferred until function-pointer support lands in the compiler;
+// deferred for now (fn-pointer types exist; the allocator API doesn't yet);
 // once it does, `std.mem.Allocator` will be a runtime vtable type.
 //
 // `Option(T)` lives in `std/option` and is imported here for
