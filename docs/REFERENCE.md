@@ -786,8 +786,9 @@ compile time and emits code into the caller (`std.fmt.print` is one — the
 format string is parsed during compilation). A `cfn` **method** is an
 ordinary runtime function that opts into compiler-synthesized call sites:
 `cfn drop` registers with automatic drop, `cfn clone` with `.clone()`,
-`cfn at`/`setAt`/`len` with `v[i]` indexing — and a `cfn` method may declare
-a variadic pack (see extern / FFI).
+`cfn at`/`setAt`/`len` with `v[i]` indexing (on plain bindings and field
+chains alike: `h.buf[i]` dispatches the same way) — and a `cfn` method may
+declare a variadic pack (see extern / FFI).
 
 ---
 
