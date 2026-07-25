@@ -39,3 +39,69 @@ tfn varStringsAssign() {
     msg = "second";
     assert(eq(msg, "second") as u8, 1);
 }
+
+const { trim, trimLeft, trimRight, slice, concat, fromInt, parseInt } = import("std").string;
+const { Vec } = import("std").collections;
+
+tfn trimFamily() {
+    assert(eq(trim("  hi there \n"), "hi there") as u8, 1);
+    assert(eq(trimLeft("\t x"), "x") as u8, 1);
+    assert(eq(trimRight("x \r\n"), "x") as u8, 1);
+    assert(eq(trim("   "), "") as u8, 1);
+    assert(eq(trim("solid"), "solid") as u8, 1);
+}
+
+tfn sliceHelper() {
+    assert(eq(slice("hello world", 6, 11), "world") as u8, 1);
+    assert(eq(slice("abc", 1, 1), "") as u8, 1);
+}
+
+tfn concatHeap() {
+    var joined: Vec(u8) = concat("foo", "bar");
+    assert((joined.asSlice() == "foobar") as u8, 1);
+    var left: Vec(u8) = concat("", "tail");
+    assert((left.asSlice() == "tail") as u8, 1);
+}
+
+tfn intToString() {
+    var zero: Vec(u8) = fromInt(0);
+    assert((zero.asSlice() == "0") as u8, 1);
+    var neg: Vec(u8) = fromInt(-42);
+    assert((neg.asSlice() == "-42") as u8, 1);
+    var big: Vec(u8) = fromInt(9007199254740993);
+    assert((big.asSlice() == "9007199254740993") as u8, 1);
+}
+
+tfn stringToInt() {
+    match (parseInt("-1234")) {
+        Some(v) { assert((v == -1234) as u8, 1); }
+        None    { assert(1, 0); }
+    }
+    match (parseInt("9223372036854775807")) {
+        Some(v) { assert((v == 9223372036854775807) as u8, 1); }
+        None    { assert(1, 0); }
+    }
+}
+
+tfn stringToIntRejects() {
+    match (parseInt("")) {
+        Some(v) { assert(1, 0); }
+        None    { }
+    }
+    match (parseInt("12x4")) {
+        Some(v) { assert(1, 0); }
+        None    { }
+    }
+    match (parseInt("-")) {
+        Some(v) { assert(1, 0); }
+        None    { }
+    }
+    match (parseInt("9223372036854775808")) {
+        Some(v) { assert(1, 0); }
+        None    { }
+    }
+    match (parseInt("18446744073709551616")) {
+        Some(v) { assert(1, 0); }   // would wrap u64 without the digit guard
+        None    { }
+    }
+}

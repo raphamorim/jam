@@ -6,19 +6,13 @@
 // operations are bytewise; there's no Unicode normalization or
 // case folding in this layer.
 
+const { Vec } = import("collections");
+const { Option } = import("option");
+
 // Byte-equality. Strings of different lengths are unequal.
+// (`a == b` on slices does the same thing; this stays for call-style use.)
 pub fn eq(a: []u8, b: []u8) bool {
-    if (a.len != b.len) {
-        return false;
-    }
-    var i: u32 = 0;
-    while (i < a.len) {
-        if (a.ptr[i] != b.ptr[i]) {
-            return false;
-        }
-        i = i + 1;
-    }
-    return true;
+    return a == b;
 }
 
 // True iff `s` begins with `prefix`. Empty prefix always matches.
@@ -88,11 +82,6 @@ pub fn contains(s: []u8, needle: []u8) bool {
     return find(s, needle) >= 0;
 }
 
-// `slice(s, start, end)` for sub-slicing deferred — requires a
-// slice-literal codegen path (`{ ptr, len }` as a slice value)
-// that doesn't exist yet. Lexer / parser code paths that need
-// sub-slicing can fall back to byte-pointer + length pairs.
-
 // Single-byte search. Returns the first index of `byte` in `s`,
 // or -1 if absent. Useful for lexer scans (newlines, quote chars).
 pub fn indexOfByte(s: []u8, byte: u8) i32 {
@@ -105,3 +94,113 @@ pub fn indexOfByte(s: []u8, byte: u8) i32 {
     }
     return -1;
 }
+
+// Sub-slice [start, end). Bounds are the caller's problem, same as
+// indexing. (`s[a..b]` is the operator form.)
+pub fn slice(s: []u8, start: u64, end: u64) []u8 {
+    return s[start..end];
+}
+
+fn isSpace(b: u8) bool {
+    return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+// Strip ASCII whitespace (space, tab, newline, carriage return).
+pub fn trimLeft(s: []u8) []u8 {
+    var i: u64 = 0;
+    while (i < s.len && isSpace(s.ptr[i])) {
+        i = i + 1;
+    }
+    return s[i..s.len];
+}
+
+pub fn trimRight(s: []u8) []u8 {
+    var end: u64 = s.len;
+    while (end > 0 && isSpace(s.ptr[end - 1])) {
+        end = end - 1;
+    }
+    return s[0..end];
+}
+
+pub fn trim(s: []u8) []u8 {
+    return trimLeft(trimRight(s));
+}
+
+// `a` followed by `b`, in fresh heap storage (drop the Vec when done).
+pub fn concat(a: []u8, b: []u8) Vec(u8) {
+    var out: Vec(u8) = Vec(u8).withCapacity(a.len + b.len);
+    out.appendSlice(a);
+    out.appendSlice(b);
+    return out;
+}
+
+// Decimal digits of `v` (with a leading `-` when negative).
+pub fn fromInt(v: i64) Vec(u8) {
+    var out: Vec(u8) = Vec(u8).withCapacity(20);
+    if (v == 0) {
+        out.push(48);
+        return out;
+    }
+    var neg: bool = false;
+    var m: u64 = v as u64;
+    if (v < 0) {
+        neg = true;
+        m = ((0 as i64) - v) as u64;
+    }
+    var digits: [20]u8 = [0; 20];
+    var n: u64 = 0;
+    while (m > 0) {
+        digits[n] = (48 + (m % 10)) as u8;
+        m = m / 10;
+        n = n + 1;
+    }
+    if (neg) {
+        out.push(45);
+    }
+    while (n > 0) {
+        n = n - 1;
+        out.push(digits[n]);
+    }
+    return out;
+}
+
+// Parse a decimal integer (optional leading `-`). None on empty input,
+// stray bytes, or overflow past i64.
+pub fn parseInt(s: []u8) Option(i64) {
+    if (s.len == 0) {
+        return Option(i64).None();
+    }
+    var i: u64 = 0;
+    var neg: bool = false;
+    if (s.ptr[0] == 45) {
+        neg = true;
+        i = 1;
+        if (s.len == 1) {
+            return Option(i64).None();
+        }
+    }
+    var acc: u64 = 0;
+    while (i < s.len) {
+        const b: u8 = s.ptr[i];
+        if (b < 48 || b > 57) {
+            return Option(i64).None();
+        }
+        const d: u64 = (b - 48) as u64;
+        if (acc > 1844674407370955161 || (acc == 1844674407370955161 && d > 5)) {
+            return Option(i64).None();   // acc * 10 + d would wrap
+        }
+        acc = acc * 10 + d;
+        i = i + 1;
+    }
+    if (neg) {
+        if (acc > 9223372036854775808) {
+            return Option(i64).None();
+        }
+        return Option(i64).Some((0 as i64) - (acc as i64));
+    }
+    if (acc > 9223372036854775807) {
+        return Option(i64).None();
+    }
+    return Option(i64).Some(acc as i64);
+}
+
