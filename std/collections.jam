@@ -83,6 +83,12 @@ pub fn Vec(T: type) type {
 
         cfn len(self: Self) u32 { return self.length; }
 
+        // Borrowed view over the live elements. Valid until the next
+        // mutation — push/reserve may reallocate the backing buffer.
+        fn asSlice(self: Self) []T {
+            return self.ptr[0..self.length];
+        }
+
         fn get(self: Self, i: u32) Option(T) {
             if (i >= self.length) {
                 return Option(T).None();
