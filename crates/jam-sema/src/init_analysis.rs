@@ -122,6 +122,10 @@ struct Analyzer<'a, 'ctx> {
     moved_bindings: HashSet<String>,
     /// Drop-bearing bindings that were definitely moved.
     moved_drop_bearing: HashSet<String>,
+    /// For-each loop vars that view elements of a read-only parameter —
+    /// writes through them land in the caller's storage, so they are
+    /// rejected like writes into the parameter itself.
+    readonly_views: HashSet<String>,
 }
 
 impl<'a, 'ctx> Analyzer<'a, 'ctx> {
@@ -137,6 +141,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             decl_depth: HashMap::new(),
             moved_bindings: HashSet::new(),
             moved_drop_bearing: HashSet::new(),
+            readonly_views: HashSet::new(),
         }
     }
 
@@ -147,6 +152,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         self.decl_depth.clear();
         self.moved_bindings.clear();
         self.moved_drop_bearing.clear();
+        self.readonly_views.clear();
         self.comp_names.clear();
         self.cond_depth = 0;
 
@@ -424,6 +430,12 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 }
             }
         }
+        // MVS P2: a write whose destination storage is OWNED by a read-only
+        // (default-mode) parameter lands in the caller's value — reject it.
+        // Writes through pointer indirection (`p.*`, `self.ptr[i]`) are not
+        // the parameter's storage and stay allowed.
+        self.check_readonly_param_write(NodeIdx::new(n.lhs));
+
         // RHS evaluated first (drop old, then store new).
         let mut r = self.analyze_node(NodeIdx::new(n.rhs), state);
         if r.terminated {
@@ -632,7 +644,21 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
         let state_before = r.state.clone();
         let var_name = self.str_name(var_idx);
-        r.state.insert(var_name, InitState::Init);
+        r.state.insert(var_name.clone(), InitState::Init);
+
+        // A for-each var binds elements in place; when the iterable's storage
+        // belongs to a read-only parameter, the var is a read-only view for
+        // the body (membership is save/restored around shadowing).
+        let was_view = self.readonly_views.contains(&var_name);
+        let is_view = n.op == 1
+            && self
+                .write_root(start_idx)
+                .is_some_and(|root| self.is_readonly_root(&root));
+        if is_view {
+            self.readonly_views.insert(var_name.clone());
+        } else {
+            self.readonly_views.remove(&var_name);
+        }
 
         self.cond_depth += 1;
         let mut body_r = StmtResult {
@@ -647,6 +673,12 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             body_r = self.analyze_node(s, body_r.state);
         }
         self.cond_depth -= 1;
+
+        if was_view {
+            self.readonly_views.insert(var_name);
+        } else {
+            self.readonly_views.remove(&var_name);
+        }
 
         // For-over-range assumes the body runs at least once (matches existing
         // Jam idioms). On `break`, fall back to the pre-loop state.
@@ -1319,6 +1351,118 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             return 0;
         }
         self.ctx.node_store.get_line(idx)
+    }
+
+    /// Static type of a simple lvalue chain, or None when a step can't be
+    /// typed (calls, unregistered types, unions). Purely a helper for the
+    /// read-only-parameter write check — permissive on None.
+    fn lvalue_type(&self, idx: NodeIdx) -> Option<TypeIdx> {
+        let n = *self.ctx.node_store.get(idx);
+        match n.tag {
+            AstTag::Variable => self.var_types.get(&self.str_name(n.lhs)).copied(),
+            AstTag::MemberAccess => {
+                let mut bt = self.lvalue_type(NodeIdx::new(n.lhs))?;
+                let k = self.ctx.type_pool.get(bt);
+                if k.kind == TypeKind::PtrSingle {
+                    bt = TypeIdx::new(k.a);
+                }
+                let field = self.str_name(n.rhs);
+                self.ctx
+                    .struct_fields(bt)?
+                    .into_iter()
+                    .find(|(name, _)| *name == field)
+                    .map(|(_, ty)| ty)
+            }
+            AstTag::Index | AstTag::Slice => {
+                let bt = self.lvalue_type(NodeIdx::new(n.lhs))?;
+                let k = self.ctx.type_pool.get(bt);
+                match k.kind {
+                    TypeKind::Array | TypeKind::Slice | TypeKind::PtrMany => {
+                        if n.tag == AstTag::Slice {
+                            Some(self.ctx.type_pool.intern_slice(TypeIdx::new(k.a)))
+                        } else {
+                            Some(TypeIdx::new(k.a))
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            AstTag::Deref => {
+                let bt = self.lvalue_type(NodeIdx::new(n.lhs))?;
+                let k = self.ctx.type_pool.get(bt);
+                match k.kind {
+                    TypeKind::PtrSingle | TypeKind::PtrMany => Some(TypeIdx::new(k.a)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The binding whose storage a write to this lvalue lands in, walking
+    /// value projections (fields, array/slice elements, sub-slices) back to
+    /// the root. None when the chain passes through pointer indirection
+    /// (`.*`, a many-item pointer, a pointer-typed field) or a non-lvalue —
+    /// those writes are not the root binding's own storage.
+    fn write_root(&self, idx: NodeIdx) -> Option<String> {
+        let n = *self.ctx.node_store.get(idx);
+        match n.tag {
+            AstTag::Variable => Some(self.str_name(n.lhs)),
+            AstTag::MemberAccess => {
+                let base = NodeIdx::new(n.lhs);
+                let k = self.ctx.type_pool.get(self.lvalue_type(base)?).kind;
+                if k == TypeKind::PtrSingle || k == TypeKind::PtrMany {
+                    return None;
+                }
+                self.write_root(base)
+            }
+            AstTag::Index | AstTag::Slice => {
+                let base = NodeIdx::new(n.lhs);
+                let k = self.ctx.type_pool.get(self.lvalue_type(base)?).kind;
+                match k {
+                    // A slice's elements are the borrowed pointee — a
+                    // read-only borrow covers them (mode table: default
+                    // mode's pointee is read-only).
+                    TypeKind::Array | TypeKind::Slice => self.write_root(base),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Is `name` a read-only borrow whose storage the caller owns — a
+    /// default-mode parameter (not shadowed by a local) or a for-each view
+    /// over one?
+    fn is_readonly_root(&self, name: &str) -> bool {
+        if self.readonly_views.contains(name) {
+            return true;
+        }
+        self.param_modes.get(name) == Some(&ParamMode::Let)
+            && !self.decl_depth.contains_key(name)
+    }
+
+    /// Reject an assignment whose destination is owned by a read-only
+    /// parameter (directly or through a for-each element view).
+    fn check_readonly_param_write(&mut self, target: NodeIdx) {
+        let Some(root) = self.write_root(target) else {
+            return;
+        };
+        if !self.is_readonly_root(&root) {
+            return;
+        }
+        let msg = if self.readonly_views.contains(&root) {
+            format!(
+                "cannot write through `{root}` — it views elements of a read-only \
+                 parameter; take the parameter as `mut` in the signature"
+            )
+        } else {
+            format!(
+                "cannot write into parameter `{root}` — parameters are read-only \
+                 borrows by default; declare it `{root}: mut ...` in the signature"
+            )
+        };
+        self.emit_error(msg, target, root);
     }
 
     fn emit_error(&mut self, message: String, anchor: NodeIdx, var_name: String) {

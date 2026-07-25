@@ -1,0 +1,90 @@
+// MVS P2 boundaries: default-mode parameters reject writes (see
+// reject_param_readonly_write.jam) — these are the writes that stay
+// legal. `mut` mode writes flow back to the caller; pointer params
+// write through their pointee, not the parameter; locals copied from
+// a parameter are freely mutable.
+
+const { assert } = import("test");
+
+const Point = struct {
+    x: f64,
+    y: f64,
+};
+
+fn pokeArr(arr: mut [4]u16) {
+    arr[0] = 99;
+}
+
+tfn mutArrayFlowsBack() {
+    var a: [4]u16 = [1, 2, 3, 4];
+    pokeArr(a);
+    assert(a[0] as u32, 99);
+    assert(a[1] as u32, 2);
+}
+
+fn scale(p: mut Point, factor: f64) {
+    p.x = p.x * factor;
+    p.y = p.y * factor;
+}
+
+tfn mutStructFlowsBack() {
+    var pt: Point = Point { x: 3.0, y: 4.0 };
+    scale(pt, 2.0);
+    assert((pt.x == 6.0) as u8, 1);
+    assert((pt.y == 8.0) as u8, 1);
+}
+
+fn fill(buf: mut []u8, b: u8) {
+    for v in buf {
+        v = b;
+    }
+}
+
+tfn mutSliceElementsWritable() {
+    var raw: [3]u8 = [0, 0, 0];
+    fill(raw[0..3], 9);
+    assert(raw[0], 9);
+    assert(raw[2], 9);
+}
+
+fn derefWrite(p: *mut u8) {
+    p.* = 77;
+}
+
+fn manyItemWrite(p: *mut[] u8) {
+    p[1] = 55;
+}
+
+tfn pointerParamsWriteThrough() {
+    var x: u8 = 1;
+    derefWrite(&x);
+    assert(x, 77);
+    var arr: [3]u8 = [1, 2, 3];
+    manyItemWrite(&arr[0]);
+    assert(arr[1], 55);
+}
+
+fn copyThenMutate(arr: [4]u16) u16 {
+    var scratch: [4]u16 = arr;
+    scratch[0] = 42;
+    return scratch[0];
+}
+
+tfn localCopyIsMutable() {
+    var a: [4]u16 = [1, 2, 3, 4];
+    assert(copyThenMutate(a) as u32, 42);
+    assert(a[0] as u32, 1);   // caller's storage untouched
+}
+
+fn sumReadonly(arr: [4]u16) u32 {
+    var total: u32 = 0;
+    for v in arr {
+        total = total + (v as u32);
+    }
+    return total;
+}
+
+tfn readingParamElementsIsFine() {
+    var a: [4]u16 = [10, 20, 30, 40];
+    assert(sumReadonly(a), 100);
+}

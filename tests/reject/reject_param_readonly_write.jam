@@ -1,0 +1,52 @@
+// MVS P2: parameters are read-only borrows by default. A write whose
+// destination storage belongs to a default-mode parameter — the binding
+// itself, a field, an array/slice element, or a for-each element view —
+// is rejected. (Writes through pointer indirection stay allowed; see
+// test_param_readonly.jam.)
+// expect-error: cannot write into parameter `n`
+// expect-error: cannot write into parameter `p`
+// expect-error: cannot write into parameter `arr`
+// expect-error: cannot write into parameter `buf`
+// expect-error: cannot write through `v` — it views elements of a read-only parameter
+
+const Point = struct {
+    x: i32,
+    y: i32,
+};
+
+fn bumpScalar(n: u32) u32 {
+    n = n + 1;
+    return n;
+}
+
+fn pokeField(p: Point) i32 {
+    p.x = 99;
+    return p.x;
+}
+
+fn pokeElement(arr: [4]u16) u16 {
+    arr[0] = 99;
+    return arr[0];
+}
+
+fn pokeSlice(buf: []u8) {
+    buf[0] = 1;
+}
+
+fn pokeThroughView(s: []u8) {
+    for v in s {
+        v = 0;
+    }
+}
+
+fn main() u8 {
+    var a: [4]u16 = [1, 2, 3, 4];
+    var pt: Point = Point { x: 1, y: 2 };
+    var b: [2]u8 = [0, 0];
+    bumpScalar(7);
+    pokeField(pt);
+    pokeElement(a);
+    pokeSlice(b[0..2]);
+    pokeThroughView(b[0..2]);
+    return 0;
+}
