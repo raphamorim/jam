@@ -1,0 +1,65 @@
+// String literals live in read-only data (writing them is a runtime
+// fault), so every write path into literal bytes is rejected: a bound
+// slice, a for-each element, a call result deriving from a literal
+// argument or returning one, a `mut` arg, and a struct field.
+// expect-error: cannot write through `s` — it views string literal bytes
+// expect-error: cannot write through `b` — it views string literal bytes
+// expect-error: cannot write through `g` — it views string literal bytes
+// expect-error: cannot write through `t` — it views string literal bytes
+// expect-error: cannot pass string literal storage as a `mut` argument
+// expect-error: cannot write through `p` — it views string literal bytes
+
+const { trim } = import("std").string;
+
+fn pokeBound() {
+    var s: []u8 = "hi";
+    s[0] = 88;
+}
+
+fn pokeForEach() {
+    for b in "abc" {
+        b = 0;
+    }
+}
+
+fn greet() []u8 {
+    return "hello";
+}
+
+fn pokeReturned() {
+    var g: []u8 = greet();
+    g[0] = 72;
+}
+
+fn pokeTrimmed() {
+    var t: []u8 = trim("  hi  ");
+    t[0] = 72;
+}
+
+fn fill(buf: mut []u8, b: u8) {
+    for v in buf {
+        v = b;
+    }
+}
+
+fn pokeMutArg() {
+    fill("abc", 0);
+}
+
+const Pair = struct {
+    data: []u8,
+    n: u32,
+};
+
+fn label() Pair {
+    return Pair { data: "static", n: 0 };
+}
+
+fn pokeStructField() {
+    var p: Pair = label();
+    p.data[0] = 104;
+}
+
+fn main() u8 {
+    return 0;
+}

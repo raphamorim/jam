@@ -98,6 +98,8 @@ enum Recv {
 struct WriteRoot {
     name: String,
     via_slice: bool,
+    /// Rooted at a string literal — the bytes live in read-only data.
+    literal: bool,
 }
 
 impl WriteRoot {
@@ -105,8 +107,32 @@ impl WriteRoot {
         WriteRoot {
             name,
             via_slice: false,
+            literal: false,
         }
     }
+    fn literal() -> Self {
+        WriteRoot {
+            name: String::new(),
+            via_slice: false,
+            literal: true,
+        }
+    }
+}
+
+/// Why a write root is read-only: it is (or views) a default-mode
+/// parameter's storage, or it points at string-literal bytes (rodata).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewSource {
+    Param,
+    Literal,
+}
+
+/// A callee's return-provenance summary: which parameters the returned
+/// value may view, and whether it may view string-literal bytes.
+#[derive(Clone, Default)]
+struct ReturnViews {
+    params: Vec<usize>,
+    literal: bool,
 }
 
 /// Result of analyzing a statement or expression.
@@ -154,11 +180,11 @@ struct Analyzer<'a, 'ctx> {
     /// rejected like writes into the parameter itself. Slice bindings
     /// initialized from such storage (directly or through a call that
     /// returns a view, e.g. `v.asSlice()`) join the set too.
-    readonly_views: HashSet<String>,
-    /// Cache: fn name -> parameter indices whose storage the fn's returned
-    /// slice may view (see `return_view_params`). Shared across the run;
-    /// summaries are position-independent facts about the callee.
-    view_summaries: std::cell::RefCell<HashMap<String, Vec<usize>>>,
+    readonly_views: HashMap<String, ViewSource>,
+    /// Cache: fn name -> return-provenance summary (see
+    /// `return_view_params`). Shared across the run; summaries are
+    /// position-independent facts about the callee.
+    view_summaries: std::cell::RefCell<HashMap<String, ReturnViews>>,
 }
 
 impl<'a, 'ctx> Analyzer<'a, 'ctx> {
@@ -174,7 +200,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             decl_depth: HashMap::new(),
             moved_bindings: HashSet::new(),
             moved_drop_bearing: HashSet::new(),
-            readonly_views: HashSet::new(),
+            readonly_views: HashMap::new(),
             view_summaries: std::cell::RefCell::new(HashMap::new()),
         }
     }
@@ -434,11 +460,11 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         self.readonly_views.remove(&name);
         if !init_idx.is_none()
             && self.type_contains_slice(type_idx, 8)
-            && self
+            && let Some(src) = self
                 .write_root(init_idx)
-                .is_some_and(|r| self.is_readonly_root(&r.name))
+                .and_then(|r| self.root_source(&r))
         {
-            self.readonly_views.insert(name.clone());
+            self.readonly_views.insert(name.clone(), src);
         }
 
         if init_idx.is_none() {
@@ -517,13 +543,16 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                         self.decl_depth.contains_key(&tname)
                     });
                 if is_view_carrier_local {
-                    if self
+                    match self
                         .write_root(NodeIdx::new(n.rhs))
-                        .is_some_and(|r| self.is_readonly_root(&r.name))
+                        .and_then(|r| self.root_source(&r))
                     {
-                        self.readonly_views.insert(tname);
-                    } else {
-                        self.readonly_views.remove(&tname);
+                        Some(src) => {
+                            self.readonly_views.insert(tname, src);
+                        }
+                        None => {
+                            self.readonly_views.remove(&tname);
+                        }
                     }
                 }
             }
@@ -727,15 +756,20 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         // A for-each var binds elements in place; when the iterable's storage
         // belongs to a read-only parameter, the var is a read-only view for
         // the body (membership is save/restored around shadowing).
-        let was_view = self.readonly_views.contains(&var_name);
-        let is_view = n.op == 1
-            && self
-                .write_root(start_idx)
-                .is_some_and(|root| self.is_readonly_root(&root.name));
-        if is_view {
-            self.readonly_views.insert(var_name.clone());
+        let was_view = self.readonly_views.get(&var_name).copied();
+        let view_src = if n.op == 1 {
+            self.write_root(start_idx)
+                .and_then(|root| self.root_source(&root))
         } else {
-            self.readonly_views.remove(&var_name);
+            None
+        };
+        match view_src {
+            Some(src) => {
+                self.readonly_views.insert(var_name.clone(), src);
+            }
+            None => {
+                self.readonly_views.remove(&var_name);
+            }
         }
 
         self.cond_depth += 1;
@@ -752,10 +786,13 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         }
         self.cond_depth -= 1;
 
-        if was_view {
-            self.readonly_views.insert(var_name);
-        } else {
-            self.readonly_views.remove(&var_name);
+        match was_view {
+            Some(src) => {
+                self.readonly_views.insert(var_name, src);
+            }
+            None => {
+                self.readonly_views.remove(&var_name);
+            }
         }
 
         // For-over-range assumes the body runs at least once (matches existing
@@ -800,9 +837,9 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         // read-only views inside their arm. Variant payload types are
         // resolved regardless, so arm bindings are typed for the write
         // checks (`s[0] = ...` needs `s`'s static type).
-        let scrut_view = self
+        let scrut_src = self
             .write_root(NodeIdx::new(n.lhs))
-            .is_some_and(|root| self.is_readonly_root(&root.name));
+            .and_then(|root| self.root_source(&root));
         let scrut_variants = self
             .lvalue_type(NodeIdx::new(n.lhs))
             .and_then(|t| self.ctx.enum_variants_of_type(t));
@@ -820,7 +857,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
 
             // Type and mark (or shadow-clear) this arm's payload bindings;
             // both are restored after the arm body.
-            let mut saved_views: Vec<(String, bool)> = Vec::new();
+            let mut saved_views: Vec<(String, Option<ViewSource>)> = Vec::new();
             let mut saved_types: Vec<(String, Option<TypeIdx>)> = Vec::new();
             if let Some((variant, names)) = self.pattern_payload_bindings(pat_idx) {
                 for (i, bname) in names.iter().enumerate() {
@@ -838,13 +875,16 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                             self.var_types.remove(bname);
                         }
                     }
-                    saved_views.push((bname.clone(), self.readonly_views.contains(bname)));
+                    saved_views.push((bname.clone(), self.readonly_views.get(bname).copied()));
                     // Untypeable payload on a viewed scrutinee: conservative.
                     let carries = payload_ty.is_none_or(|t| self.type_contains_slice(t, 8));
-                    if scrut_view && carries {
-                        self.readonly_views.insert(bname.clone());
-                    } else {
-                        self.readonly_views.remove(bname);
+                    match scrut_src {
+                        Some(src) if carries => {
+                            self.readonly_views.insert(bname.clone(), src);
+                        }
+                        _ => {
+                            self.readonly_views.remove(bname);
+                        }
                     }
                 }
             }
@@ -865,10 +905,13 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             cursor += arm_body_count;
 
             for (bname, was) in saved_views {
-                if was {
-                    self.readonly_views.insert(bname);
-                } else {
-                    self.readonly_views.remove(&bname);
+                match was {
+                    Some(src) => {
+                        self.readonly_views.insert(bname, src);
+                    }
+                    None => {
+                        self.readonly_views.remove(&bname);
+                    }
                 }
             }
             for (bname, prev) in saved_types {
@@ -1100,17 +1143,28 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             // wrap-the-write-in-a-helper bypass of the P2 write check.)
             if info.mode == ParamMode::Mut
                 && let Some(root) = self.write_root(info.arg_idx)
-                && self.is_readonly_root(&root.name)
+                && let Some(src) = self.root_source(&root)
             {
-                let root = root.name;
-                self.emit_error(
-                    format!(
-                        "cannot pass `{root}` as a `mut` argument — it is a read-only \
-                         borrow; take the parameter as `mut` in this fn's signature too"
-                    ),
-                    info.arg_idx,
-                    root,
-                );
+                let msg = if root.literal {
+                    "cannot pass string literal storage as a `mut` argument — its \
+                     bytes are read-only; copy them into a Vec or an array first"
+                        .to_string()
+                } else {
+                    let root = &root.name;
+                    match src {
+                        ViewSource::Param => format!(
+                            "cannot pass `{root}` as a `mut` argument — it is a \
+                             read-only borrow; take the parameter as `mut` in this \
+                             fn's signature too"
+                        ),
+                        ViewSource::Literal => format!(
+                            "cannot pass `{root}` as a `mut` argument — it views \
+                             string literal bytes; copy them into a Vec or an array \
+                             first"
+                        ),
+                    }
+                };
+                self.emit_error(msg, info.arg_idx, root.name);
             }
 
             // `move`-mode arg moves the caller's base binding.
@@ -1617,6 +1671,11 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 let (callee, _, _) = self.resolve_call(idx, param_ctx)?;
                 (!callee.return_type.is_none()).then_some(callee.return_type)
             }
+            AstTag::StringLit => Some(
+                self.ctx
+                    .type_pool
+                    .intern_slice(jam_syntax::ast_flat::builtin::U8),
+            ),
             _ => None,
         }
     }
@@ -1630,6 +1689,13 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         let n = *self.ctx.node_store.get(idx);
         match n.tag {
             AstTag::Variable => Some(WriteRoot::direct(self.str_name(n.lhs))),
+            // `""` is the zero-length placeholder: it has no writable byte,
+            // so it never taints (writes through an empty slice are an
+            // out-of-bounds bug of a different class).
+            AstTag::StringLit => {
+                (!self.ctx.string_pool.get(StringIdx::new(n.lhs)).is_empty())
+                    .then(WriteRoot::literal)
+            }
             AstTag::MemberAccess => {
                 let base = NodeIdx::new(n.lhs);
                 let k = self.ctx.type_pool.get(self.lvalue_type(base)?).kind;
@@ -1667,9 +1733,9 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             // read-only borrow — other derivations stay permissive.
             AstTag::Call => {
                 let (callee, recv, args) = self.resolve_call(idx, None)?;
-                let viewed = self.return_view_params(&callee, 4);
+                let summary = self.return_view_params(&callee, 4);
                 let offset = usize::from(recv.is_some());
-                for k in viewed {
+                for k in summary.params {
                     let root = if k == 0 && offset == 1 {
                         match recv.as_ref() {
                             Some(Recv::Name(s)) => Some(WriteRoot::direct(s.clone())),
@@ -1680,7 +1746,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                         args.get(k - offset).and_then(|&a| self.write_root(a))
                     };
                     if let Some(mut r) = root
-                        && self.is_readonly_root(&r.name)
+                        && self.root_source(&r).is_some()
                     {
                         // The call boundary itself is a borrow of the
                         // argument's tree: writes through the result are
@@ -1688,6 +1754,11 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                         r.via_slice = true;
                         return Some(r);
                     }
+                }
+                if summary.literal {
+                    let mut r = WriteRoot::literal();
+                    r.via_slice = true;
+                    return Some(r);
                 }
                 None
             }
@@ -1860,24 +1931,24 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     /// excluded: their pointee is governed by the pointer's own
     /// `mut`/`const`, not the parameter mode. Extern fns view nothing.
     /// Summaries are cached by fn name; `depth` bounds transitive chasing.
-    fn return_view_params(&self, callee: &FunctionAST, depth: u32) -> Vec<usize> {
+    fn return_view_params(&self, callee: &FunctionAST, depth: u32) -> ReturnViews {
         if depth == 0 || callee.is_extern || callee.return_type.is_none() {
-            return Vec::new();
+            return ReturnViews::default();
         }
         if !self.type_contains_slice(callee.return_type, 8) {
-            return Vec::new();
+            return ReturnViews::default();
         }
         if let Some(v) = self.view_summaries.borrow().get(&callee.name) {
             return v.clone();
         }
         let mut returns = Vec::new();
         self.collect_returns(&callee.body, &mut returns);
-        let mut out: Vec<usize> = Vec::new();
+        let mut out = ReturnViews::default();
         for r in returns {
-            self.expr_view_params(callee, r, depth, &mut out);
+            self.expr_view_params(callee, r, depth, &mut out.params, &mut out.literal);
         }
-        out.sort_unstable();
-        out.dedup();
+        out.params.sort_unstable();
+        out.params.dedup();
         self.view_summaries
             .borrow_mut()
             .insert(callee.name.clone(), out.clone());
@@ -2010,6 +2081,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         idx: NodeIdx,
         depth: u32,
         out: &mut Vec<usize>,
+        lit: &mut bool,
     ) {
         let push_param = |name: &str, out: &mut Vec<usize>| {
             if let Some(k) = fn_ast.args.iter().position(|p| p.name == name) {
@@ -2050,7 +2122,15 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                     &mut sources,
                 );
                 for src in sources {
-                    self.expr_view_params(fn_ast, src, depth - 1, out);
+                    self.expr_view_params(fn_ast, src, depth - 1, out, lit);
+                }
+            }
+            // A string literal flowing into the (slice-carrying) result:
+            // the returned value views read-only bytes. `""` placeholders
+            // have no writable byte and don't taint.
+            AstTag::StringLit => {
+                if !self.ctx.string_pool.get(StringIdx::new(n.lhs)).is_empty() {
+                    *lit = true;
                 }
             }
             AstTag::MemberAccess
@@ -2058,7 +2138,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             | AstTag::Slice
             | AstTag::Deref
             | AstTag::AsCast => {
-                self.expr_view_params(fn_ast, NodeIdx::new(n.lhs), depth, out);
+                self.expr_view_params(fn_ast, NodeIdx::new(n.lhs), depth, out, lit);
             }
             // Aggregate literals carry views built from their
             // slice-carrying element / field initializers
@@ -2077,7 +2157,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                             .is_none_or(|(_, t)| self.type_contains_slice(*t, 8))
                     });
                     if carries {
-                        self.expr_view_params(fn_ast, field_expr, depth, out);
+                        self.expr_view_params(fn_ast, field_expr, depth, out, lit);
                     }
                 }
             }
@@ -2086,24 +2166,27 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 let count = self.extra(extra);
                 for i in 0..count {
                     let elem = NodeIdx::new(self.extra(extra + 1 + i));
-                    self.expr_view_params(fn_ast, elem, depth, out);
+                    self.expr_view_params(fn_ast, elem, depth, out, lit);
                 }
             }
             AstTag::Call => {
                 if let Some((inner, recv, args)) = self.resolve_call(idx, Some(fn_ast)) {
-                    let viewed = self.return_view_params(&inner, depth - 1);
+                    let inner_summary = self.return_view_params(&inner, depth - 1);
+                    if inner_summary.literal {
+                        *lit = true;
+                    }
                     let offset = usize::from(recv.is_some());
-                    for k in viewed {
+                    for k in inner_summary.params {
                         if k == 0 && offset == 1 {
                             match recv.as_ref() {
                                 Some(Recv::Name(s)) => push_param(s, out),
                                 Some(Recv::Expr(e)) => {
-                                    self.expr_view_params(fn_ast, *e, depth, out);
+                                    self.expr_view_params(fn_ast, *e, depth, out, lit);
                                 }
                                 None => {}
                             }
                         } else if let Some(&a) = args.get(k - offset) {
-                            self.expr_view_params(fn_ast, a, depth, out);
+                            self.expr_view_params(fn_ast, a, depth, out, lit);
                         }
                     }
                 } else if n.flags & 1 == 0 {
@@ -2130,7 +2213,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                                     .is_none_or(|&t| self.type_contains_slice(t, 8));
                                 if carries {
                                     let a = NodeIdx::new(self.extra(extra + 1 + i));
-                                    self.expr_view_params(fn_ast, a, depth, out);
+                                    self.expr_view_params(fn_ast, a, depth, out, lit);
                                 }
                             }
                         }
@@ -2159,15 +2242,19 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                             .get(i)
                             .is_none_or(|&t| self.type_contains_slice(t, 8))
                         {
-                            self.expr_view_params(fn_ast, a, depth, out);
+                            self.expr_view_params(fn_ast, a, depth, out, lit);
                         }
                     }
                 } else if let Some(type_name) = self.ctx.struct_name_of(recv_ty)
                     && let Some(f) = self.ctx.get_function_ast(&format!("{type_name}.{method}"))
                 {
-                    for k in self.return_view_params(&f, depth - 1) {
+                    let inner_summary = self.return_view_params(&f, depth - 1);
+                    if inner_summary.literal {
+                        *lit = true;
+                    }
+                    for k in inner_summary.params {
                         if let Some(&a) = args.get(k) {
-                            self.expr_view_params(fn_ast, a, depth, out);
+                            self.expr_view_params(fn_ast, a, depth, out, lit);
                         }
                     }
                 }
@@ -2218,23 +2305,47 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     /// default-mode parameter (not shadowed by a local) or a for-each view
     /// over one?
     fn is_readonly_root(&self, name: &str) -> bool {
-        if self.readonly_views.contains(name) {
+        if self.readonly_views.contains_key(name) {
             return true;
         }
         self.param_modes.get(name) == Some(&ParamMode::Let)
             && !self.decl_depth.contains_key(name)
     }
 
-    /// Reject an assignment whose destination is owned by a read-only
-    /// parameter (directly or through a view of one).
+    /// Why (if at all) `wr`'s storage is read-only.
+    fn root_source(&self, wr: &WriteRoot) -> Option<ViewSource> {
+        if wr.literal {
+            return Some(ViewSource::Literal);
+        }
+        if let Some(&src) = self.readonly_views.get(&wr.name) {
+            return Some(src);
+        }
+        (self.param_modes.get(&wr.name) == Some(&ParamMode::Let)
+            && !self.decl_depth.contains_key(&wr.name))
+        .then_some(ViewSource::Param)
+    }
+
+    /// Reject an assignment whose destination is owned by read-only
+    /// storage: a default-mode parameter, a view of one, or string-literal
+    /// bytes.
     fn check_readonly_param_write(&mut self, target: NodeIdx) {
         let Some(wr) = self.write_root(target) else {
             return;
         };
-        let root = wr.name;
-        if !self.is_readonly_root(&root) {
+        if wr.literal {
+            self.emit_error(
+                "cannot write into string literal storage — its bytes are \
+                 read-only; copy them into a Vec or an array first"
+                    .to_string(),
+                target,
+                String::new(),
+            );
             return;
         }
+        let Some(source) = self.root_source(&wr) else {
+            return;
+        };
+        let root = wr.name;
         if self.param_modes.get(&root) == Some(&ParamMode::Let)
             && !self.decl_depth.contains_key(&root)
         {
@@ -2257,14 +2368,17 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         if self.var_types.contains_key(&root) && !wr.via_slice {
             return;
         }
-        self.emit_error(
-            format!(
+        let msg = match source {
+            ViewSource::Param => format!(
                 "cannot write through `{root}` — it views elements of a read-only \
                  parameter; take the parameter as `mut` in the signature"
             ),
-            target,
-            root,
-        );
+            ViewSource::Literal => format!(
+                "cannot write through `{root}` — it views string literal bytes; \
+                 copy them into a Vec or an array first"
+            ),
+        };
+        self.emit_error(msg, target, root);
     }
 
     fn emit_error(&mut self, message: String, anchor: NodeIdx, var_name: String) {

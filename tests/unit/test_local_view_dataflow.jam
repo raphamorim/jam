@@ -48,11 +48,13 @@ fn label(v: Vec(u8), count: u32) Pair {
 }
 
 fn rewire(v: Vec(u8), count: u32) u32 {
-    var p: Pair = label(v, count);
+    var q: Pair = label(v, count);
     var owned: [1]u8 = [65];
-    p.data = owned[0..1];
-    p.data[0] = 66;       // owned storage — compiles because `label`'s
-    return p.data[0] as u32;   // summary carries no view of `v`
+    // `label`'s result views literal bytes; a WHOLE rebind onto owned
+    // storage releases the view and restores writability.
+    q = Pair { data: owned[0..1], n: q.n };
+    q.data[0] = 66;
+    return (q.data[0] as u32) + q.n;
 }
 
 tfn scalarWritesDoNotTaint() {
@@ -61,5 +63,5 @@ tfn scalarWritesDoNotTaint() {
     var p: Pair = label(v, 3);
     assert(p.n, 3);
     assert(p.data[0] as u32, 115);   // 's' — reads through are fine
-    assert(rewire(v, 2), 66);
+    assert(rewire(v, 2), 68);
 }

@@ -1,0 +1,41 @@
+// String literals live in read-only data; the write checks treat them
+// as a view source (rejections in reject_literal_write.jam). Reads,
+// rebinds onto owned storage, and the copy-first idiom stay legal.
+// `""` placeholders have no writable byte and never taint.
+
+const { assert } = import("test");
+const { Vec } = import("std").collections;
+const { eq, trim } = import("std").string;
+
+tfn readsThroughLiteralsAreFine() {
+    var s: []u8 = "hello";
+    assert(s[1] as u32, 101);
+    assert(s.len as u32, 5);
+    const t: []u8 = trim("  hi ");
+    assert(eq(t, "hi") as u8, 1);
+}
+
+tfn rebindOntoOwnedRestoresWrites() {
+    var s: []u8 = "hello";
+    var arr: [2]u8 = [0, 0];
+    s = arr[0..2];
+    s[0] = 9;
+    assert(arr[0] as u32, 9);
+}
+
+tfn copyFirstIdiom() {
+    var buf: Vec(u8) = Vec(u8).empty();
+    buf.appendSlice("hi");
+    var view: []u8 = buf.asSlice();
+    view[0] = 72;
+    assert(buf[0] as u32, 72);
+    assert(buf[1] as u32, 105);
+}
+
+tfn emptyPlaceholderDoesNotTaint() {
+    var s: []u8 = "";
+    var arr: [2]u8 = [0, 0];
+    s = arr[0..2];
+    s[1] = 7;
+    assert(arr[1] as u32, 7);
+}
