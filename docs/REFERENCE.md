@@ -1025,7 +1025,10 @@ in a struct's fields (`Pair { data: v.asSlice(), n: 0 }`), or in an enum payload
 from, so views of a read-only parameter reject writes no matter how many bindings,
 calls, or `match` arms they pass through, including locals assembled inside the
 callee and then returned (`var p = ...; p.data = v.asSlice(); return p;`). Scalar
-payloads and fields are plain copies and stay freely mutable. A view-carrying struct still owns its
+payloads and fields are plain copies and stay freely mutable. View state is per
+field: `p.data = owned;` releases just that field for writing, a later
+`p.data = v.asSlice();` re-views it, and a whole rebind of `p` recomputes
+everything. A view-carrying struct still owns its
 inline fields: `p.n = 5` and whole rebinds stay legal; only writes reaching the
 borrowed elements are rejected. Passing read-only storage as a `mut`
 argument or calling a `mut self` method on it, directly (`v.push(1)`) or through a
