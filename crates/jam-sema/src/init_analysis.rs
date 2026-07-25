@@ -26,9 +26,9 @@ use std::collections::{HashMap, HashSet};
 use jam_core::index::{ExtraIdx, NodeIdx, StringIdx, TypeIdx};
 use jam_core::param_mode::ParamMode;
 use jam_syntax::ast::FunctionAST;
-use jam_syntax::ast_flat::{AstTag, TypeKind};
+use jam_syntax::ast_flat::{AstNode, AstTag, TypeKind};
 
-use crate::codegen_context::CodegenContext;
+use crate::codegen_context::{CodegenContext, EnumVariantInfo};
 
 /// Per-binding initialization state, a 2-bit lattice. Merge is bitwise OR.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -1546,24 +1546,35 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     /// typed (unregistered types, unions). Purely a helper for the
     /// read-only-parameter write check — permissive on None.
     fn lvalue_type(&self, idx: NodeIdx) -> Option<TypeIdx> {
-        self.lvalue_type_in(idx, None)
+        self.lvalue_type_in(idx, None, None)
     }
 
     /// `lvalue_type` scoped to `param_ctx`: when summarizing a callee's
-    /// body, root Variables resolve against ITS parameter list (never the
-    /// current function's bindings — that would be the wrong scope).
-    fn lvalue_type_in(&self, idx: NodeIdx, param_ctx: Option<&FunctionAST>) -> Option<TypeIdx> {
+    /// body, root Variables resolve against ITS parameter list (plus its
+    /// collected local decls via `local_ctx`) — never the current
+    /// function's bindings, which would be the wrong scope.
+    fn lvalue_type_in(
+        &self,
+        idx: NodeIdx,
+        param_ctx: Option<&FunctionAST>,
+        local_ctx: Option<&HashMap<String, TypeIdx>>,
+    ) -> Option<TypeIdx> {
         let n = *self.ctx.node_store.get(idx);
         match n.tag {
             AstTag::Variable => {
                 let name = self.str_name(n.lhs);
+                if let Some(locals) = local_ctx
+                    && let Some(&t) = locals.get(&name)
+                {
+                    return Some(t);
+                }
                 match param_ctx {
                     Some(f) => f.args.iter().find(|p| p.name == name).map(|p| p.ty),
                     None => self.var_types.get(&name).copied(),
                 }
             }
             AstTag::MemberAccess => {
-                let mut bt = self.lvalue_type_in(NodeIdx::new(n.lhs), param_ctx)?;
+                let mut bt = self.lvalue_type_in(NodeIdx::new(n.lhs), param_ctx, local_ctx)?;
                 let k = self.ctx.type_pool.get(bt);
                 if k.kind == TypeKind::PtrSingle {
                     bt = TypeIdx::new(k.a);
@@ -1576,7 +1587,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                     .map(|(_, ty)| ty)
             }
             AstTag::Index | AstTag::Slice => {
-                let bt = self.lvalue_type_in(NodeIdx::new(n.lhs), param_ctx)?;
+                let bt = self.lvalue_type_in(NodeIdx::new(n.lhs), param_ctx, local_ctx)?;
                 let k = self.ctx.type_pool.get(bt);
                 match k.kind {
                     TypeKind::Array | TypeKind::Slice | TypeKind::PtrMany => {
@@ -1590,7 +1601,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 }
             }
             AstTag::Deref => {
-                let bt = self.lvalue_type_in(NodeIdx::new(n.lhs), param_ctx)?;
+                let bt = self.lvalue_type_in(NodeIdx::new(n.lhs), param_ctx, local_ctx)?;
                 let k = self.ctx.type_pool.get(bt);
                 match k.kind {
                     TypeKind::PtrSingle | TypeKind::PtrMany => Some(TypeIdx::new(k.a)),
@@ -1755,7 +1766,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             }
             let recv_node = NodeIdx::new(chain.lhs);
             let method = self.str_name(chain.rhs);
-            let recv_ty = self.lvalue_type_in(recv_node, param_ctx)?;
+            let recv_ty = self.lvalue_type_in(recv_node, param_ctx, None)?;
             let f = method_on(recv_ty, &method)?;
             return Some((f, Some(Recv::Expr(recv_node)), args));
         }
@@ -1868,6 +1879,124 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         out
     }
 
+    /// Root variable name of a pure lvalue chain (no typing needed) —
+    /// `p.data[0]` → `p`. None off-chain.
+    fn ast_chain_root_name(&self, idx: NodeIdx) -> Option<String> {
+        let n = *self.ctx.node_store.get(idx);
+        match n.tag {
+            AstTag::Variable => Some(self.str_name(n.lhs)),
+            AstTag::MemberAccess | AstTag::Index | AstTag::Slice => {
+                self.ast_chain_root_name(NodeIdx::new(n.lhs))
+            }
+            _ => None,
+        }
+    }
+
+    /// Collect declared types of every `var`/`const` local in `stmts`
+    /// (recursing through if/while/for/match bodies) — the local scope for
+    /// typing target chains during summary dataflow.
+    fn collect_local_types(&self, stmts: &[NodeIdx], out: &mut HashMap<String, TypeIdx>) {
+        self.walk_stmts(stmts, &mut |n: &AstNode| {
+            if n.tag == AstTag::VarDecl {
+                let name = self.str_name(self.extra(n.lhs));
+                let ty = TypeIdx::new(self.extra(n.lhs + 1));
+                if !ty.is_none() {
+                    out.insert(name, ty);
+                }
+            }
+        });
+    }
+
+    /// RHS expressions of every write landing in `name`'s slice-carrying
+    /// storage inside `stmts`: its decl init and any assignment whose
+    /// target roots at `name` and whose target type carries a slice
+    /// (element writes into scalars don't change what `name` views).
+    fn collect_local_view_sources(
+        &self,
+        fn_ast: &FunctionAST,
+        local_types: &HashMap<String, TypeIdx>,
+        stmts: &[NodeIdx],
+        name: &str,
+        out: &mut Vec<NodeIdx>,
+    ) {
+        self.walk_stmts(stmts, &mut |n: &AstNode| match n.tag {
+            AstTag::VarDecl => {
+                if self.str_name(self.extra(n.lhs)) == name {
+                    let init = NodeIdx::new(self.extra(n.lhs + 2));
+                    if !init.is_none() {
+                        out.push(init);
+                    }
+                }
+            }
+            AstTag::Assign => {
+                let target = NodeIdx::new(n.lhs);
+                if self.ast_chain_root_name(target).as_deref() == Some(name)
+                    && self
+                        .lvalue_type_in(target, Some(fn_ast), Some(local_types))
+                        .is_none_or(|t| self.type_contains_slice(t, 8))
+                {
+                    out.push(NodeIdx::new(n.rhs));
+                }
+            }
+            _ => {}
+        });
+    }
+
+    /// Apply `visit` to every statement in `stmts`, recursing through
+    /// if/while/for bodies and match arms.
+    fn walk_stmts(&self, stmts: &[NodeIdx], visit: &mut dyn FnMut(&AstNode)) {
+        for &s in stmts {
+            if s.is_none() {
+                continue;
+            }
+            let n = *self.ctx.node_store.get(s);
+            visit(&n);
+            match n.tag {
+                AstTag::IfNode => {
+                    let extra = n.rhs;
+                    let count = self.extra(extra) + self.extra(extra + 1);
+                    let body: Vec<NodeIdx> = (0..count)
+                        .map(|i| NodeIdx::new(self.extra(extra + 2 + i)))
+                        .collect();
+                    self.walk_stmts(&body, visit);
+                }
+                AstTag::WhileNode => {
+                    let extra = n.rhs;
+                    let count = self.extra(extra);
+                    let body: Vec<NodeIdx> = (0..count)
+                        .map(|i| NodeIdx::new(self.extra(extra + 1 + i)))
+                        .collect();
+                    self.walk_stmts(&body, visit);
+                }
+                AstTag::ForNode => {
+                    let extra = n.lhs;
+                    let count = self.extra(extra + 3);
+                    let body: Vec<NodeIdx> = (0..count)
+                        .map(|i| NodeIdx::new(self.extra(extra + 4 + i)))
+                        .collect();
+                    self.walk_stmts(&body, visit);
+                }
+                AstTag::MatchNode => {
+                    let extra = n.rhs;
+                    let arm_count = self.extra(extra);
+                    let mut cursor = 1u32;
+                    let mut body: Vec<NodeIdx> = Vec::new();
+                    for _ in 0..arm_count {
+                        cursor += 1; // pattern
+                        let c = self.extra(extra + cursor);
+                        cursor += 1;
+                        for i in 0..c {
+                            body.push(NodeIdx::new(self.extra(extra + cursor + i)));
+                        }
+                        cursor += c;
+                    }
+                    self.walk_stmts(&body, visit);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Which of `fn_ast`'s parameters the expression at `idx` (inside
     /// `fn_ast`'s body) derives from, chasing projections and calls.
     fn expr_view_params(
@@ -1885,9 +2014,40 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 }
             }
         };
+        if depth == 0 {
+            return;
+        }
         let n = *self.ctx.node_store.get(idx);
         match n.tag {
-            AstTag::Variable => push_param(&self.str_name(n.lhs), out),
+            AstTag::Variable => {
+                let vname = self.str_name(n.lhs);
+                if fn_ast.args.iter().any(|p| p.name == vname) {
+                    push_param(&vname, out);
+                    return;
+                }
+                // A LOCAL: its views are whatever the body stored into its
+                // slice-carrying storage (`var p = ...; p.data = v.asSlice();
+                // return p;`). Depth bounds hop chains and cycles.
+                let mut local_types = HashMap::new();
+                self.collect_local_types(&fn_ast.body, &mut local_types);
+                if !local_types
+                    .get(&vname)
+                    .is_some_and(|&t| self.type_contains_slice(t, 8))
+                {
+                    return;
+                }
+                let mut sources = Vec::new();
+                self.collect_local_view_sources(
+                    fn_ast,
+                    &local_types,
+                    &fn_ast.body,
+                    &vname,
+                    &mut sources,
+                );
+                for src in sources {
+                    self.expr_view_params(fn_ast, src, depth - 1, out);
+                }
+            }
             AstTag::MemberAccess
             | AstTag::Index
             | AstTag::Slice
@@ -1895,14 +2055,25 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             | AstTag::AsCast => {
                 self.expr_view_params(fn_ast, NodeIdx::new(n.lhs), depth, out);
             }
-            // Aggregate literals carry views built from their element /
-            // field initializers (`Pair { data: v.asSlice(), n: 0 }`).
+            // Aggregate literals carry views built from their
+            // slice-carrying element / field initializers
+            // (`Pair { data: v.asSlice(), n: 0 }` — `n` is a plain copy).
             AstTag::StructLit => {
+                let lit_ty = TypeIdx::new(n.lhs);
+                let fields = self.ctx.struct_fields(lit_ty);
                 let extra = n.rhs;
                 let count = self.extra(extra);
                 for i in 0..count {
+                    let field_name = self.str_name(self.extra(extra + 1 + i * 2));
                     let field_expr = NodeIdx::new(self.extra(extra + 2 + i * 2));
-                    self.expr_view_params(fn_ast, field_expr, depth, out);
+                    let carries = fields.as_ref().is_none_or(|fs| {
+                        fs.iter()
+                            .find(|(fname, _)| *fname == field_name)
+                            .is_none_or(|(_, t)| self.type_contains_slice(*t, 8))
+                    });
+                    if carries {
+                        self.expr_view_params(fn_ast, field_expr, depth, out);
+                    }
                 }
             }
             AstTag::ArrayLit => {
@@ -1931,28 +2102,31 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                         }
                     }
                 } else if n.flags & 1 == 0 {
-                    // Enum-variant ctor (`ParseResult.Ok(x)`): the payload
-                    // exprs flow into the returned value. The receiver may
-                    // be the enum's registry name or a module-scope alias
-                    // of an instantiation.
+                    // Enum-variant ctor (`ParseResult.Ok(x)`): the
+                    // slice-carrying payload exprs flow into the returned
+                    // value. The receiver may be the enum's registry name
+                    // or a module-scope alias of an instantiation.
                     let callee_name = self.str_name(n.lhs);
                     if let Some(dot) = callee_name.find('.')
                         && callee_name.rfind('.') == Some(dot)
                     {
                         let (recv, method) = (&callee_name[..dot], &callee_name[dot + 1..]);
-                        let is_ctor = self.is_enum_variant_ctor(recv, method) || {
-                            let aliased = self.ctx.lookup_type_alias(recv);
-                            !aliased.is_none()
-                                && self.ctx.enum_variants_of_type(aliased).is_some_and(|vs| {
-                                    vs.iter().any(|v| v.name == method)
-                                })
-                        };
-                        if is_ctor {
+                        let variants = self.ctor_variants(recv);
+                        let payloads = variants
+                            .as_ref()
+                            .and_then(|vs| vs.iter().find(|v| v.name == method))
+                            .map(|v| v.payload_types.clone());
+                        if let Some(payloads) = payloads {
                             let extra = n.rhs;
                             let count = self.extra(extra);
                             for i in 0..count {
-                                let a = NodeIdx::new(self.extra(extra + 1 + i));
-                                self.expr_view_params(fn_ast, a, depth, out);
+                                let carries = payloads
+                                    .get(i as usize)
+                                    .is_none_or(|&t| self.type_contains_slice(t, 8));
+                                if carries {
+                                    let a = NodeIdx::new(self.extra(extra + 1 + i));
+                                    self.expr_view_params(fn_ast, a, depth, out);
+                                }
                             }
                         }
                     }
@@ -1969,13 +2143,19 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 let args: Vec<NodeIdx> = (0..count)
                     .map(|i| NodeIdx::new(self.extra(extra + 2 + i)))
                     .collect();
-                let is_ctor = self
+                let ctor_payloads = self
                     .ctx
                     .enum_variants_of_type(recv_ty)
-                    .is_some_and(|vs| vs.iter().any(|v| v.name == method));
-                if is_ctor {
-                    for &a in &args {
-                        self.expr_view_params(fn_ast, a, depth, out);
+                    .and_then(|vs| vs.iter().find(|v| v.name == method).cloned())
+                    .map(|v| v.payload_types);
+                if let Some(payloads) = ctor_payloads {
+                    for (i, &a) in args.iter().enumerate() {
+                        if payloads
+                            .get(i)
+                            .is_none_or(|&t| self.type_contains_slice(t, 8))
+                        {
+                            self.expr_view_params(fn_ast, a, depth, out);
+                        }
                     }
                 } else if let Some(type_name) = self.ctx.struct_name_of(recv_ty)
                     && let Some(f) = self.ctx.get_function_ast(&format!("{type_name}.{method}"))
@@ -1989,6 +2169,26 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             }
             _ => {}
         }
+    }
+
+    /// Variants of the enum named by a ctor receiver — the registry name,
+    /// its body-module-qualified spelling, or a module-scope alias of an
+    /// instantiation.
+    fn ctor_variants(&self, recv: &str) -> Option<Vec<EnumVariantInfo>> {
+        if let Some(vs) = self.ctx.enum_variants_by_name(recv) {
+            return Some(vs);
+        }
+        let bm = self.ctx.current_body_module();
+        if !bm.is_empty()
+            && let Some(vs) = self.ctx.enum_variants_by_name(&format!("{bm}.{recv}"))
+        {
+            return Some(vs);
+        }
+        let aliased = self.ctx.lookup_type_alias(recv);
+        if aliased.is_none() {
+            return None;
+        }
+        self.ctx.enum_variants_of_type(aliased)
     }
 
     /// Payload bindings of a match-arm pattern: (variant name, binding
@@ -2087,7 +2287,7 @@ fn merge_maps(a: &NameMap, b: &NameMap) -> NameMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen_context::CodegenContext;
+    use crate::codegen_context::{CodegenContext, EnumVariantInfo};
     use jam_llvm::Context;
     use jam_syntax::lexer::Lexer;
     use jam_syntax::parser::Parser;

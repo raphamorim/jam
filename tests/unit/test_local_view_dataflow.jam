@@ -1,0 +1,65 @@
+// Summary dataflow through callee locals: a returned local carries the
+// views of everything the body stored into its slice-carrying storage
+// (`var p = ...; p.data = v.asSlice(); return p;`). Scalar-field writes
+// into the local don't taint the summary. Rejections live in
+// reject_param_view_escape.jam.
+
+const { assert } = import("test");
+const { Vec } = import("std").collections;
+
+const Pair = struct {
+    data: []u8,
+    n: u32,
+};
+
+fn wrap(v: Vec(u8)) Pair {
+    var p: Pair = Pair { data: "", n: 0 };
+    p.data = v.asSlice();
+    p.n = 7;
+    return p;
+}
+
+fn bump(v: mut Vec(u8)) {
+    var p: Pair = wrap(v);
+    p.data[0] = p.data[0] + 1;
+}
+
+tfn assembledViewFlowsBack() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(10);
+    bump(v);
+    assert(v[0] as u32, 11);
+}
+
+tfn assembledViewOnLocalWrites() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(10);
+    var p: Pair = wrap(v);
+    assert(p.n, 7);
+    p.data[0] = 42;
+    assert(v[0] as u32, 42);
+}
+
+// Scalar-field writes into the returned local don't make it a view.
+fn label(v: Vec(u8), count: u32) Pair {
+    var p: Pair = Pair { data: "static", n: 0 };
+    p.n = count;
+    return p;
+}
+
+fn rewire(v: Vec(u8), count: u32) u32 {
+    var p: Pair = label(v, count);
+    var owned: [1]u8 = [65];
+    p.data = owned[0..1];
+    p.data[0] = 66;       // owned storage — compiles because `label`'s
+    return p.data[0] as u32;   // summary carries no view of `v`
+}
+
+tfn scalarWritesDoNotTaint() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    var p: Pair = label(v, 3);
+    assert(p.n, 3);
+    assert(p.data[0] as u32, 115);   // 's' — reads through are fine
+    assert(rewire(v, 2), 66);
+}
