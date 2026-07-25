@@ -83,6 +83,9 @@ pub enum AstTag {
 
     Spread, // lhs = StringIdx (pack name) — `args...` in a call-arg list
 
+    TypeLit, // lhs = TypeIdx — a structural type in expression position
+             // (generic-call args: `Result([]u8, u32)`)
+
     Count, // sentinel for table sizing
 }
 

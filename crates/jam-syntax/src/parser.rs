@@ -1822,6 +1822,32 @@ impl<'a> Parser<'a> {
     /// parens), optionally wrapped by a trailing `...` into a pack-spread
     /// node (`args...` — forwards a variadic cfn's pack).
     fn parse_call_arg(&mut self) -> PResult<NodeIdx> {
+        // A structural TYPE in argument position (`Result([]u8, u32)`,
+        // `Vec(*const u8)`, `Set([4]f32)`). Speculative: `[` also starts
+        // array literals, so the parse only sticks when a type parses
+        // clean AND the argument ends right after; otherwise rewind
+        // (dropping any diagnostics the attempt pushed).
+        if self.check(TokenType::OpenBracket)
+            || self.check(TokenType::Star)
+            || self.check(TokenType::Fn)
+        {
+            let saved = self.current;
+            let saved_diags = self.diagnostics.len();
+            if let Ok(ty) = self.parse_type()
+                && (self.check(TokenType::Comma) || self.check(TokenType::CloseParen))
+            {
+                return Ok(self.emit(AstNode {
+                    tag: AstTag::TypeLit,
+                    op: 0,
+                    flags: 0,
+                    main_token: 0,
+                    lhs: ty.raw(),
+                    rhs: 0,
+                }));
+            }
+            self.current = saved;
+            self.diagnostics.truncate_to(saved_diags);
+        }
         let e = self.parse_logical_or()?;
         if self.check(TokenType::Ellipsis) {
             self.advance();
