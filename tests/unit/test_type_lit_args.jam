@@ -1,0 +1,66 @@
+// Structural types in generic-argument position: `Result([]u8, u32)`,
+// `Option(*const u8)`, `sizeOfIt([4]u16)`. The parser tries a type when
+// an argument starts with `[` / `*` / `fn` and the type fills the whole
+// argument; array literals still parse as values otherwise.
+
+const { assert } = import("test");
+const { Vec } = import("std").collections;
+const { Result } = import("std").result;
+const { Option } = import("std").option;
+const { eq } = import("std").string;
+
+const BytesResult = Result([]u8, u32);
+const PtrOption = Option(*const u8);
+
+fn tryView(v: Vec(u8)) BytesResult {
+    if (v.len() == 0) {
+        return BytesResult.Err(0);
+    }
+    return BytesResult.Ok(v.asSlice());
+}
+
+tfn sliceArgInAlias() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(104);
+    v.push(105);
+    match (tryView(v)) {
+        Ok(s)  { assert(eq(s, "hi") as u8, 1); }
+        Err(e) { assert(1, 0); }
+    }
+    var empty: Vec(u8) = Vec(u8).empty();
+    match (tryView(empty)) {
+        Ok(s)  { assert(1, 0); }
+        Err(e) { assert(e, 0); }
+    }
+}
+
+tfn pointerArgInAlias() {
+    var x: u8 = 7;
+    const po: PtrOption = PtrOption.Some(&x);
+    match (po) {
+        Some(p) { assert(p.* as u32, 7); }
+        None    { assert(1, 0); }
+    }
+}
+
+fn sizeOfIt(T: type) u64 {
+    return @sizeOf(T);
+}
+
+tfn structuralArgsToTypeParams() {
+    assert(sizeOfIt([]u8) as u32, 16);        // slice = {ptr, len}
+    assert(sizeOfIt(*const u8) as u32, 8);
+    assert(sizeOfIt([4]u16) as u32, 8);
+    assert(sizeOfIt(u8) as u32, 1);           // names still work
+}
+
+fn sum3(s: []u8) u32 {
+    return (s[0] as u32) + (s[1] as u32) + (s[2] as u32);
+}
+
+tfn arrayLiteralArgsStillValues() {
+    var arr: [3]u8 = [1, 2, 3];
+    assert(sum3(arr[0..3]), 6);
+    var one: [1]u8 = [9];
+    assert(one[0] as u32, 9);
+}

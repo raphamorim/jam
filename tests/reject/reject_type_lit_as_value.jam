@@ -1,0 +1,12 @@
+// A structural type in argument position only makes sense for generic
+// instantiations; handing one to a runtime parameter is rejected.
+// expect-error: a type is not a runtime value here
+
+fn takesByte(x: u64) u64 {
+    return x;
+}
+
+fn main() u8 {
+    takesByte([]u8);
+    return 0;
+}

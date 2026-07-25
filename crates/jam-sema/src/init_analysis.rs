@@ -310,6 +310,11 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 state,
                 terminated: false,
             },
+            // A type spelled in argument position — nothing to track.
+            AstTag::TypeLit => StmtResult {
+                state,
+                terminated: false,
+            },
             AstTag::TypeMethodCall => self.analyze_type_method_call(idx, &n, state),
             AstTag::BinaryOp => {
                 let r = self.analyze_node(NodeIdx::new(n.lhs), state);

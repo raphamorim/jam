@@ -1298,6 +1298,13 @@ fn astgen_expr(gctx: &mut AstGenCtx, node: NodeIdx, expected: TypeIdx) -> Result
             astgen_continue(gctx)?;
             Ok(NO_JIR_REF)
         }
+        AstTag::TypeLit => Ok(recover_here(
+            gctx,
+            "astgen: a type is not a runtime value here — structural type \
+             arguments only apply to generic instantiations"
+                .to_string(),
+            TypeIdx::NONE,
+        )),
         other => Err(format!("astgen: node {other:?} not yet ported")),
     }
 }
@@ -3406,6 +3413,13 @@ fn type_arg_from_expr(
     param_name: &str,
 ) -> Result<TypeIdx, String> {
     let n = gctx.ctx.node_store.get(arg_idx);
+    // A structural type spelled at the call site (`f([]u8, ...)`): the
+    // parser interned it; element Named refs still get subst/qualification.
+    if n.tag == AstTag::TypeLit {
+        let t = gctx.ctx.apply_current_subst(TypeIdx::new(n.lhs));
+        let bm = gctx.ctx.current_body_module();
+        return Ok(gctx.ctx.requalify_type(t, &bm));
+    }
     if n.tag != AstTag::Variable {
         return Err(format!(
             "astgen: argument for type param `{param_name}` must be a type name"

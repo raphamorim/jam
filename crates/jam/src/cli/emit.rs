@@ -280,6 +280,11 @@ fn dump_node(
             o.extend_from_slice(&sp.get(StringIdx::new(n.lhs)));
             o.extend_from_slice(b"...\n");
         }
+        AstTag::TypeLit => {
+            o.extend_from_slice(b"TypeLit ");
+            spell_type(o, tp, sp, TypeIdx::new(n.lhs));
+            o.push(b'\n');
+        }
         AstTag::MemberAccess => {
             o.extend_from_slice(b"MemberAccess .");
             o.extend_from_slice(&sp.get(StringIdx::new(n.rhs)));
@@ -1098,6 +1103,9 @@ fn resolve_expr_as_type(cg: &mut CodegenContext, expr: NodeIdx) -> TypeIdx {
             let sid = cg.string_pool.intern(callee.as_bytes());
             cg.type_pool.intern_generic_call(sid, arg_types)
         }
+        // A structural type spelled in argument position (`[]u8`,
+        // `*const u8`): the parser already interned it.
+        AstTag::TypeLit => TypeIdx::new(n.lhs),
         _ => TypeIdx::NONE,
     }
 }
