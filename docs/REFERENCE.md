@@ -365,6 +365,28 @@ The `for` loop iterates a half-open integer range, `for i in 0:N` binds `i = 0, 
 With a literal end bound the index is a `u64`; with a variable bound it takes that
 variable's type.
 
+Without a `:`, `for` walks a slice or array element-wise. The loop var binds each
+element *in place* — like `s[i]` as an lvalue — so assigning through it writes to the
+underlying storage.
+
+```jam
+fn sumBytes(s: []u8) u32 {
+    var total: u32 = 0;
+    for b in s {
+        total = total + (b as u32);
+    }
+    return total;
+}
+
+fn firstFourSquares() [4]u16 {
+    var arr: [4]u16 = [1, 2, 3, 4];
+    for v in arr {
+        v = v * v;
+    }
+    return arr;                    // [1, 4, 9, 16]
+}
+```
+
 `loop { … }` runs forever (sugar for `while (true)`); `break` exits the innermost
 loop and `continue` jumps to its next iteration.
 
