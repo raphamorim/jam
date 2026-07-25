@@ -1983,6 +1983,14 @@ impl<'ctx> CodegenContext<'ctx> {
                         Ok(self.ctx.i8_type())
                     }
                 } else {
+                    // Alias chase: `const ParseResult = Result(u64, str);`
+                    // binds a Named to a GenericCall (or another Named) —
+                    // instantiate and lower the target.
+                    let alias = self.lookup_type_alias(&self.str_name(k.a));
+                    if !alias.is_none() && alias != ty {
+                        let resolved = self.resolve_generic_call_instantiate(alias)?;
+                        return self.get_llvm_type(resolved);
+                    }
                     Err(format!(
                         "unresolved Named type `{}` (subst/alias/chained resolution \
                          not yet ported)",
@@ -2070,7 +2078,15 @@ impl<'ctx> CodegenContext<'ctx> {
                     let padded = align_up(mps, mpa);
                     return Ok(if padded == 0 { 2 * mpa } else { mpa + padded });
                 }
-                Err("type_size: unresolved user type (subst/alias resolution deferred)".into())
+                {
+                    // Alias chase, mirroring get_llvm_type's Named fallback.
+                    let alias = self.lookup_type_alias(&self.str_name(k.a));
+                    if !alias.is_none() && alias != ty {
+                        let resolved = self.resolve_generic_call_instantiate(alias)?;
+                        return self.type_size(resolved);
+                    }
+                }
+                Err(format!("type_size: unresolved user type `{}` (subst/alias resolution deferred)", self.str_name(k.a)))
             }
             TypeKind::Union => match self.union_fields(ty) {
                 Some(fields) => self.union_size(fields),
