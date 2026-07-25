@@ -1061,6 +1061,10 @@ fn resolve_expr_as_type(cg: &mut CodegenContext, expr: NodeIdx) -> TypeIdx {
                 "f64" => builtin::F64,
                 "type" => builtin::TYPE,
                 "noreturn" => builtin::NORETURN,
+                // `str` is []u8 sugar, same as the parser's type path —
+                // without this, `const R = Result(u64, str)` recorded a
+                // phantom Named("str") that nothing could resolve.
+                "str" => cg.type_pool.intern_slice(builtin::U8),
                 _ => {
                     let sid = cg.string_pool.intern(name.as_bytes());
                     cg.type_pool.intern_named(sid)
