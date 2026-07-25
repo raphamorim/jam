@@ -703,6 +703,17 @@ const BoxI32 = Box(i32);
 var b: BoxI32 = BoxI32 { value: 17 };
 ```
 
+Type arguments are not limited to names: structural types work too, in aliases and in
+calls with `T: type` parameters.
+
+```jam
+const Bytes = Box([]u8);
+const Ptrs  = Pair(*const u8, [4]u16);
+
+fn sizeOfIt(T: type) u64 { return @sizeOf(T); }
+const SLICE_SIZE = sizeOfIt([]u8);    // 16: {ptr, len}
+```
+
 ### Generic Methods
 
 Methods on generic types are cloned per instantiation. Each instantiation gets its own
