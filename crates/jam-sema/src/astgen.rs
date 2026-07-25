@@ -1777,6 +1777,155 @@ fn materialize_comptime_value(
     }
 }
 
+/// `[]T == []T`: length compare, then memcmp over `len * sizeOf(elem)`
+/// bytes — short-circuited so mismatched lengths never touch the data.
+fn astgen_slice_eq(
+    gctx: &mut AstGenCtx,
+    lhs: JirRef,
+    rhs: JirRef,
+    negate: bool,
+) -> Result<JirRef, String> {
+    let lk = gctx.ctx.type_pool.get(gctx.jfn.get_inst(lhs).ty);
+    let elem = TypeIdx::new(lk.a);
+    let ek = gctx.ctx.type_pool.get(elem);
+    let elem_ok = matches!(
+        ek.kind,
+        TypeKind::Int | TypeKind::Bool | TypeKind::PtrSingle | TypeKind::PtrMany
+    );
+    if !elem_ok {
+        return Err(
+            "astgen: `==` on slices needs an integer/bool/pointer element type; \
+             compare float slices with an explicit loop"
+                .into(),
+        );
+    }
+    let elem_size = gctx.ctx.type_size(elem)?;
+    let extract = |gctx: &mut AstGenCtx, val: JirRef, field: u32, ty: TypeIdx| {
+        emit(
+            gctx,
+            JirInst {
+                tag: JirTag::ExtractValue,
+                a: val,
+                b: field,
+                ty,
+                ..Default::default()
+            },
+        )
+    };
+    let pm = gctx.ctx.type_pool.intern_ptr_many(elem);
+    let a_len = extract(gctx, lhs, 1, builtin::U64);
+    let b_len = extract(gctx, rhs, 1, builtin::U64);
+    let lens_eq = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ICmpEq,
+            a: a_len,
+            b: b_len,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    );
+    let res_slot = emit_alloca_hoisted(
+        gctx,
+        JirInst {
+            tag: JirTag::Alloca,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: res_slot,
+            b: lens_eq,
+            ..Default::default()
+        },
+    );
+    let cmp_b = gctx.jfn.push_block("sliceeq.cmp");
+    let end_b = gctx.jfn.push_block("sliceeq.end");
+    emit_cond_br(gctx, lens_eq, cmp_b, end_b);
+    gctx.current_block = cmp_b;
+    ensure_memcmp(gctx);
+    let a_ptr = extract(gctx, lhs, 0, pm);
+    let b_ptr = extract(gctx, rhs, 0, pm);
+    let size_k = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: (elem_size & 0xFFFF_FFFF) as u32,
+            b: (elem_size >> 32) as u32,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let bytes = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Mul,
+            a: a_len,
+            b: size_k,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let memcmp = gctx
+        .ctx
+        .get_function_ast("memcmp")
+        .ok_or("astgen: memcmp missing after ensure")?;
+    let rc = emit_call(gctx, &memcmp, &[a_ptr, b_ptr, bytes], NO_JIR_REF)?;
+    let zero = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            ty: builtin::I32,
+            ..Default::default()
+        },
+    );
+    let bytes_eq = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ICmpEq,
+            a: rc,
+            b: zero,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: res_slot,
+            b: bytes_eq,
+            ..Default::default()
+        },
+    );
+    emit_br(gctx, end_b);
+    gctx.current_block = end_b;
+    let loaded = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: res_slot,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    );
+    if !negate {
+        return Ok(loaded);
+    }
+    Ok(emit(
+        gctx,
+        JirInst {
+            tag: JirTag::LogNot,
+            a: loaded,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    ))
+}
+
 fn astgen_binary_op(
     gctx: &mut AstGenCtx,
     n: &AstNode,
@@ -1842,6 +1991,17 @@ fn astgen_binary_op(
     // Peer-type hint: lower the RHS at the LHS's resolved width.
     let mut lhs_type = gctx.jfn.get_inst(lhs_ref).ty;
     let mut rhs_ref = astgen_expr(gctx, NodeIdx::new(n.rhs), lhs_type)?;
+
+    // Slice equality (`a == b` / `a != b` on `[]T`): same length AND same
+    // bytes (memcmp). Element type must compare by representation — ints,
+    // bools, pointers; float slices are rejected (byte equality is not
+    // float equality: -0.0 == 0.0, NaN != NaN).
+    if (n.op == 13 || n.op == 14)
+        && gctx.ctx.type_pool.get(lhs_type).kind == TypeKind::Slice
+        && gctx.ctx.type_pool.get(gctx.jfn.get_inst(rhs_ref).ty).kind == TypeKind::Slice
+    {
+        return astgen_slice_eq(gctx, lhs_ref, rhs_ref, n.op == 14);
+    }
 
     // Width reconciliation: floats must match exactly; integers widen the
     // narrower side (sext if signed, else zext).
@@ -3735,6 +3895,27 @@ fn ensure_printf(gctx: &mut AstGenCtx) {
     f.is_var_args = true;
     let jfn = astgen_metadata(&f, gctx.ctx);
     gctx.ctx.register_function_ast("printf", f);
+    let _ = jir_declare_prototype(&jfn, gctx.ctx);
+}
+
+fn ensure_memcmp(gctx: &mut AstGenCtx) {
+    if gctx.ctx.get_function_ast("memcmp").is_some() {
+        return;
+    }
+    let u8ptr = gctx.ctx.type_pool.intern_ptr_many(builtin::U8);
+    let mut f = FunctionAST::new(
+        "memcmp",
+        vec![
+            Param::new("a", u8ptr),
+            Param::new("b", u8ptr),
+            Param::new("n", builtin::U64),
+        ],
+        builtin::I32,
+        vec![],
+    );
+    f.is_extern = true;
+    let jfn = astgen_metadata(&f, gctx.ctx);
+    gctx.ctx.register_function_ast("memcmp", f);
     let _ = jir_declare_prototype(&jfn, gctx.ctx);
 }
 
@@ -6884,12 +7065,41 @@ fn astgen_slice(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     let start_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(ex)));
     let end_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(ex + 1)));
 
-    let base = astgen_expr(gctx, base_idx, TypeIdx::NONE)?;
-    let bk = gctx.ctx.type_pool.get(gctx.jfn.get_inst(base).ty);
+    let mut base = astgen_expr(gctx, base_idx, TypeIdx::NONE)?;
+    let mut bk = gctx.ctx.type_pool.get(gctx.jfn.get_inst(base).ty);
+    // A slice base re-slices through its data pointer; an array base (a
+    // byref pointer in SSA) is already the base address.
+    if bk.kind == TypeKind::Slice {
+        let pm = gctx.ctx.type_pool.intern_ptr_many(TypeIdx::new(bk.a));
+        base = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::ExtractValue,
+                a: base,
+                b: 0,
+                ty: pm,
+                ..Default::default()
+            },
+        );
+        bk = gctx.ctx.type_pool.get(pm);
+    } else if bk.kind == TypeKind::Array {
+        let pm = gctx.ctx.type_pool.intern_ptr_many(TypeIdx::new(bk.a));
+        base = emit(
+            gctx,
+            JirInst {
+                tag: JirTag::BitCast,
+                a: base,
+                ty: pm,
+                ..Default::default()
+            },
+        );
+        bk = gctx.ctx.type_pool.get(pm);
+    }
     if bk.kind != TypeKind::PtrMany && bk.kind != TypeKind::PtrSingle {
         return Ok(recover_here(
             gctx,
-            "slice expression `base[a..b]` needs a many-item pointer base".to_string(),
+            "slice expression `base[a..b]` needs a slice, array, or many-item pointer base"
+                .to_string(),
             TypeIdx::NONE,
         ));
     }

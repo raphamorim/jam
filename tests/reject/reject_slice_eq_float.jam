@@ -1,0 +1,14 @@
+// `==` on slices is bytewise (memcmp); float elements would make
+// NaN != NaN silently wrong, so the compiler refuses them.
+// expect-error: `==` on slices needs an integer/bool/pointer element type
+
+fn main() u8 {
+    var a: [2]f32 = [1.0, 2.0];
+    var b: [2]f32 = [1.0, 2.0];
+    const sa: []f32 = a[0..2];
+    const sb: []f32 = b[0..2];
+    if (sa == sb) {
+        return 1;
+    }
+    return 0;
+}

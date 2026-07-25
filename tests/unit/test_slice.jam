@@ -1,5 +1,6 @@
 // `base[start..end]` range-slicing: builds a []T value {ptr+start,
-// end-start} from a many-item pointer. v1 covers many-item pointer bases.
+// end-start}. Bases can be many-item pointers, slices, or arrays.
+// Also covers `==`/`!=` on slices (length check + memcmp).
 
 const { assert } = import("test");
 
@@ -46,4 +47,51 @@ tfn sliceViaPointerVar() {
     var s: []u8 = p[2..5];   // "cde"
     assert(s.len as u32, 3);
     assert(s[0], 99);   // 'c'
+}
+
+// Slice base: reslicing a slice directly, no .ptr hop.
+tfn sliceOfSlice() {
+    const s: str = "hello world";
+    const hello: []u8 = s[0..5];
+    const world: []u8 = s[6..11];
+    assert(hello.len as u32, 5);
+    assert(world.len as u32, 5);
+    assert(hello[0], 104);  // 'h'
+    assert(world[0], 119);  // 'w'
+}
+
+// Array base: slicing decays the array to its elements in place.
+tfn sliceOfArray() {
+    var arr: [6]u16 = [1, 2, 3, 4, 5, 6];
+    const mid: []u16 = arr[2..5];
+    assert(mid.len as u32, 3);
+    assert(mid[0] as u32, 3);
+    assert(mid[2] as u32, 5);
+}
+
+// `==` compares length first, then bytes.
+tfn sliceEquality() {
+    const s: str = "hello world";
+    const hello: []u8 = s[0..5];
+    assert((hello == "hello") as u8, 1);
+    assert((hello == "world") as u8, 0);
+    assert((hello != "world") as u8, 1);
+    assert((hello == "hell") as u8, 0);   // length mismatch
+}
+
+// Empty slices are equal to each other and nothing else.
+tfn sliceEqualityEmpty() {
+    const s: str = "abc";
+    const e1: []u8 = s[1..1];
+    const e2: []u8 = s[2..2];
+    assert((e1 == e2) as u8, 1);
+    assert((e1 == s) as u8, 0);
+}
+
+// Wider element types compare by element size, not count.
+tfn sliceEqualityWide() {
+    var a: [3]u32 = [7, 8, 9];
+    var b: [4]u32 = [0, 7, 8, 9];
+    assert((a[0..3] == b[1..4]) as u8, 1);
+    assert((a[0..3] == b[0..3]) as u8, 0);
 }
