@@ -1,6 +1,6 @@
 // std.fmt — interpolation-based formatted output.
 //
-// `print` and `eprint` are compile-time functions (`cfn`): the body
+// `print`/`println` and `eprint`/`eprintln` are compile-time functions (`cfn`): the body
 // runs at each call site during astgen and emits a sequence of
 // `@-emit` intrinsic calls into the caller's JIR. The format string
 // is parsed at compile time; per-`{ident}` placeholder, the compiler
@@ -77,6 +77,56 @@ pub cfn print(fmt: str) {
     @emitWriteBytes(1, fmt, runStart, fmt.length);
 }
 
+pub cfn println(fmt: str) {
+    var i: u32 = 0;
+    var runStart: u32 = 0;
+    while (i < fmt.length) {
+        if (fmt[i] == 123) {
+            if (i + 1 < fmt.length) {
+                if (fmt[i + 1] == 123) {
+                    // `{{` — emit a single literal `{` by extending
+                    // the run through index `i` then resuming after
+                    // the second brace.
+                    @emitWriteBytes(1, fmt, runStart, i + 1);
+                    runStart = i + 2;
+                    i = i + 2;
+                } else {
+                    // `{name}` — flush the literal run, interp.
+                    @emitWriteBytes(1, fmt, runStart, i);
+                    var nameStart: u32 = i + 1;
+                    var nameEnd: u32 = nameStart;
+                    while (fmt[nameEnd] != 125) {
+                        nameEnd = nameEnd + 1;
+                    }
+                    @emitPrintLocalByRange(1, fmt, nameStart, nameEnd);
+                    i = nameEnd + 1;
+                    runStart = i;
+                }
+            } else {
+                // Trailing `{` with no closer — fold into the run.
+                i = i + 1;
+            }
+        } else if (fmt[i] == 125) {
+            if (i + 1 < fmt.length) {
+                if (fmt[i + 1] == 125) {
+                    @emitWriteBytes(1, fmt, runStart, i + 1);
+                    runStart = i + 2;
+                    i = i + 2;
+                } else {
+                    // Bare `}` — keep it as a literal byte in the run.
+                    i = i + 1;
+                }
+            } else {
+                i = i + 1;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    @emitWriteBytes(1, fmt, runStart, fmt.length);
+    @emitPutByte(1, 10);
+}
+
 pub cfn eprint(fmt: str) {
     var i: u32 = 0;
     var runStart: u32 = 0;
@@ -118,4 +168,49 @@ pub cfn eprint(fmt: str) {
         }
     }
     @emitWriteBytes(2, fmt, runStart, fmt.length);
+}
+
+// `print` / `eprint` with a trailing newline.
+pub cfn eprintln(fmt: str) {
+    var i: u32 = 0;
+    var runStart: u32 = 0;
+    while (i < fmt.length) {
+        if (fmt[i] == 123) {
+            if (i + 1 < fmt.length) {
+                if (fmt[i + 1] == 123) {
+                    @emitWriteBytes(2, fmt, runStart, i + 1);
+                    runStart = i + 2;
+                    i = i + 2;
+                } else {
+                    @emitWriteBytes(2, fmt, runStart, i);
+                    var nameStart: u32 = i + 1;
+                    var nameEnd: u32 = nameStart;
+                    while (fmt[nameEnd] != 125) {
+                        nameEnd = nameEnd + 1;
+                    }
+                    @emitPrintLocalByRange(2, fmt, nameStart, nameEnd);
+                    i = nameEnd + 1;
+                    runStart = i;
+                }
+            } else {
+                i = i + 1;
+            }
+        } else if (fmt[i] == 125) {
+            if (i + 1 < fmt.length) {
+                if (fmt[i + 1] == 125) {
+                    @emitWriteBytes(2, fmt, runStart, i + 1);
+                    runStart = i + 2;
+                    i = i + 2;
+                } else {
+                    i = i + 1;
+                }
+            } else {
+                i = i + 1;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    @emitWriteBytes(2, fmt, runStart, fmt.length);
+    @emitPutByte(2, 10);
 }

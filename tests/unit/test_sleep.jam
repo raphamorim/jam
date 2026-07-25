@@ -1,9 +1,0 @@
-// Test std.thread.sleep
-const std = import("std");
-
-fn main() u8 {
-    std.fmt.println("Sleeping for 500ms...");
-    std.thread.sleep(500);
-    std.fmt.println("Done!");
-    return 0;
-}

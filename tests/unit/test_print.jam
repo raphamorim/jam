@@ -41,3 +41,15 @@ tfn printStrCompiles() { assert(callsPrintWithStrOK(), 1); }
 tfn printBoolCompiles() { assert(callsPrintWithBoolOK(), 1); }
 tfn eprintCompiles() { assert(callsEprintRoutesOK(), 1); }
 tfn escapesCompile() { assert(callsEscapesOK(), 1); }
+
+fn callsPrintlnOK() i32 {
+    var n: u64 = 7;
+    fmt.println("n = {n}");
+    fmt.println("");
+    fmt.eprintln("stderr line");
+    return 1;
+}
+
+tfn printlnSmoke() {
+    assert(callsPrintlnOK(), 1);
+}
