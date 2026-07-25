@@ -4,7 +4,7 @@
 // `lib` is imported HERE only. The entry test module does NOT import it, so
 // the `cfn drop` body below can only compile if its qualified call resolves
 // against THIS module's imports (the fix), not the entry module's.
-const lib = import("test_xmod_lib");
+const lib = import("mod_xmod_lib");
 
 pub const XThing = struct {
     sink: *mut u32,

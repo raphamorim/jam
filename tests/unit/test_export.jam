@@ -1,8 +1,16 @@
-// Test export function declarations
-export fn exported_func(a: i32, b: i32) i32 {
+// `export fn` keeps its exact symbol for C callers and stays callable
+// from jam.
+const { assert } = import("test");
+
+export fn jam_exported_add(a: i32, b: i32) i32 {
     return a + b;
 }
 
-fn main() u8 {
-    return 0;
+tfn exportedFnCallableLocally() {
+    assert(jam_exported_add(2, 3), 5);
+}
+
+tfn exportedFnAddressTaken() {
+    // The exported symbol is C-ABI; its address works through @callC.
+    assert(@callC(i32, jam_exported_add as u64, 4 as i32, 5 as i32), 9);
 }

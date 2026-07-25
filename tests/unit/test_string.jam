@@ -1,62 +1,41 @@
-// Test string literals and str type
-fn test_string_literal() str {
+// String literals and the str type ([]u8 slice).
+const { assert } = import("test");
+const { eq } = import("std").string;
+
+tfn literalBasics() {
     const greeting: str = "Hello, world!";
-    return greeting;
-}
-
-fn test_string_empty() str {
+    assert(greeting.len as i32, 13);
+    assert(greeting[0] as i32, 72);    // H
+    assert(greeting[12] as i32, 33);   // !
     const empty: str = "";
-    return empty;
+    assert(empty.len as i32, 0);
 }
 
-fn test_string_unicode() str {
-    const unicode: str = "Hello, 世界! 🌍";
-    return unicode;
+tfn utf8Literals() {
+    // "世界" is six UTF-8 bytes; the emoji four more.
+    const cjk: str = "世界";
+    assert(cjk.len as i32, 6);
+    const emoji: str = "🌍";
+    assert(emoji.len as i32, 4);
 }
 
-fn test_string_with_spaces() str {
-    const spaced: str = "This is a test string";
-    return spaced;
-}
-
-fn test_string_parameter(message: str) str {
+fn echo(message: str) str {
     return message;
 }
 
-fn test_string_variable() str {
-    var msg: str = "Variable string";
-    return msg;
+tfn stringsThroughCalls() {
+    assert(eq(echo("pass me through"), "pass me through") as u8, 1);
 }
 
-fn test_string_const() str {
-    const msg: str = "Constant string";
-    return msg;
+tfn strIsU8Slice() {
+    const text: str = "convert me";
+    const bytes: []u8 = text;
+    assert(bytes.len as i32, 10);
+    assert(eq(bytes, text) as u8, 1);
 }
 
-// Test escape sequences
-fn test_string_escapes() str {
-    const escaped: str = "Line1\nLine2\tTabbed\\Backslash\"Quote";
-    return escaped;
-}
-
-// Test hex escapes
-fn test_string_hex() str {
-    const hex: str = "\x48\x65\x6C\x6C\x6F";
-    return hex;
-}
-
-// Test unicode escapes
-fn test_string_unicode_escape() str {
-    const earth: str = "\u{1F30D}";
-    return earth;
-}
-
-fn test_string_unicode_escape_ascii() str {
-    const letter: str = "\u{41}\u{42}\u{43}";
-    return letter;
-}
-
-fn test_string_unicode_escape_cjk() str {
-    const chinese: str = "\u{4E16}\u{754C}";
-    return chinese;
+tfn varStringsAssign() {
+    var msg: str = "first";
+    msg = "second";
+    assert(eq(msg, "second") as u8, 1);
 }

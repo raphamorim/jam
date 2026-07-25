@@ -1,21 +1,49 @@
-// Test escape sequences in strings
-const std = import("std");
+// String escape sequences, asserted byte by byte (this file used to be
+// a print-only script the runner silently skipped).
+const { assert } = import("test");
 
-fn main() u8 {
-    // Test basic escapes
-    std.fmt.println("Tab:\ttest");
-    std.fmt.println("Newline embedded:\nline2");
-    std.fmt.println("Quote: \"hello\"");
-    std.fmt.println("Backslash: \\path");
+tfn basicEscapes() {
+    const s: str = "a\tb\nc\rd";
+    assert(s[1] as i32, 9);    // \t
+    assert(s[3] as i32, 10);   // \n
+    assert(s[5] as i32, 13);   // \r
+    assert(s.len as i32, 7);
+}
 
-    // Test hex escapes (ANSI escape codes)
-    std.fmt.print("\x1b[31m");  // red color
-    std.fmt.println("This should be red");
-    std.fmt.print("\x1b[0m");   // reset
-    std.fmt.println("Back to normal");
+tfn quoteAndBackslash() {
+    const s: str = "\"\\\'";
+    assert(s[0] as i32, 34);
+    assert(s[1] as i32, 92);
+    assert(s[2] as i32, 39);
+}
 
-    // Test clear screen codes (don't actually clear for this test)
-    // \x1b[2J = clear screen, \x1b[H = cursor home
+tfn nulByte() {
+    const s: str = "a\0b";
+    assert(s[1] as i32, 0);
+    assert(s.len as i32, 3);
+}
 
-    return 0;
+tfn hexEscapes() {
+    const hello: str = "\x48\x65\x6C\x6C\x6F";
+    assert(hello[0] as i32, 72);   // H
+    assert(hello[4] as i32, 111);  // o
+    assert(hello.len as i32, 5);
+}
+
+tfn unicodeEscapes() {
+    // U+0041..43 encode as single bytes.
+    const abc: str = "\u{41}\u{42}\u{43}";
+    assert(abc[0] as i32, 65);
+    assert(abc.len as i32, 3);
+    // U+4E16 (世) is three UTF-8 bytes: E4 B8 96.
+    const shi: str = "\u{4E16}";
+    assert(shi.len as i32, 3);
+    assert(shi[0] as i32, 228);
+    assert(shi[1] as i32, 184);
+    assert(shi[2] as i32, 150);
+    // U+1F30D (🌍) is four bytes: F0 9F 8C 8D.
+    const earth: str = "\u{1F30D}";
+    assert(earth.len as i32, 4);
+    assert(earth[0] as i32, 240);
+    assert(earth[3] as i32, 141);
 }
