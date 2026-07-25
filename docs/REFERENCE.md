@@ -1006,10 +1006,12 @@ fn broken(arr: [4]u16) {
 }
 ```
 
-The borrow follows the value through calls: a returned slice — bare or carried in a
-struct's fields (`Pair { data: v.asSlice(), n: 0 }`) — is tracked back to the
-arguments it derives from, so views of a read-only parameter reject writes no matter
-how many bindings or calls they pass through. A view-carrying struct still owns its
+The borrow follows the value through calls: a returned slice — bare, carried in a
+struct's fields (`Pair { data: v.asSlice(), n: 0 }`), or in an enum payload
+(`Option([]u8).Some(v.asSlice())`) — is tracked back to the arguments it derives
+from, so views of a read-only parameter reject writes no matter how many bindings,
+calls, or `match` arms they pass through. Scalar payloads are plain copies and stay
+freely mutable. A view-carrying struct still owns its
 inline fields: `p.n = 5` and whole rebinds stay legal; only writes reaching the
 borrowed elements are rejected. Passing read-only storage as a `mut`
 argument or calling a `mut self` method on it — directly (`v.push(1)`) or through a
