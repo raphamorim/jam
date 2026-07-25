@@ -12,6 +12,9 @@
 // expect-error: cannot write through `fb` — it views elements of a read-only parameter
 // expect-error: cannot write through `p` — it views elements of a read-only parameter
 // expect-error: cannot write through `sb` — it views elements of a read-only parameter
+// expect-error: cannot write through `os` — it views elements of a read-only parameter
+// expect-error: cannot write through `ob` — it views elements of a read-only parameter
+// expect-error: cannot write through `rs` — it views elements of a read-only parameter
 
 const { Vec } = import("std").collections;
 
@@ -85,6 +88,50 @@ fn pokeStructField(v: Vec(u8)) {
 fn pokeStructDirect(v: Vec(u8)) {
     for sb in wrap(v).data {
         sb = 0;
+    }
+}
+
+const { Option } = import("std").option;
+const { Result } = import("std").result;
+
+const ViewResult = Result(str, u32);
+
+fn firstView(v: Vec(u8)) Option([]u8) {
+    return Option([]u8).Some(v.asSlice());
+}
+
+fn tryView(v: Vec(u8)) ViewResult {
+    if (v.len() == 0) {
+        return ViewResult.Err(0);
+    }
+    return ViewResult.Ok(v.asSlice());
+}
+
+// Enum payloads carry the view: matched bindings of a read-only-rooted
+// scrutinee reject element writes (direct call, bound, and alias-ctor).
+fn pokeOptionPayload(v: Vec(u8)) {
+    match (firstView(v)) {
+        Some(os) { os[0] = 1; }
+        None     { }
+    }
+}
+
+fn pokeBoundOption(v: Vec(u8)) {
+    var o: Option([]u8) = firstView(v);
+    match (o) {
+        Some(s2) {
+            for ob in s2 {
+                ob = 0;
+            }
+        }
+        None { }
+    }
+}
+
+fn pokeResultAlias(v: Vec(u8)) {
+    match (tryView(v)) {
+        Ok(rs)  { rs[0] = 1; }
+        Err(e2) { }
     }
 }
 

@@ -789,15 +789,60 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         let arm_count = self.extra(extra);
         let state_before = r.state.clone();
 
+        // Payload bindings copy the payload out — but a slice-carrying
+        // payload still points at the scrutinee's borrowed bytes. When the
+        // scrutinee roots at a read-only borrow, such bindings are
+        // read-only views inside their arm. Variant payload types are
+        // resolved regardless, so arm bindings are typed for the write
+        // checks (`s[0] = ...` needs `s`'s static type).
+        let scrut_view = self
+            .write_root(NodeIdx::new(n.lhs))
+            .is_some_and(|root| self.is_readonly_root(&root.name));
+        let scrut_variants = self
+            .lvalue_type(NodeIdx::new(n.lhs))
+            .and_then(|t| self.ctx.enum_variants_of_type(t));
+
         let mut merged = StmtResult {
             state: HashMap::new(),
             terminated: true,
         };
         let mut cursor = 1u32;
         for _ in 0..arm_count {
+            let pat_idx = NodeIdx::new(self.extra(extra + cursor));
             cursor += 1; // patIdx
             let arm_body_count = self.extra(extra + cursor);
             cursor += 1;
+
+            // Type and mark (or shadow-clear) this arm's payload bindings;
+            // both are restored after the arm body.
+            let mut saved_views: Vec<(String, bool)> = Vec::new();
+            let mut saved_types: Vec<(String, Option<TypeIdx>)> = Vec::new();
+            if let Some((variant, names)) = self.pattern_payload_bindings(pat_idx) {
+                for (i, bname) in names.iter().enumerate() {
+                    let payload_ty = scrut_variants.as_ref().and_then(|vs| {
+                        vs.iter()
+                            .find(|v| v.name == variant)
+                            .and_then(|v| v.payload_types.get(i).copied())
+                    });
+                    saved_types.push((bname.clone(), self.var_types.get(bname).copied()));
+                    match payload_ty {
+                        Some(t) => {
+                            self.var_types.insert(bname.clone(), t);
+                        }
+                        None => {
+                            self.var_types.remove(bname);
+                        }
+                    }
+                    saved_views.push((bname.clone(), self.readonly_views.contains(bname)));
+                    // Untypeable payload on a viewed scrutinee: conservative.
+                    let carries = payload_ty.is_none_or(|t| self.type_contains_slice(t, 8));
+                    if scrut_view && carries {
+                        self.readonly_views.insert(bname.clone());
+                    } else {
+                        self.readonly_views.remove(bname);
+                    }
+                }
+            }
 
             self.cond_depth += 1;
             let mut arm = StmtResult {
@@ -813,6 +858,24 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             }
             self.cond_depth -= 1;
             cursor += arm_body_count;
+
+            for (bname, was) in saved_views {
+                if was {
+                    self.readonly_views.insert(bname);
+                } else {
+                    self.readonly_views.remove(&bname);
+                }
+            }
+            for (bname, prev) in saved_types {
+                match prev {
+                    Some(t) => {
+                        self.var_types.insert(bname, t);
+                    }
+                    None => {
+                        self.var_types.remove(&bname);
+                    }
+                }
+            }
 
             if merged.terminated && arm.terminated {
                 // both terminated; stay terminated
@@ -1628,13 +1691,20 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         match k.kind {
             TypeKind::Slice => true,
             TypeKind::Array => self.type_contains_slice(TypeIdx::new(k.a), depth - 1),
-            TypeKind::Struct | TypeKind::Named | TypeKind::GenericCall => self
-                .ctx
-                .struct_fields(ty)
-                .is_some_and(|fs| {
-                    fs.iter()
-                        .any(|(_, t)| self.type_contains_slice(*t, depth - 1))
-                }),
+            TypeKind::Struct | TypeKind::Named | TypeKind::GenericCall | TypeKind::Enum => {
+                if let Some(fs) = self.ctx.struct_fields(ty) {
+                    return fs
+                        .iter()
+                        .any(|(_, t)| self.type_contains_slice(*t, depth - 1));
+                }
+                // An enum carries a slice when any variant's payload does
+                // (`Option([]u8)`).
+                self.ctx.enum_variants_of_type(ty).is_some_and(|vs| {
+                    vs.iter()
+                        .flat_map(|v| v.payload_types.iter())
+                        .any(|&t| self.type_contains_slice(t, depth - 1))
+                })
+            }
             _ => false,
         }
     }
@@ -1860,10 +1930,83 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                             self.expr_view_params(fn_ast, a, depth, out);
                         }
                     }
+                } else if n.flags & 1 == 0 {
+                    // Enum-variant ctor (`ParseResult.Ok(x)`): the payload
+                    // exprs flow into the returned value. The receiver may
+                    // be the enum's registry name or a module-scope alias
+                    // of an instantiation.
+                    let callee_name = self.str_name(n.lhs);
+                    if let Some(dot) = callee_name.find('.')
+                        && callee_name.rfind('.') == Some(dot)
+                    {
+                        let (recv, method) = (&callee_name[..dot], &callee_name[dot + 1..]);
+                        let is_ctor = self.is_enum_variant_ctor(recv, method) || {
+                            let aliased = self.ctx.lookup_type_alias(recv);
+                            !aliased.is_none()
+                                && self.ctx.enum_variants_of_type(aliased).is_some_and(|vs| {
+                                    vs.iter().any(|v| v.name == method)
+                                })
+                        };
+                        if is_ctor {
+                            let extra = n.rhs;
+                            let count = self.extra(extra);
+                            for i in 0..count {
+                                let a = NodeIdx::new(self.extra(extra + 1 + i));
+                                self.expr_view_params(fn_ast, a, depth, out);
+                            }
+                        }
+                    }
+                }
+            }
+            // `Type.method(args)`: a variant ctor (`Option([]u8).Some(x)`)
+            // carries its payload exprs; a static struct method maps its
+            // summary straight onto the args (no self).
+            AstTag::TypeMethodCall => {
+                let recv_ty = TypeIdx::new(n.lhs);
+                let extra = n.rhs;
+                let method = self.str_name(self.extra(extra));
+                let count = self.extra(extra + 1);
+                let args: Vec<NodeIdx> = (0..count)
+                    .map(|i| NodeIdx::new(self.extra(extra + 2 + i)))
+                    .collect();
+                let is_ctor = self
+                    .ctx
+                    .enum_variants_of_type(recv_ty)
+                    .is_some_and(|vs| vs.iter().any(|v| v.name == method));
+                if is_ctor {
+                    for &a in &args {
+                        self.expr_view_params(fn_ast, a, depth, out);
+                    }
+                } else if let Some(type_name) = self.ctx.struct_name_of(recv_ty)
+                    && let Some(f) = self.ctx.get_function_ast(&format!("{type_name}.{method}"))
+                {
+                    for k in self.return_view_params(&f, depth - 1) {
+                        if let Some(&a) = args.get(k) {
+                            self.expr_view_params(fn_ast, a, depth, out);
+                        }
+                    }
                 }
             }
             _ => {}
         }
+    }
+
+    /// Payload bindings of a match-arm pattern: (variant name, binding
+    /// names, in payload order). None for patterns that bind nothing.
+    fn pattern_payload_bindings(&self, pat_idx: NodeIdx) -> Option<(String, Vec<String>)> {
+        let p = *self.ctx.node_store.get(pat_idx);
+        if p.tag != AstTag::PatEnumVariant || p.flags & 1 == 0 {
+            return None;
+        }
+        // Every binding-carrying encoding shares the extra layout
+        // [recv, variant, count, b0...].
+        let ex = p.lhs;
+        let variant = self.str_name(self.extra(ex + 1));
+        let count = self.extra(ex + 2);
+        let names = (0..count)
+            .map(|i| self.str_name(self.extra(ex + 3 + i)))
+            .collect();
+        Some((variant, names))
     }
 
     /// Is `name` a read-only borrow whose storage the caller owns — a

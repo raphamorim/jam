@@ -1732,6 +1732,20 @@ impl<'ctx> CodegenContext<'ctx> {
     pub fn enum_variants_by_name(&self, name: &str) -> Option<Vec<EnumVariantInfo>> {
         self.enums.borrow().get(name).map(|e| e.variants.clone())
     }
+    /// Variants (name + payload types) of the enum a TypeIdx resolves to,
+    /// chasing generic instantiations / aliases and probing the bare and
+    /// body-module-qualified registry keys.
+    pub fn enum_variants_of_type(&self, ty: TypeIdx) -> Option<Vec<EnumVariantInfo>> {
+        let name = self.name_for_kinds(ty, &[TypeKind::Enum, TypeKind::Named])?;
+        if let Some(vs) = self.enum_variants_by_name(&name) {
+            return Some(vs);
+        }
+        let bm = self.current_body_module();
+        if bm.is_empty() {
+            return None;
+        }
+        self.enum_variants_by_name(&format!("{bm}.{name}"))
+    }
     pub fn enum_has_payload_by_name(&self, name: &str) -> Option<bool> {
         self.enums.borrow().get(name).map(|e| e.has_payload_variant)
     }

@@ -1,0 +1,69 @@
+// Enum payloads carrying slice views: `Option([]u8).Some(v.asSlice())`
+// taints the returned value with the argument's provenance, and match
+// arms bind the payload with that view-ness (rejections live in
+// reject_param_view_escape.jam). Scalar payloads are plain copies —
+// writable even off a viewed scrutinee.
+
+const { assert } = import("test");
+const { Vec } = import("std").collections;
+const { Option } = import("std").option;
+const { Result } = import("std").result;
+
+const Sized = Result(u64, str);
+
+fn firstView(v: Vec(u8)) Option([]u8) {
+    if (v.len() == 0) {
+        return Option([]u8).None();
+    }
+    return Option([]u8).Some(v.asSlice());
+}
+
+fn measure(v: Vec(u8)) Sized {
+    if (v.len() == 0) {
+        return Sized.Err("empty");
+    }
+    return Sized.Ok(v.len() as u64);
+}
+
+fn countPlusOne(v: Vec(u8)) u64 {
+    match (measure(v)) {
+        Ok(n) {
+            n = n + 1;      // scalar payload: a copy, freely mutable
+            return n;
+        }
+        Err(e) { return 0; }
+    }
+    return 0;
+}
+
+tfn scalarPayloadsAreCopies() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    v.push(2);
+    assert(countPlusOne(v) as u32, 3);
+}
+
+fn bumpFirst(v: mut Vec(u8)) {
+    match (firstView(v)) {
+        Some(s) { s[0] = s[0] + 1; }
+        None    { }
+    }
+}
+
+tfn mutParamMatchedViewFlowsBack() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(10);
+    bumpFirst(v);
+    assert(v[0] as u32, 11);
+}
+
+tfn localMatchedViewWrites() {
+    var v: Vec(u8) = Vec(u8).empty();
+    v.push(1);
+    v.push(2);
+    match (firstView(v)) {
+        Some(s) { s[1] = 99; }
+        None    { }
+    }
+    assert(v[1] as u32, 99);
+}
