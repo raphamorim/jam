@@ -1006,10 +1006,12 @@ fn broken(arr: [4]u16) {
 }
 ```
 
-The borrow follows the value through calls: a slice returned by a function is
-tracked back to the arguments it derives from (`v.asSlice()`, a `trim(s)` result, a
-wrapper's return), so views of a read-only parameter reject writes no matter how
-many bindings or calls they pass through. Passing read-only storage as a `mut`
+The borrow follows the value through calls: a returned slice — bare or carried in a
+struct's fields (`Pair { data: v.asSlice(), n: 0 }`) — is tracked back to the
+arguments it derives from, so views of a read-only parameter reject writes no matter
+how many bindings or calls they pass through. A view-carrying struct still owns its
+inline fields: `p.n = 5` and whole rebinds stay legal; only writes reaching the
+borrowed elements are rejected. Passing read-only storage as a `mut`
 argument or calling a `mut self` method on it — directly (`v.push(1)`) or through a
 field chain (`h.buf.push(1)`) — is rejected the same way; the fix is always to take
 the parameter as `mut` in the signature.
