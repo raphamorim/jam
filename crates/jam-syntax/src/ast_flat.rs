@@ -56,7 +56,7 @@ pub enum AstTag {
     VarDecl,   // lhs = ExtraIdx -> [name, type, init]; rhs = flags (bit0 = isConst)
     IfNode,    // lhs = NodeIdx (cond); rhs = ExtraIdx -> [thenCount, elseCount, then.., else..]
     WhileNode, // lhs = NodeIdx (cond); rhs = ExtraIdx -> [bodyCount, body..]
-    ForNode,   // lhs = ExtraIdx -> [var, start, end, bodyCount, body..]
+    ForNode,   // lhs = ExtraIdx -> [var, start, end, bodyCount, body..]; op 1 = element walk: [var, iterable, 0, bodyCount, body..]
     Break,
     Continue,
 

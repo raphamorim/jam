@@ -618,17 +618,28 @@ impl<'a> Parser<'a> {
             let prev_allow = self.allow_struct_lit;
             self.allow_struct_lit = false;
             let start = self.parse_comparison()?;
-            self.consume(TokenType::Colon, "Expected ':' in for range")?;
-            let end = self.parse_comparison()?;
+            // `start:end` is a range walk; no ':' means the expression is an
+            // iterable (slice or array) walked element-wise. op 1 marks the
+            // element form; the range's `end` slot stays 0 so the extra
+            // layout (and the body offset) is shared.
+            let iterates_elements = !self.match_(TokenType::Colon);
+            let end = if iterates_elements {
+                None
+            } else {
+                Some(self.parse_comparison()?)
+            };
             self.allow_struct_lit = prev_allow;
-            self.consume(TokenType::OpenBrace, "Expected '{' after for range")?;
+            self.consume(TokenType::OpenBrace, "Expected '{' after for header")?;
             let body = self.parse_stmts_until_brace()?;
             self.consume(TokenType::CloseBrace, "Expected '}' after for body")?;
             let e = self.nodes.reserve_extra(4 + body.len());
             self.nodes.set_extra(e, var_id.raw());
             self.nodes
                 .set_extra(ExtraIdx::new(e.raw() + 1), start.raw());
-            self.nodes.set_extra(ExtraIdx::new(e.raw() + 2), end.raw());
+            self.nodes.set_extra(
+                ExtraIdx::new(e.raw() + 2),
+                end.map(|n| n.raw()).unwrap_or(0),
+            );
             self.nodes
                 .set_extra(ExtraIdx::new(e.raw() + 3), body.len() as u32);
             for (i, b) in body.iter().enumerate() {
@@ -637,7 +648,7 @@ impl<'a> Parser<'a> {
             }
             return Ok(self.emit(AstNode {
                 tag: AstTag::ForNode,
-                op: 0,
+                op: if iterates_elements { 1 } else { 0 },
                 flags: 0,
                 main_token: 0,
                 lhs: e.raw(),
