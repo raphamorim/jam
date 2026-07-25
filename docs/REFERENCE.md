@@ -213,6 +213,28 @@ A slice is a two-word value: a pointer to the data and a length.
 | `ptr` | `*const[] u8` | Many-item pointer to the first byte                                |
 | `len` | `u64`         | Number of bytes (excludes any trailing null in literals)           |
 
+### Slicing & Comparison
+
+`base[start..end]` produces a sub-slice. The base may be a slice, a fixed array, or a
+many-item pointer; bounds are the caller's responsibility, like indexing. `==` and `!=`
+compare two slices by length and contents (float element types are rejected; NaN makes
+byte equality a lie — compare those with a loop).
+
+```jam
+const s: str = "hello world";
+const hello: []u8 = s[0..5];
+const world: []u8 = s[6..11];
+
+if (hello == "hello") { /* taken */ }
+if (hello != world)   { /* taken */ }
+
+var arr: [6]u16 = [1, 2, 3, 4, 5, 6];
+const mid: []u16 = arr[2..5];          // [3, 4, 5]
+```
+
+`std.string` layers call-style helpers on top: `eq`, `startsWith`, `endsWith`, `find`,
+`contains`, `slice`, `trim`/`trimLeft`/`trimRight`, `concat`, `fromInt`, `parseInt`.
+
 ### Escape Sequences
 
 | Escape       | Description                                       |
@@ -694,6 +716,22 @@ pub fn Option(T: type) type {
 
 Construct variants by qualifying with the instantiated type: `Option(i32).Some(42)`,
 `Option(i32).None`.
+
+`Result(T, E)` ships the same way (`import("std").result`). An instantiation can be
+bound to a module-scope alias and used like any named type:
+
+```jam
+const { Result } = import("std").result;
+
+const ParseResult = Result(u64, str);
+
+fn parse(s: []u8) ParseResult {
+    if (s.len == 0) {
+        return ParseResult.Err("empty input");
+    }
+    return ParseResult.Ok(s.len);
+}
+```
 
 ---
 
