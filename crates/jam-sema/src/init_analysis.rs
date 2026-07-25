@@ -620,7 +620,12 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         if r.terminated {
             return r;
         }
-        let mut r = self.analyze_node(end_idx, r.state);
+        // op 1 walks an iterable; there is no end bound to analyze.
+        let mut r = if n.op == 1 {
+            r
+        } else {
+            self.analyze_node(end_idx, r.state)
+        };
         if r.terminated {
             return r;
         }

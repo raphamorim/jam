@@ -8282,6 +8282,9 @@ fn astgen_while(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
 /// bound's exact width and signedness; otherwise the narrower side of the
 /// comparison is widened (sext/zext).
 fn astgen_for(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
+    if n.op == 1 {
+        return astgen_for_each(gctx, n);
+    }
     let extra = n.lhs;
     let var_name_id = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra));
     let start_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 1)));
@@ -8474,6 +8477,237 @@ fn astgen_for(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
     gctx.current_block = exit_b;
     gctx.locals.remove(&var_name);
     gctx.local_types.remove(&var_name);
+    Ok(())
+}
+
+/// Lower `for v in iterable` — the iterable is a slice or an array. `v`
+/// binds each element *in place* (the address of `elem[i]`, like `s[i]`
+/// as an lvalue), so writes through `v` land in the underlying storage
+/// and the loop never re-owns drop-bearing elements.
+fn astgen_for_each(gctx: &mut AstGenCtx, n: &AstNode) -> Result<(), String> {
+    let extra = n.lhs;
+    let var_name_id = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra));
+    let iter_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 1)));
+    let body_count = gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 3));
+    let var_name = str_at(gctx, var_name_id);
+
+    let iter_ref = astgen_expr(gctx, iter_idx, TypeIdx::NONE)?;
+    let ik = gctx.ctx.type_pool.get(gctx.jfn.get_inst(iter_ref).ty);
+    let elem_ty = TypeIdx::new(ik.a);
+    // Preheader: split the iterable into a data pointer and a length; both
+    // dominate every loop block.
+    let (data_ptr, len_ref) = match ik.kind {
+        TypeKind::Slice => {
+            let pm = gctx.ctx.type_pool.intern_ptr_many(elem_ty);
+            let ptr = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::ExtractValue,
+                    a: iter_ref,
+                    b: 0,
+                    ty: pm,
+                    ..Default::default()
+                },
+            );
+            let len = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::ExtractValue,
+                    a: iter_ref,
+                    b: 1,
+                    ty: builtin::U64,
+                    ..Default::default()
+                },
+            );
+            (ptr, len)
+        }
+        TypeKind::Array => {
+            // A byref array is already its base address.
+            let pm = gctx.ctx.type_pool.intern_ptr_many(elem_ty);
+            let ptr = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::BitCast,
+                    a: iter_ref,
+                    ty: pm,
+                    ..Default::default()
+                },
+            );
+            let len = emit(
+                gctx,
+                JirInst {
+                    tag: JirTag::Int,
+                    a: ik.b,
+                    ty: builtin::U64,
+                    ..Default::default()
+                },
+            );
+            (ptr, len)
+        }
+        _ => {
+            return Err("astgen: `for x in v` needs a slice or array to walk; \
+                        numeric walks are `for i in start:end`"
+                .into());
+        }
+    };
+
+    let slot = emit_alloca_hoisted(
+        gctx,
+        JirInst {
+            tag: JirTag::Alloca,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let zero_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: 0,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: slot,
+            b: zero_ref,
+            ..Default::default()
+        },
+    );
+
+    let cond_b = gctx.jfn.push_block("forcond");
+    let body_b = gctx.jfn.push_block("forbody");
+    let step_b = gctx.jfn.push_block("forstep");
+    let exit_b = gctx.jfn.push_block("forexit");
+    emit_br(gctx, cond_b);
+
+    gctx.current_block = cond_b;
+    let load_idx = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let cmp_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::ICmpUlt,
+            a: load_idx,
+            b: len_ref,
+            ty: builtin::BOOL,
+            ..Default::default()
+        },
+    );
+    emit_cond_br(gctx, cmp_ref, body_b, exit_b);
+
+    // Body: rebind the element address for this iteration, then the
+    // statements. `continue` jumps to the step block, `break` to exit.
+    gctx.current_block = body_b;
+    let body_idx = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let elem_ptr = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::IndexAddr,
+            a: data_ptr,
+            b: body_idx,
+            ty: gctx.ctx.type_pool.intern_ptr_single(elem_ty),
+            ..Default::default()
+        },
+    );
+    let shadowed = gctx.locals.insert(var_name.clone(), elem_ptr);
+    let shadowed_ty = gctx.local_types.insert(var_name.clone(), elem_ty);
+
+    push_drop_scope(gctx);
+    let body_scope_idx = gctx.drop_scopes.len() - 1;
+    gctx.loop_stack.push(LoopFrame {
+        continue_block: step_b,
+        break_block: exit_b,
+        body_scope_idx,
+    });
+    gctx.runtime_cond_depth += 1;
+    for i in 0..body_count {
+        let s = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 4 + i)));
+        astgen_expr(gctx, s, TypeIdx::NONE)?;
+    }
+    gctx.runtime_cond_depth -= 1;
+    pop_drop_scope_emitting(gctx);
+    if !block_has_terminator(gctx) {
+        emit_br(gctx, step_b);
+    }
+    gctx.loop_stack.pop();
+
+    // Step: i = i + 1; br cond.
+    gctx.current_block = step_b;
+    let cur = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Load,
+            a: slot,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let one_ref = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Int,
+            a: 1,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    let next = emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Add,
+            a: cur,
+            b: one_ref,
+            ty: builtin::U64,
+            ..Default::default()
+        },
+    );
+    emit(
+        gctx,
+        JirInst {
+            tag: JirTag::Store,
+            a: slot,
+            b: next,
+            ..Default::default()
+        },
+    );
+    emit_br(gctx, cond_b);
+
+    gctx.current_block = exit_b;
+    match shadowed {
+        Some(prev) => {
+            gctx.locals.insert(var_name.clone(), prev);
+        }
+        None => {
+            gctx.locals.remove(&var_name);
+        }
+    }
+    match shadowed_ty {
+        Some(prev) => {
+            gctx.local_types.insert(var_name.clone(), prev);
+        }
+        None => {
+            gctx.local_types.remove(&var_name);
+        }
+    }
     Ok(())
 }
 

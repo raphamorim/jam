@@ -1,0 +1,11 @@
+// `for x in v` walks elements, so v must be a slice or an array —
+// a bare number is a range typo (`for i in 0:n`).
+// expect-error: `for x in v` needs a slice or array to walk
+
+fn main() u8 {
+    var n: u32 = 7;
+    for x in n {
+        return 1;
+    }
+    return 0;
+}

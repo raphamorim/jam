@@ -376,11 +376,13 @@ fn dump_node(
             let start = ex(ns, n.lhs, 1);
             let end = ex(ns, n.lhs, 2);
             let body_n = ex(ns, n.lhs, 3);
-            o.extend_from_slice(b"For ");
+            o.extend_from_slice(if n.op == 1 { b"ForEach " } else { b"For " });
             o.extend_from_slice(&sp.get(StringIdx::new(var)));
             o.push(b'\n');
             dump_child(o, ns, tp, sp, start, ci);
-            dump_child(o, ns, tp, sp, end, ci);
+            if n.op != 1 {
+                dump_child(o, ns, tp, sp, end, ci);
+            }
             for i in 0..body_n {
                 dump_child(o, ns, tp, sp, ex(ns, n.lhs, 4 + i), ci);
             }
