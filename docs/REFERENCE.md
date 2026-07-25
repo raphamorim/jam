@@ -192,8 +192,10 @@ fn validate(hasEmail: bool, hasPassword: bool) bool {
 ## Strings {#strings}
 
 Strings in Jam are represented as slices of bytes (`[]u8`). The `str` type is an alias for
-`[]u8`. Element mutability follows the binding: `const s: []u8 = "..."` is read-only;
-`var s: []u8 = "..."` permits writes.
+`[]u8`. Literal bytes live in read-only data: a slice bound to a literal can be read and
+rebound but not written through, and the compiler rejects such writes no matter how many
+bindings or calls the literal passes through. To edit the bytes, copy them into owned
+storage first (`buf.appendSlice("hi")`, or an array).
 
 ```jam
 const greeting: str   = "Hello, World!";
