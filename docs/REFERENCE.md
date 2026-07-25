@@ -175,7 +175,7 @@ Jam provides three logical operators for working with boolean values:
 
 The `&&` and `\|\|` operators use **short-circuit evaluation**: if the result can
 be determined from the first operand alone, the second operand is not
-evaluated — a call on the right-hand side does not run.
+evaluated; a call on the right-hand side does not run.
 
 ```jam
 fn checkAccess(isAdmin: bool, isOwner: bool) bool {
@@ -218,7 +218,7 @@ A slice is a two-word value: a pointer to the data and a length.
 `base[start..end]` produces a sub-slice. The base may be a slice, a fixed array, or a
 many-item pointer; bounds are the caller's responsibility, like indexing. `==` and `!=`
 compare two slices by length and contents (float element types are rejected; NaN makes
-byte equality a lie — compare those with a loop).
+byte equality a lie; compare those with a loop).
 
 ```jam
 const s: str = "hello world";
@@ -366,7 +366,7 @@ With a literal end bound the index is a `u64`; with a variable bound it takes th
 variable's type.
 
 Without a `:`, `for` walks a slice or array element-wise. The loop var binds each
-element *in place* — like `s[i]` as an lvalue — so assigning through it writes to the
+element *in place*, like `s[i]` as an lvalue, so assigning through it writes to the
 underlying storage.
 
 ```jam
@@ -486,7 +486,7 @@ fn run() i32 {
 }
 ```
 
-There are no closures — a callback that needs state takes an explicit context
+There are no closures: a callback that needs state takes an explicit context
 argument (see `std/box` and jam-objc's block support for the pattern).
 
 ---
@@ -495,7 +495,7 @@ argument (see `std/box` and jam-objc's block support for the pattern).
 
 A struct groups fields under a single name. Top-level structs are declared via
 `const Name = struct { … };`. Field names are `field: Type`; instances are built with
-`TypeName { field: value, … }` — literals always name their type.
+`TypeName { field: value, … }`: literals always name their type.
 
 ```jam
 const Vec3   = struct { x: f32, y: f32, z: f32 };
@@ -663,7 +663,7 @@ fn unwrap(o: Option(i32), fallback: i32) i32 {
 
 Arms that bind payload fields introduce those names into the arm's scope.
 
-A match **expression** must be exhaustive — cover every variant of the enum or
+A match **expression** must be exhaustive: cover every variant of the enum or
 add a `_` arm; anything else is a compile error (a fallthrough would leave the
 result undefined). Statement-position matches keep switch-style fallthrough.
 
@@ -782,12 +782,12 @@ fn size() u32 {
 ```
 
 `cfn` is the second compile-time form. A top-level `cfn` runs its body at
-compile time and emits code into the caller (`std.fmt.print` is one — the
+compile time and emits code into the caller (`std.fmt.print` is one; the
 format string is parsed during compilation). A `cfn` **method** is an
 ordinary runtime function that opts into compiler-synthesized call sites:
 `cfn drop` registers with automatic drop, `cfn clone` with `.clone()`,
 `cfn at`/`setAt`/`len` with `v[i]` indexing (on plain bindings and field
-chains alike: `h.buf[i]` dispatches the same way) — and a `cfn` method may
+chains alike: `h.buf[i]` dispatches the same way), and a `cfn` method may
 declare a variadic pack (see extern / FFI).
 
 ---
@@ -825,7 +825,7 @@ fn show() {
 
 // Destructured binding, pulls specific names into the current scope.
 // Re-exports under `std` can be reached via chained access on the
-// import expression — pick the names you need without binding the
+// import expression: pick the names you need without binding the
 // whole module.
 const { Vec }    = import("std").collections;
 const { Option } = import("std").option;
@@ -899,7 +899,7 @@ When the callee is only known as an address (`dlsym` results,
 `objc_msgSend`-style dispatchers), `@callC(R, addr, args...)` performs an
 indirect call with the C calling convention. `R` is the return type (`void`
 is accepted here), `addr` is a `u64`, and each argument's *static* type
-becomes the corresponding parameter type of the synthesized signature — no
+becomes the corresponding parameter type of the synthesized signature, with no
 coercion happens at the boundary, so spell scalar types explicitly
 (`0 as i64`, `x as u64`).
 
@@ -913,15 +913,15 @@ fn callThroughAddress() f64 {
 ```
 
 By-value aggregates are allowed when they are homogeneous float aggregates
-of at most 4 same-width floats (`{f64,f64,f64,f64}` — FP registers) or at
-most two full 64-bit words (`{u64,u64}` — GP registers); other shapes are
+of at most 4 same-width floats (`{f64,f64,f64,f64}`, FP registers) or at
+most two full 64-bit words (`{u64,u64}`, GP registers); other shapes are
 rejected at compile time.
 
 ### Variadic `cfn`: forwarding argument packs
 
 A `cfn` method may declare one trailing argument pack, `args: ...`. The
 method is instantiated per call-site shape (each pack argument's static
-type becomes a real parameter), and the pack's only use is forwarding —
+type becomes a real parameter), and the pack's only use is forwarding:
 `args...` at the end of a call-argument list, most usefully into `@callC`
 or an extern C-variadic like `printf`:
 
@@ -937,7 +937,7 @@ const n: i32 = c.callThrough(i32, -7 as i32);   // fn(i32) i32
 const d: f64 = c.callThrough(f64, 1.5, 2.5);    // fn(f64, f64) f64
 ```
 
-The pack cannot be read, indexed, or stored — only spread. Packs are not
+The pack cannot be read, indexed, or stored, only spread. Packs are not
 available on plain `fn` or on top-level (comptime) `cfn`s.
 
 ---
@@ -986,7 +986,7 @@ fn storeIn(buf: move []u8, db: mut Database) {
 }
 ```
 
-Call sites are sigil-free for every mode — the signature's mode declaration does all
+Call sites are sigil-free for every mode: the signature's mode declaration does all
 the work, and the argument is always a plain expression:
 
 ```jam
@@ -995,8 +995,8 @@ scale(p, 2.0);                   // mut access, no sigil
 distance(p, otherPoint);         // read-only, no sigil
 ```
 
-The default mode is enforced: writing into a default-mode parameter — the binding
-itself, a field, an array or slice element, or a `for`-each element view over it —
+The default mode is enforced: writing into a default-mode parameter (the binding
+itself, a field, an array or slice element, or a `for`-each element view over it)
 is a compile error. Writes through a pointer-typed *value* (`p.*`, `self.ptr[i]`)
 are governed by the pointer's own `mut`/`const` qualifier, not the parameter's mode.
 
@@ -1006,16 +1006,17 @@ fn broken(arr: [4]u16) {
 }
 ```
 
-The borrow follows the value through calls: a returned slice — bare, carried in a
-struct's fields (`Pair { data: v.asSlice(), n: 0 }`), or in an enum payload
-(`Option([]u8).Some(v.asSlice())`) — is tracked back to the arguments it derives
+The borrow follows the value through calls: a returned slice, whether bare, carried
+in a struct's fields (`Pair { data: v.asSlice(), n: 0 }`), or in an enum payload
+(`Option([]u8).Some(v.asSlice())`), is tracked back to the arguments it derives
 from, so views of a read-only parameter reject writes no matter how many bindings,
-calls, or `match` arms they pass through. Scalar payloads are plain copies and stay
-freely mutable. A view-carrying struct still owns its
+calls, or `match` arms they pass through, including locals assembled inside the
+callee and then returned (`var p = ...; p.data = v.asSlice(); return p;`). Scalar
+payloads and fields are plain copies and stay freely mutable. A view-carrying struct still owns its
 inline fields: `p.n = 5` and whole rebinds stay legal; only writes reaching the
 borrowed elements are rejected. Passing read-only storage as a `mut`
-argument or calling a `mut self` method on it — directly (`v.push(1)`) or through a
-field chain (`h.buf.push(1)`) — is rejected the same way; the fix is always to take
+argument or calling a `mut self` method on it, directly (`v.push(1)`) or through a
+field chain (`h.buf.push(1)`), is rejected the same way; the fix is always to take
 the parameter as `mut` in the signature.
 
 There is no reference type in jam, so `&` is not a borrow operator: it is address-of,
@@ -1072,34 +1073,34 @@ A value *moved* into another function (via the `move` mode) becomes uninitialize
 the caller, so the drop fires at the new owner's scope exit, never twice.
 
 A `move` parameter is owned by the callee: it drops when the function exits, unless
-the body moves it onward — into a container slot, a struct-literal field, another
+the body moves it onward: into a container slot, a struct-literal field, another
 `move` call, or a `return`. Binding a bare drop-bearing value to a new name
 (`var owned = c;`) or storing it (`arr[i] = c;`) is likewise a move, never a copy.
 Assigning over a live drop-bearing value (`c = newCounter();`, `h.field = x;`,
 `v[i] = x;`) drops the previous occupant before the store, so overwriting never
 leaks.
-Moving a drop-bearing value out of a `let`/`mut` parameter is rejected — those are
+Moving a drop-bearing value out of a `let`/`mut` parameter is rejected; those are
 borrowed, not owned; declare the parameter `move` to take ownership.
 
 Matching a drop-bearing enum by value consumes the scrutinee: arm bindings take
 ownership of the payload (they drop at the arm's end unless moved onward), arms
 that don't bind drop the residual payload on entry, and a temporary scrutinee
 (`match (v.pop())`) is owned by the match itself. Matching a `let`/`mut`
-parameter's enum is rejected — borrowed values can't be consumed; clone the
+parameter's enum is rejected (borrowed values can't be consumed); clone the
 scrutinee or take it by `move`.
 
 When both values are genuinely needed, clone explicitly: `x.clone()` is a deep
 copy. Plain data clones for free (it is the value), structs without their own
 `drop` clone field-wise, arrays clone element-wise, and a type that owns
 resources (has `cfn drop`) must define `cfn clone(self: Self) Self` to say how
-its resource duplicates — the compiler can clone structure, never resources.
+its resource duplicates: the compiler can clone structure, never resources.
 Container clones are conditional: `Vec(T).clone()` exists exactly when `T` is
 cloneable. There are no implicit clones.
 
-Drops stay static — jam never inserts runtime drop flags. Two restrictions on
+Drops stay static: jam never inserts runtime drop flags. Two restrictions on
 drop-bearing bindings keep that possible: a move must be unconditional relative to the
 binding's declaration (moving inside an `if` arm, loop body, or `match` arm that does
 not also contain the declaration is rejected with "move it on all control-flow paths
-or none"), and a moved binding cannot be re-assigned — bind a new name instead. Where
+or none"), and a moved binding cannot be re-assigned; bind a new name instead. Where
 Rust would insert a runtime drop flag for a conditionally-moved value, jam rejects the
 program, the same static resolution Swift's noncopyable types use.
