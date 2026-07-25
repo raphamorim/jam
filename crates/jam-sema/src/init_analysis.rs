@@ -82,6 +82,14 @@ struct BorrowPath {
     steps: Vec<PathStep>,
 }
 
+/// Receiver of a resolved method call: a plain binding name (direct
+/// `recv.method(...)`) or an expression subtree (indirect chains like
+/// `self.buf.push(x)` / `f().method()`).
+enum Recv {
+    Name(String),
+    Expr(NodeIdx),
+}
+
 /// Result of analyzing a statement or expression.
 struct StmtResult {
     state: NameMap,
@@ -867,9 +875,24 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             }
         }
 
+        // Indirect chains (`self.buf.push(x)`, `f().method()`): type the
+        // receiver subtree to recover the callee, so its parameter modes
+        // (and the receiver checks below) apply to these calls too.
+        let mut recv_expr: Option<NodeIdx> = None;
+        if n.flags & 1 != 0
+            && let Some((f, Some(Recv::Expr(e)), _)) = self.resolve_call(idx, None)
+        {
+            callee = Some(f);
+            arg_mode_offset = 1;
+            recv_expr = Some(e);
+        }
+
         // A `mut self` method writes into the receiver's storage — reject
         // calling one through a read-only borrow.
-        if let (Some(c), Some(rn)) = (&callee, &recv_name)
+        let recv_root = recv_name
+            .clone()
+            .or_else(|| recv_expr.and_then(|e| self.write_root(e)));
+        if let (Some(c), Some(rn)) = (&callee, &recv_root)
             && !c.args.is_empty()
             && c.args[0].mode == ParamMode::Mut
             && self.is_readonly_root(rn)
@@ -1438,14 +1461,27 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
     }
 
     /// Static type of a simple lvalue chain, or None when a step can't be
-    /// typed (calls, unregistered types, unions). Purely a helper for the
+    /// typed (unregistered types, unions). Purely a helper for the
     /// read-only-parameter write check — permissive on None.
     fn lvalue_type(&self, idx: NodeIdx) -> Option<TypeIdx> {
+        self.lvalue_type_in(idx, None)
+    }
+
+    /// `lvalue_type` scoped to `param_ctx`: when summarizing a callee's
+    /// body, root Variables resolve against ITS parameter list (never the
+    /// current function's bindings — that would be the wrong scope).
+    fn lvalue_type_in(&self, idx: NodeIdx, param_ctx: Option<&FunctionAST>) -> Option<TypeIdx> {
         let n = *self.ctx.node_store.get(idx);
         match n.tag {
-            AstTag::Variable => self.var_types.get(&self.str_name(n.lhs)).copied(),
+            AstTag::Variable => {
+                let name = self.str_name(n.lhs);
+                match param_ctx {
+                    Some(f) => f.args.iter().find(|p| p.name == name).map(|p| p.ty),
+                    None => self.var_types.get(&name).copied(),
+                }
+            }
             AstTag::MemberAccess => {
-                let mut bt = self.lvalue_type(NodeIdx::new(n.lhs))?;
+                let mut bt = self.lvalue_type_in(NodeIdx::new(n.lhs), param_ctx)?;
                 let k = self.ctx.type_pool.get(bt);
                 if k.kind == TypeKind::PtrSingle {
                     bt = TypeIdx::new(k.a);
@@ -1458,7 +1494,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                     .map(|(_, ty)| ty)
             }
             AstTag::Index | AstTag::Slice => {
-                let bt = self.lvalue_type(NodeIdx::new(n.lhs))?;
+                let bt = self.lvalue_type_in(NodeIdx::new(n.lhs), param_ctx)?;
                 let k = self.ctx.type_pool.get(bt);
                 match k.kind {
                     TypeKind::Array | TypeKind::Slice | TypeKind::PtrMany => {
@@ -1472,7 +1508,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 }
             }
             AstTag::Deref => {
-                let bt = self.lvalue_type(NodeIdx::new(n.lhs))?;
+                let bt = self.lvalue_type_in(NodeIdx::new(n.lhs), param_ctx)?;
                 let k = self.ctx.type_pool.get(bt);
                 match k.kind {
                     TypeKind::PtrSingle | TypeKind::PtrMany => Some(TypeIdx::new(k.a)),
@@ -1480,7 +1516,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 }
             }
             AstTag::Call => {
-                let (callee, _, _) = self.resolve_call(idx, None)?;
+                let (callee, _, _) = self.resolve_call(idx, param_ctx)?;
                 (!callee.return_type.is_none()).then_some(callee.return_type)
             }
             _ => None,
@@ -1525,7 +1561,11 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 let offset = usize::from(recv.is_some());
                 for k in viewed {
                     let root = if k == 0 && offset == 1 {
-                        recv.clone()
+                        match recv.as_ref() {
+                            Some(Recv::Name(s)) => Some(s.clone()),
+                            Some(Recv::Expr(e)) => self.write_root(*e),
+                            None => None,
+                        }
                     } else {
                         args.get(k - offset).and_then(|&a| self.write_root(a))
                     };
@@ -1541,27 +1581,58 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         }
     }
 
-    /// Resolve a direct Call node to (callee AST, receiver name, arg nodes).
-    /// Mirrors `analyze_call`'s resolution: the stored callee name first,
-    /// then `recv.method` through the receiver's static type. Receiver
-    /// types come from `param_ctx`'s parameter list when summarizing a
-    /// callee body, else from the current function's bindings. None for
-    /// indirect calls (`expr.method(...)`) and unresolved names.
+    /// Resolve a Call node to (callee AST, receiver, arg nodes). Mirrors
+    /// `analyze_call`'s resolution: the stored callee name first, then
+    /// `recv.method` through the receiver's static type; indirect calls
+    /// (`expr.method(...)`, flags bit 0) type the receiver subtree the
+    /// same way. Receiver types come from `param_ctx`'s parameter list
+    /// when summarizing a callee body, else from the current function's
+    /// bindings. None when the callee can't be resolved.
     fn resolve_call(
         &self,
         idx: NodeIdx,
         param_ctx: Option<&FunctionAST>,
-    ) -> Option<(FunctionAST, Option<String>, Vec<NodeIdx>)> {
+    ) -> Option<(FunctionAST, Option<Recv>, Vec<NodeIdx>)> {
         let n = *self.ctx.node_store.get(idx);
-        if n.tag != AstTag::Call || n.flags & 1 != 0 {
+        if n.tag != AstTag::Call {
             return None;
         }
-        let callee_name = self.str_name(n.lhs);
         let extra = n.rhs;
         let arg_count = self.extra(extra);
         let args: Vec<NodeIdx> = (0..arg_count)
             .map(|i| NodeIdx::new(self.extra(extra + 1 + i)))
             .collect();
+
+        let method_on = |recv_ty: TypeIdx, method: &str| -> Option<FunctionAST> {
+            let recv_ty = self
+                .ctx
+                .requalify_type(recv_ty, &self.ctx.current_body_module());
+            let k = self.ctx.type_pool.get(recv_ty);
+            if !matches!(
+                k.kind,
+                TypeKind::Struct | TypeKind::Named | TypeKind::GenericCall
+            ) {
+                return None;
+            }
+            let type_name = self.str_name(k.a);
+            self.ctx.get_function_ast(&format!("{type_name}.{method}"))
+        };
+
+        if n.flags & 1 != 0 {
+            // Indirect: lhs is the callee chain, a MemberAccess whose base
+            // is the receiver expression and whose field is the method.
+            let chain = *self.ctx.node_store.get(NodeIdx::new(n.lhs));
+            if chain.tag != AstTag::MemberAccess {
+                return None;
+            }
+            let recv_node = NodeIdx::new(chain.lhs);
+            let method = self.str_name(chain.rhs);
+            let recv_ty = self.lvalue_type_in(recv_node, param_ctx)?;
+            let f = method_on(recv_ty, &method)?;
+            return Some((f, Some(Recv::Expr(recv_node)), args));
+        }
+
+        let callee_name = self.str_name(n.lhs);
         if let Some(f) = self.ctx.get_function_ast(&callee_name) {
             return Some((f, None, args));
         }
@@ -1575,19 +1646,8 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             Some(f) => f.args.iter().find(|p| p.name == recv).map(|p| p.ty)?,
             None => self.var_types.get(recv).copied()?,
         };
-        let recv_ty = self
-            .ctx
-            .requalify_type(recv_ty, &self.ctx.current_body_module());
-        let k = self.ctx.type_pool.get(recv_ty);
-        if !matches!(
-            k.kind,
-            TypeKind::Struct | TypeKind::Named | TypeKind::GenericCall
-        ) {
-            return None;
-        }
-        let type_name = self.str_name(k.a);
-        let f = self.ctx.get_function_ast(&format!("{type_name}.{method}"))?;
-        Some((f, Some(recv.to_string()), args))
+        let f = method_on(recv_ty, method)?;
+        Some((f, Some(Recv::Name(recv.to_string())), args))
     }
 
     /// Collect the operands of every `return` reachable in `stmts`
@@ -1712,7 +1772,13 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                     let offset = usize::from(recv.is_some());
                     for k in viewed {
                         if k == 0 && offset == 1 {
-                            push_param(recv.as_deref().unwrap_or(""), out);
+                            match recv.as_ref() {
+                                Some(Recv::Name(s)) => push_param(s, out),
+                                Some(Recv::Expr(e)) => {
+                                    self.expr_view_params(fn_ast, *e, depth, out);
+                                }
+                                None => {}
+                            }
                         } else if let Some(&a) = args.get(k - offset) {
                             self.expr_view_params(fn_ast, a, depth, out);
                         }

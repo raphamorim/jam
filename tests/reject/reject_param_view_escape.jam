@@ -8,6 +8,8 @@
 // expect-error: cannot write through `w` — it views elements of a read-only parameter
 // expect-error: cannot pass `buf` as a `mut` argument
 // expect-error: cannot call `mut self` method `push` through `v`
+// expect-error: cannot call `mut self` method `push` through `h`
+// expect-error: cannot write through `fb` — it views elements of a read-only parameter
 
 const { Vec } = import("std").collections;
 
@@ -43,6 +45,23 @@ fn pokeViaMutArg(buf: []u8) {
 
 fn pokeViaMutMethod(v: Vec(u8)) {
     v.push(1);
+}
+
+const Holder = struct {
+    tag: u32,
+    buf: Vec(u8),
+};
+
+// Indirect receiver chains resolve too: the method is found through the
+// typed field, and the write-root walks back to the parameter.
+fn pokeFieldMethod(h: Holder) {
+    h.buf.push(1);
+}
+
+fn pokeFieldView(h: Holder) {
+    for fb in h.buf.asSlice() {
+        fb = 0;
+    }
 }
 
 fn main() u8 {

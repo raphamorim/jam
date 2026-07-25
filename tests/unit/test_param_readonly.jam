@@ -135,3 +135,25 @@ tfn readingViewsIsFine() {
     v.push(5);
     assert(viewLen(v) as u32, 2);
 }
+
+const Holder = struct {
+    tag: u32,
+    buf: Vec(u8),
+};
+
+fn bumpAll(h: mut Holder) {
+    for b in h.buf.asSlice() {
+        b = b + 1;
+    }
+    h.buf.push(9);
+}
+
+tfn mutParamFieldChainsWritable() {
+    var h: Holder = Holder { tag: 0, buf: Vec(u8).empty() };
+    h.buf.push(4);
+    bumpAll(h);
+    const view: []u8 = h.buf.asSlice();
+    assert(view[0] as u32, 5);
+    assert(view[1] as u32, 9);
+    assert(view.len as u32, 2);
+}
