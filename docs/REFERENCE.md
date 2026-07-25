@@ -1005,6 +1005,13 @@ fn broken(arr: [4]u16) {
 }
 ```
 
+The borrow follows the value through calls: a slice returned by a function is
+tracked back to the arguments it derives from (`v.asSlice()`, a `trim(s)` result, a
+wrapper's return), so views of a read-only parameter reject writes no matter how
+many bindings or calls they pass through. Passing read-only storage as a `mut`
+argument or calling a `mut self` method on it is rejected the same way — the fix is
+always to take the parameter as `mut` in the signature.
+
 There is no reference type in jam, so `&` is not a borrow operator: it is address-of,
 producing a `*mut T` / `*const T` pointer value, and is only meaningful where the
 parameter's *type* is a pointer (FFI, sink out-params). Writing `&x` for a mode
