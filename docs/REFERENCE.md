@@ -994,6 +994,17 @@ scale(p, 2.0);                   // mut access, no sigil
 distance(p, otherPoint);         // read-only, no sigil
 ```
 
+The default mode is enforced: writing into a default-mode parameter — the binding
+itself, a field, an array or slice element, or a `for`-each element view over it —
+is a compile error. Writes through a pointer-typed *value* (`p.*`, `self.ptr[i]`)
+are governed by the pointer's own `mut`/`const` qualifier, not the parameter's mode.
+
+```jam
+fn broken(arr: [4]u16) {
+    arr[0] = 99;    // error: parameters are read-only borrows by default
+}
+```
+
 There is no reference type in jam, so `&` is not a borrow operator: it is address-of,
 producing a `*mut T` / `*const T` pointer value, and is only meaningful where the
 parameter's *type* is a pointer (FFI, sink out-params). Writing `&x` for a mode
