@@ -1548,6 +1548,13 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                     // read-only borrow covers them (mode table: default
                     // mode's pointee is read-only).
                     TypeKind::Array | TypeKind::Slice => self.write_root(base),
+                    // Container `v[i] = x` dispatches its `cfn setAt`
+                    // (`mut self`) — the write is the container's.
+                    TypeKind::Struct | TypeKind::Named | TypeKind::GenericCall
+                        if n.tag == AstTag::Index =>
+                    {
+                        self.write_root(base)
+                    }
                     _ => None,
                 }
             }

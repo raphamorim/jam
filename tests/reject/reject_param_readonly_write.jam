@@ -8,6 +8,8 @@
 // expect-error: cannot write into parameter `arr`
 // expect-error: cannot write into parameter `buf`
 // expect-error: cannot write through `v` — it views elements of a read-only parameter
+// expect-error: cannot write into parameter `vec`
+// expect-error: cannot write into parameter `h`
 
 const Point = struct {
     x: i32,
@@ -37,6 +39,23 @@ fn pokeThroughView(s: []u8) {
     for v in s {
         v = 0;
     }
+}
+
+const { Vec } = import("std").collections;
+
+const Holder = struct {
+    tag: u32,
+    buf: Vec(u8),
+};
+
+// Container index-assign dispatches `cfn setAt` (`mut self`) — the write
+// is the container's, on plain and field bases alike.
+fn pokeContainer(vec: Vec(u8)) {
+    vec[0] = 1;
+}
+
+fn pokeFieldContainer(h: Holder) {
+    h.buf[0] = 1;
 }
 
 fn main() u8 {
