@@ -1,4 +1,4 @@
-.PHONY: build release test test-unit test-release test-x86_64 install uninstall clean fmt lint check-format info docs
+.PHONY: build release test test-unit test-release test-x86_64 install uninstall clean fmt lint check-format info docs install-docs
 .DEFAULT_GOAL := build
 
 # Check if we're on macOS or Linux
@@ -89,8 +89,14 @@ info:
 	@echo "  make install        - Install jam + std to $(PREFIX)"
 	@echo "  make fmt            - cargo fmt"
 	@echo "  make lint           - fmt --check + clippy"
+	@echo "  make install-docs   - Install website gems (bundler)"
 	@echo "  make docs           - Serve the website locally"
+
+# Vendor gems under docs/vendor/bundle so `bundle exec` finds executables
+# regardless of stray user-dir gem installs (~/.gem).
+install-docs:
+	cd docs && bundle config set --local path vendor/bundle && bundle install
 
 docs:
 	@echo "Serving documentation at http://localhost:4000..."
-	cd docs && bundle install && bundle exec jekyll serve --livereload
+	cd docs && bundle exec jekyll serve --livereload
