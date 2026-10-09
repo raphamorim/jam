@@ -490,9 +490,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         self.readonly_views.remove(&name);
         if !init_idx.is_none()
             && self.type_contains_slice(type_idx, 8)
-            && let Some(src) = self
-                .write_root(init_idx)
-                .and_then(|r| self.root_source(&r))
+            && let Some(src) = self.write_root(init_idx).and_then(|r| self.root_source(&r))
         {
             self.readonly_views
                 .insert(name.clone(), ViewState::whole(src));
@@ -581,8 +579,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                         .and_then(|r| self.root_source(&r))
                     {
                         Some(src) => {
-                            self.readonly_views
-                                .insert(tname, ViewState::whole(src));
+                            self.readonly_views.insert(tname, ViewState::whole(src));
                         }
                         None => {
                             self.readonly_views.remove(&tname);
@@ -594,9 +591,10 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
                 && let Some(field) = twr.first_field.clone()
                 && !twr.via_slice
                 && self.var_types.contains_key(&twr.name)
-                && self.param_modes.get(&twr.name).is_none_or(|_| {
-                    self.decl_depth.contains_key(&twr.name)
-                })
+                && self
+                    .param_modes
+                    .get(&twr.name)
+                    .is_none_or(|_| self.decl_depth.contains_key(&twr.name))
                 && self
                     .lvalue_type(NodeIdx::new(n.lhs))
                     .is_some_and(|t| self.type_contains_slice(t, 8))
@@ -1750,10 +1748,8 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
             // `""` is the zero-length placeholder: it has no writable byte,
             // so it never taints (writes through an empty slice are an
             // out-of-bounds bug of a different class).
-            AstTag::StringLit => {
-                (!self.ctx.string_pool.get(StringIdx::new(n.lhs)).is_empty())
-                    .then(WriteRoot::literal)
-            }
+            AstTag::StringLit => (!self.ctx.string_pool.get(StringIdx::new(n.lhs)).is_empty())
+                .then(WriteRoot::literal),
             AstTag::MemberAccess => {
                 let base = NodeIdx::new(n.lhs);
                 let k = self.ctx.type_pool.get(self.lvalue_type(base)?).kind;
@@ -2370,8 +2366,7 @@ impl<'a, 'ctx> Analyzer<'a, 'ctx> {
         if self.readonly_views.get(name).is_some_and(ViewState::any) {
             return true;
         }
-        self.param_modes.get(name) == Some(&ParamMode::Let)
-            && !self.decl_depth.contains_key(name)
+        self.param_modes.get(name) == Some(&ParamMode::Let) && !self.decl_depth.contains_key(name)
     }
 
     /// Why (if at all) `wr`'s storage is read-only. A per-field entry

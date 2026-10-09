@@ -500,7 +500,8 @@ fn dump_node(
         }
         AstTag::PatRange => {
             let ex = ExtraIdx::new(n.lhs);
-            let lo = (ns.get_extra(ex) as u64) | ((ns.get_extra(ExtraIdx::new(n.lhs + 1)) as u64) << 32);
+            let lo =
+                (ns.get_extra(ex) as u64) | ((ns.get_extra(ExtraIdx::new(n.lhs + 1)) as u64) << 32);
             let hi = (ns.get_extra(ExtraIdx::new(n.lhs + 2)) as u64)
                 | ((ns.get_extra(ExtraIdx::new(n.lhs + 3)) as u64) << 32);
             o.extend_from_slice(b"PatRange ");

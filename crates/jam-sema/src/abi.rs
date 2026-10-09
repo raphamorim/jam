@@ -154,10 +154,15 @@ pub enum CAbiClass {
     /// AArch64 only: homogeneous float aggregate, natural struct value.
     Hfa,
     /// <= 16 bytes, coerced to one or two 64-bit words.
-    Coerce { w0: CWord, w1: Option<CWord> },
+    Coerce {
+        w0: CWord,
+        w1: Option<CWord>,
+    },
     /// > 16 bytes. Args: caller copy — a plain pointer on aarch64,
     /// byval on x86-64. Returns: sret on both.
-    Memory { byval: bool },
+    Memory {
+        byval: bool,
+    },
 }
 
 pub fn classify_c_abi(ty: TypeIdx, ctx: &CodegenContext) -> Result<CAbiClass, String> {
@@ -170,7 +175,11 @@ pub fn classify_c_abi(ty: TypeIdx, ctx: &CodegenContext) -> Result<CAbiClass, St
             if size <= 16 {
                 let w = sysv_words(ty, ctx)?;
                 let w0 = w[0].unwrap_or(CWord::Int);
-                let w1 = if size > 8 { Some(w[1].unwrap_or(CWord::Int)) } else { None };
+                let w1 = if size > 8 {
+                    Some(w[1].unwrap_or(CWord::Int))
+                } else {
+                    None
+                };
                 return Ok(CAbiClass::Coerce { w0, w1 });
             }
             Ok(CAbiClass::Memory { byval: true })
@@ -217,7 +226,11 @@ fn c_abi_float_leaves(ty: TypeIdx, ctx: &CodegenContext) -> Option<(u32, u32)> {
                 }
                 count += fcount;
             }
-            if count == 0 { None } else { Some((bits, count)) }
+            if count == 0 {
+                None
+            } else {
+                Some((bits, count))
+            }
         }
         _ => None,
     }
@@ -256,9 +269,7 @@ fn sysv_walk(
 ) -> Result<(), String> {
     let ty = ctx.requalify_type(ty, &ctx.current_body_module());
     let k = ctx.type_pool.get(ty);
-    let align_up = |off: u64, a: u64| -> u64 {
-        if a == 0 { off } else { off.div_ceil(a) * a }
-    };
+    let align_up = |off: u64, a: u64| -> u64 { if a == 0 { off } else { off.div_ceil(a) * a } };
     match k.kind {
         TypeKind::Float => {
             sysv_mark(w, base, (k.a as u64) / 8, CWord::Fp);

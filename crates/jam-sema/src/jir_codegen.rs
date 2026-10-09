@@ -932,7 +932,9 @@ fn emit_inst_impl<'ctx>(
                     let agg_ty = lctx.ctx.get_llvm_type(ret_ty)?;
                     let align = lctx.ctx.type_align(ret_ty)?;
                     result.add_call_site_sret(0, agg_ty, align as u32);
-                    Ok(Some(sret_slot.expect("sret slot exists for Memory returns")))
+                    Ok(Some(
+                        sret_slot.expect("sret slot exists for Memory returns"),
+                    ))
                 }
                 CAbiClass::Coerce { w0, w1 } => {
                     // Spill the coerced words; the byref consumer reads the

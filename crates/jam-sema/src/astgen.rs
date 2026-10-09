@@ -5409,11 +5409,7 @@ fn astgen_call_c(gctx: &mut AstGenCtx, n: &AstNode) -> Result<JirRef, String> {
     let mut arg_refs: Vec<u32> = Vec::with_capacity(count as usize - 1);
     let mut param_tys: Vec<TypeIdx> = Vec::with_capacity(count as usize - 1);
     for i in 1..count {
-        let arg_idx = NodeIdx::new(
-            gctx.ctx
-                .node_store
-                .get_extra(ExtraIdx::new(extra + 2 + i)),
-        );
+        let arg_idx = NodeIdx::new(gctx.ctx.node_store.get_extra(ExtraIdx::new(extra + 2 + i)));
         // `pack...` — forward the enclosing variadic-cfn clone's pack; each
         // materialized param contributes its own static type to the
         // synthesized signature.
@@ -5503,7 +5499,10 @@ fn expand_pack_spread(gctx: &mut AstGenCtx, name: &str) -> Result<Vec<JirRef>, S
 /// caller-copy + sret memory class).
 fn callc_check_abi(gctx: &AstGenCtx, ty: TypeIdx, what: &str) -> Result<(), String> {
     match gctx.ctx.type_pool.get(ty).kind {
-        TypeKind::Invalid | TypeKind::Void | TypeKind::NoReturn | TypeKind::Type
+        TypeKind::Invalid
+        | TypeKind::Void
+        | TypeKind::NoReturn
+        | TypeKind::Type
         | TypeKind::Module => {
             return Err(format!("astgen: @callC {what} has no runtime value"));
         }
@@ -9546,10 +9545,7 @@ mod tests {
     #[test]
     fn callc_rejects_non_u64_address() {
         let err = astgen_first_fn("fn f(b: bool) u64 { return @callC(u64, b); }").unwrap_err();
-        assert!(
-            err.contains("@callC address must be a u64"),
-            "got: {err}"
-        );
+        assert!(err.contains("@callC address must be a u64"), "got: {err}");
     }
 
     /// Recoverable diagnostics accumulate: one pass over a body reports every

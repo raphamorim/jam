@@ -1061,8 +1061,16 @@ impl<'a> Parser<'a> {
                 }
                 // Full 64-bit bounds in the extra pool (they used to truncate
                 // to u32); flags carry the signs.
-                let lo_signed = if is_negative { (lo as i64).wrapping_neg() } else { lo as i64 };
-                let hi_signed = if hineg { (hi as i64).wrapping_neg() } else { hi as i64 };
+                let lo_signed = if is_negative {
+                    (lo as i64).wrapping_neg()
+                } else {
+                    lo as i64
+                };
+                let hi_signed = if hineg {
+                    (hi as i64).wrapping_neg()
+                } else {
+                    hi as i64
+                };
                 if lo_signed > hi_signed {
                     return Err(self.parse_error("empty `..=` range (low is above high)"));
                 }
@@ -1074,8 +1082,7 @@ impl<'a> Parser<'a> {
                     .set_extra(ExtraIdx::new(e.raw() + 2), (hi & 0xFFFF_FFFF) as u32);
                 self.nodes
                     .set_extra(ExtraIdx::new(e.raw() + 3), (hi >> 32) as u32);
-                let flags: u16 =
-                    u16::from(is_negative) | (u16::from(hineg) << 1);
+                let flags: u16 = u16::from(is_negative) | (u16::from(hineg) << 1);
                 return Ok(self.emit(AstNode {
                     tag: AstTag::PatRange,
                     op: 0,
@@ -1347,9 +1354,9 @@ impl<'a> Parser<'a> {
                     "Expected ')' after '@' intrinsic arguments",
                 )?;
                 if args.is_empty() {
-                    return Err(self.parse_error(
-                        "@callC expects a function address after the return type",
-                    ));
+                    return Err(
+                        self.parse_error("@callC expects a function address after the return type")
+                    );
                 }
                 let e = self.nodes.reserve_extra(2 + args.len());
                 self.nodes.set_extra(e, ret_ty.raw());
@@ -2175,9 +2182,7 @@ impl<'a> Parser<'a> {
                 if self.check(TokenType::Ellipsis) {
                     self.advance();
                     if !is_cfn {
-                        return Err(
-                            self.parse_error("argument packs (`name: ...`) require `cfn`")
-                        );
+                        return Err(self.parse_error("argument packs (`name: ...`) require `cfn`"));
                     }
                     if is_comp {
                         return Err(self.parse_error("a variadic pack cannot be `comp`"));
@@ -2866,8 +2871,14 @@ mod tests {
         );
         let meth = &m.structs[0].methods[0];
         assert_eq!(meth.var_args_pack.as_deref(), Some("args"));
-        assert!(!meth.is_var_args, "pack must not set the extern varargs flag");
-        assert!(meth.is_generic(), "pack-bearing cfn is an instantiation template");
+        assert!(
+            !meth.is_var_args,
+            "pack must not set the extern varargs flag"
+        );
+        assert!(
+            meth.is_generic(),
+            "pack-bearing cfn is an instantiation template"
+        );
         assert_eq!(meth.args.len(), 1, "pack is not a Param");
     }
 
@@ -2882,9 +2893,8 @@ mod tests {
 
     #[test]
     fn pack_not_last_rejected() {
-        let msgs = parse_module_err(
-            "const S = struct { v: u64, cfn f(self: S, args: ..., x: u64) {} };",
-        );
+        let msgs =
+            parse_module_err("const S = struct { v: u64, cfn f(self: S, args: ..., x: u64) {} };");
         assert!(
             msgs.iter().any(|m| m.contains("last parameter")),
             "got: {msgs:?}"

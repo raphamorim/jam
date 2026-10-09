@@ -122,8 +122,7 @@ impl FunctionAST {
         if self.is_comp_time_fn || self.return_type == builtin::TYPE {
             return false;
         }
-        self.var_args_pack.is_some()
-            || self.args.iter().any(|p| p.is_comp || p.ty == builtin::TYPE)
+        self.var_args_pack.is_some() || self.args.iter().any(|p| p.is_comp || p.ty == builtin::TYPE)
     }
 }
 

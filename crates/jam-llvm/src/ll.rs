@@ -899,8 +899,7 @@ impl<'ctx> Value<'ctx> {
             let sret_kind = raw::LLVMGetEnumAttributeKindForName("sret".as_ptr() as *const _, 4);
             let sret = raw::LLVMCreateTypeAttribute(ctx, sret_kind, pointee.as_ptr());
             raw::LLVMAddCallSiteAttribute(self.0, idx, sret);
-            let na_kind =
-                raw::LLVMGetEnumAttributeKindForName("noalias".as_ptr() as *const _, 7);
+            let na_kind = raw::LLVMGetEnumAttributeKindForName("noalias".as_ptr() as *const _, 7);
             let na = raw::LLVMCreateEnumAttribute(ctx, na_kind, 0);
             raw::LLVMAddCallSiteAttribute(self.0, idx, na);
             let al_kind = raw::LLVMGetEnumAttributeKindForName("align".as_ptr() as *const _, 5);

@@ -56,22 +56,22 @@ pub enum AstTag {
     VarDecl,   // lhs = ExtraIdx -> [name, type, init]; rhs = flags (bit0 = isConst)
     IfNode,    // lhs = NodeIdx (cond); rhs = ExtraIdx -> [thenCount, elseCount, then.., else..]
     WhileNode, // lhs = NodeIdx (cond); rhs = ExtraIdx -> [bodyCount, body..]
-    ForNode,   // lhs = ExtraIdx -> [var, start, end, bodyCount, body..]; op 1 = element walk: [var, iterable, 0, bodyCount, body..]
+    ForNode, // lhs = ExtraIdx -> [var, start, end, bodyCount, body..]; op 1 = element walk: [var, iterable, 0, bodyCount, body..]
     Break,
     Continue,
 
     // Module-level
-    ImportLit,      // lhs = StringIdx (module path)
-    StructLit,      // lhs = TypeIdx; rhs = ExtraIdx -> [fieldCount, name0, expr0, ...]
-    ArrayLit,       // lhs = TypeIdx (elem); rhs = ExtraIdx -> [count, elem0, ...]
-    ArrayRepeat,    // lhs = TypeIdx; rhs = ExtraIdx -> [valueNode, countNode]
-    StructExpr,     // lhs = u32 (index into ModuleAST::AnonStructs)
-    EnumExpr,       // lhs = u32 (index into ModuleAST::AnonEnums)
-    MatchNode,      // lhs = NodeIdx (scrutinee); rhs = ExtraIdx -> [armCount, ...]
-    AsCast,         // lhs = NodeIdx (operand), rhs = TypeIdx (target)
-    AtCall,         // lhs = StringIdx (name); rhs = TypeIdx | ExtraIdx (flags bit0);
-                    // flags bit1: extra has a leading TypeIdx header
-                    // ([retTypeIdx, argCount, arg0, ...] — @callC)
+    ImportLit,   // lhs = StringIdx (module path)
+    StructLit,   // lhs = TypeIdx; rhs = ExtraIdx -> [fieldCount, name0, expr0, ...]
+    ArrayLit,    // lhs = TypeIdx (elem); rhs = ExtraIdx -> [count, elem0, ...]
+    ArrayRepeat, // lhs = TypeIdx; rhs = ExtraIdx -> [valueNode, countNode]
+    StructExpr,  // lhs = u32 (index into ModuleAST::AnonStructs)
+    EnumExpr,    // lhs = u32 (index into ModuleAST::AnonEnums)
+    MatchNode,   // lhs = NodeIdx (scrutinee); rhs = ExtraIdx -> [armCount, ...]
+    AsCast,      // lhs = NodeIdx (operand), rhs = TypeIdx (target)
+    AtCall,      // lhs = StringIdx (name); rhs = TypeIdx | ExtraIdx (flags bit0);
+    // flags bit1: extra has a leading TypeIdx header
+    // ([retTypeIdx, argCount, arg0, ...] — @callC)
     TypeMethodCall, // lhs = TypeIdx (receiver); rhs = ExtraIdx -> [methodNameId, argCount, ...]
 
     // Pattern atoms (internal to MatchNode arms)
@@ -84,8 +84,7 @@ pub enum AstTag {
     Spread, // lhs = StringIdx (pack name) — `args...` in a call-arg list
 
     TypeLit, // lhs = TypeIdx — a structural type in expression position
-             // (generic-call args: `Result([]u8, u32)`)
-
+    // (generic-call args: `Result([]u8, u32)`)
     Count, // sentinel for table sizing
 }
 

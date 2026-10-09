@@ -1106,11 +1106,7 @@ impl<'ctx> CodegenContext<'ctx> {
                     "extern `{name}` is declared twice with different signatures; \
                      every declaration of a C symbol must agree"
                 );
-                let already = self
-                    .diagnostics()
-                    .all()
-                    .iter()
-                    .any(|d| d.message == msg);
+                let already = self.diagnostics().all().iter().any(|d| d.message == msg);
                 if !already {
                     self.push_error(jam_core::diag::SrcLoc::none(), msg);
                 }
@@ -2100,7 +2096,10 @@ impl<'ctx> CodegenContext<'ctx> {
                         return self.type_size(resolved);
                     }
                 }
-                Err(format!("type_size: unresolved user type `{}` (subst/alias resolution deferred)", self.str_name(k.a)))
+                Err(format!(
+                    "type_size: unresolved user type `{}` (subst/alias resolution deferred)",
+                    self.str_name(k.a)
+                ))
             }
             TypeKind::Union => match self.union_fields(ty) {
                 Some(fields) => self.union_size(fields),
